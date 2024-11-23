@@ -1,5 +1,5 @@
 
-CFLAGS=-std=c11 -g -static
+CFLAGS=-std=c11 -g
 
 mycc: mycc.c
 test: mycc
@@ -7,5 +7,5 @@ test: mycc
 
 clean:
 	rm -f 9cc *.o *~ tmp*
-	
+
 .PHONY: test clean

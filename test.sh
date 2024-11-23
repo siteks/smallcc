@@ -19,4 +19,6 @@ assert 0 0
 assert 76 76
 assert -5 -5
 
+assert 21 "5+20-4"
+
 echo OK
