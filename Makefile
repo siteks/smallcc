@@ -1,7 +1,7 @@
 
 CFLAGS=-std=c11 -g
 
-mycc: mycc.c
+mycc: mycc.c tokeniser.c parser.c codegen.c
 test: mycc
 	./test.sh
 
