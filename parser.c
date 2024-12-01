@@ -3,18 +3,47 @@
 
 
 // Grammer
-// program      = stmt*
-// stmt         = expr ";" | "return" expr ";"
-// expr         = assign
-// assign       = equality ("=" assign)?
-// equality     = relational ("==" relational | "!=" relational)*
-// relational   = add ("<" add | "<=" add | ">" add | ">=" add)*
-// add          = mul ("+" mul | "-" mul)*
-// mul          = unary ("*" unary | "/" unary)*
-// unary        = ("+" | "-")? primary
-// primary      = num | ident | "(" expr ")"
+// program              ::      { func_def }
+// func_def             ::=     "int" ident "(" [ param_list ] ")" "{" { stmt } "}"
+// param_list           ::=     "int" ident { "," "int" ident }
+// stmt                 ::=     decl_stmt
+//                          |   expr_stmt
+//                          |   comp_stmt
+//                          |   if_stmt
+//                          |   while_stmt
+//                          |   return_stmt
+// decl_stmt            ::=     "int" ident [ "=" expr ] ";"
+// comp_stmt            ::=     "{" { stmt } "}"
+// expr_stmt            ::=     [ expr ] ";"
+// if_stmt              ::=     "if" "(" expr ")" stmt [ "else" stmt ]
+// while_stmt           ::=     "while" "(" expr ")" stmt
+// return_stmt          ::=     "return" [ expr ] ";"
+// expr                 ::=     assign_expr
+// assign_expr          ::=     equal_expr [ "=" assign_expr ]
+// equal_expr           ::=     rel_expr
+//                          |   equal_expr "==" rel_expr
+//                          |   equal_expr "!=" rel_expr
+// rel_expr             ::=     add_expr
+//                          |   rel_expr "<" add_expr
+//                          |   rel_expr ">" add_expr
+//                          |   rel_expr "<=" add_expr
+//                          |   rel_expr ">=" add_expr
+// add_expr             ::=     mult_expr
+//                          |   add_expr "+" mult_expr
+//                          |   add_expr "-" mult_expr
+// mult_expr            ::=     primary_expr
+//                          |   mult_expr "*" primary_expr
+//                          |   mult_expr "/" primary_expr
+// primary_expr         ::=     ident
+//                          |   integer_literal
+//                          |   "(" expr ")"
+// ident                ::=     ident_start { letter | digit | "_" }
+// ident_start          ::=     letter | "_"
+// integer_literal      ::=     digit { digit }
+// letter               ::=     "a" | "b" | "c" | ... | "z" | "A" | "B" | "C" | ... | "Z"
+// digit                ::=     "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9"
 
-
+extern Token *token;
 extern Node *code[];
 extern Local *locals;
 
@@ -29,182 +58,239 @@ Local *find_local(char *ident)
 }
 
 
-Node *new_node(Node_kind kind, Node *lhs, Node *rhs)
+
+Node *new_node(Node_kind kind, char *val)
 {
-    Node *node  = calloc(1, sizeof(Node));
-    node->kind  = kind;
-    node->lhs   = lhs;
-    node->rhs   = rhs;
+    Node *node = calloc(1, sizeof(Node));
+    node->kind = kind;
+    if (val)
+        strncpy(node->val, val, 63);
     return node;
 }
 
-Node *new_node_num(int val)
+void add_child(Node *parent, Node *child)
 {
-    Node *node  = calloc(1, sizeof(Node));
-    node->kind  = ND_NUM;
-    node->val   = val;
-    return node;
+    parent->child_count++;
+    parent->children = (Node **)realloc(parent->children, parent->child_count * sizeof(Node *));
+    parent->children[parent->child_count - 1] = child;
 }
-Node *new_node_ident(char *ident)
+
+
+Node *primary_expr();
+Node *mult_expr();
+Node *add_expr();
+Node *assign_expr();
+Node *expr();
+Node *stmt();
+Node *param_list();
+Node *func_def();
+
+Node *primary_expr()
 {
-    Node *node      = calloc(1, sizeof(Node));
-    node->kind      = ND_LOCAL;
-    Local *local    = find_local(ident);
-    if (local)
+    Node *node;
+    if (token->kind == TK_IDENT)
     {
-        node->offset = local->offset;
-        printf(";Ident %s exists at offset %d\n", ident, node->offset);
+        node = new_node(ND_IDENT, expect(TK_IDENT));
+    }
+    else if (token->kind == TK_NUM)
+    {
+        node = new_node(ND_LITERAL, expect(TK_NUM));
     }
     else
     {
-        local           = calloc(1, sizeof(Local));
-        local->next     = locals;
-        local->name     = ident;
-        local->len      = strlen(ident);
-        local->offset   = locals ? locals->offset + 1 : 0;
-        node->offset    = local->offset;
-        node->ident     = ident;
-        locals          = local;
-        printf(";Ident %s created at offset %d\n", ident, node->offset);
+        expect(TK_LPAREN);
+        node = expr();
+        expect(TK_RPAREN);
     }
     return node;
 }
-
-Node *expr();
-
-Node *primary()
+Node *mult_expr()
 {
-    if (consume("("))
+    Node *node = primary_expr();
+    while (token->kind == TK_STAR || token->kind == TK_SLASH)
     {
-        Node *node = expr();
-        expect(")");
-        return node;
+        Node *enode = new_node(ND_BINOP, expect(token->kind));
+        enode->lhs = node;
+        enode->rhs = primary_expr();
+        node = enode;
     }
-    if (is_ident())
+    return node;
+}
+Node *add_expr()
+{
+    Node *node = mult_expr();
+    while (token->kind == TK_PLUS || token->kind == TK_MINUS)
     {
-        return new_node_ident(expect_ident());
+        Node *enode = new_node(ND_BINOP, expect(token->kind));
+        enode->lhs = node;
+        enode->rhs = mult_expr();
+        node = enode;
     }
-    return new_node_num(expect_number());
+    return node;
 }
-Node *unary()
+Node *rel_expr()
 {
-    if (consume("+"))
-        return primary();
-    if (consume("-"))
-        return new_node(ND_SUB, new_node_num(0), primary());
-    return primary();
-}
-Node *mul()
-{
-    Node *node = unary();
-    while(1)
+    Node *node = add_expr();
+    while (token->kind == TK_LT || token->kind == TK_LE || token->kind == TK_GT || token->kind == TK_GE)
     {
-        if (consume("*"))
-            node = new_node(ND_MUL, node, unary());
-        else if (consume("/"))
-            node = new_node(ND_DIV, node, unary());
-        else
-            return node;
+        Node *enode = new_node(ND_BINOP, expect(token->kind));
+        enode->lhs = node;
+        enode->rhs = add_expr();
+        node = enode;
     }
+    return node;
 }
-Node *add()
+Node *equal_expr()
 {
-    Node *node = mul();
-    while(1)
+    Node *node = rel_expr();
+    while (token->kind == TK_EQ || token->kind == TK_NE)
     {
-        if (consume("+"))
-            node = new_node(ND_ADD, node, mul());
-        else if (consume("-"))
-            node = new_node(ND_SUB, node, mul());
-        else
-            return node;
+        Node *enode = new_node(ND_BINOP, expect(token->kind));
+        enode->lhs = node;
+        enode->rhs = rel_expr();
+        node = enode;
     }
+    return node;
 }
-Node *relational()
+Node *assign_expr()
 {
-    Node *node = add();
-    while(1)
+    Node *node = equal_expr();
+    if (token->kind == TK_ASSIGN)
     {
-        if (consume("<"))
-            node = new_node(ND_LT, node, add());
-        else if (consume("<="))
-            node = new_node(ND_LE, node, add());
-        else if (consume(">"))
-            node = new_node(ND_GT, node, add());
-        else if (consume(">="))
-            node = new_node(ND_GE, node, add());
-        else
-            return node;
+        Node *anode = new_node(ND_ASSIGN, expect(TK_ASSIGN));
+        anode->lhs = node;
+        anode->rhs = assign_expr();
+        return anode;
     }
-}
-Node *equality()
-{
-    Node *node = relational();
-    while(1)
-    {
-        if (consume("=="))
-            node = new_node(ND_EQ, node, relational());
-        else if (consume("=="))
-            node = new_node(ND_EQ, node, relational());
-        else
-            return node;
-    }
-}
-Node *assign()
-{
-    Node *node =equality();
-    if (consume("="))
-        node = new_node(ND_ASSIGN, node, assign());
     return node;
 }
 Node *expr()
 {
-    Node *node = assign();
-    return node;
+    return assign_expr();
 }
 Node *stmt()
 {
-    Node *node;
-    if (consume_tk(TK_RETURN))
+    Node *node = new_node(ND_STMT, 0);
+    if (token->kind == TK_LBRACE)
     {
-        node = calloc(1, sizeof(Node));
-        node->kind = ND_RETURN;
-        node->lhs = expr();
+        node->kind = ND_COMPSTMT;
+        expect(TK_LBRACE);
+        while (token->kind != TK_RBRACE)
+            add_child(node, stmt());
+        expect(TK_RBRACE);
     }
-    else
+    else if (token->kind == TK_INT)
     {
-        node = expr();
+        node->kind = ND_DECLSTMT;
+        expect(TK_INT);
+        add_child(node, new_node(ND_IDENT, expect(TK_IDENT)));
+        if (token->kind == TK_ASSIGN)
+        {
+            expect(TK_ASSIGN);
+            add_child(node, expr());
+        }
+        expect(TK_SEMICOLON);
     }
-    expect(";");
+    else if (token->kind == TK_IF)
+    {
+        node->kind = ND_IFSTMT;
+        expect(TK_IF);
+        expect(TK_LPAREN);
+        add_child(node, expr());
+        expect(TK_RPAREN);
+        add_child(node, stmt());
+        if (token->kind == TK_ELSE)
+        {
+            expect(TK_ELSE);
+            add_child(node, stmt());
+        }
+    }
+    else if (token->kind == TK_WHILE)
+    {
+        node->kind = ND_WHILESTMT;
+        expect(TK_WHILE);
+        expect(TK_LPAREN);
+        add_child(node, expr());
+        expect(TK_RPAREN);
+        add_child(node, stmt());
+    }
+    else if (token->kind == TK_RETURN)
+    {
+        node->kind = ND_RETURNSTMT;
+        expect(TK_RETURN);
+        if (token->kind != TK_SEMICOLON)
+        {
+            add_child(node, expr());
+        }
+        expect(TK_SEMICOLON);
+    }
+    else if (token->kind != TK_SEMICOLON)
+    {
+        node->kind = ND_EXPRSTMT;
+        add_child(node, expr());
+        expect(TK_SEMICOLON);
+    }
     return node;
 }
-void program()
+Node *param_list()
 {
-    int i = 0;
+    Node *node = new_node(ND_PARAM_LIST, 0);
+    if (token->kind == TK_INT)
+    {
+        expect(TK_INT);
+        add_child(node, new_node(ND_IDENT, expect(TK_IDENT)));
+        while(token->kind == TK_COMMA)
+        {
+            expect(TK_COMMA);
+            expect(TK_INT);
+            add_child(node, new_node(ND_IDENT, expect(TK_IDENT)));
+        }
+    }
+    return node;
+}
+Node *func_def()
+{
+    expect(TK_INT);
+    Node *node = new_node(ND_FUNCTION, expect(TK_IDENT));
+    expect(TK_LPAREN);
+    add_child(node, param_list());
+    expect(TK_RPAREN);
+    expect(TK_LBRACE);
+    while(token->kind != TK_RBRACE)
+        add_child(node, stmt());
+    expect(TK_RBRACE);
+    return node;
+}
+Node *program()
+{
+    Node *node = new_node(ND_PROGRAM, 0);
     while(!at_eof())
-        code[i++] = stmt();
-    code[i] = 0;
+    {
+        add_child(node, func_def());
+    }
+    return node;
 }
 
 char *nodestr(Node_kind k)
 {
     switch(k)
     {
-        case    ND_ADD: return "ND_ADD";
-        case    ND_SUB: return "ND_SUB";
-        case    ND_MUL: return "ND_MUL";
-        case    ND_DIV: return "ND_DIV";
-        case    ND_NUM: return "ND_NUM";
-        case    ND_LT: return "ND_LT";
-        case    ND_LE: return "ND_LE";
-        case    ND_GT: return "ND_GT";
-        case    ND_GE: return "ND_GE";
-        case    ND_EQ: return "ND_EQ";
-        case    ND_NE: return "ND_NE";
-        case    ND_ASSIGN: return "ND_ASSIGN";
-        case    ND_LOCAL: return "ND_LOCAL";
-        case    ND_RETURN: return "ND_RETURN";
-        default:;
+        case ND_PROGRAM :   return "PROGRAM     ";
+        case ND_FUNCTION:   return "FUNCTION    ";
+        case ND_PARAM_LIST: return "PARAM_LIST  ";
+        case ND_STMT:       return "STMT        ";
+        case ND_DECLSTMT:   return "DECLSTMT    ";
+        case ND_EXPRSTMT:   return "EXPRSTMT    ";
+        case ND_COMPSTMT:   return "COMPSTMT    ";
+        case ND_IFSTMT:     return "IFSTMT      ";
+        case ND_WHILESTMT:  return "WHILESTMT   ";
+        case ND_RETURNSTMT: return "RETURNSTMT  ";
+        case ND_EXPR:       return "EXPR        ";
+        case ND_BINOP:      return "BINOP       ";
+        case ND_ASSIGN:     return "ASSIGN      ";
+        case ND_IDENT:      return "IDENT       ";
+        case ND_LITERAL:    return "LITERAL     ";
+        default:            return "unknown     ";
     }
 }
 void print_tree(Node *node, int depth)
@@ -213,16 +299,14 @@ void print_tree(Node *node, int depth)
         return;
     for(int i = 0; i < depth; i++) 
         fprintf(stderr, "  ");
-    fprintf(stderr, "Node:%s", nodestr(node->kind));
-    if (node->kind == ND_NUM)
-        fprintf(stderr, " val:%d\n", node->val);
-    else 
-        fprintf(stderr,"\n");
+    fprintf(stderr, "%s: %s ch:%d\n", nodestr(node->kind), node->val, node->child_count);
     if (node->lhs)
     {
-        print_tree(node->lhs, depth+1);
-        print_tree(node->rhs, depth+1);
+        print_tree(node->lhs, depth + 1);
+        print_tree(node->rhs, depth + 1);
     }
+    for(int i = 0; i < node->child_count; i++)
+        print_tree(node->children[i], depth + 1);
 }
 void print_locals()
 {

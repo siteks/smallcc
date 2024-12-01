@@ -15,11 +15,32 @@ void error(char *fmt, ...);
 // ---------------------------------------------------------------
 typedef enum
 {
-    TK_RESERVED,    // Reserved word
-    TK_IDENT,       // Identifier
-    TK_NUM,         // Number
+    TK_INT,
+    TK_IDENT,
+    TK_NUM,
+    TK_LPAREN,
+    TK_RPAREN,
+    TK_LBRACE,
+    TK_RBRACE,
+    TK_COMMA,
+    TK_SEMICOLON,
+    TK_EQ,
+    TK_NE,
+    TK_GE,
+    TK_GT,
+    TK_LE,
+    TK_LT,
     TK_RETURN,
+    TK_IF,
+    TK_ELSE,
+    TK_WHILE,
+    TK_ASSIGN,
+    TK_PLUS,
+    TK_MINUS,
+    TK_STAR,
+    TK_SLASH,
     TK_EOF,
+    TK_INVALID,
 } Token_kind;
 
 typedef struct Token Token;
@@ -28,15 +49,14 @@ struct Token
 {
     Token_kind  kind;
     Token       *next;
-    int         val;
-    char        *str;
-    int         len;
+    char        *val;
+    int         loc;
 };
 
 bool consume(char *op);
 bool consume_tk(Token_kind tk);
 bool is_ident();
-void expect(char *op);
+char *expect(Token_kind tk);
 int expect_number();
 char *expect_ident();
 bool at_eof();
@@ -51,20 +71,21 @@ void print_tokens();
 // ---------------------------------------------------------------
 typedef enum
 {
-    ND_ADD, // 0 
-    ND_SUB, // 1
-    ND_MUL, // 2
-    ND_DIV, // 3
-    ND_NUM, // 4
-    ND_LT,
-    ND_LE,
-    ND_GT,
-    ND_GE,
-    ND_EQ,
-    ND_NE,
+    ND_PROGRAM, 
+    ND_FUNCTION,
+    ND_PARAM_LIST,
+    ND_DECLSTMT,
+    ND_EXPRSTMT,
+    ND_COMPSTMT,
+    ND_IFSTMT,
+    ND_WHILESTMT,
+    ND_RETURNSTMT,
+    ND_STMT,
+    ND_EXPR,
+    ND_BINOP,
     ND_ASSIGN,
-    ND_LOCAL,
-    ND_RETURN,
+    ND_IDENT,
+    ND_LITERAL,
 } Node_kind;
 
 typedef struct Node Node;
@@ -72,10 +93,11 @@ typedef struct Node Node;
 struct Node
 {
     Node_kind   kind;
+    char        val[64];
     Node        *lhs;
     Node        *rhs;
-    int         val;
-    char        *ident;
+    Node        **children;
+    int         child_count;
     int         offset;
 };
 
@@ -88,7 +110,7 @@ struct Local
     int     offset;
 };
 
-void program();
+Node *program();
 void print_tree(Node *node, int depth);
 void print_locals();
 
@@ -101,5 +123,7 @@ void gen_code(Node *node);
 void gen_preamble(int offset);
 void gen_postamble();
 void gen_pop(int r);
+void gen_stmt(Node *node);
+char *nodestr(Node_kind k);
 
 #endif

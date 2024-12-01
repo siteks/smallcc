@@ -10,54 +10,61 @@
 
 
 extern Token *token;
+extern char *user_input;
 
-bool consume(char *op)
-{
-    if (token->kind != TK_RESERVED || 
-        strlen(op) != token->len ||
-        memcmp(token->str, op, token->len))
-        return false;
-    token = token->next;
-    return true;
-}
-bool consume_tk(Token_kind tk)
-{
-    if (token->kind != tk)
-        return false;
-    token = token->next;
-    return true;
-}
-bool is_ident()
-{
-    return token->kind == TK_IDENT;
-}
-void expect(char *op)
-{
-    if (token->kind != TK_RESERVED || 
-        strlen(op) != token->len ||
-        memcmp(token->str, op, token->len))
-        error("Expecting '%s' got '%s'\n", op, token->str);
-    token = token->next;
-}
 
-int expect_number()
+char *token_str(Token_kind tk)
 {
-    if (token->kind != TK_NUM)
-        error("Expecting number, got kind:%d, str:%s\n", token->kind, token->str);
-    int val = token->val;
-    token = token->next;
-    return val;
+    return 
+        tk == TK_INT       ? "INT      " :
+        tk == TK_IDENT     ? "IDENT    " :
+        tk == TK_NUM       ? "NUM      " :
+        tk == TK_LPAREN    ? "LPAREN   " :
+        tk == TK_RPAREN    ? "RPAREN   " :
+        tk == TK_LBRACE    ? "LBRACE   " :
+        tk == TK_RBRACE    ? "RBRACE   " :
+        tk == TK_COMMA     ? "COMMA    " :
+        tk == TK_SEMICOLON ? "SEMICOLON" :
+        tk == TK_EQ        ? "EQ       " :
+        tk == TK_NE        ? "NE       " :
+        tk == TK_GE        ? "GE       " :
+        tk == TK_GT        ? "GT       " :
+        tk == TK_LE        ? "LE       " :
+        tk == TK_LT        ? "LT       " :
+        tk == TK_RETURN    ? "RETURN   " :
+        tk == TK_IF        ? "IF       " :
+        tk == TK_ELSE      ? "ELSE     " :
+        tk == TK_WHILE     ? "WHILE    " :
+        tk == TK_ASSIGN    ? "ASSIGN   " :
+        tk == TK_PLUS      ? "PLUS     " :
+        tk == TK_MINUS     ? "MINUS    " :
+        tk == TK_STAR      ? "STAR     " :
+        tk == TK_SLASH     ? "SLASH    " :
+        tk == TK_EOF       ? "EOF      " :
+        tk == TK_INVALID   ? "INVALID  " : 
+                             "UNKNOWN  ";
 }
 
-char *expect_ident()
+char *expect(Token_kind tk)
 {
-    if (token->kind != TK_IDENT)
-        error("Expecting ident, got kind:%d, str:%s\n", token->kind, token->str);
-    char *ident = token->str;
-    token = token->next;
-    return ident;
-
+    if (token->kind == tk)
+    {
+        char *val   = token->val;
+        token       = token->next;
+        return val;
+    }
+    else
+    {
+        char space[1024];
+        memset(space, 0x20, 1024);
+        space[token->loc] = 0;
+        fprintf(stderr, "%s\n", user_input);
+        fprintf(stderr, "%s^\n", space);
+        error("Expecting '%s' got '%s'\n", token_str(tk), token_str(token->kind));
+    }
+    return 0;
 }
+
 
 bool at_eof()
 {
@@ -68,16 +75,12 @@ Token *new_token(Token_kind kind, Token *cur, char *str, int len)
 {
     Token *tok  = calloc(1, sizeof(Token));
     tok->kind   = kind;
-    tok->str    = calloc(1, len + 1);
+    tok->val    = calloc(1, len + 1);
+    tok->loc    = str - user_input;
     if (len)
-        memcpy(tok->str, str, len);
-    tok->len    = len;
+        memcpy(tok->val, str, len);
     cur->next   = tok;
     return tok;
-}
-bool istkchar(char c)
-{
-    return isalpha(c) || c == '_';
 }
 Token *tokenise(char *p)
 {
@@ -89,46 +92,62 @@ Token *tokenise(char *p)
     {
         if (isspace(*p))
         {
+            // Skip white space
             p++;
             continue;
         }
-        if ((strlen(p) >= 2) && !strncmp(p, "==", 2) || !strncmp(p, "!=", 2) || !strncmp(p, ">=", 2) || !strncmp(p, "<=", 2))
+        if (strlen(p) >= 2)
         {
-            cur = new_token(TK_RESERVED, cur, p, 2);
-            p += 2;
-            continue;
+            // Two character tokens
+            if (!strncmp(p, "==", 2)) {cur = new_token(TK_EQ, cur, p, 2); p += 2; continue;}
+            if (!strncmp(p, "!=", 2)) {cur = new_token(TK_NE, cur, p, 2); p += 2; continue;}
+            if (!strncmp(p, ">=", 2)) {cur = new_token(TK_GE, cur, p, 2); p += 2; continue;}
+            if (!strncmp(p, "<=", 2)) {cur = new_token(TK_LE, cur, p, 2); p += 2; continue;}
         }
-        if (*p == '+' || *p == '-' || *p == '*' || *p == '/' || *p == '(' || *p == ')' ||
-            *p == '>' || *p == '<' || *p == '=' || *p == ';')
+        // Single character tokens
+        switch (*p) 
         {
-            cur = new_token(TK_RESERVED, cur, p++, 1);
+            case '+': cur = new_token(TK_PLUS,      cur, p++, 1); continue;
+            case '-': cur = new_token(TK_MINUS,     cur, p++, 1); continue;
+            case '*': cur = new_token(TK_STAR,      cur, p++, 1); continue;
+            case '/': cur = new_token(TK_SLASH,     cur, p++, 1); continue;
+            case '(': cur = new_token(TK_LPAREN,    cur, p++, 1); continue;
+            case ')': cur = new_token(TK_RPAREN,    cur, p++, 1); continue;
+            case '>': cur = new_token(TK_GT,        cur, p++, 1); continue;
+            case '<': cur = new_token(TK_LT,        cur, p++, 1); continue;
+            case '=': cur = new_token(TK_ASSIGN,    cur, p++, 1); continue;
+            case ';': cur = new_token(TK_SEMICOLON, cur, p++, 1); continue;
+            case '{': cur = new_token(TK_LBRACE,    cur, p++, 1); continue;
+            case '}': cur = new_token(TK_RBRACE,    cur, p++, 1); continue;
+        }
+        // Keywords and identifiers
+        if (isalpha(*p) || *p == '_')
+        {
+            // Scan forwards until non ident char, assume no longer than 64 chars
+            char *q = p;
+            int i   = 0;
+            while(*q && (isalnum(*q) || *q == '_')) q++;
+            int l   = q - p;
+            // Keywords
+            if (!strncmp(p, "int", l))    {cur = new_token(TK_INT,     cur, p, l); p = q; continue;}
+            if (!strncmp(p, "return", l)) {cur = new_token(TK_RETURN,  cur, p, l); p = q; continue;}
+            if (!strncmp(p, "if", l))     {cur = new_token(TK_IF,      cur, p, l); p = q; continue;}
+            if (!strncmp(p, "else", l))   {cur = new_token(TK_ELSE,    cur, p, l); p = q; continue;}
+            if (!strncmp(p, "while", l))  {cur = new_token(TK_WHILE,   cur, p, l); p = q; continue;}
+            // Must be an identifier
+            cur = new_token(TK_IDENT, cur, p, l);
+            p = q;
             continue;
         }
         if (isdigit(*p))
         {
-            cur = new_token(TK_NUM, cur, p, 0);
-            cur->val = (int)strtol(p, &p, 10);
+            char *q;
+            strtol(p, &q, 10);
+            cur = new_token(TK_NUM, cur, p, q - p);
+            p = q;
             continue;
         }
-        if (strlen(p) >= 6 && !strncmp(p, "return", 6) && !istkchar(p[6]))
-        {
-            cur = new_token(TK_RETURN, cur, p, 6);
-            p += 6;
-            continue;
-        }
-        if (isalpha(*p) || *p == '_')
-        {
-            fprintf(stderr, "%s\n", p);
-            int len = 1;
-            char *start = p;
-            for(p++; *p; p++, len++)
-            {
-                if (!istkchar(*p))
-                    break;
-            }
-            cur = new_token(TK_IDENT, cur, start, len);
-            continue;
-        }
+
         error("Unexpected input %s\n", p);
     }
     new_token(TK_EOF, cur, p, 0);
@@ -139,6 +158,6 @@ void print_tokens()
 {
     for(Token *p = token; p; p = p->next)
     {
-        fprintf(stderr, "Kind:%d str:%s val:%d\n", p->kind, p->str, p->val);
+        fprintf(stderr, "Kind:%s val:%s\n", token_str(p->kind), p->val);
     }
 }

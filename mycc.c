@@ -14,7 +14,6 @@ void error(char *fmt, ...)
 
 
 Token   *token;
-Node    *code[100];
 char    *user_input;
 Local   *locals;
 
@@ -32,10 +31,9 @@ int main(int argc, char **argv)
     locals = NULL;
     print_tokens();
 
-    //Node *node = expr();
-    program();
-    print_tree(code[0], 0);
-    print_locals();
+    Node *node = program();
+    print_tree(node, 0);
+
 
     printf(".text=0\n");
     printf("    li      r6 0x0\n");
@@ -43,17 +41,13 @@ int main(int argc, char **argv)
     printf("    bl      r5 main\n");
     printf("    halt\n");
     printf(".text=0x20\n");
-    printf("main:\n");
 
-    int i = 0;
-    gen_preamble(locals ? locals->offset + 1 : 0);
-    while(code[i])
-    {
-        gen_code(code[i++]);
-    }
-    gen_postamble();
-    gen_pop(0);
-    printf("    halt\n");
+    // int i = 0;
+    // gen_preamble(locals ? locals->offset + 1 : 0);
+    gen_code(node);
+    // gen_postamble();
+    // gen_pop(0);
+    // printf("    halt\n");
 
     return 0;
 }
