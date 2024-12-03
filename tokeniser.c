@@ -40,6 +40,9 @@ char *token_str(Token_kind tk)
         tk == TK_MINUS     ? "MINUS    " :
         tk == TK_STAR      ? "STAR     " :
         tk == TK_SLASH     ? "SLASH    " :
+        tk == TK_AMPERSAND ? "AMPERSAND" :
+        tk == TK_TWIDDLE   ? "TWIDDLE  " :
+        tk == TK_BANG      ? "BANG     " :
         tk == TK_EOF       ? "EOF      " :
         tk == TK_INVALID   ? "INVALID  " : 
                              "UNKNOWN  ";
@@ -119,6 +122,9 @@ Token *tokenise(char *p)
             case ';': cur = new_token(TK_SEMICOLON, cur, p++, 1); continue;
             case '{': cur = new_token(TK_LBRACE,    cur, p++, 1); continue;
             case '}': cur = new_token(TK_RBRACE,    cur, p++, 1); continue;
+            case '&': cur = new_token(TK_AMPERSAND, cur, p++, 1); continue;
+            case '~': cur = new_token(TK_TWIDDLE,   cur, p++, 1); continue;
+            case '!': cur = new_token(TK_BANG,      cur, p++, 1); continue;
         }
         // Keywords and identifiers
         if (isalpha(*p) || *p == '_')

@@ -39,6 +39,9 @@ typedef enum
     TK_MINUS,
     TK_STAR,
     TK_SLASH,
+    TK_AMPERSAND,
+    TK_TWIDDLE,
+    TK_BANG,
     TK_EOF,
     TK_INVALID,
 } Token_kind;
@@ -83,6 +86,7 @@ typedef enum
     ND_STMT,
     ND_EXPR,
     ND_BINOP,
+    ND_UNARYOP,
     ND_ASSIGN,
     ND_IDENT,
     ND_LITERAL,

@@ -25,6 +25,41 @@ int find_local_addr(char *name)
     }
     return -1;
 }
+//--------------------------------------------------------------------------------
+// Pseudoinstructions
+//--------------------------------------------------------------------------------
+int new_label()
+{
+    return labels++;
+}
+void gen_label(int label)
+{
+    printf("l%d:\n", label);
+}
+
+void gen_jz(int reg, int label)
+{
+    int lskip   = labels++;
+    printf("    bnz r%d l%d\n", reg, lskip);
+    printf("    li r4  l(l%d)\n", label);
+    printf("    lih r4 h(l%d)\n", label);
+    printf("    jl r4 0\n");
+    gen_label(lskip);
+}
+void gen_j(int label)
+{
+    printf("    li r4  l(l%d)\n", label);
+    printf("    lih r4 h(l%d)\n", label);
+    printf("    jl r4 0\n");
+}
+void gen_jr(int reg)
+{
+    printf("    jl r%d 0\n", reg);
+}
+void gen_mov(int dest, int src)
+{
+    printf("    add r%d r%d r7\n", dest, src);
+}
 void gen_li(int reg, int val)
 {
     printf(";%s\n", __func__);
@@ -53,7 +88,6 @@ void gen_pop(int r)
     printf("    ldw     r%d r6(0)\n", r);
     printf("    adj2\n");
 }
-
 void gen_add()
 {
     printf(";%s\n", __func__);
@@ -75,17 +109,20 @@ void gen_mul()
     printf(";%s\n", __func__);
     gen_pop(1);
     gen_pop(0);
+    int l1 = new_label();
+    int l2 = new_label();
+    int l3 = new_label();
     printf("    li      r2 0\n");
     printf("    li      r3 1\n");
-    printf("l3: bz      r0 l1\n");
-    printf("    bz      r1 l1\n");
+    printf("l%d: bz      r0 l%d\n", l3, l1);
+    printf("    bz      r1 l%d\n", l1);
     printf("    and     r4 r1 r3\n");
-    printf("    bz      r4 l2\n");
+    printf("    bz      r4 l%d\n", l2);
     printf("    add     r2 r2 r0\n");
-    printf("l2: slsl    r0\n");
+    printf("l%d: slsl    r0\n", l2);
     printf("    slsr    r1\n");
-    printf("    bz      r7 l3\n");
-    printf("l1:");
+    printf("    bz      r7 l%d\n", l3);
+    printf("l%d:", l1);
     gen_pushr(2);
 }
 
@@ -149,7 +186,6 @@ void gen_assign()
     printf(";%s\n", __func__);
     // if the variable has not yet been assigned, there needs
     // to be space allocated om the stack to hold it
-
     gen_pop(0);
     gen_pop(1);
     printf("    stw     r0 r1(0)\n");
@@ -186,6 +222,30 @@ void gen_lvaraddr(Node *node)
     printf("    sub     r0 r5 r0\n");
     gen_pushr(0);
 }
+void gen_preamble(int localidx)
+{
+    // printf(";%s\n", __func__);
+    printf(";Save return address\n");
+    gen_pushr(5);
+    printf(";Set frame\n");
+    gen_mov(5, 6);
+    printf(";Reserve space for %d locals\n", localidx);
+    int t = localidx * 2;
+    gen_li(0, t);
+    printf("    sub     r6 r6 r0\n");
+}
+void gen_postamble()
+{
+    printf(";%s\n", __func__);
+}
+
+//--------------------------------------------------------------------------------
+// Everything below here uses pseudoinstructions
+//--------------------------------------------------------------------------------
+
+
+
+
 void gen_expr(Node *node)
 {
     printf(";%s %s %s\n", __func__, nodestr(node->kind), node->val);
@@ -225,12 +285,11 @@ void gen_return()
 {
     printf(";%s\n", __func__);
 
-    printf(";get return vale in r0, dont do full pop since r6 overwritten\n");
-    printf("    ldw     r0 r6(0)\n");
-    printf(";sp adjust before return\n");
-    printf("    add     r6 r5 r7\n");
+    // Get return val in r0, restore 
+    gen_pop(0);
+    gen_mov(6, 5); // Restore sp to frame
     gen_pop(5);
-    printf("    jl      r5 0\n");
+    gen_jr(5);
 }
 void gen_returnstmt(Node *node)
 {
@@ -249,10 +308,10 @@ void gen_ifstmt(Node *node)
     // Structure is expr, stmt, [stmt]
     gen_expr(node->children[0]);
     gen_pop(0);
-    int label = labels++;
-    printf("    bz r0 l%d\n", label);
+    int label = new_label();
+    gen_jz(0, label);
     gen_stmt(node->children[1]);
-    printf("l%d:\n", label);
+    gen_label(label);
     if (node->child_count == 3)
     {
         printf(";else clause\n");
@@ -266,43 +325,19 @@ void gen_whilestmt(Node *node)
     // structure is expr, stmt
     int lloop   = labels++;
     int lbreak  = labels++;
-    int lskip   = labels++;
-    printf("l%d:\n", lloop);
+    gen_label(lloop);
     gen_expr(node->children[0]);
     gen_pop(0);
-    printf("    bnz r0 l%d\n", lskip);
-    printf("    li r4  l(l%d)\n", lbreak);
-    printf("    lih r4 h(l%d)\n", lbreak);
-    printf("    jl r4 0\n");
-    printf("l%d:\n", lskip);
+    gen_jz(0, lbreak);
     gen_stmt(node->children[1]);
-    printf("    li r4  l(l%d)\n", lloop);
-    printf("    lih r4 h(l%d)\n", lloop);
-    printf("    jl r4 0\n");
-    printf("l%d:\n", lbreak);
+    gen_j(lloop);
+    gen_label(lbreak);
 }
 void gen_exprstmt(Node *node)
 {
     printf(";%s\n", __func__);
     gen_expr(node->children[0]);
 }
-void gen_preamble(int localidx)
-{
-    // printf(";%s\n", __func__);
-    printf(";Save return address\n");
-    gen_pushr(5);
-    printf(";Set frame\n");
-    printf("    add     r5 r6 r7\n");
-    printf(";Reserve space for %d locals\n", localidx);
-    int t = localidx * 2;
-    gen_li(0, t);
-    printf("    sub     r6 r6 r0\n");
-}
-void gen_postamble()
-{
-    printf(";%s\n", __func__);
-}
-
 void gen_decl(Node *node)
 {
     printf(";%s %s\n", __func__, node->val);

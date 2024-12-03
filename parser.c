@@ -31,9 +31,16 @@
 // add_expr             ::=     mult_expr
 //                          |   add_expr "+" mult_expr
 //                          |   add_expr "-" mult_expr
-// mult_expr            ::=     primary_expr
-//                          |   mult_expr "*" primary_expr
-//                          |   mult_expr "/" primary_expr
+// mult_expr            ::=     unary_expr
+//                          |   mult_expr "*" unary_expr
+//                          |   mult_expr "/" unary_expr
+// unary_expr           ::=     primary_expr
+//                          |   '&' unary_expr
+//                          |   '*' mult_expr
+//                          |   '+' mult_expr
+//                          |   '-' mult_expr
+//                          |   '~' mult_expr
+//                          |   '!' mult_expr
 // primary_expr         ::=     ident
 //                          |   integer_literal
 //                          |   "(" expr ")"
@@ -104,14 +111,25 @@ Node *primary_expr()
     }
     return node;
 }
+Node *unary_expr()
+{
+
+    if(token->kind == TK_AMPERSAND || token->kind == TK_STAR || token->kind == TK_PLUS || token->kind == TK_MINUS)
+    {
+        Node *unode = new_node(ND_UNARYOP, expect(token->kind));
+        add_child(unode, unary_expr());
+        return unode;
+    }
+    return primary_expr();
+}
 Node *mult_expr()
 {
-    Node *node = primary_expr();
+    Node *node = unary_expr();
     while (token->kind == TK_STAR || token->kind == TK_SLASH)
     {
         Node *enode = new_node(ND_BINOP, expect(token->kind));
         enode->lhs = node;
-        enode->rhs = primary_expr();
+        enode->rhs = unary_expr();
         node = enode;
     }
     return node;
@@ -287,6 +305,7 @@ char *nodestr(Node_kind k)
         case ND_RETURNSTMT: return "RETURNSTMT  ";
         case ND_EXPR:       return "EXPR        ";
         case ND_BINOP:      return "BINOP       ";
+        case ND_UNARYOP:    return "UNARYOP      ";
         case ND_ASSIGN:     return "ASSIGN      ";
         case ND_IDENT:      return "IDENT       ";
         case ND_LITERAL:    return "LITERAL     ";
