@@ -4,7 +4,7 @@ assert() {
     expected="$1"
     input="$2"
     ./mycc "$input" > tmp.s
-    actual=`./cpu2/sim.py tmp.s |tail -1`
+    actual=`./cpu3/sim.py tmp.s |tail -1`
     # echo $actual
     final=`echo $actual|awk '{v=int("0x"substr($1,4));if (v>32767)v=v-65536;print v}'`
 
@@ -47,8 +47,7 @@ assert() {
 # assert 5 "int main(){int a=0; while(a < 5) a=a+1; return a;}"
 # assert 11 "int main(){int a=0;int b=0; {a=a+1;b=b+a+10;} return b;}"
 # assert 15 "int main(){int a=0;int b=0; while(a<5) {a=a+1;b=b+a;} return b;}"
-
-
-assert -1 "int main(){return -1;}"
+# assert -1 "int main(){return -1;}"
+assert 1 "int main(){float b;return 1;}"
 
 echo OK

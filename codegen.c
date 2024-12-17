@@ -27,6 +27,36 @@ int find_local_addr(char *name)
 }
 //--------------------------------------------------------------------------------
 // Pseudoinstructions
+//
+// Stack VM
+//
+// State:
+//  pc
+//  sp
+//  bp
+//  lr
+//  r0  
+//
+//  imm     val     r0 = val
+//  lb              r0 = *r0
+//  lw              r0 = *r0
+//  sb              **sp++ = r0
+//  sw              **sp++ = r0
+//
+//  op              r0 = *sp++ op r0
+//  push            *--sp = r0
+//  pop             r0 = *sp++
+
+//  jl      val     lr = pc; pc = val; 
+//  enter   val     *--sp = lr; *--sp = bp; bp = sp; sp -= val;
+//  return          sp = bp; bp = *sp++; pc = *sp++
+//  lea     val     r0 = bp + val
+//
+//
+// To store to local var
+//  lea     offset
+//  push
+//  
 //--------------------------------------------------------------------------------
 int new_label()
 {
@@ -37,173 +67,86 @@ void gen_label(int label)
     printf("l%d:\n", label);
 }
 
-void gen_jz(int reg, int label)
+void gen_jz(int label)
 {
-    int lskip   = labels++;
-    printf("    bnz r%d l%d\n", reg, lskip);
-    printf("    li r4  l(l%d)\n", label);
-    printf("    lih r4 h(l%d)\n", label);
-    printf("    jl r4 0\n");
-    gen_label(lskip);
+    printf("    jz      l%d\n", label);
+}
+void gen_jnz(int label)
+{
+    printf("    jnz     l%d\n", label);
 }
 void gen_j(int label)
 {
-    printf("    li r4  l(l%d)\n", label);
-    printf("    lih r4 h(l%d)\n", label);
-    printf("    jl r4 0\n");
-}
-void gen_jr(int reg)
-{
-    printf("    jl r%d 0\n", reg);
-}
-void gen_mov(int dest, int src)
-{
-    printf("    add r%d r%d r7\n", dest, src);
-}
-void gen_li(int reg, int val)
-{
-    printf(";%s\n", __func__);
-    printf("    li      r%d 0x%02x\n", reg, val & 0xff);
-    if (val & 0xff00) 
-    {
-        printf("    lih     r%d 0x%02x\n", reg, val >> 8);
-    }
+    printf("    j       l%d\n", label);
 }
 void gen_pushi(int val)
 {
-    printf(";%s %d\n", __func__, val);
-    gen_li(0, val);
-    printf("    adjm2\n");
-    printf("    stw     r0 r6(0)\n");
+    printf("    immw    0x%04x\n", val);
+    printf("    push\n");
 }
-void gen_pushr(int r)
+void gen_imm(int val)
 {
-    printf(";%s r%d\n", __func__, r);
-    printf("    adjm2\n");
-    printf("    stw     r%d r6(0)\n", r);
+    printf("    immw    0x%04x\n", val);
+}
+void gen_push()
+{
+    printf("    push\n");
 }
 void gen_pop(int r)
 {
-    printf(";%s r%d\n", __func__, r);
-    printf("    ldw     r%d r6(0)\n", r);
-    printf("    adj2\n");
+    printf("    pop\n");
 }
 void gen_add()
 {
-    printf(";%s\n", __func__);
-    gen_pop(1);
-    gen_pop(0);
-    printf("    add     r0 r0 r1\n");
-    gen_pushr(0);
+    printf("    add\n");
 }
 void gen_sub()
 {
-    printf(";%s\n", __func__);
-    gen_pop(1);
-    gen_pop(0);
-    printf("    sub     r0 r0 r1\n");
-    gen_pushr(0);
+    printf("    sub\n");
 }
 void gen_mul()
 {
-    printf(";%s\n", __func__);
-    gen_pop(1);
-    gen_pop(0);
-    int l1 = new_label();
-    int l2 = new_label();
-    int l3 = new_label();
-    printf("    li      r2 0\n");
-    printf("    li      r3 1\n");
-    printf("l%d: bz      r0 l%d\n", l3, l1);
-    printf("    bz      r1 l%d\n", l1);
-    printf("    and     r4 r1 r3\n");
-    printf("    bz      r4 l%d\n", l2);
-    printf("    add     r2 r2 r0\n");
-    printf("l%d: slsl    r0\n", l2);
-    printf("    slsr    r1\n");
-    printf("    bz      r7 l%d\n", l3);
-    printf("l%d:", l1);
-    gen_pushr(2);
+    printf("    mul\n");
 }
 
 void gen_div()
 {
-    printf(";%s\n", __func__);
+    printf("    div\n");
 }
 void gen_eq()
 {
-    printf(";%s\n", __func__);
-    gen_pop(0);
-    gen_pop(1);
-    printf("    xor     r0 r0 r1\n");
-    printf("    inv     r0\n");
-    gen_pushr(0);
+    printf("    eq\n");
 }
 void gen_ne()
 {
-    printf(";%s\n", __func__);
-    gen_pop(0);
-    gen_pop(1);
-    printf("    xor     r0 r0 r1\n");
-    gen_pushr(0);
+    printf("    ne\n");
 }
 void gen_lt()
 {
-    printf(";%s\n", __func__);
-    gen_pop(1);
-    gen_pop(0);
-    printf("    slt      r0 r0 r1\n");
-    gen_pushr(0);
+    printf("    lt\n");
 }
 void gen_le()
 {
-    printf(";%s\n", __func__);
-    gen_pop(0);
-    gen_pop(1);
-    printf("    slt     r0 r0 r1\n");
-    printf("    inv     r0\n");
-    gen_pushr(0);
+    printf("    le\n");
 }
 void gen_gt()
 {
-    printf(";%s\n", __func__);
-    gen_pop(0);
-    gen_pop(1);
-    printf("    slt      r0 r0 r1\n");
-    gen_pushr(0);
+    printf("    gt\n");
 }
 void gen_ge()
 {
-    printf(";%s\n", __func__);
-    gen_pop(1);
-    gen_pop(0);
-    printf("    slt     r0 r0 r1\n");
-    printf("    inv     r0\n");
-    gen_pushr(0);
+    printf("    ge\n");
+}
+void gen_lw()
+{
+    printf("    lw\n");
+}
+void gen_sw()
+{
+    printf("    sw\n");
 }
 void gen_assign()
 {
-    printf(";%s\n", __func__);
-    // if the variable has not yet been assigned, there needs
-    // to be space allocated om the stack to hold it
-    gen_pop(0);
-    gen_pop(1);
-    printf("    stw     r0 r1(0)\n");
-}
-void gen_readlocal()
-{
-    printf(";%s\n", __func__);
-    gen_pop(0);
-    printf("    ldw     r0 r0(0)\n");
-    gen_pushr(0);
-}
-void gen_writelocal()
-{
-    printf(";%s\n", __func__);
-    gen_pop(0);
-    gen_pop(1);
-    printf("    stw     r0 r1(0)\n");
-    gen_pushr(0);
 }
 void gen_lvaraddr(Node *node)
 {
@@ -217,22 +160,13 @@ void gen_lvaraddr(Node *node)
     printf(";%s %s offset %d\n", __func__, node->val, offset);
 
     // frame is pointing to sp, so offset needs incrementing
-    int t = (offset + 1) * 2;
-    gen_li(0, t);
-    printf("    sub     r0 r5 r0\n");
-    gen_pushr(0);
+    int t = offset + 1;
+    printf("    lea     %d\n", -t);
 }
 void gen_preamble(int localidx)
 {
-    // printf(";%s\n", __func__);
-    printf(";Save return address\n");
-    gen_pushr(5);
-    printf(";Set frame\n");
-    gen_mov(5, 6);
     printf(";Reserve space for %d locals\n", localidx);
-    int t = localidx * 2;
-    gen_li(0, t);
-    printf("    sub     r6 r6 r0\n");
+    printf("    enter   %d\n", localidx);
 }
 void gen_postamble()
 {
@@ -251,8 +185,9 @@ void gen_expr(Node *node)
     printf(";%s %s %s\n", __func__, nodestr(node->kind), node->val);
     if (node->kind == ND_BINOP)
     {
-        gen_expr(node->lhs);
-        gen_expr(node->rhs);
+        gen_expr(node->children[0]);
+        gen_push();
+        gen_expr(node->children[1]);
         if (!strcmp(node->val, "+"))    {gen_add(); return;}
         if (!strcmp(node->val, "-"))    {gen_sub(); return;}
         if (!strcmp(node->val, "*"))    {gen_mul(); return;}
@@ -267,29 +202,35 @@ void gen_expr(Node *node)
     }
     else if (node->kind == ND_LITERAL)
     {
-        gen_pushi((int)strtol(node->val, 0, 0));
+        gen_imm((int)strtol(node->val, 0, 0));
     }
     else if (node->kind == ND_IDENT)
     {
         gen_lvaraddr(node);
-        gen_readlocal();
+        gen_lw();
+    }
+    else if (node->kind == ND_UNARYOP)
+    {
+        if (!strcmp(node->val, "+"))    {gen_expr(node->children[0]); return;}      
+        if (!strcmp(node->val, "-"))    
+        {
+            gen_imm(0);
+            gen_push();
+            gen_expr(node->children[0]);
+            gen_sub();
+        }
     }
     else if (node->kind == ND_ASSIGN)
     {
-        gen_lvaraddr(node->lhs);
-        gen_expr(node->rhs);
-        gen_assign();
+        gen_lvaraddr(node->children[0]);
+        gen_push();
+        gen_expr(node->children[1]);
+        gen_sw();
     }
 }
 void gen_return()
 {
-    printf(";%s\n", __func__);
-
-    // Get return val in r0, restore 
-    gen_pop(0);
-    gen_mov(6, 5); // Restore sp to frame
-    gen_pop(5);
-    gen_jr(5);
+    printf("    ret\n");
 }
 void gen_returnstmt(Node *node)
 {
@@ -307,9 +248,8 @@ void gen_ifstmt(Node *node)
     printf(";%s\n", __func__);
     // Structure is expr, stmt, [stmt]
     gen_expr(node->children[0]);
-    gen_pop(0);
     int label = new_label();
-    gen_jz(0, label);
+    gen_jz(label);
     gen_stmt(node->children[1]);
     gen_label(label);
     if (node->child_count == 3)
@@ -327,15 +267,14 @@ void gen_whilestmt(Node *node)
     int lbreak  = labels++;
     gen_label(lloop);
     gen_expr(node->children[0]);
-    gen_pop(0);
-    gen_jz(0, lbreak);
+    gen_jz(lbreak);
     gen_stmt(node->children[1]);
     gen_j(lloop);
     gen_label(lbreak);
 }
 void gen_exprstmt(Node *node)
 {
-    printf(";%s\n", __func__);
+    // printf(";%s\n", __func__);
     gen_expr(node->children[0]);
 }
 void gen_decl(Node *node)
@@ -347,8 +286,9 @@ void gen_decl(Node *node)
     {
         // This is a declaration with assignment
         gen_lvaraddr(node->children[0]);
+        gen_push();
         gen_expr(node->children[1]);
-        gen_assign();
+        gen_sw();
     }
 }
 void gen_compstmt(Node *node)

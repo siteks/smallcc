@@ -12,40 +12,131 @@
 extern Token *token;
 extern char *user_input;
 
+struct Keyword keywords[] = 
+{
+    "auto",     TK_AUTO,
+    "break",    TK_BREAK,
+    "case",     TK_CASE,
+    "char",     TK_CHAR,
+    "const",    TK_CONST,
+    "continue", TK_CONTINUE,
+    "default",  TK_DEFAULT,
+    "do",       TK_DO,
+    "double",   TK_DOUBLE,
+    "else",     TK_ELSE,
+    "enum",     TK_ENUM,
+    "extern",   TK_EXTERN,
+    "float",    TK_FLOAT,
+    "for",      TK_FOR,
+    "goto",     TK_GOTO,
+    "if",       TK_IF,
+    "int",      TK_INT,
+    "long",     TK_LONG,
+    "register", TK_REGISTER,
+    "return",   TK_RETURN,
+    "short",    TK_SHORT,
+    "signed",   TK_SIGNED,
+    "sizeof",   TK_SIZEOF,
+    "static",   TK_STATIC,
+    "struct",   TK_STRUCT,
+    "switch",   TK_SWITCH,
+    "typedef",  TK_TYPEDEF,
+    "union",    TK_UNION,
+    "unsigned", TK_UNSIGNED,
+    "void",     TK_VOID,
+    "volatile", TK_VOLATILE,
+    "while",    TK_WHILE,
+    "",         TK_INVALID,
+};
+
 
 char *token_str(Token_kind tk)
 {
     return 
-        tk == TK_INT       ? "INT      " :
-        tk == TK_IDENT     ? "IDENT    " :
-        tk == TK_NUM       ? "NUM      " :
-        tk == TK_LPAREN    ? "LPAREN   " :
-        tk == TK_RPAREN    ? "RPAREN   " :
-        tk == TK_LBRACE    ? "LBRACE   " :
-        tk == TK_RBRACE    ? "RBRACE   " :
-        tk == TK_COMMA     ? "COMMA    " :
-        tk == TK_SEMICOLON ? "SEMICOLON" :
-        tk == TK_EQ        ? "EQ       " :
-        tk == TK_NE        ? "NE       " :
-        tk == TK_GE        ? "GE       " :
-        tk == TK_GT        ? "GT       " :
-        tk == TK_LE        ? "LE       " :
-        tk == TK_LT        ? "LT       " :
-        tk == TK_RETURN    ? "RETURN   " :
-        tk == TK_IF        ? "IF       " :
-        tk == TK_ELSE      ? "ELSE     " :
-        tk == TK_WHILE     ? "WHILE    " :
-        tk == TK_ASSIGN    ? "ASSIGN   " :
-        tk == TK_PLUS      ? "PLUS     " :
-        tk == TK_MINUS     ? "MINUS    " :
-        tk == TK_STAR      ? "STAR     " :
-        tk == TK_SLASH     ? "SLASH    " :
-        tk == TK_AMPERSAND ? "AMPERSAND" :
-        tk == TK_TWIDDLE   ? "TWIDDLE  " :
-        tk == TK_BANG      ? "BANG     " :
-        tk == TK_EOF       ? "EOF      " :
-        tk == TK_INVALID   ? "INVALID  " : 
-                             "UNKNOWN  ";
+        tk == TK_EMPTY      ? "EMPTY    " :
+        tk == TK_IDENT      ? "IDENT    " :
+        tk == TK_NUM        ? "NUM      " :
+        tk == TK_LPAREN     ? "LPAREN   " :
+        tk == TK_RPAREN     ? "RPAREN   " :
+        tk == TK_LBRACE     ? "LBRACE   " :
+        tk == TK_RBRACE     ? "RBRACE   " :
+        tk == TK_LBRACKET   ? "LBRACKET " :
+        tk == TK_RBRACKET   ? "RBRACKET " :
+        tk == TK_COMMA      ? "COMMA    " :
+        tk == TK_SEMICOLON  ? "SEMICOLON" :
+        tk == TK_EQ         ? "EQ       " :
+        tk == TK_NE         ? "NE       " :
+        tk == TK_GE         ? "GE       " :
+        tk == TK_GT         ? "GT       " :
+        tk == TK_LE         ? "LE       " :
+        tk == TK_LT         ? "LT       " :
+        tk == TK_ASSIGN     ? "ASSIGN   " :
+        tk == TK_PLUS       ? "PLUS     " :
+        tk == TK_MINUS      ? "MINUS    " :
+        tk == TK_STAR       ? "STAR     " :
+        tk == TK_SLASH      ? "SLASH    " :
+        tk == TK_AMPERSAND  ? "AMPERSAND" :
+        tk == TK_TWIDDLE    ? "TWIDDLE  " :
+        tk == TK_BANG       ? "BANG     " :
+        tk == TK_EOF        ? "EOF      " :
+        tk == TK_AUTO       ? "auto     " :
+        tk == TK_BREAK      ? "break    " :
+        tk == TK_CASE       ? "case     " :
+        tk == TK_CHAR       ? "char     " :
+        tk == TK_CONST      ? "const    " :
+        tk == TK_CONTINUE   ? "continue " :
+        tk == TK_DEFAULT    ? "default  " :
+        tk == TK_DO         ? "do       " :
+        tk == TK_DOUBLE     ? "double   " :
+        tk == TK_ELSE       ? "else     " :
+        tk == TK_ENUM       ? "enum     " :
+        tk == TK_EXTERN     ? "extern   " :
+        tk == TK_FLOAT      ? "float    " :
+        tk == TK_FOR        ? "for      " :
+        tk == TK_GOTO       ? "goto     " :
+        tk == TK_IF         ? "if       " :
+        tk == TK_INT        ? "int      " :
+        tk == TK_LONG       ? "long     " :
+        tk == TK_REGISTER   ? "register " :
+        tk == TK_RETURN     ? "return   " :
+        tk == TK_SHORT      ? "short    " :
+        tk == TK_SIGNED     ? "signed   " :
+        tk == TK_SIZEOF     ? "sizeof   " :
+        tk == TK_STATIC     ? "static   " :
+        tk == TK_STRUCT     ? "struct   " :
+        tk == TK_SWITCH     ? "switch   " :
+        tk == TK_TYPEDEF    ? "typedef  " :
+        tk == TK_UNION      ? "union    " :
+        tk == TK_UNSIGNED   ? "unsigned " :
+        tk == TK_VOID       ? "void     " :
+        tk == TK_VOLATILE   ? "volatile " :
+        tk == TK_WHILE      ? "while    " :
+        tk == TK_INVALID    ? "INVALID  " : 
+                              "UNKNOWN  ";
+}
+char *type_token_str(Token_kind tk)
+{
+    return 
+        tk == TK_AUTO       ? "auto " :
+        tk == TK_CHAR       ? "char " :
+        tk == TK_CONST      ? "const " :
+        tk == TK_DOUBLE     ? "double " :
+        tk == TK_ENUM       ? "enum " :
+        tk == TK_EXTERN     ? "extern " :
+        tk == TK_FLOAT      ? "float " :
+        tk == TK_INT        ? "int " :
+        tk == TK_LONG       ? "long " :
+        tk == TK_REGISTER   ? "register " :
+        tk == TK_SHORT      ? "short " :
+        tk == TK_SIGNED     ? "signed " :
+        tk == TK_STATIC     ? "static " :
+        tk == TK_STRUCT     ? "struct " :
+        tk == TK_TYPEDEF    ? "typedef " :
+        tk == TK_UNION      ? "union " :
+        tk == TK_UNSIGNED   ? "unsigned " :
+        tk == TK_VOID       ? "void " :
+        tk == TK_VOLATILE   ? "volatile " :
+                              "";
 }
 
 char *expect(Token_kind tk)
@@ -85,6 +176,16 @@ Token *new_token(Token_kind kind, Token *cur, char *str, int len)
     cur->next   = tok;
     return tok;
 }
+Token_kind find_token(char *str, int l)
+{
+    fprintf(stderr, "%s %s %d\n", __func__, str, l);
+    for(int i = 0; keywords[i].token != TK_INVALID; i++)
+    {
+        if (strlen(keywords[i].keyword) == l && !strncmp(str, keywords[i].keyword, l))
+            return keywords[i].token;
+    }
+    return TK_IDENT;
+}
 Token *tokenise(char *p)
 {
     Token head;
@@ -116,6 +217,8 @@ Token *tokenise(char *p)
             case '/': cur = new_token(TK_SLASH,     cur, p++, 1); continue;
             case '(': cur = new_token(TK_LPAREN,    cur, p++, 1); continue;
             case ')': cur = new_token(TK_RPAREN,    cur, p++, 1); continue;
+            case '[': cur = new_token(TK_LBRACKET,  cur, p++, 1); continue;
+            case ']': cur = new_token(TK_RBRACKET,  cur, p++, 1); continue;
             case '>': cur = new_token(TK_GT,        cur, p++, 1); continue;
             case '<': cur = new_token(TK_LT,        cur, p++, 1); continue;
             case '=': cur = new_token(TK_ASSIGN,    cur, p++, 1); continue;
@@ -125,23 +228,19 @@ Token *tokenise(char *p)
             case '&': cur = new_token(TK_AMPERSAND, cur, p++, 1); continue;
             case '~': cur = new_token(TK_TWIDDLE,   cur, p++, 1); continue;
             case '!': cur = new_token(TK_BANG,      cur, p++, 1); continue;
+            case ',': cur = new_token(TK_COMMA,     cur, p++, 1); continue;
         }
         // Keywords and identifiers
         if (isalpha(*p) || *p == '_')
         {
-            // Scan forwards until non ident char, assume no longer than 64 chars
+            // Scan forwards until non ident char
             char *q = p;
             int i   = 0;
             while(*q && (isalnum(*q) || *q == '_')) q++;
             int l   = q - p;
-            // Keywords
-            if (!strncmp(p, "int", l))    {cur = new_token(TK_INT,     cur, p, l); p = q; continue;}
-            if (!strncmp(p, "return", l)) {cur = new_token(TK_RETURN,  cur, p, l); p = q; continue;}
-            if (!strncmp(p, "if", l))     {cur = new_token(TK_IF,      cur, p, l); p = q; continue;}
-            if (!strncmp(p, "else", l))   {cur = new_token(TK_ELSE,    cur, p, l); p = q; continue;}
-            if (!strncmp(p, "while", l))  {cur = new_token(TK_WHILE,   cur, p, l); p = q; continue;}
-            // Must be an identifier
-            cur = new_token(TK_IDENT, cur, p, l);
+            // Keywords and identifiers
+            Token_kind tk = find_token(p, l);
+            cur = new_token(tk, cur, p, l);
             p = q;
             continue;
         }

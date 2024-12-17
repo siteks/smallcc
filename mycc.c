@@ -13,10 +13,12 @@ void error(char *fmt, ...)
 }
 
 
-Token   *token;
-char    *user_input;
-Local   *locals;
-
+Token           *token;
+char            *user_input;
+Local           *locals;
+Type            *types;
+Symbol_table    *symbol_table;
+Symbol_table    *curr_st_scope;
 
 int main(int argc, char **argv)
 {
@@ -30,24 +32,24 @@ int main(int argc, char **argv)
     token = tokenise(user_input);
     locals = NULL;
     print_tokens();
+    symbol_table = calloc(1, sizeof(Symbol_table));
+    curr_st_scope = symbol_table;
+    
 
     Node *node = program();
+    get_types_and_symbols(node);
     print_tree(node, 0);
+    print_symbol_table(symbol_table, 0);
+    print_type_table();
 
 
     printf(".text=0\n");
-    printf("    li      r6 0x0\n");
-    printf("    lih     r6 0x10\n");
-    printf("    bl      r5 main\n");
+    printf("    ssp     0x1000\n");
+    printf("    jl      main\n");
     printf("    halt\n");
     printf(".text=0x20\n");
 
-    // int i = 0;
-    // gen_preamble(locals ? locals->offset + 1 : 0);
     gen_code(node);
-    // gen_postamble();
-    // gen_pop(0);
-    // printf("    halt\n");
 
     return 0;
 }
