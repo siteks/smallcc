@@ -70,6 +70,9 @@ char *token_str(Token_kind tk)
         tk == TK_GT         ? "GT       " :
         tk == TK_LE         ? "LE       " :
         tk == TK_LT         ? "LT       " :
+        tk == TK_INC        ? "INC      " :
+        tk == TK_DEC        ? "DEC      " :
+        tk == TK_DOT        ? "DOT      " :
         tk == TK_ASSIGN     ? "ASSIGN   " :
         tk == TK_PLUS       ? "PLUS     " :
         tk == TK_MINUS      ? "MINUS    " :
@@ -207,6 +210,8 @@ Token *tokenise(char *p)
             if (!strncmp(p, "!=", 2)) {cur = new_token(TK_NE, cur, p, 2); p += 2; continue;}
             if (!strncmp(p, ">=", 2)) {cur = new_token(TK_GE, cur, p, 2); p += 2; continue;}
             if (!strncmp(p, "<=", 2)) {cur = new_token(TK_LE, cur, p, 2); p += 2; continue;}
+            if (!strncmp(p, "++", 2)) {cur = new_token(TK_INC, cur, p, 2); p += 2; continue;}
+            if (!strncmp(p, "--", 2)) {cur = new_token(TK_DEC, cur, p, 2); p += 2; continue;}
         }
         // Single character tokens
         switch (*p) 
@@ -229,6 +234,7 @@ Token *tokenise(char *p)
             case '~': cur = new_token(TK_TWIDDLE,   cur, p++, 1); continue;
             case '!': cur = new_token(TK_BANG,      cur, p++, 1); continue;
             case ',': cur = new_token(TK_COMMA,     cur, p++, 1); continue;
+            case '.': cur = new_token(TK_DOT,       cur, p++, 1); continue;
         }
         // Keywords and identifiers
         if (isalpha(*p) || *p == '_')
@@ -247,7 +253,7 @@ Token *tokenise(char *p)
         if (isdigit(*p))
         {
             char *q;
-            strtol(p, &q, 10);
+            strtol(p, &q, 0);
             cur = new_token(TK_NUM, cur, p, q - p);
             p = q;
             continue;

@@ -3,28 +3,60 @@
 #include "mycc.h"
 
 
-static int labels;
-extern Local *locals;
+extern Symbol_table *symbol_table;
+char *scope_str(Scope sc);
 
-// Insert new local var at start of list
-void new_local(Node *node)
+
+int find_local_addr(Node *node, char *name)
 {
-    Local *l    = calloc(1, sizeof(Local));
-    l->next     = locals;
-    l->name     = node->val;
-    l->offset   = node->offset;
-    locals      = l;
-}
-// Return offset of local, or -1 if not found
-int find_local_addr(char *name)
-{
-    for(Local *p = locals; p; p = p->next)
+    // Get the offset from bp of the local variable in node.
+    // Go to scope in node, then search for variable name in that scope,
+    // and successively enclosing scopes, until found.
+    Scope sc = node->scope;
+    fprintf(stderr, "%s scope is %s\n", __func__, scope_str(sc));
+    Symbol_table *st = symbol_table;
+    if (sc.depth)
     {
-        if (!strcmp(p->name, name))
-            return p->offset;
+        for(int d = 1; d <= sc.depth; d++)
+        {
+            int index = sc.indices[d - 1] - 1;
+            st = st->children[index];
+        }
     }
-    return -1;
+    // st now pointing to symbol table at scope.
+    Symbol *s;
+    bool found = false;
+    while(!found)
+    { 
+        fprintf(stderr, "Searching in scope:%s\n", scope_str(st->scope));
+        for(s = st->symbols; s; s = s->next)
+        {
+            fprintf(stderr, "Ident:%s\n", s->name);
+            if (!strcmp(name, s->name))
+            {
+                found = true;
+                break;
+            }
+        }
+        if (found)
+            break;
+        // Not found in this scope, go to enclosing scope
+        fprintf(stderr, "Not found, going to enclosing scope\n");
+        if (st->parent)
+            st = st->parent;
+    }
+    if (!found)
+    {
+        error("Symbol %s not found!\n", name);
+    }
+    int offset = st->global_offset + s->offset;
+    printf(";%s ident:%s at scope:%s got offset %d\n", __func__, name, scope_str(st->scope), offset);
+    return offset;
 }
+
+
+static int labels;
+
 //--------------------------------------------------------------------------------
 // Pseudoinstructions
 //
@@ -92,9 +124,13 @@ void gen_push()
 {
     printf("    push\n");
 }
-void gen_pop(int r)
+void gen_pop()
 {
     printf("    pop\n");
+}
+void gen_adj(int offset)
+{
+    printf("    adj %d\n", offset);
 }
 void gen_add()
 {
@@ -148,25 +184,33 @@ void gen_sw()
 void gen_assign()
 {
 }
-void gen_lvaraddr(Node *node)
+void gen_varaddr(Node *node)
 {
     if (node->kind != ND_IDENT)
         error("Expecting local var got %s", nodestr(node->kind));
     
-    int offset = find_local_addr(node->val);
-    if (offset < 0)
-        error("Could not find local var %s address!", node->val);
+    int offset = find_local_addr(node, node->val);
 
     printf(";%s %s offset %d\n", __func__, node->val, offset);
 
     // frame is pointing to sp, so offset needs incrementing
-    int t = offset + 1;
+    int t = offset + 2;
     printf("    lea     %d\n", -t);
 }
-void gen_preamble(int localidx)
+void gen_varaddr_from_ident(Node *node, char *name)
 {
-    printf(";Reserve space for %d locals\n", localidx);
-    printf("    enter   %d\n", localidx);
+    int offset = find_local_addr(node, name);
+
+    printf(";%s %s offset %d\n", __func__, name, offset);
+
+    // frame is pointing to sp, so offset needs incrementing
+    int t = offset + 2;
+    printf("    lea     %d\n", -t);
+}
+void gen_preamble(int words)
+{
+    printf(";Reserve space for %d words\n", words);
+    printf("    enter   %d\n", words);
 }
 void gen_postamble()
 {
@@ -177,8 +221,21 @@ void gen_postamble()
 // Everything below here uses pseudoinstructions
 //--------------------------------------------------------------------------------
 
-
-
+void gen_expr(Node *node);
+void gen_addr(Node *node)
+{
+    printf(";%s %s %s\n", __func__, nodestr(node->kind), node->val);
+    if (node->kind == ND_IDENT)
+    {
+        gen_varaddr(node);
+    }
+    else if (node->kind == ND_UNARYOP && !strcmp(node->val, "*"))
+    {
+        gen_expr(node->children[0]);
+    }
+    else
+        error("Expecting lvalue\n");
+}
 
 void gen_expr(Node *node)
 {
@@ -206,23 +263,31 @@ void gen_expr(Node *node)
     }
     else if (node->kind == ND_IDENT)
     {
-        gen_lvaraddr(node);
+        gen_varaddr(node);
         gen_lw();
     }
     else if (node->kind == ND_UNARYOP)
     {
-        if (!strcmp(node->val, "+"))    {gen_expr(node->children[0]); return;}      
-        if (!strcmp(node->val, "-"))    
+        if (!strcmp(node->val, "+"))    
+        {
+            gen_expr(node->children[0]);
+        }      
+        else if (!strcmp(node->val, "-"))    
         {
             gen_imm(0);
             gen_push();
             gen_expr(node->children[0]);
             gen_sub();
         }
+        else if (!strcmp(node->val, "*"))
+        {
+            gen_expr(node->children[0]);
+            gen_lw();
+        }
     }
     else if (node->kind == ND_ASSIGN)
     {
-        gen_lvaraddr(node->children[0]);
+        gen_addr(node->children[0]);
         gen_push();
         gen_expr(node->children[1]);
         gen_sw();
@@ -280,27 +345,55 @@ void gen_exprstmt(Node *node)
 void gen_decl(Node *node)
 {
     printf(";%s %s\n", __func__, node->val);
-    // Function delarations. Space has already been reserved
-    // Add the declaration to the list of variables
-    if (node->child_count == 2)
+    // The symbol table has all the details needed for declarations.
+    // Reserve space for local variables.
+
+    // Iterate over declarators, generating code for initialisations
+    for(int i = 0; i < node->child_count; i++)
     {
-        // This is a declaration with assignment
-        gen_lvaraddr(node->children[0]);
-        gen_push();
-        gen_expr(node->children[1]);
-        gen_sw();
+        Node *n = node->children[i];
+        if (n->kind == ND_DECLARATOR && n->child_count == 2)
+        {
+            // Get ident from symbol table
+            if (!n->symbol)
+                error("Missing symbol!\n");
+            gen_varaddr_from_ident(n, n->symbol->name);
+            gen_push();
+            gen_expr(n->children[1]);
+            gen_sw();
+        }
     }
+
+
+    // TODO init_declarator
+    // if (node->child_count == 2)
+    // {
+    //     // This is a declaration with assignment
+    //     Gen_lvaraddr(node->children[0]);
+    //     gen_push();
+    //     gen_expr(node->children[1]);
+    //     gen_sw();
+    // }
 }
 void gen_compstmt(Node *node)
 {
     printf(";%s\n", __func__);
+    // Make space on stack for this scope's locals
+    gen_adj(-node->symtable->size);
     for(int i = 0; i < node->child_count; i++)
     {
-        gen_stmt(node->children[i]);
+        Node *n = node->children[i];
+        if (n->kind == ND_DECLARATION)
+            gen_decl(n);
+        else
+            gen_stmt(n);
     }
+    // Release the space back
+    gen_adj(node->symtable->size);
 }
 void gen_stmt(Node *node)
 {
+    printf(";%s\n", __func__);
     switch(node->kind)
     {
     case ND_EXPRSTMT:   gen_exprstmt(node); return;
@@ -308,35 +401,20 @@ void gen_stmt(Node *node)
     case ND_IFSTMT:     gen_ifstmt(node); return;
     case ND_WHILESTMT:  gen_whilestmt(node); return;
     case ND_RETURNSTMT: gen_returnstmt(node); return;
+    case ND_STMT:       gen_stmt(node->children[0]); return;
     default:;
     }
+}
+void gen_param_list(Node *node)
+{
+    gen_preamble(node->child_count);
 }
 void gen_function(Node *node)
 {
     printf(";%s\n", __func__);
     printf("%s:\n", node->val);
-    int localidx = 0;
-    locals = NULL;
-    int labels = 0;
-    for(int i = 0; i < node->child_count; i++)
-        if (node->children[i]->kind == ND_DECLSTMT)
-        {
-            node->children[i]->children[0]->offset = localidx++;
-            new_local(node->children[i]->children[0]);
-        }
-    gen_preamble(localidx);
-    for(int i = 0; i < node->child_count; i++)
-        if (node->children[i]->kind == ND_DECLSTMT)
-            gen_decl(node->children[i]);
-
-
-
-    for(int i = 0; i < node->child_count; i++)
-        if (node->children[i]->kind != ND_DECLSTMT)
-        {
-            Node *n = node->children[i];
-            gen_stmt(n);
-        }
+    gen_param_list(node->children[0]);
+    gen_stmt(node->children[1]);
     gen_return();
 }
 void gen_code(Node *node)

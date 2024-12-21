@@ -1,0 +1,12 @@
+0000 t                87 00 10      ssp    4096                                 
+0003 t                80 03 00      immw   3                                    
+0006 t                02            push                                        
+0007 t                82 0b 00      jl     main                                 
+000a t                00            halt                                        
+000b t main           85 02 00      enter  2                                    
+000e t                86 01 00      lea    1                                    
+0011 t                05            lw                                          
+0012 t                02            push                                        
+0013 t                80 02 00      immw   2                                    
+0016 t                08            add                                         
+0017 t                01            ret                                         

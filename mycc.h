@@ -41,7 +41,9 @@ typedef enum
     TK_TWIDDLE,
     TK_BANG,
     TK_EOF,
-
+    TK_INC,
+    TK_DEC,
+    TK_DOT,
 
     TK_AUTO,
     TK_BREAK,
@@ -152,7 +154,14 @@ struct Type
     Token_kind      typequal;
     Token_kind      sclass;
     char            *derived;
-    char            *name; // for struct, union, typedef
+    bool            is_pointer;
+    bool            is_array;
+    int             size;       // Size in bytes
+    int             dimensions;
+    int             **dim_sizes;
+    int             elements;
+    int             elem_size;
+    char            *name;      // for struct, union, typedef
     Type            *next;
 };
 
@@ -197,6 +206,27 @@ struct Scope
     int     *indices;
 };
 
+typedef struct Symbol Symbol;
+struct Symbol
+{
+    char    *name;
+    Type    *type;
+    int     offset;
+    Symbol  *next;
+};
+typedef struct Symbol_table Symbol_table;
+struct Symbol_table
+{
+    // 
+    Scope           scope;
+    int             symbol_count;
+    Symbol          *symbols;
+    int             size;
+    int             global_offset;
+    int             child_count;
+    Symbol_table    **children;
+    Symbol_table    *parent;
+};
 typedef struct Node Node;
 struct Node
 {
@@ -209,10 +239,14 @@ struct Node
     bool            is_function;
     bool            is_array;
     int             array_size;
+    bool            size_mult;
+    Node            *array_ident;
     Token_kind      typespec;
     Token_kind      sclass;
     Token_kind      typequal;
     Scope           scope;
+    Symbol_table    *symtable;
+    Symbol          *symbol;
 
 };
 
@@ -229,26 +263,6 @@ Node *program();
 void print_tree(Node *node, int depth);
 void print_locals();
 
-typedef struct Symbol Symbol;
-struct Symbol
-{
-    char    *name;
-    Type    *type;
-    Symbol  *next;
-};
-
-typedef struct Symbol_table Symbol_table;
-struct Symbol_table
-{
-    // 
-    Scope           scope;
-    int             symbol_count;
-    Symbol          *symbols;
-    int             child_count;
-    Symbol_table    **children;
-    Symbol_table    *parent;
-};
-
 // ---------------------------------------------------------------
 // Code gen
 // ---------------------------------------------------------------
@@ -256,15 +270,17 @@ struct Symbol_table
 void gen_code(Node *node);
 void gen_preamble(int offset);
 void gen_postamble();
-void gen_pop(int r);
+void gen_pop();
 void gen_stmt(Node *node);
 char *nodestr(Node_kind k);
-void get_types_and_symbols(Node *node);
+// void get_types_and_symbols(Node *node);
 void print_symbol_table(Symbol_table *s, int depth);
 void print_type_table();
-
+void add_types_and_symbols(Node *node);
+char *fulltype_str(Type *t);
 char *token_str(Token_kind tk);
 char *type_token_str(Token_kind tk);
 
-
+Symbol *find_symbol(Node *node, char *name);
+Symbol_table *find_scope(Node *node);
 #endif
