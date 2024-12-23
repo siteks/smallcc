@@ -177,12 +177,20 @@ void gen_lw()
 {
     printf("    lw\n");
 }
+void gen_sb()
+{
+    printf("    sb\n");
+}
 void gen_sw()
 {
     printf("    sw\n");
 }
 void gen_assign()
 {
+}
+void gen_lea(int o)
+{
+    printf("    lea     %d\n", o);
 }
 void gen_varaddr(Node *node)
 {
@@ -194,7 +202,7 @@ void gen_varaddr(Node *node)
     printf(";%s %s offset %d\n", __func__, node->val, offset);
 
     // frame is pointing to sp, so offset needs incrementing
-    int t = offset + 2;
+    int t = offset;
     printf("    lea     %d\n", -t);
 }
 void gen_varaddr_from_ident(Node *node, char *name)
@@ -204,7 +212,7 @@ void gen_varaddr_from_ident(Node *node, char *name)
     printf(";%s %s offset %d\n", __func__, name, offset);
 
     // frame is pointing to sp, so offset needs incrementing
-    int t = offset + 2;
+    int t = offset;
     printf("    lea     %d\n", -t);
 }
 void gen_preamble(int words)
@@ -215,6 +223,22 @@ void gen_preamble(int words)
 void gen_postamble()
 {
     printf(";%s\n", __func__);
+}
+void gen_fill(int offset, int size)
+{
+    int step = 1;
+    if (size %2 == 0)
+        step = 2;
+    for(int i = 0; i < size; i+=step)
+    {
+        gen_lea(offset + i);
+        gen_push();
+        gen_imm(0);
+        if (step == 1)
+            gen_sb();
+        else 
+            gen_sw();
+    }
 }
 
 //--------------------------------------------------------------------------------
@@ -264,7 +288,9 @@ void gen_expr(Node *node)
     else if (node->kind == ND_IDENT)
     {
         gen_varaddr(node);
-        gen_lw();
+        // Don't fetch from address if pointer or array
+        if (!node->symbol->type->is_array && !node->symbol->type->is_pointer)
+            gen_lw();
     }
     else if (node->kind == ND_UNARYOP)
     {
@@ -342,11 +368,85 @@ void gen_exprstmt(Node *node)
     // printf(";%s\n", __func__);
     gen_expr(node->children[0]);
 }
+bool is_constexpr(Node *n)
+{
+    // TODO this isnt rigorous
+    return n->kind == ND_LITERAL || n->kind == ND_BINOP || n->kind == ND_IDENT || n->kind == ND_UNARYOP;
+}
+int count_constexpr(Node *n)
+{
+    if (is_constexpr(n))
+        return 1;
+    int count = 0;
+    for(int i = 0; i < n->child_count; i++)
+        count += count_constexpr(n->children[i]);
+    return count;
+}
+void gen_inits(Node *n, Symbol *s, int vaddr, int offset, int depth)
+{
+    printf(";%s %s vaddr:%d os:%d depth:%d\n", __func__, nodestr(n->kind),vaddr,offset, depth);
+    // Recurse through initlist
+    int ptr = offset;
+    for(int i = 0; i < n->child_count; i++)
+        if (is_constexpr(n->children[i]))
+        {
+            gen_lea(vaddr + ptr);
+            gen_push();
+            gen_expr(n->children[i]);
+            gen_sw();
+            ptr += s->type->elem_size;
+        }
+        else
+        {
+            // Going deeper, we need to set the offset to be the start of the row
+            int new_offset = offset;
+            if (ptr != offset)
+                // If we've done anything on this row, advance to next row
+                new_offset = offset + *s->type->elems_per_row[depth] * s->type->elem_size;
+            gen_inits(n->children[i], s, vaddr, new_offset, depth + 1);
+            // Now out of level, we move on a whole row
+            offset =  new_offset + *s->type->elems_per_row[depth] * s->type->elem_size;
+            fprintf(stderr, "out of inits, now inc offset to %d\n", offset);
+            ptr = offset;
+        }
+}
+void gen_initlist(Node *n, Symbol *s)
+{
+    // Address of variable to be initialised is on the stack
+    Type *t = s->type;
+
+    int constexpr = count_constexpr(n);
+    if (!t->dimensions)
+    {
+        // Scalar object, just take the first element of the list. There should be 
+        // only one element
+        if (constexpr != 1)
+            error("Should be exactly one constexpr in initialiser\n");
+        Node *l;
+        for(l = n; !is_constexpr(l); l = l->children[0]);
+        // gen_varaddr_from_ident(n, n->symbol->name);
+        gen_varaddr_from_ident(n, s->name);
+        gen_push();
+        gen_expr(l);
+        gen_sw();
+    }
+    else if (constexpr)
+    {
+        // Fill the whole variable with zero, then add in init values.
+        // Optimisation would be to create a data area and copy the data over..
+        // 
+        // Offset here is what you apply to lea to get address
+        int vaddr = -find_local_addr(n, s->name);
+        gen_fill(vaddr, t->size);
+        gen_inits(n, s, vaddr, 0, 0);
+    }
+    // int size = *t->dim_sizes[i];
+}
 void gen_decl(Node *node)
 {
     printf(";%s %s\n", __func__, node->val);
     // The symbol table has all the details needed for declarations.
-    // Reserve space for local variables.
+    // Space is reserved at the start of the compound statement
 
     // Iterate over declarators, generating code for initialisations
     for(int i = 0; i < node->child_count; i++)
@@ -354,26 +454,25 @@ void gen_decl(Node *node)
         Node *n = node->children[i];
         if (n->kind == ND_DECLARATOR && n->child_count == 2)
         {
+            // This is an initialiser.
             // Get ident from symbol table
             if (!n->symbol)
                 error("Missing symbol!\n");
-            gen_varaddr_from_ident(n, n->symbol->name);
-            gen_push();
-            gen_expr(n->children[1]);
-            gen_sw();
+            if (n->children[1]->kind == ND_INITLIST)
+            {
+                gen_initlist(n->children[1], n->symbol);
+            }
+            // TODO string initialiser goes here
+            else
+            {
+                gen_varaddr_from_ident(n, n->symbol->name);
+                gen_push();
+                gen_expr(n->children[1]);
+                gen_sw();
+            }
         }
     }
 
-
-    // TODO init_declarator
-    // if (node->child_count == 2)
-    // {
-    //     // This is a declaration with assignment
-    //     Gen_lvaraddr(node->children[0]);
-    //     gen_push();
-    //     gen_expr(node->children[1]);
-    //     gen_sw();
-    // }
 }
 void gen_compstmt(Node *node)
 {

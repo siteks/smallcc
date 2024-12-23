@@ -135,6 +135,7 @@ typedef enum
     ND_ASSIGN,
     ND_IDENT,
     ND_LITERAL,
+    ND_INITLIST,
     ND_DECLARATION,
     ND_DECLARATOR,
     ND_DIRECT_DECL,
@@ -159,6 +160,7 @@ struct Type
     int             size;       // Size in bytes
     int             dimensions;
     int             **dim_sizes;
+    int             **elems_per_row;
     int             elements;
     int             elem_size;
     char            *name;      // for struct, union, typedef

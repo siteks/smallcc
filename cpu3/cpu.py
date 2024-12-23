@@ -125,7 +125,7 @@ def sext(b, w):
 
 class Mem:
     def __init__(self):
-        self.mem    = np.zeros(65536, np.byte)
+        self.mem    = np.full(65536, 0xff, np.byte)
         self.trace = ''
 
     def read8(self, addr, trace=True):

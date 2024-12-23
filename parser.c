@@ -183,23 +183,27 @@ Node *unary_expr()
         {
             case(TK_LBRACKET):
                 // rewrite as per A.7.3.1: E1[E2] equiv *((E1) + (E2))
-                // e1[e2][e3]
-                // Mark nodes performing size mult so we can fix them up later
+                // e1[e2][e3] as *(e1 + e2 * size(d2) + e3)
                 {
                     if (!s)
                         error("No ident before left bracket\n");
                     expect(token->kind);
-                    Node *e1        = node;
-                    node            = new_node(ND_UNARYOP, "*");
-                    Node *add       = add_child(node, new_node(ND_BINOP, "+"));
+                    Node *e1    = node;
+                    Node *add;
+                    // Only dereference at the outer calculation, put
+                    // unary '+' which has no effect in for symmetry
+                    if (array_depth == s->type->dimensions - 1)
+                        node    = new_node(ND_UNARYOP, "*");
+                    else
+                        node    = new_node(ND_UNARYOP, "+");
+                    add         = add_child(node, new_node(ND_BINOP, "+"));
                     add_child(add, e1);
-                    Node *mul       = new_node(ND_BINOP, "*");
+                    Node *mul   = new_node(ND_BINOP, "*");
                     // Get array dimension
                     if (array_depth >= s->type->dimensions)
                         error("Too many dimensions for array type %s\n", fulltype_str(s->type));
-                    int mult = 1;
-                    for(int i = 1; i < s->type->dimensions - array_depth; i++)
-                        mult *= *s->type->dim_sizes[array_depth + i];
+                    int mult = s->type->elem_size;
+                    mult *= *s->type->elems_per_row[array_depth ];
                     array_depth++;
                     char buf[64]; 
                     sprintf(buf, "%d", mult);
@@ -397,18 +401,35 @@ Node *declarator()
     add_child(node, direct_decl());
     return node;
 }
+Node *initializer();
+Node *initializer_list()
+{
+    Node *node = new_node(ND_INITLIST, 0);
+    add_child(node, initializer());
+    while (token->kind == TK_COMMA)
+    {
+        expect(TK_COMMA);
+        add_child(node, initializer());
+    }
+    return node;
+}
 Node *initializer()
 {
     fprintf(stderr, "%s\n", __func__);
     // <initializer> ::= <assignment-expression>
     //                 | { <initializer-list> }
     //                 | { <initializer-list> , }  
-    Node *node = assign_expr();
-    // while (token->kind == TK_COMMA)
-    // {
-    //     expect(TK_COMMA);
-    //     add_child(node, assign_expr());
-    // }
+    Node *node;
+    if (token->kind == TK_LBRACE)
+    {
+        expect(token->kind);
+        node = initializer_list();
+        if (token->kind == TK_COMMA)
+            expect(token->kind);
+        expect(TK_RBRACE);
+    }
+    else
+        node = assign_expr();
     return node;
 }
 Node *init_declarator()
@@ -600,6 +621,7 @@ char *nodestr(Node_kind k)
         case ND_UNARYOP:    return "UNARYOP     ";
         case ND_ASSIGN:     return "ASSIGN      ";
         case ND_IDENT:      return "IDENT       ";
+        case ND_INITLIST:   return "INITLIST    ";
         case ND_LITERAL:    return "LITERAL     ";
         case ND_DECLARATION:return "DECLARATION ";
         case ND_DECLARATOR: return "DECLARATOR  ";
@@ -806,9 +828,9 @@ void calc_tsize(Type *t)
     else if (t->derived[0] == '[')
     {
         // This is an array, work out the dimensions
-        t->is_array = true;
-        char *p = t->derived;
-        t->dimensions = 0;
+        t->is_array     = true;
+        char *p         = t->derived;
+        t->dimensions   = 0;
         while(*p && *p != '*')
         {
             if (*p == '[')
@@ -824,6 +846,9 @@ void calc_tsize(Type *t)
                 t->dim_sizes = (int**)realloc(t->dim_sizes, t->dimensions * sizeof(int**));
                 t->dim_sizes[t->dimensions - 1] = calloc(1, sizeof(int));
                 *t->dim_sizes[t->dimensions - 1] = d;
+
+                t->elems_per_row = (int**)realloc(t->elems_per_row, t->dimensions * sizeof(int**));
+                t->elems_per_row[t->dimensions - 1] = calloc(1, sizeof(int));
                 if (*q == ']')
                     p = q;
             }
@@ -834,6 +859,12 @@ void calc_tsize(Type *t)
         else
             t->elem_size = s;
         t->size = t->elements * t->elem_size;
+        int num_elems = 1;
+        for(int i = t->dimensions - 1; i >= 0; i--)
+        {
+            *t->elems_per_row[i] = num_elems;
+            num_elems *= *t->dim_sizes[i];
+        }
     }
 }
 Type *insert_type(Node *node, char *ts)
@@ -862,6 +893,7 @@ Type *insert_type(Node *node, char *ts)
     t->sclass   = node->sclass;
     t->derived  = calloc(1, strlen(ts) + 1);
     strcpy(t->derived, ts);
+    // Work out the dimensions and sizes
     calc_tsize(t);
     t->next     = types;
     types       = t;
@@ -883,6 +915,7 @@ int align(int val, int size)
 }
 Symbol *insert_symbol(Node *node, Type *type, char *ident)
 {
+    fprintf(stderr, "%s %s %s\n", __func__, fulltype_str(type), ident);
     Scope sc = node->scope;
     // Find scope in table, the scope structure already exists from the parse process
     Symbol_table *st = symbol_table;
@@ -898,21 +931,24 @@ Symbol *insert_symbol(Node *node, Type *type, char *ident)
     }
     st->global_offset = go;
     // We are now at the correct scope, insert the symbol at the end of the list,
-    // with offset within the current scope. This is the size of the previous type,
+    // with offset within the current scope. This is the size of the current type,
     // added to the previous offset. (TODO alignment)
     //
     // Global offset is offset within the function, whatever scope level we are at.
     // This is the enclosing scopes
-    Symbol *s, *ls = 0;
-    int offset = 0;
+    Symbol *s = 0, *ls = 0;
+    int offset  = 0;
     for(s = st->symbols; s; s = s->next)
     {
-        ls = s;
-        offset = s->offset + s->type->size;
+        offset  = s->offset;
+        ls      = s;
     }
+    // ls now points to last symbol in list
+    // Move offset to make space for this type
+    offset      += type->size;
     // Align offset with elem_size
-    offset      = align(offset, type->elem_size);
-    st->size    = offset + type->size;
+    // offset      = align(offset, type->elem_size);
+    st->size    += offset;
     Symbol *n   = new_symbol(type, ident, offset);
     if (!ls)
         st->symbols = n;
@@ -1011,46 +1047,7 @@ Symbol *find_symbol(Node *node, char *name)
     return s;
 }
 
-// Type *get_array_type(Node *n)
-// {
-//     if (n->kind == ND_IDENT)
-//     {
-//         Symbol *s = find_symbol(n, n->val);
-//         return s->type;
-//     }
-//     return get_array_type(n->children[0]);
-// }
 
-// Node *fix_array_sizes(Node *n, Type *t)
-// {
-//     // n is pointing to the the deref unaryop node. The child node is the add
-//     // The second term of the add is the size multiply
-// }
-
-// void get_types_and_symbols(Node *node)
-// {
-//     if (!node)
-//         return;
-//     if (node->kind == ND_DECLARATION)
-//     {
-//         add_types_and_symbols(node);
-//     }
-//     else if (node->is_array)
-//     {
-//         // Fixup dimension sizes
-//         Symbol *s = find_symbol(node->array_ident, node->array_ident->val);
-//         Type *t = s->type;
-//         fprintf(stderr, "Found array type %s\n", fulltype_str(t));
-//         fix_array_sizes(node->children[0], t);
-//     }
-//     else
-//     {
-//         for(int i = 0; i < node->child_count; i++)
-//         {
-//             get_types_and_symbols(node->children[i]);
-//         }
-//     }
-// }
 
 void print_symbol_table(Symbol_table *s, int depth)
 {

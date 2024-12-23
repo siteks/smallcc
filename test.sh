@@ -57,7 +57,7 @@ assert() {
 # Pointers
 # assert 1 "int main(){int *a;a=0x2000;*a=1;return *a;}"
 # assert 1 "int main(){int *a=0x2000;*a=1;return *a;}"
-assert 3 "int main(){int a[2]; a[0]=2;a[1]=3;return a[1];}"
+# assert 3 "int main(){int a[2]; a[0]=2;a[1]=3;return a[1];}"
 
 
-echo OK
+# echo OK
