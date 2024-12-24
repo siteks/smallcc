@@ -94,7 +94,7 @@ class Assembler(object):
                     \s*
                     (0x[0-9a-fA-F]+|-?\d+|\w+)?
                     ''', actual, flags=re.VERBOSE)
-                #print(actual)
+                print(actual)
                 if m:
                     label   = m.group(1)
                     ins     = m.group(2)
@@ -109,6 +109,10 @@ class Assembler(object):
                             val = int(label.split('=')[1], 0)
                             adr(val)
                             val = None
+                        else:
+                            if self.mode == 'text': self.textaddr = self.dataaddr
+                            if self.mode == 'data': self.dataaddr = self.textaddr
+
 
                     if new_addr:
                         i = Item()
@@ -153,13 +157,30 @@ class Assembler(object):
                                     adr(adr() + 1)
                                     self.symbols[i.label] = Sym(adr(), self.mode)
                                 adr(adr() + val * 2)
+                            elif ins == 'align':
+                                i.length = 0
+                                if adr() & 1:
+                                    # ensure that space allocated is word aligned
+                                    adr(adr() + 1)
+                                    i.length = 0
+                                i.ins = [0]
+
                             else:
-                                i.length = G.directive[ins]
-                                if val:
-                                    v = val
-                                    i.ins = [(v >> (8 * j)) & 0xff for j in range(i.length)]
+                                # byte or word directive, accept any number of args
+                                f = actual.split()[1:]
+                                i.length = G.directive[ins] * len(f)
+                                
+                                if G.directive[ins] == 1:
+                                    i.ins = [int(f[j],0) & 0xff for j in range(len(f))]
                                 else:
-                                    i.ins = [0]*i.length
+                                    i.ins = []
+                                    for j in range(len(f) * 2):
+                                        if j % 2 == 0:
+                                            i.ins.append(int(f[j>>1],0) & 0xff)
+                                        else:
+                                            i.ins.append((int(f[j>>1],0)>>8) & 0xff)
+
+                                print(i.ins)
                             fmt = 99
                         elif ins in G.ptable:
                             instr, fmt = G.ptable[ins]

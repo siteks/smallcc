@@ -444,6 +444,7 @@ Node *init_declarator()
     }
     return node;
 }
+Node *comp_stmt();
 Node *declaration()
 {
     fprintf(stderr, "%s\n", __func__);
@@ -462,8 +463,21 @@ Node *declaration()
     {
         add_child(node, init_declarator());
         if (token->kind != TK_SEMICOLON)
+        {
+            // We could get this far to find out this is a function definition.
+            // If the next token is a '{' and we are not in a struct, union, enum, then
+            // it is a func definition
+            if (token->kind == TK_LBRACE)
+            {
+                add_types_and_symbols(node);
+                add_child(node, comp_stmt());
+                node->is_func_defn = true;
+                return node;
+            }
             expect(TK_COMMA);
+        }
     }
+
     expect(TK_SEMICOLON);
     // At this point, we can add the symbols and types to the tables
     add_types_and_symbols(node);
@@ -579,24 +593,25 @@ Node *param_list()
     }
     return node;
 }
-Node *func_def()
-{
-    fprintf(stderr, "%s\n", __func__);
-    expect(TK_INT);
-    Node *node = new_node(ND_FUNCTION, expect(TK_IDENT));
-    expect(TK_LPAREN);
-    add_child(node, param_list());
-    expect(TK_RPAREN);
-    add_child(node, comp_stmt());
-    return node;
-}
+// Node *func_def()
+// {
+//     fprintf(stderr, "%s\n", __func__);
+//     expect(TK_INT);
+//     Node *node = new_node(ND_FUNCTION, expect(TK_IDENT));
+//     expect(TK_LPAREN);
+//     add_child(node, param_list());
+//     expect(TK_RPAREN);
+//     add_child(node, comp_stmt());
+//     return node;
+// }
 Node *program()
 {
     fprintf(stderr, "%s\n", __func__);
     Node *node = new_node(ND_PROGRAM, 0);
     while(!at_eof())
     {
-        add_child(node, func_def());
+
+        add_child(node, declaration());
     }
     return node;
 }
@@ -920,20 +935,40 @@ Symbol *insert_symbol(Node *node, Type *type, char *ident)
     // Find scope in table, the scope structure already exists from the parse process
     Symbol_table *st = symbol_table;
     int go = 0; 
+    // TODO refactor this, unify repeated logic
     if (sc.depth)
     {
         for(int d = 1; d <= sc.depth; d++)
         {
-            go += st->size;
+            if (d > 1)
+                // Don't include size from globals
+                go += st->size;
             int index = sc.indices[d - 1] - 1;
             st = st->children[index];
         }
     }
+    else
+    {
+        // Treat global scope differently, we are not allocating downwards in stack space
+        // but upwards in data space
+        int offset  = st->size;
+        st->size += type->size;
+        Symbol *n   = new_symbol(type, ident, offset);
+        Symbol *s = 0, *ls = 0;
+        for(s = st->symbols; s; s = s->next)
+            ls      = s;
+        if (!ls)
+            st->symbols = n;
+        else
+            ls->next = n;
+
+        return n;
+    }
     st->global_offset = go;
     // We are now at the correct scope, insert the symbol at the end of the list,
     // with offset within the current scope. This is the size of the current type,
-    // added to the previous offset. (TODO alignment)
-    //
+    // added to the previous offset for local scopes. (TODO alignment)
+
     // Global offset is offset within the function, whatever scope level we are at.
     // This is the enclosing scopes
     Symbol *s = 0, *ls = 0;
@@ -946,9 +981,7 @@ Symbol *insert_symbol(Node *node, Type *type, char *ident)
     // ls now points to last symbol in list
     // Move offset to make space for this type
     offset      += type->size;
-    // Align offset with elem_size
-    // offset      = align(offset, type->elem_size);
-    st->size    += offset;
+    st->size    += type->size;
     Symbol *n   = new_symbol(type, ident, offset);
     if (!ls)
         st->symbols = n;

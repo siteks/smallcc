@@ -47,7 +47,6 @@ int main(int argc, char **argv)
     printf("    ssp     0x1000\n");
     printf("    jl      main\n");
     printf("    halt\n");
-    printf(".text=0x20\n");
 
     gen_code(node);
 

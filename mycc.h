@@ -238,6 +238,7 @@ struct Node
     int             child_count;
     int             offset;
     int             pointer_level;
+    bool            is_func_defn;
     bool            is_function;
     bool            is_array;
     int             array_size;

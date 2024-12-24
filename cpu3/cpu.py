@@ -66,6 +66,7 @@ class G:
         'word'  :   2,
         'allocb':   1,
         'allocw':   2,
+        'align':   1,
     }
 
     ptable = {
