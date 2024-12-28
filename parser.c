@@ -76,10 +76,14 @@ extern Local        *locals;
 extern Type         *types;
 extern Symbol_table *symbol_table;
 
+Symbol_table        *last_symbol_table;
+
 int depth;
 int indices[100];
 
 
+Symbol_table *enter_new_scope(bool use_last_scope);
+void leave_scope();
 
 void set_scope(Scope *sc)
 {
@@ -122,7 +126,7 @@ Node *add_expr();
 Node *assign_expr();
 Node *expr();
 Node *stmt();
-Node *param_list();
+// Node *param_list();
 Node *func_def();
 
 Node *primary_expr()
@@ -174,9 +178,12 @@ Node *unary_expr()
             node->symbol = find_symbol(node, node->val);
         }
     }
-    // Keep pointer to array ident, so we can reference later during fixup
+    // postfix-expr
+    // Keep pointer to array or func ident, so we can reference later during fixup
     Symbol *s = node->symbol;
     int array_depth = 0;
+    // Keep ref to primary expression node so we can mark as function call is necessary
+    Node *pex_node = node;
     while(is_postfix(token->kind))
     {
         switch (token->kind)
@@ -214,6 +221,12 @@ Node *unary_expr()
                     break;
                 }
             case(TK_LPAREN):
+                // Function call
+                expect(TK_LPAREN);
+                pex_node->is_function = true;
+                if (token->kind != TK_RPAREN)
+                    add_child(node, expr());
+                expect(TK_RPAREN);
                 break;
             case(TK_DOT):
                 expect(token->kind);
@@ -278,15 +291,80 @@ Node *equal_expr()
     }
     return node;
 }
-Node *assign_expr()
+Node *bitand_expr()
 {
     fprintf(stderr, "%s\n", __func__);
     Node *node = equal_expr();
+    while (token->kind == TK_AMPERSAND)
+    {
+        Node *enode = new_node(ND_BINOP, expect(token->kind));
+        add_child(enode, node);
+        add_child(enode, equal_expr());
+        node = enode;
+    }
+    return node;
+}
+Node *bitxor_expr()
+{
+    fprintf(stderr, "%s\n", __func__);
+    Node *node = bitand_expr();
+    while (token->kind == TK_BITXOR)
+    {
+        Node *enode = new_node(ND_BINOP, expect(token->kind));
+        add_child(enode, node);
+        add_child(enode, bitand_expr());
+        node = enode;
+    }
+    return node;
+}
+Node *bitor_expr()
+{
+    fprintf(stderr, "%s\n", __func__);
+    Node *node = bitxor_expr();
+    while (token->kind == TK_BITOR)
+    {
+        Node *enode = new_node(ND_BINOP, expect(token->kind));
+        add_child(enode, node);
+        add_child(enode, bitxor_expr());
+        node = enode;
+    }
+    return node;
+}
+Node *logand_expr()
+{
+    fprintf(stderr, "%s\n", __func__);
+    Node *node = bitor_expr();
+    while (token->kind == TK_LOGAND)
+    {
+        Node *enode = new_node(ND_BINOP, expect(token->kind));
+        add_child(enode, node);
+        add_child(enode, bitor_expr());
+        node = enode;
+    }
+    return node;
+}
+Node *logor_expr()
+{
+    fprintf(stderr, "%s\n", __func__);
+    Node *node = logand_expr();
+    while (token->kind == TK_LOGOR)
+    {
+        Node *enode = new_node(ND_BINOP, expect(token->kind));
+        add_child(enode, node);
+        add_child(enode, logand_expr());
+        node = enode;
+    }
+    return node;
+}
+Node *assign_expr()
+{
+    fprintf(stderr, "%s\n", __func__);
+    Node *node = logor_expr();
     if (token->kind == TK_ASSIGN)
     {
         Node *anode = new_node(ND_ASSIGN, expect(TK_ASSIGN));
         add_child(anode, node);
-        add_child(anode, equal_expr());
+        add_child(anode, logor_expr());
         return anode;
     }
     return node;
@@ -321,10 +399,50 @@ bool is_typequal(Token_kind tk)
     return (tk == TK_CONST)
         || (tk == TK_VOLATILE);
 }
+Node *declarator();
+Node *param_declaration()
+{
+
+    fprintf(stderr, "%s\n", __func__);
+    // <parameter-list> ::= <parameter-declaration> <parameter-list-tail>*
+    // <parameter-list-tail> ::= , <parameter-declaration>
+    // <parameter-declaration> ::= {<declaration-specifier>}+ <declarator>
+    //                           | {<declaration-specifier>}+ <abstract-declarator>
+    //                           | {<declaration-specifier>}+
+    Node *node = new_node(ND_DECLARATION, 0);
+    // At least one decl_spec
+    // TODO storage class defaults A.8.1
+    while(is_sc_spec(token->kind) || is_typespec(token->kind) || is_typequal(token->kind))
+    {
+        if (is_sc_spec(token->kind))    node->sclass = token->kind;
+        if (is_typespec(token->kind))   node->typespec = token->kind;
+        if (is_typequal(token->kind))   node->typequal = token->kind;
+        expect(token->kind);
+    }
+    if (token->kind == TK_STAR || token->kind == TK_IDENT)
+    {
+        Node *n = add_child(node, declarator());
+        // add_types_and_symbols(n);
+    }
+    else
+        error("Expecting declarator in function param list\n");
+
+    // At this point, we can add the symbols and types to the tables
+    add_types_and_symbols(node, true);
+    return node;
+}
 Node *param_type_list()
 {
     fprintf(stderr, "%s\n", __func__);
     Node *node = new_node(ND_PTYPE_LIST, 0);
+    node->symtable = enter_new_scope(false);
+    while(token->kind != TK_RPAREN)
+    {
+        add_child(node, param_declaration());
+        if (token->kind == TK_COMMA)
+            expect(token->kind);
+    }
+    leave_scope();
     return node;
 }
 Node *constant_expr()
@@ -332,7 +450,6 @@ Node *constant_expr()
     fprintf(stderr, "%s\n", __func__);
     return equal_expr();
 }
-Node *declarator();
 Node *direct_decl()
 {
     fprintf(stderr, "%s\n", __func__);
@@ -444,7 +561,7 @@ Node *init_declarator()
     }
     return node;
 }
-Node *comp_stmt();
+Node *comp_stmt(bool use_last_scope);
 Node *declaration()
 {
     fprintf(stderr, "%s\n", __func__);
@@ -469,8 +586,11 @@ Node *declaration()
             // it is a func definition
             if (token->kind == TK_LBRACE)
             {
-                add_types_and_symbols(node);
-                add_child(node, comp_stmt());
+                add_types_and_symbols(node, false);
+                // This is the first compound statement of a 
+                // function, so we need to use the scope
+                /// created in the parameter list
+                add_child(node, comp_stmt(true));
                 node->is_func_defn = true;
                 return node;
             }
@@ -480,7 +600,7 @@ Node *declaration()
 
     expect(TK_SEMICOLON);
     // At this point, we can add the symbols and types to the tables
-    add_types_and_symbols(node);
+    add_types_and_symbols(node, false);
     return node;
 }
 extern Symbol_table *curr_st_scope;
@@ -499,13 +619,30 @@ Symbol_table *new_st_scope()
     curr_st_scope   = nt;
     return curr_st_scope;
 }
-Node *comp_stmt()
+Symbol_table *enter_new_scope(bool use_last_scope)
+{
+    if (use_last_scope)
+    {
+        depth++;
+        curr_st_scope = last_symbol_table;
+        return last_symbol_table;
+    }
+    indices[depth++]++;
+    indices[depth]      = 0;
+    last_symbol_table   = new_st_scope();
+    curr_st_scope       = last_symbol_table;
+    return last_symbol_table;
+}
+void leave_scope()
+{
+    depth--;
+    curr_st_scope = curr_st_scope->parent;
+}
+Node *comp_stmt(bool use_last_scope)
 {
     fprintf(stderr, "%s\n", __func__);
-    indices[depth++]++;
-    indices[depth]  = 0;
     Node *node      = new_node(ND_COMPSTMT, 0);
-    node->symtable  = new_st_scope();
+    node->symtable  = enter_new_scope(use_last_scope);
     fprintf(stderr, "%2d:", depth); 
     for(int i = 0; i < depth; i++)
         fprintf(stderr,"%2d.", indices[i]);
@@ -523,8 +660,7 @@ Node *comp_stmt()
             add_child(node, stmt());
         expect(TK_RBRACE);
     }
-    depth--;
-    curr_st_scope = curr_st_scope->parent;
+    leave_scope();
     return node;
 }
 Node *stmt()
@@ -533,7 +669,7 @@ Node *stmt()
     Node *node = new_node(ND_STMT, 0);
     if (token->kind == TK_LBRACE)
     {
-        add_child(node, comp_stmt());
+        add_child(node, comp_stmt(false));
     }
     else if (token->kind == TK_IF)
     {
@@ -576,23 +712,23 @@ Node *stmt()
     }
     return node;
 }
-Node *param_list()
-{
-    fprintf(stderr, "%s\n", __func__);
-    Node *node = new_node(ND_PARAM_LIST, 0);
-    if (token->kind == TK_INT)
-    {
-        expect(TK_INT);
-        add_child(node, new_node(ND_IDENT, expect(TK_IDENT)));
-        while(token->kind == TK_COMMA)
-        {
-            expect(TK_COMMA);
-            expect(TK_INT);
-            add_child(node, new_node(ND_IDENT, expect(TK_IDENT)));
-        }
-    }
-    return node;
-}
+// Node *param_list()
+// {
+//     fprintf(stderr, "%s\n", __func__);
+//     Node *node = new_node(ND_PARAM_LIST, 0);
+//     if (token->kind == TK_INT)
+//     {
+//         expect(TK_INT);
+//         add_child(node, new_node(ND_IDENT, expect(TK_IDENT)));
+//         while(token->kind == TK_COMMA)
+//         {
+//             expect(TK_COMMA);
+//             expect(TK_INT);
+//             add_child(node, new_node(ND_IDENT, expect(TK_IDENT)));
+//         }
+//     }
+//     return node;
+// }
 // Node *func_def()
 // {
 //     fprintf(stderr, "%s\n", __func__);
@@ -748,7 +884,9 @@ void print_tree(Node *node, int depth)
         return;
     for(int i = 0; i < depth; i++) 
         fprintf(stderr, "  ");
-    fprintf(stderr, "%s: %s ch:%d sc:%s ", nodestr(node->kind), node->val, node->child_count, scope_str(node->scope));
+    fprintf(stderr, "%s: %5s %s ch:%d sc:%s ", nodestr(node->kind), 
+        node->is_array ? "array" : node->is_func_defn ? "fdef " : node->is_function ? "func " : "     ", 
+        node->val, node->child_count, scope_str(node->scope));
     if (node->kind == ND_DECLARATION)
     {
         fprintf(stderr, "%s %s %s ", 
@@ -840,6 +978,13 @@ void calc_tsize(Type *t)
         t->size         = 2;
         t->elem_size    = t->size;
     }
+    else if (t->derived[0] == '(')
+    {
+        // This is a pointer
+        t->is_function  = true;
+        t->size         = 2;
+        t->elem_size    = t->size;
+    }
     else if (t->derived[0] == '[')
     {
         // This is an array, work out the dimensions
@@ -928,9 +1073,15 @@ int align(int val, int size)
     if (size == 4) return (val & 3) ? (val & ~3) + 4 : val;
     return val;
 }
-Symbol *insert_symbol(Node *node, Type *type, char *ident)
+Symbol *insert_symbol(Node *node, Type *type, char *ident, bool is_param)
 {
     fprintf(stderr, "%s %s %s\n", __func__, fulltype_str(type), ident);
+    // If we are inserting a symbol that is a parameter, we need to use a 
+    // different offset, since this has been pushed onto the stack. We need to
+    // insert the symbols backwards, while pushing them onto the stack in 
+    // forwards order. Parameters can only occur at scope depth 1.
+
+
     Scope sc = node->scope;
     // Find scope in table, the scope structure already exists from the parse process
     Symbol_table *st = symbol_table;
@@ -972,21 +1123,34 @@ Symbol *insert_symbol(Node *node, Type *type, char *ident)
     // Global offset is offset within the function, whatever scope level we are at.
     // This is the enclosing scopes
     Symbol *s = 0, *ls = 0;
-    int offset  = 0;
+    int offset          = 0;
+    int param_offset    = 4; // There needs to be space for the link and base regs
+    int last_size = 0;
     for(s = st->symbols; s; s = s->next)
     {
-        offset  = s->offset;
+        if (s->is_param)
+        {
+            param_offset = s->offset;
+            last_size = s->type->size;
+        }
+        else
+            offset  = s->offset;
         ls      = s;
     }
     // ls now points to last symbol in list
     // Move offset to make space for this type
-    offset      += type->size;
-    st->size    += type->size;
-    Symbol *n   = new_symbol(type, ident, offset);
+    offset          += type->size;
+    param_offset    += last_size;
+    if (!is_param)
+        // Size is used for allocating space on stack for this
+        // scope, we don't include parameters
+        st->size        += type->size;
+    Symbol *n       = new_symbol(type, ident, is_param ? param_offset : offset);
+    n->is_param     = is_param;
     if (!ls)
         st->symbols = n;
     else
-        ls->next = n;
+        ls->next    = n;
     return n;
 }
 char *get_decl_ident(Node *node)
@@ -999,7 +1163,7 @@ char *get_decl_ident(Node *node)
     }
     return 0;
 }
-void add_types_and_symbols(Node *node)
+void add_types_and_symbols(Node *node, bool is_param)
 {
     // This is a declaration node, get all the derived types and 
     // variables. Put variable in symbol table structured to represent scope.
@@ -1021,7 +1185,7 @@ void add_types_and_symbols(Node *node)
             fprintf(stderr, "Found %s %s\n", ts, ident);
             Type *ty = insert_type(node, ts);
             // ty is pointer to type in type table
-            n->symbol = insert_symbol(node, ty, ident);
+            n->symbol = insert_symbol(node, ty, ident, is_param);
         }
     }
 }
@@ -1093,7 +1257,8 @@ void print_symbol_table(Symbol_table *s, int depth)
     {
         for(int i = 0; i < depth; i++) 
             fprintf(stderr, "  ");
-        fprintf(stderr, "%-10s 0x%02x %s\n", sm->name, sm->offset, fulltype_str(sm->type));
+        fprintf(stderr, "%-10s %s 0x%02x %s\n", sm->name, 
+            sm->is_param ? "param" : "local", sm->offset, fulltype_str(sm->type));
     }
     for(int i = 0; i < s->child_count; i++)
     {

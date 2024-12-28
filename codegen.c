@@ -50,10 +50,18 @@ int find_local_addr(Node *node, char *name)
         error("Symbol %s not found!\n", name);
     }
     int offset = st->global_offset + s->offset;
+    if (s->is_param)
+    {
+        // FIXME!! This is very hacky, but we set bit 30 to indicate that 
+        // this is a param, and the offset is in the opposite direction to a
+        // local
+        offset |= 0x40000000;
+    }
     if (!st->scope.depth)
         // If at top scope, addresses are labels
         offset = -1;
-    printf(";%s ident:%s at scope:%s got offset %d\n", __func__, name, scope_str(st->scope), offset);
+    printf(";%s ident:%s at scope:%s %s got offset %d\n", __func__, name, scope_str(st->scope), 
+        s->is_param ? "is param" : "", offset&0xffff);
     return offset;
 }
 
@@ -175,6 +183,10 @@ void gen_pop()
 {
     printf("    pop\n");
 }
+void gen_jl(char *label)
+{
+    printf("    jl %s\n", label);
+}
 void gen_adj(int offset)
 {
     printf("    adj %d\n", offset);
@@ -220,6 +232,41 @@ void gen_ge()
 {
     printf("    ge\n");
 }
+void gen_logor()
+{
+    int l1 = new_label();
+    int l2 = new_label();
+    gen_jnz(l1);
+    gen_pop();
+    gen_jnz(l1);
+    gen_j(l2);
+    gen_label(l1);
+    gen_imm(1);
+    gen_label(l2);
+
+}
+void gen_logand()
+{
+    int l1 = new_label();
+    int l2 = new_label();
+    gen_jz(l1);
+    gen_pop();
+    gen_jz(l1);
+    gen_imm(1);
+    gen_label(l1);
+}
+void gen_bitor()
+{
+    printf("    or\n");
+}
+void gen_bitand()
+{
+    printf("    and\n");
+}
+void gen_bitxor()
+{
+    printf("    xor\n");
+}
 void gen_lw()
 {
     printf("    lw\n");
@@ -246,8 +293,12 @@ void gen_varaddr_from_ident(Node *node, char *name)
         // Global, the name is a label
         printf("    immw    %s\n", name);
     else
-        // This is a local variable
-        printf("    lea     %d\n", -offset);
+        if (offset & 0x40000000)
+            // This is a function parameter
+            printf("    lea     %d\n", offset & 0xffff);
+        else
+            // This is a local variable
+            printf("    lea     %d\n", -(offset & 0xffff));
 }
 void gen_varaddr(Node *node)
 {
@@ -287,6 +338,48 @@ void gen_fill(int offset, int size)
 //--------------------------------------------------------------------------------
 
 void gen_expr(Node *node);
+void gen_callfunction(Node *node)
+{
+    // We have to call the function. This means setting up the
+    // parameters on the stack.
+    //
+    // Call structure is thus:
+    //  2n  param n
+    //      ..
+    //  6   param 1
+    //  4   param 0     <- sp on entry
+    //  2   link
+    //  0   old bp      <- bp set to this
+    //  -2  local 0
+    //  -4  local 1
+    //  ..
+    //  -2n  local n     <- sp set to this after entry
+    //
+    // Parameters are push onto the stack. On entry, the lr, holding the
+    // return address is saved, and the old bp is saved. The sp is then adjusted
+    // by the space required for this local scope variables. These are accessed 
+    // through the bp with an offset from the symbol table. Each time we enter
+    // a new scope, the sp is adjusted to make space for the new locals, each
+    // time the end of a scope is reached, the sp is adjusted back the other way
+    // to reclaim the space.
+    //
+    // At the end of the function, ret sets the sp to bp, old bp is restored, then
+    // pc is set to saved link address, returning to the caller.
+    //
+    // Push the params on backwards, the offsets from the symbol table then work
+    int param_size = 0;
+    for(int i = node->child_count - 1; i >= 0; i--)
+    {
+        gen_expr(node->children[i]);
+        gen_push();
+        param_size += 2;
+    }
+    gen_jl(node->symbol->name);
+    // For the function postamble, we need to adjust the stack by the size of he
+    // push parameters
+    gen_adj(param_size);
+
+}
 void gen_addr(Node *node)
 {
     printf(";%s %s %s\n", __func__, nodestr(node->kind), node->val);
@@ -319,7 +412,11 @@ void gen_expr(Node *node)
         if (!strcmp(node->val, ">"))    {gen_gt(); return;}
         if (!strcmp(node->val, ">="))   {gen_ge(); return;}
         if (!strcmp(node->val, "=="))   {gen_eq(); return;}
-        if (!strcmp(node->val, "!="))   {gen_ne(); return;}
+        if (!strcmp(node->val, "||"))   {gen_logor(); return;}
+        if (!strcmp(node->val, "&&"))   {gen_logand(); return;}
+        if (!strcmp(node->val, "|"))    {gen_bitor(); return;}
+        if (!strcmp(node->val, "^"))    {gen_bitxor(); return;}
+        if (!strcmp(node->val, "&"))    {gen_bitand(); return;}
         error("%s not handled in codegen", node->val);
     }
     else if (node->kind == ND_LITERAL)
@@ -328,10 +425,18 @@ void gen_expr(Node *node)
     }
     else if (node->kind == ND_IDENT)
     {
-        gen_varaddr(node);
-        // Don't fetch from address if pointer or array
-        if (!node->symbol->type->is_array && !node->symbol->type->is_pointer)
-            gen_lw();
+        // This could be a function call
+        if (node->symbol->type->is_function)
+        {
+            gen_callfunction(node);
+        }
+        else
+        {
+            gen_varaddr(node);
+            // Don't fetch from address if pointer or array
+            if (!node->symbol->type->is_array && !node->symbol->type->is_pointer)
+                gen_lw();
+        }
     }
     else if (node->kind == ND_UNARYOP)
     {
@@ -663,7 +768,7 @@ void gen_stmt(Node *node)
 }
 void gen_param_list(Node *node)
 {
-    gen_preamble(node->child_count);
+    gen_preamble(0);
 }
 void gen_function(Node *node)
 {

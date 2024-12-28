@@ -229,7 +229,7 @@ class CPU:
         m.trace = ''
         p = ''
         if      i == 'halt':    s.H = 1
-        elif    i == 'ret':     s.sp = s.bp; bp = m.read16(s.sp); s.pc = m.read16(s.sp + 2); s.sp += 4
+        elif    i == 'ret':     s.sp = s.bp; s.bp = m.read16(s.sp); s.pc = m.read16(s.sp + 2); s.sp += 4
         elif    i == 'push':    s.sp -= 2; m.write16(s.sp, s.r0)
         elif    i == 'pop':     s.r0 = m.read16(s.sp); s.sp += 2
         elif    i == 'lb':      s.r0 = m.read8(s.r0)
@@ -251,7 +251,7 @@ class CPU:
         elif    i == 'ne':      s.r0 = m.read16(s.sp) != s.r0; s.sp += 2
         elif    i == 'and':     s.r0 = m.read16(s.sp) & s.r0; s.sp += 2
         elif    i == 'or':      s.r0 = m.read16(s.sp) | s.r0; s.sp += 2
-        elif    i == 'and':     s.r0 = m.read16(s.sp) ^ s.r0; s.sp += 2
+        elif    i == 'xor':     s.r0 = m.read16(s.sp) ^ s.r0; s.sp += 2
         
         elif    i == 'immb':    s.r0 = imm
         elif    i == 'adj':     s.sp += imm

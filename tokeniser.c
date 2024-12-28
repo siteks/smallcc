@@ -181,7 +181,7 @@ Token *new_token(Token_kind kind, Token *cur, char *str, int len)
 }
 Token_kind find_token(char *str, int l)
 {
-    fprintf(stderr, "%s %s %d\n", __func__, str, l);
+    // fprintf(stderr, "%s %s %d\n", __func__, str, l);
     for(int i = 0; keywords[i].token != TK_INVALID; i++)
     {
         if (strlen(keywords[i].keyword) == l && !strncmp(str, keywords[i].keyword, l))
@@ -212,6 +212,8 @@ Token *tokenise(char *p)
             if (!strncmp(p, "<=", 2)) {cur = new_token(TK_LE, cur, p, 2); p += 2; continue;}
             if (!strncmp(p, "++", 2)) {cur = new_token(TK_INC, cur, p, 2); p += 2; continue;}
             if (!strncmp(p, "--", 2)) {cur = new_token(TK_DEC, cur, p, 2); p += 2; continue;}
+            if (!strncmp(p, "&&", 2)) {cur = new_token(TK_LOGAND, cur, p, 2); p += 2; continue;}
+            if (!strncmp(p, "||", 2)) {cur = new_token(TK_LOGOR, cur, p, 2); p += 2; continue;}
         }
         // Single character tokens
         switch (*p) 
@@ -235,6 +237,9 @@ Token *tokenise(char *p)
             case '!': cur = new_token(TK_BANG,      cur, p++, 1); continue;
             case ',': cur = new_token(TK_COMMA,     cur, p++, 1); continue;
             case '.': cur = new_token(TK_DOT,       cur, p++, 1); continue;
+            // case '&': cur = new_token(TK_BITAND,    cur, p++, 1); continue;
+            case '|': cur = new_token(TK_BITOR,     cur, p++, 1); continue;
+            case '^': cur = new_token(TK_BITXOR,    cur, p++, 1); continue;
         }
         // Keywords and identifiers
         if (isalpha(*p) || *p == '_')

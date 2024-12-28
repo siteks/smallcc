@@ -44,6 +44,10 @@ typedef enum
     TK_INC,
     TK_DEC,
     TK_DOT,
+    TK_LOGAND,
+    TK_LOGOR,
+    TK_BITOR,
+    TK_BITXOR,
 
     TK_AUTO,
     TK_BREAK,
@@ -157,6 +161,7 @@ struct Type
     char            *derived;
     bool            is_pointer;
     bool            is_array;
+    bool            is_function;
     int             size;       // Size in bytes
     int             dimensions;
     int             **dim_sizes;
@@ -214,6 +219,7 @@ struct Symbol
     char    *name;
     Type    *type;
     int     offset;
+    bool    is_param;
     Symbol  *next;
 };
 typedef struct Symbol_table Symbol_table;
@@ -279,7 +285,7 @@ char *nodestr(Node_kind k);
 // void get_types_and_symbols(Node *node);
 void print_symbol_table(Symbol_table *s, int depth);
 void print_type_table();
-void add_types_and_symbols(Node *node);
+void add_types_and_symbols(Node *node, bool is_param);
 char *fulltype_str(Type *t);
 char *token_str(Token_kind tk);
 char *type_token_str(Token_kind tk);
