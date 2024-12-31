@@ -2,75 +2,157 @@
 #include "mycc.h"
 
 // Grammer
-// program              ::      { func_def }
-// func_def             ::=     "int" ident "(" [ param_list ] ")" "{" { stmt } "}"
-// param_list           ::=     "int" ident { "," "int" ident }
-// decl_spec            ::=     storage_class_spec
-//                          |   type_spec
-//                          |   type_qual
-// storage_class_spec   ::=     "auto" | "regster" | "static" | "extern" | "typedef"
-// type_spec            ::=     "void" 
-//                          |   "char"
-//                          |   "short"
-//                          |   "int"
-//                          |   "long"
-//                          |   "float"
-//                          |   "double"
-//                          |   "signed"
-//                          |   "unsigned"
-// type_qual            ::=     "const" | "volatile"
-// init_decl            ::=     declarator
-//                          |   declarator "=" init
-// declarator           ::=     { "*" }* direct_dcl
-// direct_dcl           ::=     ident
-//                          |   "(" declarator ")"
-//                          |   direct_dcl "[" [ const_expr ] "]"
-//                          |   direct_dcl "(" param_list ")"
-//                          |   direct_dcl "(" { ident }* ")"
-// declaration          ::=     { decl_spec }+ { init_decl }* ";"
-// stmt                 ::=     expr_stmt
-//                          |   comp_stmt
-//                          |   if_stmt
-//                          |   while_stmt
-//                          |   return_stmt
-// comp_stmt            ::=     "{" { declaration }* { stmt }* "}"
-// expr_stmt            ::=     [ expr ] ";"
-// if_stmt              ::=     "if" "(" expr ")" stmt [ "else" stmt ]
-// while_stmt           ::=     "while" "(" expr ")" stmt
-// return_stmt          ::=     "return" [ expr ] ";"
-// expr                 ::=     assign_expr
-// assign_expr          ::=     equal_expr 
-//                          |   unary_expr [ "=" assign_expr ]
-// equal_expr           ::=     rel_expr
-//                          |   equal_expr "==" rel_expr
-//                          |   equal_expr "!=" rel_expr
-// rel_expr             ::=     add_expr
-//                          |   rel_expr "<" add_expr
-//                          |   rel_expr ">" add_expr
-//                          |   rel_expr "<=" add_expr
-//                          |   rel_expr ">=" add_expr
-// add_expr             ::=     mult_expr
-//                          |   add_expr "+" mult_expr
-//                          |   add_expr "-" mult_expr
-// mult_expr            ::=     unary_expr
-//                          |   mult_expr "*" unary_expr
-//                          |   mult_expr "/" unary_expr
-// unary_expr           ::=     primary_expr
-//                          |   '&' unary_expr
-//                          |   '*' unary_expr
-//                          |   '+' unary_expr
-//                          |   '-' unary_expr
-//                          |   '~' unary_expr
-//                          |   '!' unary_expr
-// primary_expr         ::=     ident
-//                          |   integer_literal
-//                          |   "(" expr ")"
-// ident                ::=     ident_start { letter | digit | "_" }*
-// ident_start          ::=     letter | "_"
-// integer_literal      ::=     digit { digit }*
-// letter               ::=     "a" | "b" | "c" | ... | "z" | "A" | "B" | "C" | ... | "Z"
-// digit                ::=     "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9"
-
+// translation-unit ::= external-declaration*
+// external-declaration ::= function-definition
+//                       | declaration
+// function-definition ::= declaration-specifier* declarator declaration* compound-statement
+// declaration-specifier ::= storage-class-specifier
+//                         | type-specifier
+//                         | type-qualifier
+// storage-class-specifier ::= auto
+//                           | register
+//                           | static
+//                           | extern
+//                           | typedef
+// type-specifier ::= "void"
+//                  | "char"
+//                  | "short"
+//                  | "int"
+//                  | "long"
+//                  | "float"
+//                  | "double"
+//                  | "signed"
+//                  | "unsigned"
+//                  | struct-or-union-specifier
+//                  | enum-specifier
+//                  | typedef-name
+// struct-or-union-specifier ::= struct-or-union identifier "{" struct-declaration+ "}"
+//                             | struct-or-union "{" struct-declaration+ "}"
+//                             | struct-or-union identifier
+// struct-or-union ::= "struct"
+//                   | "union"
+// struct-declaration ::= specifier-qualifier* struct-declarator-list
+// specifier-qualifier ::= type-specifier
+//                       | type-qualifier
+// struct-declarator-list ::= struct-declarator ("," struct-declarator)*
+// struct-declarator ::= declarator
+//                     | declarator ":" constant-expression
+//                     | ":" constant-expression
+// declarator ::= pointer? direct-declarator
+// pointer ::= "*" type-qualifier* pointer?
+// type-qualifier ::= "const"
+//                  | "volatile"
+// direct-declarator ::= identifier direct-decl-tail*
+//                     | "(" declarator ")" direct-decl-tail*
+// direct-decl-tail ::= "[" constant-expression? "]"
+//                    | "(" parameter-type-list ")"
+//                    | "(" identifier* ")"
+// declaration ::=  declaration-specifier+ init-declarator-list? ";"
+// init-declarator-list ::= init-declarator
+//                        | init-declarator "," init-declarator-list
+// init-declarator ::= declarator
+//                   | declarator "=" initializer
+// initializer ::= assignment-expression
+//               | "{" initializer-list "}"
+//               | "{" initializer-list "," "}"
+// initializer-list ::= initializer ("," initializer-list)*
+// constant-expression ::= conditional-expression
+// conditional-expression ::= logical-or-expression
+//                          | logical-or-expression "?" expression ":" conditional-expression
+// logical-or-expression ::= logical-and-expression ("||" logical-and-expression)*
+// logical-and-expression ::= inclusive-or-expression ("&&" inclusive-or-expression)*
+// inclusive-or-expression ::= exclusive-or-expression ("|" exclusive-or-expression)*
+// exclusive-or-expression ::= and-expression ("^" and-expression)*
+// and-expression ::= equality-expression ("&" equality-expression)*
+// equality-expression ::= relational-expression (("=="|"!=") relational-expression)*
+// relational-expression ::= shift-expression (("<"|">"|"<="|">=") shift-expression)*
+// shift-expression ::= additive-expression (("<<"|">>") additive-expression)*
+// additive-expression ::= multiplicative-expression (("+"|"-") multiplicative-expression)*
+// multiplicative-expression ::= cast-expression (("*"|"/"|"%") cast-expression)*
+// cast-expression ::= unary-expression
+//                   | "(" type-name ")" cast-expression
+// unary-expression ::= postfix-expression
+//                    | "++" unary-expression
+//                    | "--" unary-expression
+//                    | unary-operator cast-expression
+//                    | "sizeof" unary-expression
+//                    | "sizeof" type-name
+// postfix-expression ::= primary-expression postfix-tail*
+// postfix-tail ::= "[" expression "]"
+//                | "(" expression? ")"
+//                | "." identifier
+//                | "->" identifier
+//                | "++"
+//                | "--"
+// primary-expression ::= identifier
+//                      | constant
+//                      | string
+//                      | "(" expression ")"
+// constant ::= integer-constant
+//            | character-constant
+//            | floating-constant
+//            | enumeration-constant
+// expression ::= assignment-expression ("," assignment-expression)*
+// assignment-expression ::= conditional-expression
+//                         | unary-expression assignment-operator assignment-expression
+// assignment-operator ::= "="
+//                       | "*="
+//                       | "/="
+//                       | "%="
+//                       | "+="
+//                       | "-="
+//                       | "<<="
+//                       | ">>="
+//                       | "&="
+//                       | "^="
+//                       | "|="
+// unary-operator ::= "&"
+//                  | "*"
+//                  | "+"
+//                  | "-"
+//                  | "~"
+//                  | "!"
+// parameter-type-list ::= parameter-list
+//                       | parameter-list "," "..."
+// parameter-list ::= parameter-declaration ("," parameter-declaration)*
+// parameter-declaration ::= declaration-specifier+ declarator
+//                         | declaration-specifier+ abstract-declarator
+//                         | declaration-specifier+
+// type-name ::= <specifier-qualifier>+ <abstract-declarator>?
+// abstract-declarator ::= pointer
+//                       | pointer direct-abstract-declarator
+//                       | direct-abstract-declarator
+// direct-abstract-declarator ::= "(" abstract-declarator ")"
+//                              ("[" constant-expression? "]" | "(" parameter-type-list? ")")*
+// enum-specifier ::= "enum" identifier "{" enumerator-list "}"
+//                  | "enum" "{" enumerator-list "}"
+//                  | "enum" identifier
+// enumerator-list ::= enumerator
+//                   | enumerator-list "," enumerator
+// enumerator ::= identifier
+//              | identifier "=" constant-expression
+// typedef-name ::= identifier
+// compound-statement ::= "{" declaration* statement* "}"
+// statement ::= labeled-statement
+//             | expression-statement
+//             | compound-statement
+//             | selection-statement
+//             | iteration-statement
+//             | jump-statement
+// labeled-statement ::= identifier ":" statement
+//                     | "case" constant-expression ":" statement
+//                     | "default" ":" statement
+// expression-statement ::= expression? ";"
+// selection-statement ::= "if" "(" expression ")" statement
+//                       | "if" "(" expression ")" statement "else" statement
+//                       | switch "(" expression ")" statement
+// iteration-statement ::= "while" "(" expression ")" statement
+//                       | "do" statement "while" "(" expression ")" ";"
+//                       | "for" "(" expression? ";" expression? ";" expression? ")" statement
+// jump-statement ::= "goto" identifier ";"
+//                  | "continue" ";"
+//                  | "break" ";"
+//                  | "return" expression? ";"
 extern Token        *token;
 extern Local        *locals;
 extern Type         *types;
@@ -131,7 +213,7 @@ Node *func_def();
 
 Node *primary_expr()
 {
-    fprintf(stderr, "%s\n", __func__);
+    fprintf(stderr, "%s %s \n", __func__, token->val);
     Node *node;
     if (token->kind == TK_IDENT)
     {
@@ -140,6 +222,14 @@ Node *primary_expr()
     else if (token->kind == TK_NUM)
     {
         node = new_node(ND_LITERAL, expect(TK_NUM));
+    }
+    else if (token->kind == TK_CHARACTER)
+    {
+        char c[64];
+        sprintf(c, "%d", (int)token->val[0]); 
+        expect(TK_CHARACTER);
+        fprintf(stderr, "%s %s\n", c, token->val);
+        node = new_node(ND_LITERAL, c);
     }
     else
     {
@@ -169,7 +259,10 @@ Node *unary_expr()
         node = new_node(ND_UNARYOP, expect(token->kind));
         add_child(node, unary_expr());
     }
-    else if (token->kind == TK_IDENT || token->kind == TK_NUM || token->kind == TK_LPAREN)
+    else if (token->kind == TK_IDENT 
+            || token->kind == TK_NUM 
+            || token->kind == TK_CHARACTER
+            || token->kind == TK_LPAREN)
     {
         node = primary_expr();
         if (node->kind == ND_IDENT)
@@ -239,15 +332,84 @@ Node *unary_expr()
     }
     return node;
 }
+bool is_type_name_or_type(Token *token)
+{
+    return is_type_name(token->kind) || (token->kind == TK_IDENT && find_type(token->val));
+}
+Node *type_name()
+{
+    fprintf(stderr, "%s\n", __func__);
+    // type-name ::= <specifier-qualifier>+ <abstract-declarator>?
+    // abstract-declarator ::= pointer
+    //                       | pointer direct-abstract-declarator
+    //                       | direct-abstract-declarator
+    // direct-abstract-declarator ::= "(" abstract-declarator ")"
+    //                              ("[" constant-expression? "]" | "(" parameter-type-list? ")")*
+    //
+    // At least one of (void, char..., typename, const, volatile), with optional abst-decl
+    // This is a strict subset of declarator
+    // We are going to ignore const, volatile
+    // if (is_type_name_or_type(token))
+    // {
+    //     return new_node(ND_TYPE_NAME, expect(token->kind));
+    // }
+    Node *node = new_node(ND_DECLARATION, 0);
+    while(is_sc_spec(token->kind) || is_typespec(token->kind) || is_typequal(token->kind))
+    {
+        if (is_sc_spec(token->kind))    node->sclass = token->kind;
+        if (is_typespec(token->kind))   node->typespec = token->kind;
+        if (is_typequal(token->kind))   node->typequal = token->kind;
+        expect(token->kind);
+    }
+    while(token->kind != TK_RPAREN)
+    {
+        add_child(node, declarator());
+    }
+    add_types_and_symbols(node, false);
+    return node;
+}
+Node *cast_expr()
+{
+    fprintf(stderr, "%s\n", __func__);
+    if (token->kind != TK_LPAREN)
+    {
+        return unary_expr();
+    }
+    // May be either a cast or a primary expr with parens eg "(" expr ")". 
+    // If the ident following the current token is a type name or 
+    // const|volatile, this is a cast. A cast may be followed by a cast
+    expect(TK_LPAREN);
+    if (is_type_name_or_type(token))
+    {
+        // This is a cast, create the node and add the type elements as
+        // children
+        Node *node = new_node(ND_CAST, 0);
+        // while (token->kind != TK_RPAREN)
+        // {
+        //     add_child(node, type_name());
+        // }
+        add_child(node, type_name());
+        expect(TK_RPAREN);
+        add_child(node, cast_expr());
+        return node;
+    }
+    else
+    {
+        // This is a primary expr
+        Node *node = expr();
+        expect(TK_RPAREN);
+        return node;
+    }
+}
 Node *mult_expr()
 {
     fprintf(stderr, "%s\n", __func__);
-    Node *node = unary_expr();
+    Node *node = cast_expr();
     while (token->kind == TK_STAR || token->kind == TK_SLASH)
     {
         Node *enode = new_node(ND_BINOP, expect(token->kind));
         add_child(enode, node);
-        add_child(enode, unary_expr());
+        add_child(enode, cast_expr());
         node = enode;
     }
     return node;
@@ -399,7 +561,6 @@ bool is_typequal(Token_kind tk)
     return (tk == TK_CONST)
         || (tk == TK_VOLATILE);
 }
-Node *declarator();
 Node *param_declaration()
 {
 
@@ -770,6 +931,7 @@ char *nodestr(Node_kind k)
         case ND_CONSTEXPR:  return "CONSTEXPR   ";
         case ND_BINOP:      return "BINOP       ";
         case ND_UNARYOP:    return "UNARYOP     ";
+        case ND_CAST:       return "CAST        ";
         case ND_ASSIGN:     return "ASSIGN      ";
         case ND_IDENT:      return "IDENT       ";
         case ND_INITLIST:   return "INITLIST    ";
@@ -778,6 +940,7 @@ char *nodestr(Node_kind k)
         case ND_DECLARATOR: return "DECLARATOR  ";
         case ND_DIRECT_DECL:return "DIRECT_DECL ";
         case ND_PTYPE_LIST: return "PTYPE_LIST  ";
+        case ND_TYPE_NAME:  return "TYPE_NAME   ";
         case ND_ARRAY_DECL: return "ARRAY_DECL  ";
         case ND_FUNC_DECL:  return "FUNC_DECL   ";
         case ND_UNDEFINED:  return "##FIXME##   ";
@@ -880,6 +1043,7 @@ char *tstr_compact(Node *node)
 }
 void print_tree(Node *node, int depth)
 {
+    if (depth==0)fprintf(stderr, "------ Parse tree ------\n");
     if (!node)
         return;
     for(int i = 0; i < depth; i++) 
@@ -889,13 +1053,12 @@ void print_tree(Node *node, int depth)
         node->val, node->child_count, scope_str(node->scope));
     if (node->kind == ND_DECLARATION)
     {
-        fprintf(stderr, "%s %s %s ", 
-            token_str(node->sclass), token_str(node->typespec), token_str(node->typequal));
+        fprintf(stderr, "sclass:%s typequal:%s typespec:%s ", 
+            type_token_str(node->sclass), type_token_str(node->typequal), type_token_str(node->typespec));
         for(int j = 0; j < node->child_count; j++)
-            if (node->children[j]->kind == ND_DECLARATOR)
-                fprintf(stderr, "%s %s <%s> | ", 
-                    typestr(node->children[j]), 
-                    token_str(node->typespec),
+            if (node->children[j]->kind == ND_DECLARATOR && node->children[j]->symbol)
+                fprintf(stderr, "%s <%s> | ", 
+                    fulltype_str(node->children[j]->symbol->type), 
                     tstr_compact(node->children[j]));
     }
     if (node->kind == ND_DECLARATOR || node->kind == ND_DIRECT_DECL)
@@ -1059,6 +1222,11 @@ Type *insert_type(Node *node, char *ts)
     types       = t;
     return t;
 }
+Type *find_type(char *name)
+{
+    // TODO find a typedef by name
+    return 0;
+}
 Symbol *new_symbol(Type *type, char *ident, int offset)
 {
     Symbol *n = calloc(1, sizeof(Symbol));
@@ -1186,6 +1354,12 @@ void add_types_and_symbols(Node *node, bool is_param)
             Type *ty = insert_type(node, ts);
             // ty is pointer to type in type table
             n->symbol = insert_symbol(node, ty, ident, is_param);
+        }
+        if (ts && !ident)
+        {
+            // This is an abstract declarator, put it in the type table
+            fprintf(stderr, "Found %s\n", ts);
+            Type *ty = insert_type(node, ts);
         }
     }
 }

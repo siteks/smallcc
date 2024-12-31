@@ -8,3 +8,6 @@ assert 2 "int f(){return 2;} int main(){return f();}"
 assert 3 "int f(int a){return a;} int main(){return f(3);}"
 
 assert 24 "int f(int a){if(a<3)return a;return a*f(a-1);}int main(){return f(4);}"
+
+assert 65 "int main(){return 'A';}"
+assert 0 "int main(){return '\0';}"

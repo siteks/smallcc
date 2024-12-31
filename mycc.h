@@ -18,6 +18,7 @@ typedef enum
     TK_EMPTY,
     TK_IDENT,
     TK_NUM,
+    TK_CHARACTER,
     TK_LPAREN,
     TK_RPAREN,
     TK_LBRACE,
@@ -136,6 +137,7 @@ typedef enum
     ND_CONSTEXPR,
     ND_BINOP,
     ND_UNARYOP,
+    ND_CAST,
     ND_ASSIGN,
     ND_IDENT,
     ND_LITERAL,
@@ -144,6 +146,7 @@ typedef enum
     ND_DECLARATOR,
     ND_DIRECT_DECL,
     ND_PTYPE_LIST,
+    ND_TYPE_NAME,
     ND_ARRAY_DECL,
     ND_FUNC_DECL,
     ND_UNDEFINED,
@@ -256,6 +259,7 @@ struct Node
     Scope           scope;
     Symbol_table    *symtable;
     Symbol          *symbol;
+    Type            *type;
 
 };
 
@@ -289,7 +293,18 @@ void add_types_and_symbols(Node *node, bool is_param);
 char *fulltype_str(Type *t);
 char *token_str(Token_kind tk);
 char *type_token_str(Token_kind tk);
+bool is_type_name(Token_kind tk);
+Node *declarator();
+Node *init_declarator();
+Node *declaration();
+
+bool is_sc_spec(Token_kind tk);
+bool is_typespec(Token_kind tk);
+bool is_typequal(Token_kind tk);
+
 
 Symbol *find_symbol(Node *node, char *name);
 Symbol_table *find_scope(Node *node);
+Type *find_type(char *name);
+
 #endif

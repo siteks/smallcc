@@ -49,6 +49,23 @@ struct Keyword keywords[] =
     "",         TK_INVALID,
 };
 
+bool is_type_name(Token_kind tk)
+{
+    return  tk == TK_CONST
+        ||  tk == TK_VOLATILE
+        ||  tk == TK_STRUCT
+        ||  tk == TK_UNION
+        ||  tk == TK_ENUM
+        ||  tk == TK_VOID
+        ||  tk == TK_CHAR
+        ||  tk == TK_SHORT
+        ||  tk == TK_INT
+        ||  tk == TK_LONG
+        ||  tk == TK_FLOAT
+        ||  tk == TK_DOUBLE
+        ||  tk == TK_UNSIGNED
+        ||  tk == TK_SIGNED;
+}
 
 char *token_str(Token_kind tk)
 {
@@ -56,6 +73,7 @@ char *token_str(Token_kind tk)
         tk == TK_EMPTY      ? "EMPTY    " :
         tk == TK_IDENT      ? "IDENT    " :
         tk == TK_NUM        ? "NUM      " :
+        tk == TK_CHARACTER  ? "CHARACTER" :
         tk == TK_LPAREN     ? "LPAREN   " :
         tk == TK_RPAREN     ? "RPAREN   " :
         tk == TK_LBRACE     ? "LBRACE   " :
@@ -189,6 +207,14 @@ Token_kind find_token(char *str, int l)
     }
     return TK_IDENT;
 }
+bool ishex(char a)
+{
+    return isdigit(a) || (a >= 'a' && a <= 'f') || (a >= 'A' && a <= 'F');
+}
+bool isoct(char a)
+{
+    return a >= '0' && a <= '7';
+}
 Token *tokenise(char *p)
 {
     Token head;
@@ -197,6 +223,7 @@ Token *tokenise(char *p)
 
     while (*p)
     {
+        // fprintf(stderr, "%s\n", p);
         if (isspace(*p))
         {
             // Skip white space
@@ -262,6 +289,83 @@ Token *tokenise(char *p)
             cur = new_token(TK_NUM, cur, p, q - p);
             p = q;
             continue;
+        }
+        if (*p == '\'')
+        {
+            // Character constant
+            // 'x'      character x
+            // '\y'     special escape character
+            // '\ooo'   octal character (1 to 3 oct digits)
+            // '\xhh    hex character (1 to 2 hex digits)
+            if (strlen(p) >= 3) // Single normal character
+            {
+                if (p[1] != '\\' && p[2] == '\'') 
+                {
+                    // not an escape and correctly formed
+                    cur = new_token(TK_CHARACTER, cur, p + 1, 1); 
+                    p += 3; 
+                    continue;
+                }
+            }
+            if (strlen(p) >= 4) // Possibly escape
+            {
+                if (p[1] == '\\')
+                {
+                    if (!strncmp(p + 2, "a", 1))     {cur = new_token(TK_CHARACTER, cur, "\a", 1); p += 4; continue;}
+                    if (!strncmp(p + 2, "b", 1))     {cur = new_token(TK_CHARACTER, cur, "\b", 1); p += 4; continue;}
+                    if (!strncmp(p + 2, "f", 1))     {cur = new_token(TK_CHARACTER, cur, "\f", 1); p += 4; continue;}
+                    if (!strncmp(p + 2, "n", 1))     {cur = new_token(TK_CHARACTER, cur, "\n", 1); p += 4; continue;}
+                    if (!strncmp(p + 2, "r", 1))     {cur = new_token(TK_CHARACTER, cur, "\r", 1); p += 4; continue;}
+                    if (!strncmp(p + 2, "t", 1))     {cur = new_token(TK_CHARACTER, cur, "\t", 1); p += 4; continue;}
+                    if (!strncmp(p + 2, "v", 1))     {cur = new_token(TK_CHARACTER, cur, "\v", 1); p += 4; continue;}
+                    if (!strncmp(p + 2, "\\", 1))    {cur = new_token(TK_CHARACTER, cur, "\\", 1); p += 4; continue;}
+                    if (!strncmp(p + 2, "?", 1))     {cur = new_token(TK_CHARACTER, cur, "\?", 1); p += 4; continue;}
+                    if (!strncmp(p + 2, "'", 1))     {cur = new_token(TK_CHARACTER, cur, "\'", 1); p += 4; continue;}
+                    if (!strncmp(p + 2, "\"", 1))    {cur = new_token(TK_CHARACTER, cur, "\"", 1); p += 4; continue;}
+                    // 1 and 2 digit hex
+                    if (p[2] == 'x' && strlen(p) >= 5 && p[4] == '\'' && ishex(p[3]))
+                    {
+                        // Single digit hex
+                        char *q;
+                        char val = strtol(p + 3, &q, 16);
+                        if (q == p + 4)
+                        {
+                            cur = new_token(TK_CHARACTER, cur, &val, 1); 
+                            p += 5; 
+                            continue;
+                        }
+                    }
+                    if (p[2] == 'x' && strlen(p) >= 6 && p[5] == '\'' && ishex(p[3]) && ishex(p[4]))
+                    {
+                        // Single digit hex
+                        char *q;
+                        char val = strtol(p + 3, &q, 16);
+                        if (q == p + 5)
+                        {
+                            cur = new_token(TK_CHARACTER, cur, &val, 1); 
+                            p += 6; 
+                            continue;
+                        }
+                    }
+                    // 1, 2, 3 digit octal
+                    bool found = false;
+                    for(int i = 0; i < 3; i++)
+                        if (strlen(p) >= 4 + i)
+                            if (isoct(p[2 + i]))
+                                if (p[3 + i] == '\'')
+                                {
+                                    char *q, val = strtol(p + 2, &q, 8);
+                                    if (q == p + 3 + i)
+                                    {
+                                        cur = new_token(TK_CHARACTER, cur, &val, 1); 
+                                        p += 4 + i; 
+                                        found = true;
+                                        break;
+                                    }
+                                }
+                    if (found) continue;
+                }
+            }
         }
 
         error("Unexpected input %s\n", p);
