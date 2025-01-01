@@ -17,7 +17,8 @@ typedef enum
 {
     TK_EMPTY,
     TK_IDENT,
-    TK_NUM,
+    TK_CONSTFLT,
+    TK_CONSTINT,
     TK_CHARACTER,
     TK_LPAREN,
     TK_RPAREN,
@@ -74,7 +75,9 @@ typedef enum
     TK_CHAR,
     TK_SHORT,
     TK_INT,
+    TK_UINT,
     TK_LONG,
+    TK_ULONG,
     TK_FLOAT,
     TK_DOUBLE,
     TK_SIGNED,
@@ -102,6 +105,8 @@ struct Token
     Token_kind  kind;
     Token       *next;
     char        *val;
+    double      fval;
+    long long   ival;
     int         loc;
 };
 
@@ -243,10 +248,13 @@ struct Node
 {
     Node_kind       kind;
     char            val[64];
+    long long       ival;
+    double          fval;
     Node            **children;
     int             child_count;
     int             offset;
     int             pointer_level;
+    bool            is_expr;
     bool            is_func_defn;
     bool            is_function;
     bool            is_array;
@@ -271,6 +279,17 @@ struct Local
     int     len;
     int     offset;
 };
+
+
+typedef enum
+{
+    TO_ULONG,
+    TO_LONG,
+    TO_UINT,
+    TO_INT,
+    TO_FLOAT,
+} UACcast;
+
 
 Node *program();
 void print_tree(Node *node, int depth);
@@ -301,8 +320,10 @@ Node *declaration();
 bool is_sc_spec(Token_kind tk);
 bool is_typespec(Token_kind tk);
 bool is_typequal(Token_kind tk);
-
-
+Type *insert_type(Node *node, char *ts);
+void propagate_types(Node *n);
+char *tstr_compact(Node *node);
+Node *new_node(Node_kind kind, char *val, bool is_expr);
 Symbol *find_symbol(Node *node, char *name);
 Symbol_table *find_scope(Node *node);
 Type *find_type(char *name);

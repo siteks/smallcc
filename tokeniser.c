@@ -72,7 +72,8 @@ char *token_str(Token_kind tk)
     return 
         tk == TK_EMPTY      ? "EMPTY    " :
         tk == TK_IDENT      ? "IDENT    " :
-        tk == TK_NUM        ? "NUM      " :
+        tk == TK_CONSTFLT   ? "CONSTFLT " :
+        tk == TK_CONSTINT   ? "CONSTINT " :
         tk == TK_CHARACTER  ? "CHARACTER" :
         tk == TK_LPAREN     ? "LPAREN   " :
         tk == TK_RPAREN     ? "RPAREN   " :
@@ -146,7 +147,9 @@ char *type_token_str(Token_kind tk)
         tk == TK_EXTERN     ? "extern " :
         tk == TK_FLOAT      ? "float " :
         tk == TK_INT        ? "int " :
+        tk == TK_UINT       ? "uint " :
         tk == TK_LONG       ? "long " :
+        tk == TK_ULONG      ? "ulong " :
         tk == TK_REGISTER   ? "register " :
         tk == TK_SHORT      ? "short " :
         tk == TK_SIGNED     ? "signed " :
@@ -284,9 +287,36 @@ Token *tokenise(char *p)
         }
         if (isdigit(*p))
         {
+            // integers may be followed by u, l, or ul (any case)
+            // floats may be followed by f, l
+            //
+            // Try both and use whichever decodes most
             char *q;
-            strtol(p, &q, 0);
-            cur = new_token(TK_NUM, cur, p, q - p);
+            int ilen, flen;
+            long long ival = strtol(p, &q, 0);
+            ilen = q - p;
+            double fval = strtod(p, &q);
+            flen = q - p;
+            if (flen > ilen)
+            {
+                if (*q == 'f' || *q == 'F' || *q == 'l' || *q == 'L')
+                    q++;
+                cur         = new_token(TK_CONSTFLT, cur, p, q - p);
+                cur->fval   = fval;
+            }
+            else
+            {
+                if (*q == 'u' || *q == 'U')
+                {
+                    q++;
+                    if (*q == 'l' || *q == 'L')
+                        q++;
+                }
+                else if (*q == 'l' || *q == 'L')
+                    q++;
+                cur         = new_token(TK_CONSTINT, cur, p, q - p);
+                cur->ival   = ival;
+            }
             p = q;
             continue;
         }

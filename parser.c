@@ -163,6 +163,30 @@ Symbol_table        *last_symbol_table;
 int depth;
 int indices[100];
 
+Type *t_char;
+Type *t_short;
+Type *t_enum;
+Type *t_int;
+Type *t_uint;
+Type *t_long;
+Type *t_ulong;
+Type *t_float;
+Type *t_double;
+
+void make_basic_types()
+{
+    Node *n = new_node(ND_CAST, 0, 0);
+    n->typespec = TK_CHAR;      t_char      = insert_type(n, "");
+    n->typespec = TK_SHORT;     t_short     = insert_type(n, "");
+    n->typespec = TK_ENUM;      t_enum      = insert_type(n, "");
+    n->typespec = TK_INT;       t_int       = insert_type(n, "");
+    n->typespec = TK_UINT;      t_uint      = insert_type(n, "");
+    n->typespec = TK_LONG;      t_long      = insert_type(n, "");
+    n->typespec = TK_ULONG;     t_ulong     = insert_type(n, "");
+    n->typespec = TK_FLOAT;     t_float     = insert_type(n, "");
+    n->typespec = TK_DOUBLE;    t_double    = insert_type(n, "");
+}
+
 
 Symbol_table *enter_new_scope(bool use_last_scope);
 void leave_scope();
@@ -183,10 +207,11 @@ char *scope_str(Scope sc)
         l += sprintf(buf + l, "%d%c", sc.indices[i], i < d ? '.' : ' ');
     return buf;
 }
-Node *new_node(Node_kind kind, char *val)
+Node *new_node(Node_kind kind, char *val, bool is_expr)
 {
     Node *node = calloc(1, sizeof(Node));
     node->kind = kind;
+    node->is_expr = is_expr;
     set_scope(&node->scope);
     if (val)
         strncpy(node->val, val, 63);
@@ -211,17 +236,83 @@ Node *stmt();
 // Node *param_list();
 Node *func_def();
 
+typedef enum
+{
+    CS_NONE,
+    CS_U,
+    CS_L,
+    CS_UL,
+    CS_F,
+    CS_OX = 0x100,
+} Const_suffix;
 Node *primary_expr()
 {
     fprintf(stderr, "%s %s \n", __func__, token->val);
     Node *node;
     if (token->kind == TK_IDENT)
     {
-        node = new_node(ND_IDENT, expect(TK_IDENT));
+        node = new_node(ND_IDENT, expect(TK_IDENT), true);
     }
-    else if (token->kind == TK_NUM)
+    else if (token->kind == TK_CONSTINT || token->kind == TK_CONSTFLT)
     {
-        node = new_node(ND_LITERAL, expect(TK_NUM));
+        Token *tk = token;
+        node = new_node(ND_LITERAL, expect(token->kind), true);
+        int slen = strlen(tk->val);
+        Const_suffix cs = CS_NONE;
+        // Get the suffix
+        if (tk->val[slen - 1] == 'l' || tk->val[slen - 1] == 'L')
+            if (!isdigit(tk->val[slen - 2]))
+                cs = CS_UL;
+            else
+                cs = CS_L;
+        else if (tk->val[slen - 1] == 'u' || tk->val[slen - 1] == 'U')
+            cs = CS_U;
+        else if (tk->val[slen - 1] == 'f' || tk->val[slen - 1] == 'F')
+            cs = CS_F;
+        if (tk->val[0] == '0') // leading zero is octal or hex
+            cs |= CS_OX;
+
+        // node->typespec = TK_INT;
+
+        if (tk->kind == TK_CONSTINT)
+        {
+            //  dec     int,            l int,  ul int
+            //  hex     int,    u int,  l int,  ul int
+            //  u               u int,          ul int
+            //  l                       l int,  ul int
+            //  ul                              ul int
+            long long i = node->ival = tk->ival;
+            if (cs == CS_NONE)
+                if (i >= -32768 && i <= 32767)                      node->type = t_int;
+                else if (i >= -2147483648ll && i <= 2147483647ll)   node->type = t_long;
+                else error("Integer constant out of range");
+            else if (cs == CS_OX)
+                if (i >= -32768 && i <= 32767)                      node->type = t_int;
+                else if (i >= 0 && i <= 65535)                      node->type = t_uint;
+                else if (i >= -2147483648ll && i <= 2147483647ll)   node->type = t_long;
+                else if (i >= 0 && i <= 4294967295ll)               node->type = t_ulong;
+                else error("Integer constant out of range");
+            else if ((cs & ~CS_OX) == CS_U)
+                if (i >= 0 && i <= 65535)                           node->type = t_uint;
+                else if (i >= 0 && i <= 4294967295ll)               node->type = t_ulong;
+                else error("Integer constant out of range");
+            else if ((cs & ~CS_OX) == CS_L)
+                if (i >= -2147483648ll && i <= 2147483647ll)        node->type = t_long;
+                else if (i >= 0 && i <= 4294967295ll)               node->type = t_ulong;
+                else error("Integer constant out of range");
+            else if ((cs & ~CS_OX) == CS_UL){
+                if (i >= 0 && i <= 4294967295ll)                    node->type = t_ulong;
+                else error("Integer constant out of range");}
+        }
+        if (tk->kind == TK_CONSTFLT)
+        {
+            //  Floats, double, and long float are all 32 bits
+            double f = node->fval = tk->fval;
+            if (f >= -3.402823466e38 && f <= 3.402823466e38)        node->type = t_float;
+            else error("Integer constant out of range");
+        }
+        // node->type = insert_type(node, "");
+
     }
     else if (token->kind == TK_CHARACTER)
     {
@@ -229,7 +320,8 @@ Node *primary_expr()
         sprintf(c, "%d", (int)token->val[0]); 
         expect(TK_CHARACTER);
         fprintf(stderr, "%s %s\n", c, token->val);
-        node = new_node(ND_LITERAL, c);
+        node = new_node(ND_LITERAL, c, true);
+        node->type = t_char;
     }
     else
     {
@@ -256,11 +348,12 @@ Node *unary_expr()
             ||  token->kind == TK_AMPERSAND || token->kind == TK_STAR 
             ||  token->kind == TK_PLUS || token->kind == TK_MINUS)
     {
-        node = new_node(ND_UNARYOP, expect(token->kind));
+        node = new_node(ND_UNARYOP, expect(token->kind), true);
         add_child(node, unary_expr());
     }
     else if (token->kind == TK_IDENT 
-            || token->kind == TK_NUM 
+            || token->kind == TK_CONSTINT 
+            || token->kind == TK_CONSTFLT 
             || token->kind == TK_CHARACTER
             || token->kind == TK_LPAREN)
     {
@@ -293,12 +386,12 @@ Node *unary_expr()
                     // Only dereference at the outer calculation, put
                     // unary '+' which has no effect in for symmetry
                     if (array_depth == s->type->dimensions - 1)
-                        node    = new_node(ND_UNARYOP, "*");
+                        node    = new_node(ND_UNARYOP, "*", true);
                     else
-                        node    = new_node(ND_UNARYOP, "+");
-                    add         = add_child(node, new_node(ND_BINOP, "+"));
+                        node    = new_node(ND_UNARYOP, "+", true);
+                    add         = add_child(node, new_node(ND_BINOP, "+", true));
                     add_child(add, e1);
-                    Node *mul   = new_node(ND_BINOP, "*");
+                    Node *mul   = new_node(ND_BINOP, "*", true);
                     // Get array dimension
                     if (array_depth >= s->type->dimensions)
                         error("Too many dimensions for array type %s\n", fulltype_str(s->type));
@@ -307,7 +400,7 @@ Node *unary_expr()
                     array_depth++;
                     char buf[64]; 
                     sprintf(buf, "%d", mult);
-                    Node *dsize     = add_child(mul, new_node(ND_LITERAL, buf));
+                    Node *dsize     = add_child(mul, new_node(ND_LITERAL, buf, true));
                     add_child(mul, expr());
                     add_child(add, mul);
                     expect(TK_RBRACKET);
@@ -323,7 +416,7 @@ Node *unary_expr()
                 break;
             case(TK_DOT):
                 expect(token->kind);
-                add_child(node, new_node(ND_IDENT, expect(TK_IDENT)));
+                add_child(node, new_node(ND_IDENT, expect(TK_IDENT), true));
                 break;
             case(TK_INC):
             case(TK_DEC):
@@ -353,7 +446,7 @@ Node *type_name()
     // {
     //     return new_node(ND_TYPE_NAME, expect(token->kind));
     // }
-    Node *node = new_node(ND_DECLARATION, 0);
+    Node *node = new_node(ND_DECLARATION, 0, true);
     while(is_sc_spec(token->kind) || is_typespec(token->kind) || is_typequal(token->kind))
     {
         if (is_sc_spec(token->kind))    node->sclass = token->kind;
@@ -365,7 +458,9 @@ Node *type_name()
     {
         add_child(node, declarator());
     }
-    add_types_and_symbols(node, false);
+    // add_types_and_symbols(node, false);
+    node->type = insert_type(node, tstr_compact(node));
+    fprintf(stderr, "%s ts:%s:\n", __func__, tstr_compact(node));
     return node;
 }
 Node *cast_expr()
@@ -383,12 +478,14 @@ Node *cast_expr()
     {
         // This is a cast, create the node and add the type elements as
         // children
-        Node *node = new_node(ND_CAST, 0);
+        Node *node = new_node(ND_CAST, 0, true);
         // while (token->kind != TK_RPAREN)
         // {
         //     add_child(node, type_name());
         // }
         add_child(node, type_name());
+        // Set the type of the cast to that declared in the child
+        node->type = node->children[node->child_count - 1]->type;
         expect(TK_RPAREN);
         add_child(node, cast_expr());
         return node;
@@ -407,7 +504,7 @@ Node *mult_expr()
     Node *node = cast_expr();
     while (token->kind == TK_STAR || token->kind == TK_SLASH)
     {
-        Node *enode = new_node(ND_BINOP, expect(token->kind));
+        Node *enode = new_node(ND_BINOP, expect(token->kind), true);
         add_child(enode, node);
         add_child(enode, cast_expr());
         node = enode;
@@ -420,7 +517,7 @@ Node *add_expr()
     Node *node = mult_expr();
     while (token->kind == TK_PLUS || token->kind == TK_MINUS)
     {
-        Node *enode = new_node(ND_BINOP, expect(token->kind));
+        Node *enode = new_node(ND_BINOP, expect(token->kind), true);
         add_child(enode, node);
         add_child(enode, mult_expr());
         node = enode;
@@ -433,7 +530,7 @@ Node *rel_expr()
     Node *node = add_expr();
     while (token->kind == TK_LT || token->kind == TK_LE || token->kind == TK_GT || token->kind == TK_GE)
     {
-        Node *enode = new_node(ND_BINOP, expect(token->kind));
+        Node *enode = new_node(ND_BINOP, expect(token->kind), true);
         add_child(enode, node);
         add_child(enode, add_expr());
         node = enode;
@@ -446,7 +543,7 @@ Node *equal_expr()
     Node *node = rel_expr();
     while (token->kind == TK_EQ || token->kind == TK_NE)
     {
-        Node *enode = new_node(ND_BINOP, expect(token->kind));
+        Node *enode = new_node(ND_BINOP, expect(token->kind), true);
         add_child(enode, node);
         add_child(enode, rel_expr());
         node = enode;
@@ -459,7 +556,7 @@ Node *bitand_expr()
     Node *node = equal_expr();
     while (token->kind == TK_AMPERSAND)
     {
-        Node *enode = new_node(ND_BINOP, expect(token->kind));
+        Node *enode = new_node(ND_BINOP, expect(token->kind), true);
         add_child(enode, node);
         add_child(enode, equal_expr());
         node = enode;
@@ -472,7 +569,7 @@ Node *bitxor_expr()
     Node *node = bitand_expr();
     while (token->kind == TK_BITXOR)
     {
-        Node *enode = new_node(ND_BINOP, expect(token->kind));
+        Node *enode = new_node(ND_BINOP, expect(token->kind), true);
         add_child(enode, node);
         add_child(enode, bitand_expr());
         node = enode;
@@ -485,7 +582,7 @@ Node *bitor_expr()
     Node *node = bitxor_expr();
     while (token->kind == TK_BITOR)
     {
-        Node *enode = new_node(ND_BINOP, expect(token->kind));
+        Node *enode = new_node(ND_BINOP, expect(token->kind), true);
         add_child(enode, node);
         add_child(enode, bitxor_expr());
         node = enode;
@@ -498,7 +595,7 @@ Node *logand_expr()
     Node *node = bitor_expr();
     while (token->kind == TK_LOGAND)
     {
-        Node *enode = new_node(ND_BINOP, expect(token->kind));
+        Node *enode = new_node(ND_BINOP, expect(token->kind), true);
         add_child(enode, node);
         add_child(enode, bitor_expr());
         node = enode;
@@ -511,7 +608,7 @@ Node *logor_expr()
     Node *node = logand_expr();
     while (token->kind == TK_LOGOR)
     {
-        Node *enode = new_node(ND_BINOP, expect(token->kind));
+        Node *enode = new_node(ND_BINOP, expect(token->kind), true);
         add_child(enode, node);
         add_child(enode, logand_expr());
         node = enode;
@@ -524,7 +621,7 @@ Node *assign_expr()
     Node *node = logor_expr();
     if (token->kind == TK_ASSIGN)
     {
-        Node *anode = new_node(ND_ASSIGN, expect(TK_ASSIGN));
+        Node *anode = new_node(ND_ASSIGN, expect(TK_ASSIGN), true);
         add_child(anode, node);
         add_child(anode, logor_expr());
         return anode;
@@ -550,7 +647,9 @@ bool is_typespec(Token_kind tk)
         || (tk == TK_CHAR)
         || (tk == TK_SHORT)
         || (tk == TK_INT)
+        || (tk == TK_UINT)
         || (tk == TK_LONG)
+        || (tk == TK_ULONG)
         || (tk == TK_FLOAT)
         || (tk == TK_DOUBLE)
         || (tk == TK_SIGNED)
@@ -570,7 +669,7 @@ Node *param_declaration()
     // <parameter-declaration> ::= {<declaration-specifier>}+ <declarator>
     //                           | {<declaration-specifier>}+ <abstract-declarator>
     //                           | {<declaration-specifier>}+
-    Node *node = new_node(ND_DECLARATION, 0);
+    Node *node = new_node(ND_DECLARATION, 0, false);
     // At least one decl_spec
     // TODO storage class defaults A.8.1
     while(is_sc_spec(token->kind) || is_typespec(token->kind) || is_typequal(token->kind))
@@ -595,7 +694,7 @@ Node *param_declaration()
 Node *param_type_list()
 {
     fprintf(stderr, "%s\n", __func__);
-    Node *node = new_node(ND_PTYPE_LIST, 0);
+    Node *node = new_node(ND_PTYPE_LIST, 0, false);
     node->symtable = enter_new_scope(false);
     while(token->kind != TK_RPAREN)
     {
@@ -619,10 +718,10 @@ Node *direct_decl()
     // <direct-decl-tail> ::= [ {<constant-expression>}? ]
     //                      | ( <parameter-type-list> )
     //                      | ( {<identifier>}* )
-    Node *node = new_node(ND_DIRECT_DECL, 0);
+    Node *node = new_node(ND_DIRECT_DECL, 0, false);
     if (token->kind == TK_IDENT)
     {
-        add_child(node, new_node(ND_IDENT, expect(TK_IDENT)));
+        add_child(node, new_node(ND_IDENT, expect(TK_IDENT), false));
     }
     else if (token->kind == TK_LPAREN)
     {
@@ -634,7 +733,7 @@ Node *direct_decl()
     {
         if (token->kind == TK_LBRACKET)
         {
-            add_child(node, new_node(ND_ARRAY_DECL, expect(TK_LBRACKET)));
+            add_child(node, new_node(ND_ARRAY_DECL, expect(TK_LBRACKET), false));
             Node *n = node->children[node->child_count - 1];
             n->is_array = true;
             if (token->kind != TK_RBRACKET)
@@ -645,7 +744,7 @@ Node *direct_decl()
         }
         else if (token->kind == TK_LPAREN)
         {
-            add_child(node, new_node(ND_FUNC_DECL, expect(TK_LPAREN)));
+            add_child(node, new_node(ND_FUNC_DECL, expect(TK_LPAREN), false));
             Node *n = node->children[node->child_count - 1];
             n->is_function = true;
             // TODO can also be identifier
@@ -664,7 +763,7 @@ Node *declarator()
     // <pointer> ::= * {<type-qualifier>}* {<pointer>}?
     // <type-qualifier> ::= const
     //                    | volatile
-    Node *node = new_node(ND_DECLARATOR, 0);
+    Node *node = new_node(ND_DECLARATOR, 0, false);
     node->pointer_level = 0;
     while(token->kind == TK_STAR)
     {
@@ -682,7 +781,7 @@ Node *declarator()
 Node *initializer();
 Node *initializer_list()
 {
-    Node *node = new_node(ND_INITLIST, 0);
+    Node *node = new_node(ND_INITLIST, 0, false);
     add_child(node, initializer());
     while (token->kind == TK_COMMA)
     {
@@ -727,7 +826,7 @@ Node *declaration()
 {
     fprintf(stderr, "%s\n", __func__);
     // <declaration> ::=  {<declaration-specifier>}+ {<init-declarator>}* ;
-    Node *node = new_node(ND_DECLARATION, 0);
+    Node *node = new_node(ND_DECLARATION, 0, false);
     // At least one decl_spec
     // TODO storage class defaults A.8.1
     while(is_sc_spec(token->kind) || is_typespec(token->kind) || is_typequal(token->kind))
@@ -802,7 +901,7 @@ void leave_scope()
 Node *comp_stmt(bool use_last_scope)
 {
     fprintf(stderr, "%s\n", __func__);
-    Node *node      = new_node(ND_COMPSTMT, 0);
+    Node *node      = new_node(ND_COMPSTMT, 0, false);
     node->symtable  = enter_new_scope(use_last_scope);
     fprintf(stderr, "%2d:", depth); 
     for(int i = 0; i < depth; i++)
@@ -827,7 +926,7 @@ Node *comp_stmt(bool use_last_scope)
 Node *stmt()
 {
     fprintf(stderr, "%s\n", __func__);
-    Node *node = new_node(ND_STMT, 0);
+    Node *node = new_node(ND_STMT, 0, false);
     if (token->kind == TK_LBRACE)
     {
         add_child(node, comp_stmt(false));
@@ -904,7 +1003,8 @@ Node *stmt()
 Node *program()
 {
     fprintf(stderr, "%s\n", __func__);
-    Node *node = new_node(ND_PROGRAM, 0);
+    make_basic_types();
+    Node *node = new_node(ND_PROGRAM, 0, false);
     while(!at_eof())
     {
 
@@ -1039,6 +1139,8 @@ char *tstr_compact(Node *node)
     ts[0] = 0;
     if (node->kind == ND_DECLARATOR)
         d(node);
+    if (node->child_count && node->children[0]->kind == ND_DECLARATOR)
+        d(node->children[0]);
     return ts;
 }
 void print_tree(Node *node, int depth)
@@ -1048,9 +1150,9 @@ void print_tree(Node *node, int depth)
         return;
     for(int i = 0; i < depth; i++) 
         fprintf(stderr, "  ");
-    fprintf(stderr, "%s: %5s %s ch:%d sc:%s ", nodestr(node->kind), 
+    fprintf(stderr, "%s: %5s %s ch:%d sc:%s fts:%s: t:%016llx ", nodestr(node->kind), 
         node->is_array ? "array" : node->is_func_defn ? "fdef " : node->is_function ? "func " : "     ", 
-        node->val, node->child_count, scope_str(node->scope));
+        node->val, node->child_count, scope_str(node->scope), node->type ? fulltype_str(node->type) : "", (unsigned long long)node->type);
     if (node->kind == ND_DECLARATION)
     {
         fprintf(stderr, "sclass:%s typequal:%s typespec:%s ", 
@@ -1090,7 +1192,6 @@ Type *new_type(Node *node, Node *child)
     {
         ty->name    = get_typename(node);
     }
-
     return ty;
 }
 bool is_named_type(Token_kind tk)
@@ -1104,7 +1205,7 @@ void calc_tsize(Type *t)
 {
     // To work out what size a type is:
     //
-    //  If there are no characters, the size is the base type size.
+    //  If there are no characters in the derivation, the size is the base type size.
     //
     //  If first character is '*' this is a pointer, all other
     //  characters do not change the size, which is 2.
@@ -1193,6 +1294,7 @@ void calc_tsize(Type *t)
 Type *insert_type(Node *node, char *ts)
 {
     // Search type table, return location if found, otherwise insert
+    fprintf(stderr, "%s ts:%s:\n", __func__, ts);
     for(Type *t = types; t; t = t->next)
     {
         if (    node->typespec == t->typespec
@@ -1206,6 +1308,7 @@ Type *insert_type(Node *node, char *ts)
                 // TODO
             }
             // if we're here, we have found a matching type, so return
+            fprintf(stderr, "%sFound type\n", __func__);
             return t;
         }
     }
@@ -1218,6 +1321,7 @@ Type *insert_type(Node *node, char *ts)
     strcpy(t->derived, ts);
     // Work out the dimensions and sizes
     calc_tsize(t);
+    fprintf(stderr, "%s ts:%s: fts:%s:\n", __func__, ts, fulltype_str(t));
     t->next     = types;
     types       = t;
     return t;
@@ -1337,6 +1441,7 @@ void add_types_and_symbols(Node *node, bool is_param)
     // variables. Put variable in symbol table structured to represent scope.
     // Put type in type table.
 
+    fprintf(stderr, "%s\n", __func__);
     char *ts = 0;
     char *ident = 0;
     for(int i = 0; i < node->child_count; i++)
@@ -1347,19 +1452,15 @@ void add_types_and_symbols(Node *node, bool is_param)
             ts      = tstr_compact(n);
             ident   = get_decl_ident(n);
         }
-        if (ts && ident)
+        if (ts)
         {
             // Its an actual declarator
             fprintf(stderr, "Found %s %s\n", ts, ident);
             Type *ty = insert_type(node, ts);
             // ty is pointer to type in type table
-            n->symbol = insert_symbol(node, ty, ident, is_param);
-        }
-        if (ts && !ident)
-        {
-            // This is an abstract declarator, put it in the type table
-            fprintf(stderr, "Found %s\n", ts);
-            Type *ty = insert_type(node, ts);
+            node->type = ty;
+            if (ident)
+                n->symbol = insert_symbol(node, ty, ident, is_param);
         }
     }
 }
@@ -1419,6 +1520,71 @@ Symbol *find_symbol(Node *node, char *name)
 }
 
 
+bool istype_float(Type *t)  { return t == t_float; }
+bool istype_char(Type *t)   { return t == t_char; }
+bool istype_short(Type *t)  { return t == t_short; }
+bool istype_enum(Type *t)   { return t == t_enum; }
+bool istype_int(Type *t)    { return t == t_int; }
+bool istype_uint(Type *t)   { return t == t_uint; }
+bool istype_long(Type *t)   { return t == t_long; }
+bool istype_ulong(Type *t)  { return t == t_ulong; }
+
+
+void insert_cast(Node *n, int child, Type *t)
+{
+    fprintf(stderr, "%s %s\n", __func__, fulltype_str(t));
+    Node *c = new_node(ND_CAST, 0, true);
+
+    // We don't care what is in the declaration, its just a placeholder
+    add_child(c, new_node(ND_DECLARATION, 0, false));
+    add_child(c, n->children[child]);
+    c->type = t;
+    n->children[child] = c;
+}
+Type *check_operands(Node *n)
+{
+    // Perform the 'usual arithmetic conversions'
+    // Check against the rules, and insert a cast to perform the conversion
+    // Ignore the float promotion, we are keeping all float types the same 32 bits
+    //
+    Node *lhs = n->children[0];
+    Node *rhs = n->children[1];
+    fprintf(stderr, "%s %016llx %016llx\n", __func__, (unsigned long long)lhs->type, (unsigned long long)rhs->type);
+    if (istype_float(lhs->type) && !istype_float(rhs->type))            insert_cast(n, 1, t_float);
+    else if (!istype_float(lhs->type) && istype_float(rhs->type))       insert_cast(n, 0, t_float);
+    if (istype_char(lhs->type))                                         insert_cast(n, 0, t_int);
+    if (istype_char(rhs->type))                                         insert_cast(n, 1, t_int);
+    if (istype_short(lhs->type))                                        insert_cast(n, 0, t_int);
+    if (istype_short(rhs->type))                                        insert_cast(n, 1, t_int);
+    if (istype_enum(lhs->type))                                         insert_cast(n, 0, t_int);
+    if (istype_enum(rhs->type))                                         insert_cast(n, 1, t_int);
+    if (istype_ulong(lhs->type) && !istype_ulong(rhs->type))            insert_cast(n, 1, t_ulong);
+    else if (!istype_ulong(lhs->type) && istype_ulong(rhs->type))       insert_cast(n, 1, t_ulong);
+    else if (istype_long(lhs->type) && istype_uint(rhs->type))          insert_cast(n, 1, t_long);
+    else if (istype_uint(lhs->type) && istype_long(rhs->type))          insert_cast(n, 0, t_long);
+    else if (istype_long(lhs->type) && !istype_long(rhs->type))         insert_cast(n, 1, t_long);
+    else if (!istype_long(lhs->type) && istype_long(rhs->type))         insert_cast(n, 0, t_long);
+
+    return lhs->type;
+}
+
+void propagate_types(Node *n)
+{
+    // Traverse expressions in tree, propagating types from literals and 
+    // variables up to unary and binary operators
+    for(int i = 0; i < n->child_count; i++)
+    {
+        propagate_types(n->children[i]);
+    }
+    if (n->is_expr)
+    {
+        if (n->kind == ND_BINOP)
+        {
+            n->type = check_operands(n);
+        }
+    }
+}
+
 
 void print_symbol_table(Symbol_table *s, int depth)
 {
@@ -1445,7 +1611,7 @@ void print_type_table()
     fprintf(stderr, "------ Type table ------\n");
     for(t = types; t; t = t->next)
     {
-        fprintf(stderr, "%-20s ", fulltype_str(t));
+        fprintf(stderr, "%016llx %-20s ", (unsigned long long)t, fulltype_str(t));
         fprintf(stderr, "size:%d ", t->size);
         if (t->is_array)
         {
