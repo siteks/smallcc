@@ -9,5 +9,11 @@ assert 3 "int f(int a){return a;} int main(){return f(3);}"
 
 assert 24 "int f(int a){if(a<3)return a;return a*f(a-1);}int main(){return f(4);}"
 
+# Implicit cast
 assert 65 "int main(){return 'A';}"
 assert 0 "int main(){return '\0';}"
+
+# Implicit cast
+assert 16 "char main(){return 0x3210;}"
+
+assert -1 "int main(){char a=-1; return a;}"

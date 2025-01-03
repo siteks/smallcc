@@ -394,7 +394,139 @@ void gen_addr(Node *node)
     else
         error("Expecting lvalue\n");
 }
+void gen_cast(Type *src, Type *dst)
+{
+    //                  dest
+    //          uc  c   s   us  e   i   u   l   ul  p   f   d
+    //      uc  .   .   z   z   z   z   z   z   z   z 
+    //      c   .   .   s   s   s   s   s   s   s   s      
+    //  s   s   m   m   .   .   .   .   .   s   s   .        
+    //  s   us  m   m   .   .   .   .   .   z   z   .        
+    //  r   e   m   m   .   .   .   .   .   z   z   .        
+    //  c   i   m   m   .   .   .   .   .   s   s   .        
+    //      u   m   m   .   .   .   .   .   z   z   .        
+    //      l   tm  tm  t   t   t   t   t   .   .   t         
+    //      ul  tm  tm  t   t   t   t   t   .   .   t         
+    //      p   m   m   .   .   .   .   .   z   z   .        
+    //      f                                           .   .
+    //      d                                           .   . 
 
+    // src is in reg if 1 or 2 bytes, otherwise on stack as:
+    //  high word   0 
+    //  low word    -2
+    // dst is in reg is 1 or 2 bytes, otherwise on stack
+
+
+    // Value in reg is in src type, needs to be converted to dst type
+    if (src == dst)
+        return;
+    if (src->size == 1 && dst->size == 1)
+        return;
+    if (src->size == 2 && dst->size == 2)
+        // Do nothing with ints uints shorts ptrs enums
+        // char to 2 byte, do nothing
+        return;
+    if (istype_uchar(src) && dst->size == 2)
+        // Zero extend, assume already zero in top 8 bits
+        return;
+    if ((istype_float(src) || istype_double(src)) && (istype_float(dst) || istype_double(dst)))
+        // floats and doubles are the same
+        return;
+    if ((istype_long(src) || istype_ulong(src)) && dst->size == 2)
+    {
+        // Truncate. The high word is first on the stack, highest address (little endian)
+        gen_pop();  // get low word
+        gen_adj(2); // adj over high word
+        // gen_push(); // put low word back
+        return;
+    }
+    if ((istype_long(src) || istype_ulong(src)) && dst->size == 1)
+    {
+        // Truncate and mask top 8 bits. 
+        // The high word is first on the stack, highest address (little endian)
+        gen_imm(0xff);
+        gen_bitand();
+        gen_adj(2); // adj over high word
+        // gen_push();
+        return;
+    }
+    if (src->size == 2 && dst->size == 1)
+    {
+        // Mask top 8 bits. 
+        // The high word is first on the stack, highest address (little endian)
+        gen_push();
+        gen_imm(0xff);
+        gen_bitand();
+        // gen_push();
+        return;
+    }
+    if (istype_char(src) && dst->size == 2)
+    {
+        // Sign extend
+        gen_push();
+        gen_push();
+        gen_imm(0x80);
+        gen_bitand();
+        int i = new_label();
+        int j = new_label();
+        gen_jz(i);
+        gen_imm(0xff00);
+        gen_bitor();
+        gen_j(j);
+        // gen_push();
+        gen_label(i);
+        gen_pop();
+        gen_label(j);
+        return;
+    }
+    if (istype_char(src) && (istype_long(dst) || istype_ulong(dst)))
+    {
+        // Sign extend
+        gen_adj(-2);
+        gen_push();
+        gen_push();
+        gen_imm(0x80);
+        gen_bitand();
+        int i = new_label();
+        gen_jz(i);
+        gen_imm(0xff00);
+        gen_push();
+        gen_imm(0xffff);
+        gen_label(i);
+        gen_adj(-4);
+        gen_push();
+        gen_adj(4);
+        return;
+    }
+    if ((istype_short(src) || istype_int(src)) && (istype_long(dst) || istype_ulong(dst)))
+    {
+        // Sign extend
+        gen_adj(-2);
+        gen_push();
+        gen_push();
+        gen_imm(0x8000);
+        gen_bitand();
+        int i = new_label();
+        gen_jz(i);
+        gen_imm(0xffff);
+        gen_label(i);
+        gen_adj(-4);
+        gen_push();
+        gen_adj(4);
+        return;
+    }
+    if ((istype_uchar(src) || istype_uint(src) || istype_enum(src) || istype_ptr(src)) 
+        && (istype_long(dst) || istype_ulong(dst)))
+    {
+        // Zero extend
+        gen_adj(-2);
+        gen_push();
+        gen_imm(0);
+        gen_adj(2);
+        gen_push();
+        gen_adj(2);
+    }
+}
 void gen_expr(Node *node)
 {
     printf(";%s %s %s\n", __func__, nodestr(node->kind), node->val);
@@ -426,7 +558,7 @@ void gen_expr(Node *node)
     else if (node->kind == ND_IDENT)
     {
         // This could be a function call
-        if (node->symbol->type->is_function)
+        if (istype_function(node->symbol->type))
         {
             gen_callfunction(node);
         }
@@ -434,7 +566,7 @@ void gen_expr(Node *node)
         {
             gen_varaddr(node);
             // Don't fetch from address if pointer or array
-            if (!node->symbol->type->is_array && !node->symbol->type->is_pointer)
+            if (!istype_array(node->symbol->type) && !istype_ptr(node->symbol->type))
                 gen_lw();
         }
     }
@@ -463,6 +595,13 @@ void gen_expr(Node *node)
         gen_push();
         gen_expr(node->children[1]);
         gen_sw();
+    }
+    else if (node->kind == ND_CAST)
+    {
+        // The type conversion is defined by the type of the expression in child 1 and the 
+        // type of the cast
+        gen_expr(node->children[1]);
+        gen_cast(node->children[1]->type, node->type);
     }
 }
 void gen_return()

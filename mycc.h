@@ -73,7 +73,9 @@ typedef enum
 // Basic types
     TK_VOID,
     TK_CHAR,
+    TK_UCHAR,
     TK_SHORT,
+    TK_USHORT,
     TK_INT,
     TK_UINT,
     TK_LONG,
@@ -158,14 +160,42 @@ typedef enum
 } Node_kind;
 
 
+// typedef enum
+// {
+//     AUTO        = 0x1,
+//     REGISTER    = 0x2,
+//     STATIC      = 0x4,
+//     EXTERN      = 0x8,
+//     CONST       = 0x10,
+//     VOLATILE    = 0x20,
+//     TYPEDEF     = 0x40,
+//     STRUCT      = 0x80,
+//     UNION       = 0x100,
+//     ENUM        = 0x200,
+// } Type_attr;
 
+typedef enum
+{
+    TB_VOID     = 0x1,
+    TB_CHAR     = 0x2,
+    TB_SHORT    = 0x4,
+    TB_ENUM     = 0x8,
+    TB_INT      = 0x10,
+    TB_LONG     = 0x20,
+    TB_FLOAT    = 0x40,
+    TB_DOUBLE   = 0x80,
+    TB_SIGNED   = 0x100,
+    TB_UNSIGNED = 0x200,
+} Type_base;
 
 typedef struct Type Type;
 struct Type
 {
-    Token_kind      typespec;
+    Type_base       typespec;
     Token_kind      typequal;
     Token_kind      sclass;
+    // Type_attr       attrib;
+    // Type_base       base;
     char            *derived;
     bool            is_pointer;
     bool            is_array;
@@ -257,11 +287,12 @@ struct Node
     bool            is_expr;
     bool            is_func_defn;
     bool            is_function;
+    Type            *return_type;
     bool            is_array;
     int             array_size;
     bool            size_mult;
     Node            *array_ident;
-    Token_kind      typespec;
+    Type_base       typespec;
     Token_kind      sclass;
     Token_kind      typequal;
     Scope           scope;
@@ -327,5 +358,25 @@ Node *new_node(Node_kind kind, char *val, bool is_expr);
 Symbol *find_symbol(Node *node, char *name);
 Symbol_table *find_scope(Node *node);
 Type *find_type(char *name);
+void make_basic_types();
+Type *elem_type(Type *t);
+
+bool istype_float(Type *t);
+bool istype_double(Type *t);
+bool istype_char(Type *t);
+bool istype_uchar(Type *t);
+bool istype_short(Type *t);
+bool istype_ushort(Type *t);
+bool istype_enum(Type *t);
+bool istype_int(Type *t);
+bool istype_uint(Type *t);
+bool istype_long(Type *t);
+bool istype_ulong(Type *t);
+bool istype_ptr(Type *t);
+bool istype_array(Type *t);
+bool istype_function(Type *t);
+Type_base to_typespec(Token_kind tk);
+char *typespec_str(Type_base tb);
+
 
 #endif

@@ -16,7 +16,6 @@ void error(char *fmt, ...)
 Token           *token;
 char            *user_input;
 Local           *locals;
-Type            *types;
 Symbol_table    *symbol_table;
 Symbol_table    *curr_st_scope;
 
@@ -35,7 +34,7 @@ int main(int argc, char **argv)
     symbol_table = calloc(1, sizeof(Symbol_table));
     curr_st_scope = symbol_table;
     
-
+    make_basic_types();
     Node *node = program();
     propagate_types(node);
     // get_types_and_symbols(node);

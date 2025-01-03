@@ -163,29 +163,15 @@ Symbol_table        *last_symbol_table;
 int depth;
 int indices[100];
 
-Type *t_char;
-Type *t_short;
-Type *t_enum;
-Type *t_int;
-Type *t_uint;
-Type *t_long;
-Type *t_ulong;
-Type *t_float;
-Type *t_double;
-
-void make_basic_types()
-{
-    Node *n = new_node(ND_CAST, 0, 0);
-    n->typespec = TK_CHAR;      t_char      = insert_type(n, "");
-    n->typespec = TK_SHORT;     t_short     = insert_type(n, "");
-    n->typespec = TK_ENUM;      t_enum      = insert_type(n, "");
-    n->typespec = TK_INT;       t_int       = insert_type(n, "");
-    n->typespec = TK_UINT;      t_uint      = insert_type(n, "");
-    n->typespec = TK_LONG;      t_long      = insert_type(n, "");
-    n->typespec = TK_ULONG;     t_ulong     = insert_type(n, "");
-    n->typespec = TK_FLOAT;     t_float     = insert_type(n, "");
-    n->typespec = TK_DOUBLE;    t_double    = insert_type(n, "");
-}
+extern Type *t_char;
+extern Type *t_short;
+extern Type *t_enum;
+extern Type *t_int;
+extern Type *t_uint;
+extern Type *t_long;
+extern Type *t_ulong;
+extern Type *t_float;
+extern Type *t_double;
 
 
 Symbol_table *enter_new_scope(bool use_last_scope);
@@ -226,6 +212,7 @@ Node *add_child(Node *parent, Node *child)
     return child;
 }
 
+Node *current_function;
 
 Node *primary_expr();
 Node *mult_expr();
@@ -386,7 +373,11 @@ Node *unary_expr()
                     // Only dereference at the outer calculation, put
                     // unary '+' which has no effect in for symmetry
                     if (array_depth == s->type->dimensions - 1)
+                    {
                         node    = new_node(ND_UNARYOP, "*", true);
+                        // Get the type element
+                        node->type = elem_type(s->type);
+                    }
                     else
                         node    = new_node(ND_UNARYOP, "+", true);
                     add         = add_child(node, new_node(ND_BINOP, "+", true));
@@ -450,7 +441,7 @@ Node *type_name()
     while(is_sc_spec(token->kind) || is_typespec(token->kind) || is_typequal(token->kind))
     {
         if (is_sc_spec(token->kind))    node->sclass = token->kind;
-        if (is_typespec(token->kind))   node->typespec = token->kind;
+        if (is_typespec(token->kind))   node->typespec |= to_typespec(token->kind);
         if (is_typequal(token->kind))   node->typequal = token->kind;
         expect(token->kind);
     }
@@ -647,9 +638,7 @@ bool is_typespec(Token_kind tk)
         || (tk == TK_CHAR)
         || (tk == TK_SHORT)
         || (tk == TK_INT)
-        || (tk == TK_UINT)
         || (tk == TK_LONG)
-        || (tk == TK_ULONG)
         || (tk == TK_FLOAT)
         || (tk == TK_DOUBLE)
         || (tk == TK_SIGNED)
@@ -660,6 +649,7 @@ bool is_typequal(Token_kind tk)
     return (tk == TK_CONST)
         || (tk == TK_VOLATILE);
 }
+
 Node *param_declaration()
 {
 
@@ -675,7 +665,7 @@ Node *param_declaration()
     while(is_sc_spec(token->kind) || is_typespec(token->kind) || is_typequal(token->kind))
     {
         if (is_sc_spec(token->kind))    node->sclass = token->kind;
-        if (is_typespec(token->kind))   node->typespec = token->kind;
+        if (is_typespec(token->kind))   node->typespec |= to_typespec(token->kind);
         if (is_typequal(token->kind))   node->typequal = token->kind;
         expect(token->kind);
     }
@@ -832,7 +822,7 @@ Node *declaration()
     while(is_sc_spec(token->kind) || is_typespec(token->kind) || is_typequal(token->kind))
     {
         if (is_sc_spec(token->kind))    node->sclass = token->kind;
-        if (is_typespec(token->kind))   node->typespec = token->kind;
+        if (is_typespec(token->kind))   node->typespec |= to_typespec(token->kind);
         if (is_typequal(token->kind))   node->typequal = token->kind;
         expect(token->kind);
     }
@@ -847,6 +837,7 @@ Node *declaration()
             if (token->kind == TK_LBRACE)
             {
                 add_types_and_symbols(node, false);
+                current_function = node;
                 // This is the first compound statement of a 
                 // function, so we need to use the scope
                 /// created in the parameter list
@@ -856,6 +847,7 @@ Node *declaration()
             }
             expect(TK_COMMA);
         }
+
     }
 
     expect(TK_SEMICOLON);
@@ -961,6 +953,7 @@ Node *stmt()
         if (token->kind != TK_SEMICOLON)
         {
             add_child(node, expr());
+
         }
         expect(TK_SEMICOLON);
     }
@@ -1007,7 +1000,6 @@ Node *program()
     Node *node = new_node(ND_PROGRAM, 0, false);
     while(!at_eof())
     {
-
         add_child(node, declaration());
     }
     return node;
@@ -1096,7 +1088,7 @@ char *fulltype_str(Type *t)
 {
     static char buf[1024];
     sprintf(buf, "%s%s%s%s", type_token_str(t->sclass), 
-            type_token_str(t->typequal), type_token_str(t->typespec), t->derived);
+            type_token_str(t->typequal), typespec_str(t->typespec), t->derived);
     return buf;
 }
 
@@ -1156,7 +1148,7 @@ void print_tree(Node *node, int depth)
     if (node->kind == ND_DECLARATION)
     {
         fprintf(stderr, "sclass:%s typequal:%s typespec:%s ", 
-            type_token_str(node->sclass), type_token_str(node->typequal), type_token_str(node->typespec));
+            type_token_str(node->sclass), type_token_str(node->typequal), typespec_str(node->typespec));
         for(int j = 0; j < node->child_count; j++)
             if (node->children[j]->kind == ND_DECLARATOR && node->children[j]->symbol)
                 fprintf(stderr, "%s <%s> | ", 
@@ -1175,162 +1167,6 @@ void print_tree(Node *node, int depth)
 
 
 
-
-char *get_typename(Node *node)
-{
-    // TODO get the struct, union, enum, or typedef identifier
-    return "";
-}
-Type *new_type(Node *node, Node *child)
-{
-    // Construct a new type, the node must be a ND_DECLARATION
-    Type *ty        = calloc(1, sizeof(Type));
-    ty->typespec    = node->typespec;
-    ty->typequal    = node->typequal;
-    ty->sclass      = node->sclass;
-    if (ty->typespec == TK_STRUCT || ty->typespec == TK_UNION || ty->typespec == TK_ENUM || ty->typespec == TK_TYPEDEF)
-    {
-        ty->name    = get_typename(node);
-    }
-    return ty;
-}
-bool is_named_type(Token_kind tk)
-{
-    return      tk == TK_STRUCT 
-            ||  tk == TK_UNION 
-            ||  tk == TK_ENUM 
-            ||  tk == TK_TYPEDEF;
-}
-void calc_tsize(Type *t)
-{
-    // To work out what size a type is:
-    //
-    //  If there are no characters in the derivation, the size is the base type size.
-    //
-    //  If first character is '*' this is a pointer, all other
-    //  characters do not change the size, which is 2.
-    //
-    //  If first character is '[' this is an array. The number of
-    //  elements will be the product of all the constants inside 
-    //  successive brackets []. If a pointer '*' is encountered,
-    //  brackets after are ignored, the elem size is 2, otherwise
-    //  the elem size is the base type size
-    int s = 0;
-    switch(t->typespec)
-    {
-        case TK_VOID:       s = 0; break;
-        case TK_CHAR:       s = 1; break;
-        case TK_SHORT:      s = 2; break;
-        case TK_INT:        s = 2; break;
-        case TK_LONG:       s = 4; break;
-        case TK_FLOAT:      s = 4; break;
-        case TK_DOUBLE:     s = 4; break;
-        case TK_SIGNED:     s = 2; break;
-        case TK_UNSIGNED:   s = 2; break;
-        default:            s = 2; break;
-    }
-    if (!t->derived[0])
-    {
-        // Base type
-        t->size         = s;
-        t->elem_size    = t->size;
-    }
-    else if (t->derived[0] == '*')
-    {
-        // This is a pointer
-        t->is_pointer   = true;
-        t->size         = 2;
-        t->elem_size    = t->size;
-    }
-    else if (t->derived[0] == '(')
-    {
-        // This is a pointer
-        t->is_function  = true;
-        t->size         = 2;
-        t->elem_size    = t->size;
-    }
-    else if (t->derived[0] == '[')
-    {
-        // This is an array, work out the dimensions
-        t->is_array     = true;
-        char *p         = t->derived;
-        t->dimensions   = 0;
-        while(*p && *p != '*')
-        {
-            if (*p == '[')
-            {
-                p++;
-                char *q;
-                int d = strtol(p, &q, 0);
-                if (!t->dimensions)
-                    t->elements = d;
-                else
-                    t->elements *= d;
-                t->dimensions++;
-                t->dim_sizes = (int**)realloc(t->dim_sizes, t->dimensions * sizeof(int**));
-                t->dim_sizes[t->dimensions - 1] = calloc(1, sizeof(int));
-                *t->dim_sizes[t->dimensions - 1] = d;
-
-                t->elems_per_row = (int**)realloc(t->elems_per_row, t->dimensions * sizeof(int**));
-                t->elems_per_row[t->dimensions - 1] = calloc(1, sizeof(int));
-                if (*q == ']')
-                    p = q;
-            }
-            p++;
-        }
-        if (p && *p == '*')
-            t->elem_size = 4;
-        else
-            t->elem_size = s;
-        t->size = t->elements * t->elem_size;
-        int num_elems = 1;
-        for(int i = t->dimensions - 1; i >= 0; i--)
-        {
-            *t->elems_per_row[i] = num_elems;
-            num_elems *= *t->dim_sizes[i];
-        }
-    }
-}
-Type *insert_type(Node *node, char *ts)
-{
-    // Search type table, return location if found, otherwise insert
-    fprintf(stderr, "%s ts:%s:\n", __func__, ts);
-    for(Type *t = types; t; t = t->next)
-    {
-        if (    node->typespec == t->typespec
-            &&  node->typequal == t->typequal
-            &&  node->sclass == t->sclass
-            &&  !strcmp(ts, t->derived))
-        {
-            // Check if named type is the same
-            if (is_named_type(t->typespec))
-            {
-                // TODO
-            }
-            // if we're here, we have found a matching type, so return
-            fprintf(stderr, "%sFound type\n", __func__);
-            return t;
-        }
-    }
-    // Didn't find type in table, create a new one
-    Type *t     = calloc(1, sizeof(Type));
-    t->typespec = node->typespec;
-    t->typequal = node->typequal;
-    t->sclass   = node->sclass;
-    t->derived  = calloc(1, strlen(ts) + 1);
-    strcpy(t->derived, ts);
-    // Work out the dimensions and sizes
-    calc_tsize(t);
-    fprintf(stderr, "%s ts:%s: fts:%s:\n", __func__, ts, fulltype_str(t));
-    t->next     = types;
-    types       = t;
-    return t;
-}
-Type *find_type(char *name)
-{
-    // TODO find a typedef by name
-    return 0;
-}
 Symbol *new_symbol(Type *type, char *ident, int offset)
 {
     Symbol *n = calloc(1, sizeof(Symbol));
@@ -1459,6 +1295,15 @@ void add_types_and_symbols(Node *node, bool is_param)
             Type *ty = insert_type(node, ts);
             // ty is pointer to type in type table
             node->type = ty;
+            // See if this is a function, if so, get the return type
+            if (ts[0] == '(')
+            {
+                fprintf(stderr, "%s this is a function, setting return type\n", __func__);
+                Type *ty = insert_type(node, ts + 2);
+                node->return_type = ty;
+            }
+
+
             if (ident)
                 n->symbol = insert_symbol(node, ty, ident, is_param);
         }
@@ -1511,6 +1356,8 @@ Symbol *find_symbol(Node *node, char *name)
         fprintf(stderr, "Not found, going to enclosing scope\n");
         if (st->parent)
             st = st->parent;
+        else
+            break;
     }
     if (!found)
     {
@@ -1520,14 +1367,7 @@ Symbol *find_symbol(Node *node, char *name)
 }
 
 
-bool istype_float(Type *t)  { return t == t_float; }
-bool istype_char(Type *t)   { return t == t_char; }
-bool istype_short(Type *t)  { return t == t_short; }
-bool istype_enum(Type *t)   { return t == t_enum; }
-bool istype_int(Type *t)    { return t == t_int; }
-bool istype_uint(Type *t)   { return t == t_uint; }
-bool istype_long(Type *t)   { return t == t_long; }
-bool istype_ulong(Type *t)  { return t == t_ulong; }
+
 
 
 void insert_cast(Node *n, int child, Type *t)
@@ -1567,6 +1407,18 @@ Type *check_operands(Node *n)
 
     return lhs->type;
 }
+Type *check_unary_operand(Node *n)
+{
+    // Perform the 'usual arithmetic conversions'
+    // Check against the rules, and insert a cast to perform the conversion
+    // Ignore the float promotion, we are keeping all float types the same 32 bits
+    //
+    Node *lhs = n->children[0];
+    fprintf(stderr, "%s %016llx\n", __func__, (unsigned long long)lhs->type);
+    if (istype_char(lhs->type))                                         insert_cast(n, 0, t_int);
+
+    return lhs->type;
+}
 
 void propagate_types(Node *n)
 {
@@ -1576,12 +1428,27 @@ void propagate_types(Node *n)
     {
         propagate_types(n->children[i]);
     }
+    if (n->kind == ND_IDENT)
+    {
+        n->type = find_symbol(n, n->val)->type;
+    }
     if (n->is_expr)
     {
         if (n->kind == ND_BINOP)
         {
             n->type = check_operands(n);
         }
+        if (n->kind == ND_UNARYOP)
+        {
+            n->type = check_unary_operand(n);
+        }
+    }
+    if (n->kind == ND_RETURNSTMT && n->child_count)
+    {
+        n->type = current_function->return_type;
+        fprintf(stderr, "%s found return stmt with expr, type of func:%s:\n", __func__, fulltype_str(n->type));
+        if (n->type != n->children[0]->type)
+            insert_cast(n, 0, n->type);
     }
 }
 
@@ -1613,7 +1480,7 @@ void print_type_table()
     {
         fprintf(stderr, "%016llx %-20s ", (unsigned long long)t, fulltype_str(t));
         fprintf(stderr, "size:%d ", t->size);
-        if (t->is_array)
+        if (istype_array(t))
         {
             fprintf(stderr, "%d", t->elem_size);
             for(int i = 0; i < t->dimensions; i++)

@@ -147,9 +147,7 @@ char *type_token_str(Token_kind tk)
         tk == TK_EXTERN     ? "extern " :
         tk == TK_FLOAT      ? "float " :
         tk == TK_INT        ? "int " :
-        tk == TK_UINT       ? "uint " :
         tk == TK_LONG       ? "long " :
-        tk == TK_ULONG      ? "ulong " :
         tk == TK_REGISTER   ? "register " :
         tk == TK_SHORT      ? "short " :
         tk == TK_SIGNED     ? "signed " :
