@@ -163,6 +163,7 @@ Symbol_table        *last_symbol_table;
 int depth;
 int indices[100];
 
+extern Type *t_void;
 extern Type *t_char;
 extern Type *t_short;
 extern Type *t_enum;
@@ -198,6 +199,7 @@ Node *new_node(Node_kind kind, char *val, bool is_expr)
     Node *node = calloc(1, sizeof(Node));
     node->kind = kind;
     node->is_expr = is_expr;
+    node->type = t_void;
     set_scope(&node->scope);
     if (val)
         strncpy(node->val, val, 63);
@@ -379,7 +381,12 @@ Node *unary_expr()
                         node->type = elem_type(s->type);
                     }
                     else
+                    {
                         node    = new_node(ND_UNARYOP, "+", true);
+                        // Mark this node so we don't double count when inserting
+                        // scaling for pointer arithmetic
+                        node->is_array_deref = true;
+                    }
                     add         = add_child(node, new_node(ND_BINOP, "+", true));
                     add_child(add, e1);
                     Node *mul   = new_node(ND_BINOP, "*", true);
@@ -387,7 +394,7 @@ Node *unary_expr()
                     if (array_depth >= s->type->dimensions)
                         error("Too many dimensions for array type %s\n", fulltype_str(s->type));
                     int mult = s->type->elem_size;
-                    mult *= *s->type->elems_per_row[array_depth ];
+                    mult *= *s->type->elems_per_row[array_depth];
                     array_depth++;
                     char buf[64]; 
                     sprintf(buf, "%d", mult);
@@ -502,6 +509,16 @@ Node *mult_expr()
     }
     return node;
 }
+void insert_scale(Node *n, int child, int size)
+{
+    Node *sc = new_node(ND_BINOP, "*", true);
+    char buf[64]; 
+    sprintf(buf, "%d", size);
+    add_child(sc, new_node(ND_LITERAL, buf, true));
+    add_child(sc, n->children[child]);
+    n->children[child] = sc;
+}
+
 Node *add_expr()
 {
     fprintf(stderr, "%s\n", __func__);
@@ -515,15 +532,28 @@ Node *add_expr()
     }
     return node;
 }
-Node *rel_expr()
+Node *shift_expr()
 {
     fprintf(stderr, "%s\n", __func__);
     Node *node = add_expr();
-    while (token->kind == TK_LT || token->kind == TK_LE || token->kind == TK_GT || token->kind == TK_GE)
+    while (token->kind == TK_SHIFTL || token->kind == TK_SHIFTR)
     {
         Node *enode = new_node(ND_BINOP, expect(token->kind), true);
         add_child(enode, node);
         add_child(enode, add_expr());
+        node = enode;
+    }
+    return node;
+}
+Node *rel_expr()
+{
+    fprintf(stderr, "%s\n", __func__);
+    Node *node = shift_expr();
+    while (token->kind == TK_LT || token->kind == TK_LE || token->kind == TK_GT || token->kind == TK_GE)
+    {
+        Node *enode = new_node(ND_BINOP, expect(token->kind), true);
+        add_child(enode, node);
+        add_child(enode, shift_expr());
         node = enode;
     }
     return node;
@@ -642,7 +672,9 @@ bool is_typespec(Token_kind tk)
         || (tk == TK_FLOAT)
         || (tk == TK_DOUBLE)
         || (tk == TK_SIGNED)
-        || (tk == TK_UNSIGNED);
+        || (tk == TK_UNSIGNED)
+        || (tk == TK_STRUCT)
+        || (tk == TK_UNION);
 }
 bool is_typequal(Token_kind tk)
 {
@@ -812,7 +844,13 @@ Node *init_declarator()
     return node;
 }
 Node *comp_stmt(bool use_last_scope);
-Node *declaration()
+void mark_struct(Node *n)
+{
+    n->is_struct = true;
+    for(int i = 0; i < n->child_count; i++)
+        mark_struct(n->children[i]);
+}
+Node *declaration(int depth)
 {
     fprintf(stderr, "%s\n", __func__);
     // <declaration> ::=  {<declaration-specifier>}+ {<init-declarator>}* ;
@@ -825,6 +863,40 @@ Node *declaration()
         if (is_typespec(token->kind))   node->typespec |= to_typespec(token->kind);
         if (is_typequal(token->kind))   node->typequal = token->kind;
         expect(token->kind);
+    }
+    if (node->typespec & TB_STRUCT)
+    {
+        // struct-or-union-specifier ::= struct-or-union identifier "{" struct-declaration+ "}"
+        //                             | struct-or-union "{" struct-declaration+ "}"
+        //                             | struct-or-union identifier        
+        Node *n = 0;
+        if (token->kind == TK_IDENT)
+        {
+            // struct or union definition with a tag, or an incomplete type, or a declaration.
+            // Declarations using incomplete types are only valid if a pointer
+            n = add_child(node, new_node(ND_STRUCT, 0, false));
+            n->struct_depth = depth;
+            add_child(n, new_node(ND_IDENT, expect(TK_IDENT), false));
+            // n->is_struct = true;
+        }
+        if (token->kind == TK_LBRACE)
+        {
+            if (!n)
+            {
+                // Anonymous struct or union definition
+                n = add_child(node, new_node(ND_STRUCT, 0, false));
+                n->struct_depth = depth;
+            }
+            expect(TK_LBRACE);
+            do
+            {
+                Node *c = add_child(n, declaration(depth + 1));
+                mark_struct(c);
+            }
+            while (token->kind != TK_RBRACE);
+            expect(TK_RBRACE);
+        }
+
     }
     while(token->kind != TK_SEMICOLON)
     {
@@ -847,11 +919,11 @@ Node *declaration()
             }
             expect(TK_COMMA);
         }
-
     }
 
     expect(TK_SEMICOLON);
     // At this point, we can add the symbols and types to the tables
+    // We don't add struct members
     add_types_and_symbols(node, false);
     return node;
 }
@@ -906,7 +978,7 @@ Node *comp_stmt(bool use_last_scope)
         while (is_sc_spec(token->kind) || is_typespec(token->kind) || is_typequal(token->kind))
         {
             // TODO Add defined types
-            add_child(node, declaration());
+            add_child(node, declaration(0));
         }
         while (token->kind != TK_RBRACE)
             add_child(node, stmt());
@@ -1000,7 +1072,7 @@ Node *program()
     Node *node = new_node(ND_PROGRAM, 0, false);
     while(!at_eof())
     {
-        add_child(node, declaration());
+        add_child(node, declaration(0));
     }
     return node;
 }
@@ -1028,6 +1100,7 @@ char *nodestr(Node_kind k)
         case ND_IDENT:      return "IDENT       ";
         case ND_INITLIST:   return "INITLIST    ";
         case ND_LITERAL:    return "LITERAL     ";
+        case ND_STRUCT:     return "STRUCT      ";
         case ND_DECLARATION:return "DECLARATION ";
         case ND_DECLARATOR: return "DECLARATOR  ";
         case ND_DIRECT_DECL:return "DIRECT_DECL ";
@@ -1143,7 +1216,7 @@ void print_tree(Node *node, int depth)
     for(int i = 0; i < depth; i++) 
         fprintf(stderr, "  ");
     fprintf(stderr, "%s: %5s %s ch:%d sc:%s fts:%s: t:%016llx ", nodestr(node->kind), 
-        node->is_array ? "array" : node->is_func_defn ? "fdef " : node->is_function ? "func " : "     ", 
+        node->is_array ? "array" : node->is_func_defn ? "fdef " : node->is_function ? "func " : node->is_struct ? "struct " : "     ", 
         node->val, node->child_count, scope_str(node->scope), node->type ? fulltype_str(node->type) : "", (unsigned long long)node->type);
     if (node->kind == ND_DECLARATION)
     {
@@ -1169,7 +1242,7 @@ void print_tree(Node *node, int depth)
 
 Symbol *new_symbol(Type *type, char *ident, int offset)
 {
-    Symbol *n = calloc(1, sizeof(Symbol));
+    Symbol *n   = calloc(1, sizeof(Symbol));
     n->name     = ident;
     n->type     = type;
     n->offset   = offset;
@@ -1189,6 +1262,9 @@ Symbol *insert_symbol(Node *node, Type *type, char *ident, bool is_param)
     // insert the symbols backwards, while pushing them onto the stack in 
     // forwards order. Parameters can only occur at scope depth 1.
 
+    if (node->is_struct)
+        // Symbols inside structs don't appear in the symbol table 
+        return 0;
 
     Scope sc = node->scope;
     // Find scope in table, the scope structure already exists from the parse process
@@ -1232,7 +1308,7 @@ Symbol *insert_symbol(Node *node, Type *type, char *ident, bool is_param)
     // This is the enclosing scopes
     Symbol *s = 0, *ls = 0;
     int offset          = 0;
-    int param_offset    = 4; // There needs to be space for the link and base regs
+    int param_offset    = 8; // There needs to be space for the link and base regs
     int last_size = 0;
     for(s = st->symbols; s; s = s->next)
     {
@@ -1257,6 +1333,32 @@ Symbol *insert_symbol(Node *node, Type *type, char *ident, bool is_param)
     n->is_param     = is_param;
     if (!ls)
         st->symbols = n;
+    else
+        ls->next    = n;
+    return n;
+}
+Symbol *insert_tag(Node *node, char *ident)
+{
+    fprintf(stderr, "%s %s\n", __func__, ident);
+    // Find scope in table, the scope structure already exists from the parse process
+    Scope sc = node->scope;
+    Symbol_table *st = symbol_table;
+    if (sc.depth)
+    {
+        for(int d = 1; d <= sc.depth; d++)
+        {
+            int index = sc.indices[d - 1] - 1;
+            st = st->children[index];
+        }
+    }
+    // st now points to the current scope
+    Symbol *n   = new_symbol(t_void, ident, 0);
+    Symbol *s = 0, *ls = 0;
+    for(s = st->tags; s; s = s->next)
+        ls      = s;
+
+    if (!ls)
+        st->tags    = n;
     else
         ls->next    = n;
     return n;
@@ -1287,6 +1389,21 @@ void add_types_and_symbols(Node *node, bool is_param)
         {
             ts      = tstr_compact(n);
             ident   = get_decl_ident(n);
+        }
+        else if (n->kind == ND_STRUCT)
+        {
+            if (n->child_count)
+            {
+                if (n->children[0]->kind == ND_IDENT)
+                {
+                    // This is a structure tag
+                    n->symbol = insert_tag(node, n->children[0]->val);
+                }
+                else
+                {
+                    // This is an anonymous struct
+                }
+            }
         }
         if (ts)
         {
@@ -1359,10 +1476,35 @@ Symbol *find_symbol(Node *node, char *name)
         else
             break;
     }
-    if (!found)
+    if (found)
+        return s;
+    st = find_scope(node);
+    while (!found)
     {
-        error("Symbol %s not found!\n", name);
+        // May be a tag
+        fprintf(stderr, "Searching tags in scope:%s\n", scope_str(st->scope));
+        for(s = st->tags; s; s = s->next)
+        {
+            fprintf(stderr, "Ident:%s\n", s->name);
+            if (!strcmp(name, s->name))
+            {
+                found = true;
+                break;
+            }
+        }
+        if (found)
+            break;
+        // Not found in this scope, go to enclosing scope
+        fprintf(stderr, "Not found, going to enclosing scope\n");
+        if (st->parent)
+            st = st->parent;
+        else
+            break;
     }
+
+    if (!found)
+        error("Symbol %s not found!\n", name);
+    
     return s;
 }
 
@@ -1419,7 +1561,10 @@ Type *check_unary_operand(Node *n)
 
     return lhs->type;
 }
-
+bool is_unscaled_ptr(Node *n)
+{
+    return (n->type->is_pointer || n->type->is_array) && !n->is_array_deref;
+}
 void propagate_types(Node *n)
 {
     // Traverse expressions in tree, propagating types from literals and 
@@ -1428,7 +1573,7 @@ void propagate_types(Node *n)
     {
         propagate_types(n->children[i]);
     }
-    if (n->kind == ND_IDENT)
+    if (n->kind == ND_IDENT && !n->is_struct)
     {
         n->type = find_symbol(n, n->val)->type;
     }
@@ -1437,6 +1582,13 @@ void propagate_types(Node *n)
         if (n->kind == ND_BINOP)
         {
             n->type = check_operands(n);
+            
+            // See if either node is a pointer and the other an int of some sort. If so, we need to 
+            // scale the int by the size of the pointed to type
+            if (is_unscaled_ptr(n->children[0]) && istype_intlike(n->children[1]->type))
+                insert_scale(n, 1, n->children[0]->type->elem_size);
+            else if (is_unscaled_ptr(n->children[1]) && istype_intlike(n->children[0]->type))
+                insert_scale(n, 0, n->children[1]->type->elem_size);
         }
         if (n->kind == ND_UNARYOP)
         {
@@ -1466,6 +1618,12 @@ void print_symbol_table(Symbol_table *s, int depth)
             fprintf(stderr, "  ");
         fprintf(stderr, "%-10s %s 0x%02x %s\n", sm->name, 
             sm->is_param ? "param" : "local", sm->offset, fulltype_str(sm->type));
+    }
+    for(sm = s->tags; sm; sm = sm->next)
+    {
+        for(int i = 0; i < depth; i++) 
+            fprintf(stderr, "  ");
+        fprintf(stderr, "%-10s tag\n", sm->name);
     }
     for(int i = 0; i < s->child_count; i++)
     {

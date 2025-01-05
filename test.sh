@@ -6,7 +6,7 @@ assert() {
     ./mycc "$input" > tmp.s
     actual=`./cpu3/sim.py tmp.s |tail -1`
     # echo $actual
-    final=`echo $actual|awk '{v=int("0x"substr($1,4));if (v>32767)v=v-65536;print v}'`
+    final=`echo $actual|awk '{v=int("0x"substr($1,4));if (v>2147483647)v=v-4294967296;print v}'`
 
     if [[ $final = $expected ]]; then
         echo "$input => $final"

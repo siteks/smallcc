@@ -17,3 +17,4 @@ assert 0 "int main(){return '\0';}"
 assert 16 "char main(){return 0x3210;}"
 
 assert -1 "int main(){char a=-1; return a;}"
+

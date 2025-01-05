@@ -34,6 +34,8 @@ typedef enum
     TK_GT,
     TK_LE,
     TK_LT,
+    TK_SHIFTR,
+    TK_SHIFTL,
     TK_ASSIGN,
     TK_PLUS,
     TK_MINUS,
@@ -156,6 +158,8 @@ typedef enum
     ND_TYPE_NAME,
     ND_ARRAY_DECL,
     ND_FUNC_DECL,
+    ND_STRUCT,
+    ND_UNION,
     ND_UNDEFINED,
 } Node_kind;
 
@@ -186,6 +190,8 @@ typedef enum
     TB_DOUBLE   = 0x80,
     TB_SIGNED   = 0x100,
     TB_UNSIGNED = 0x200,
+    TB_STRUCT   = 0x400,
+    TB_UNION    = 0x800,
 } Type_base;
 
 typedef struct Type Type;
@@ -267,6 +273,7 @@ struct Symbol_table
     Scope           scope;
     int             symbol_count;
     Symbol          *symbols;
+    Symbol          *tags;
     int             size;
     int             global_offset;
     int             child_count;
@@ -284,9 +291,12 @@ struct Node
     int             child_count;
     int             offset;
     int             pointer_level;
+    int             struct_depth;
     bool            is_expr;
     bool            is_func_defn;
     bool            is_function;
+    bool            is_struct;
+    bool            is_array_deref;
     Type            *return_type;
     bool            is_array;
     int             array_size;
@@ -346,7 +356,7 @@ char *type_token_str(Token_kind tk);
 bool is_type_name(Token_kind tk);
 Node *declarator();
 Node *init_declarator();
-Node *declaration();
+Node *declaration(int depth);
 
 bool is_sc_spec(Token_kind tk);
 bool is_typespec(Token_kind tk);
@@ -375,8 +385,11 @@ bool istype_ulong(Type *t);
 bool istype_ptr(Type *t);
 bool istype_array(Type *t);
 bool istype_function(Type *t);
+bool istype_intlike(Type *t);
+
 Type_base to_typespec(Token_kind tk);
 char *typespec_str(Type_base tb);
+bool is_struct_or_union(Type_base t);
 
 
 #endif

@@ -242,6 +242,8 @@ Token *tokenise(char *p)
             if (!strncmp(p, "--", 2)) {cur = new_token(TK_DEC, cur, p, 2); p += 2; continue;}
             if (!strncmp(p, "&&", 2)) {cur = new_token(TK_LOGAND, cur, p, 2); p += 2; continue;}
             if (!strncmp(p, "||", 2)) {cur = new_token(TK_LOGOR, cur, p, 2); p += 2; continue;}
+            if (!strncmp(p, ">>", 2)) {cur = new_token(TK_SHIFTR, cur, p, 2); p += 2; continue;}
+            if (!strncmp(p, "<<", 2)) {cur = new_token(TK_SHIFTL, cur, p, 2); p += 2; continue;}
         }
         // Single character tokens
         switch (*p) 

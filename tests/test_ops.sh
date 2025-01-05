@@ -41,3 +41,8 @@ assert 3 "int main(){int a[2]; a[0]=2;a[1]=3;return a[1];}"
 
 # Parens
 assert 9 "int main(){return (1+2)*3;}"
+
+# Shifts
+assert 2 "int main(){return 1<<1;}"
+assert 16 "int main(){return 1<<4;}"
+assert 523 "int main(){return 0x105a>>3;}"

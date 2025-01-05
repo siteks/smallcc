@@ -166,14 +166,16 @@ void gen_j(int label)
 {
     printf("    j       _l%d\n", label);
 }
-void gen_pushi(int val)
-{
-    printf("    immw    0x%04x\n", val);
-    printf("    push\n");
-}
 void gen_imm(int val)
 {
     printf("    immw    0x%04x\n", val);
+    if (val & 0xffff0000)
+        printf("    immwh   0x%04x\n", val>>16);
+}
+void gen_pushi(int val)
+{
+    gen_imm(val);
+    printf("    push\n");
 }
 void gen_push()
 {
@@ -182,6 +184,14 @@ void gen_push()
 void gen_pop()
 {
     printf("    pop\n");
+}
+void gen_pushw()
+{
+    printf("    pushw\n");
+}
+void gen_popw()
+{
+    printf("    popw\n");
 }
 void gen_jl(char *label)
 {
@@ -232,6 +242,14 @@ void gen_ge()
 {
     printf("    ge\n");
 }
+void gen_shiftl()
+{
+    printf("    shl\n");
+}
+void gen_shiftr()
+{
+    printf("    shr\n");
+}
 void gen_logor()
 {
     int l1 = new_label();
@@ -267,9 +285,17 @@ void gen_bitxor()
 {
     printf("    xor\n");
 }
+void gen_lb()
+{
+    printf("    lb\n");
+}
 void gen_lw()
 {
     printf("    lw\n");
+}
+void gen_ll()
+{
+    printf("    ll\n");
 }
 void gen_sb()
 {
@@ -278,6 +304,30 @@ void gen_sb()
 void gen_sw()
 {
     printf("    sw\n");
+}
+void gen_sl()
+{
+    printf("    sl\n");
+}
+void gen_st(int s)
+{
+    if (s == 1) gen_sb();
+    if (s == 2) gen_sw();
+    if (s == 4) gen_sl();
+}
+void gen_ld(int s)
+{
+    if (s == 1) gen_lb();
+    if (s == 2) gen_lw();
+    if (s == 4) gen_ll();
+}
+void gen_sxb()
+{
+    printf("    sxb\n");
+}
+void gen_sxw()
+{
+    printf("    sxw\n");
 }
 void gen_assign()
 {
@@ -326,10 +376,7 @@ void gen_fill(int offset, int size)
         gen_lea(offset + i);
         gen_push();
         gen_imm(0);
-        if (step == 1)
-            gen_sb();
-        else 
-            gen_sw();
+        gen_st(step);
     }
 }
 
@@ -344,16 +391,16 @@ void gen_callfunction(Node *node)
     // parameters on the stack.
     //
     // Call structure is thus:
-    //  2n  param n
+    //  4n  param n
     //      ..
-    //  6   param 1
-    //  4   param 0     <- sp on entry
-    //  2   link
+    //  12  param 1
+    //  8   param 0     <- sp on entry
+    //  4   link
     //  0   old bp      <- bp set to this
-    //  -2  local 0
-    //  -4  local 1
+    //  -4  local 0
+    //  -8  local 1
     //  ..
-    //  -2n  local n     <- sp set to this after entry
+    //  -4n  local n     <- sp set to this after entry
     //
     // Parameters are push onto the stack. On entry, the lr, holding the
     // return address is saved, and the old bp is saved. The sp is then adjusted
@@ -371,11 +418,15 @@ void gen_callfunction(Node *node)
     for(int i = node->child_count - 1; i >= 0; i--)
     {
         gen_expr(node->children[i]);
-        gen_push();
-        param_size += 2;
+        int s = node->children[i]->type->size;
+        if (s == 2)
+            gen_pushw();
+        else
+            gen_push();
+        param_size += s;
     }
     gen_jl(node->symbol->name);
-    // For the function postamble, we need to adjust the stack by the size of he
+    // For the function postamble, we need to adjust the stack by the size of the
     // push parameters
     gen_adj(param_size);
 
@@ -411,10 +462,8 @@ void gen_cast(Type *src, Type *dst)
     //      f                                           .   .
     //      d                                           .   . 
 
-    // src is in reg if 1 or 2 bytes, otherwise on stack as:
-    //  high word   0 
-    //  low word    -2
-    // dst is in reg is 1 or 2 bytes, otherwise on stack
+    // src is in reg
+    // dst is in reg
 
 
     // Value in reg is in src type, needs to be converted to dst type
@@ -423,8 +472,6 @@ void gen_cast(Type *src, Type *dst)
     if (src->size == 1 && dst->size == 1)
         return;
     if (src->size == 2 && dst->size == 2)
-        // Do nothing with ints uints shorts ptrs enums
-        // char to 2 byte, do nothing
         return;
     if (istype_uchar(src) && dst->size == 2)
         // Zero extend, assume already zero in top 8 bits
@@ -434,20 +481,18 @@ void gen_cast(Type *src, Type *dst)
         return;
     if ((istype_long(src) || istype_ulong(src)) && dst->size == 2)
     {
-        // Truncate. The high word is first on the stack, highest address (little endian)
-        gen_pop();  // get low word
-        gen_adj(2); // adj over high word
-        // gen_push(); // put low word back
+        // Truncate
+        gen_push();
+        gen_imm(0xffff);
+        gen_bitand();
         return;
     }
     if ((istype_long(src) || istype_ulong(src)) && dst->size == 1)
     {
-        // Truncate and mask top 8 bits. 
-        // The high word is first on the stack, highest address (little endian)
+        // Truncate
+        gen_push();
         gen_imm(0xff);
         gen_bitand();
-        gen_adj(2); // adj over high word
-        // gen_push();
         return;
     }
     if (src->size == 2 && dst->size == 1)
@@ -457,74 +502,32 @@ void gen_cast(Type *src, Type *dst)
         gen_push();
         gen_imm(0xff);
         gen_bitand();
-        // gen_push();
         return;
     }
     if (istype_char(src) && dst->size == 2)
     {
         // Sign extend
-        gen_push();
-        gen_push();
-        gen_imm(0x80);
-        gen_bitand();
-        int i = new_label();
-        int j = new_label();
-        gen_jz(i);
-        gen_imm(0xff00);
-        gen_bitor();
-        gen_j(j);
-        // gen_push();
-        gen_label(i);
-        gen_pop();
-        gen_label(j);
+        gen_sxb();
         return;
     }
     if (istype_char(src) && (istype_long(dst) || istype_ulong(dst)))
     {
-        // Sign extend
-        gen_adj(-2);
-        gen_push();
-        gen_push();
-        gen_imm(0x80);
-        gen_bitand();
-        int i = new_label();
-        gen_jz(i);
-        gen_imm(0xff00);
-        gen_push();
-        gen_imm(0xffff);
-        gen_label(i);
-        gen_adj(-4);
-        gen_push();
-        gen_adj(4);
+        gen_sxb();
         return;
     }
     if ((istype_short(src) || istype_int(src)) && (istype_long(dst) || istype_ulong(dst)))
     {
-        // Sign extend
-        gen_adj(-2);
-        gen_push();
-        gen_push();
-        gen_imm(0x8000);
-        gen_bitand();
-        int i = new_label();
-        gen_jz(i);
-        gen_imm(0xffff);
-        gen_label(i);
-        gen_adj(-4);
-        gen_push();
-        gen_adj(4);
+        gen_sxw();
         return;
     }
     if ((istype_uchar(src) || istype_uint(src) || istype_enum(src) || istype_ptr(src)) 
         && (istype_long(dst) || istype_ulong(dst)))
     {
         // Zero extend
-        gen_adj(-2);
         gen_push();
-        gen_imm(0);
-        gen_adj(2);
-        gen_push();
-        gen_adj(2);
+        gen_imm(0xffff);
+        gen_bitand();
+        return;
     }
 }
 void gen_expr(Node *node)
@@ -544,6 +547,8 @@ void gen_expr(Node *node)
         if (!strcmp(node->val, ">"))    {gen_gt(); return;}
         if (!strcmp(node->val, ">="))   {gen_ge(); return;}
         if (!strcmp(node->val, "=="))   {gen_eq(); return;}
+        if (!strcmp(node->val, ">>"))   {gen_shiftr(); return;}
+        if (!strcmp(node->val, "<<"))   {gen_shiftl(); return;}
         if (!strcmp(node->val, "||"))   {gen_logor(); return;}
         if (!strcmp(node->val, "&&"))   {gen_logand(); return;}
         if (!strcmp(node->val, "|"))    {gen_bitor(); return;}
@@ -567,7 +572,7 @@ void gen_expr(Node *node)
             gen_varaddr(node);
             // Don't fetch from address if pointer or array
             if (!istype_array(node->symbol->type) && !istype_ptr(node->symbol->type))
-                gen_lw();
+                gen_ld(node->symbol->type->size);
         }
     }
     else if (node->kind == ND_UNARYOP)
@@ -586,7 +591,8 @@ void gen_expr(Node *node)
         else if (!strcmp(node->val, "*"))
         {
             gen_expr(node->children[0]);
-            gen_lw();
+            // TODO!! size
+            gen_ld(node->type->elem_size);
         }
     }
     else if (node->kind == ND_ASSIGN)
@@ -594,7 +600,12 @@ void gen_expr(Node *node)
         gen_addr(node->children[0]);
         gen_push();
         gen_expr(node->children[1]);
-        gen_sw();
+        switch(node->children[0]->type->size)
+        {
+            case 1:     gen_sb(); break;
+            case 2:     gen_sw(); break;
+            default:    gen_sl(); break;
+        }
     }
     else if (node->kind == ND_CAST)
     {
@@ -678,7 +689,7 @@ void gen_inits(Node *n, Symbol *s, int vaddr, int offset, int depth)
             gen_lea(vaddr + ptr);
             gen_push();
             gen_expr(n->children[i]);
-            gen_sw();
+            gen_st(s->type->elem_size);
             ptr += s->type->elem_size;
         }
         else
@@ -836,7 +847,7 @@ void gen_decl(Node *node)
                     gen_varaddr_from_ident(n, n->symbol->name);
                     gen_push();
                     gen_expr(n->children[1]);
-                    gen_sw();
+                    gen_st(n->symbol->type->size);
                 }
             }
         }
