@@ -213,6 +213,10 @@ struct Type
     int             elements;
     int             elem_size;
     char            *name;      // for struct, union, typedef
+    char            *tag;      // for struct, union, typedef
+    int             num_members;
+    int             offset;
+    Type            **members;
     Type            *next;
 };
 
@@ -257,6 +261,8 @@ struct Scope
     int     *indices;
 };
 
+// Symbols represent declared variables, tags represent structs, unions
+// symbols within tags represent member names.
 typedef struct Symbol Symbol;
 struct Symbol
 {
@@ -366,6 +372,7 @@ void propagate_types(Node *n);
 char *tstr_compact(Node *node);
 Node *new_node(Node_kind kind, char *val, bool is_expr);
 Symbol *find_symbol(Node *node, char *name);
+Symbol *find_tag(Node *node, char *name);
 Symbol_table *find_scope(Node *node);
 Type *find_type(char *name);
 void make_basic_types();
@@ -390,6 +397,7 @@ bool istype_intlike(Type *t);
 Type_base to_typespec(Token_kind tk);
 char *typespec_str(Type_base tb);
 bool is_struct_or_union(Type_base t);
+Type *insert_struct_type(Type *t);
 
 
 #endif

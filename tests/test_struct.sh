@@ -1,4 +1,4 @@
 
 
 
-assert 1 "struct a {int a; int b;} b; int main(){b.a = 1; b.b = 2; return b.a;}"
+assert 1 "struct a {int b; int c;} d; int main(){d.b = 1; d.c = 2; return d.b;}"

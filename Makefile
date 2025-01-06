@@ -2,7 +2,7 @@
 CFLAGS=-std=c11 -g
 
 mycc: mycc.c tokeniser.c parser.c types.c codegen.c
-test_all: mycc test_init test_ops test_logops test_func test_longs test_array
+test_all: mycc test_init test_ops test_logops test_func test_longs test_array test_struct
 
 test_init: mycc
 	(source ./test.sh && source tests/test_init.sh)

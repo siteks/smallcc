@@ -36,6 +36,7 @@ int main(int argc, char **argv)
     
     make_basic_types();
     Node *node = program();
+    print_tree(node, 0);
     propagate_types(node);
     // get_types_and_symbols(node);
     print_tree(node, 0);
