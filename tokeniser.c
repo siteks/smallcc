@@ -9,8 +9,8 @@
 #include "mycc.h"
 
 
-extern Token *token;
-extern char *user_input;
+Token *token;
+char *user_input;
 
 struct Keyword keywords[] = 
 {
@@ -92,6 +92,7 @@ char *token_str(Token_kind tk)
         tk == TK_INC        ? "INC      " :
         tk == TK_DEC        ? "DEC      " :
         tk == TK_DOT        ? "DOT      " :
+        tk == TK_ARROW      ? "ARROW    " :
         tk == TK_ASSIGN     ? "ASSIGN   " :
         tk == TK_PLUS       ? "PLUS     " :
         tk == TK_MINUS      ? "MINUS    " :
@@ -161,11 +162,22 @@ char *type_token_str(Token_kind tk)
                               "";
 }
 
+static Token *last_token = 0;
+void unget_token()
+{
+    // Go back to the last token
+    if (last_token)
+        token = last_token;
+    else
+        error("No last token to go back to!\n");
+}
 char *expect(Token_kind tk)
 {
+    fprintf(stderr, "%s %s\n", __func__, token->val);
     if (token->kind == tk)
     {
         char *val   = token->val;
+        last_token  = token;
         token       = token->next;
         return val;
     }
@@ -244,6 +256,7 @@ Token *tokenise(char *p)
             if (!strncmp(p, "||", 2)) {cur = new_token(TK_LOGOR, cur, p, 2); p += 2; continue;}
             if (!strncmp(p, ">>", 2)) {cur = new_token(TK_SHIFTR, cur, p, 2); p += 2; continue;}
             if (!strncmp(p, "<<", 2)) {cur = new_token(TK_SHIFTL, cur, p, 2); p += 2; continue;}
+            if (!strncmp(p, "->", 2)) {cur = new_token(TK_ARROW, cur, p, 2); p += 2; continue;}
         }
         // Single character tokens
         switch (*p) 

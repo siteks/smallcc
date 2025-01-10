@@ -48,6 +48,7 @@ typedef enum
     TK_INC,
     TK_DEC,
     TK_DOT,
+    TK_ARROW,
     TK_LOGAND,
     TK_LOGOR,
     TK_BITOR,
@@ -160,6 +161,7 @@ typedef enum
     ND_FUNC_DECL,
     ND_STRUCT,
     ND_UNION,
+    ND_MEMBER,
     ND_UNDEFINED,
 } Node_kind;
 
@@ -180,6 +182,7 @@ typedef enum
 
 typedef enum
 {
+    TB_DERIVED  = 0,
     TB_VOID     = 0x1,
     TB_CHAR     = 0x2,
     TB_SHORT    = 0x4,
@@ -194,6 +197,9 @@ typedef enum
     TB_UNION    = 0x800,
 } Type_base;
 
+
+// Base types have no derived string. All derived types point to a base type
+// and have no type themselves
 typedef struct Type Type;
 struct Type
 {
@@ -212,13 +218,20 @@ struct Type
     int             **elems_per_row;
     int             elements;
     int             elem_size;
-    char            *name;      // for struct, union, typedef
+    char            *fieldname;      // for struct, union, typedef
     char            *tag;      // for struct, union, typedef
+    Type            *basetype;     // base type
     int             num_members;
     int             offset;
+    int             align;  // alignment of struct = size of largest element
     Type            **members;
     Type            *next;
 };
+typedef enum
+{
+    ST_COMPSTMT,
+    ST_STRUCT,
+} Scope_type;
 
 typedef struct Scope Scope;
 struct Scope
@@ -257,8 +270,9 @@ struct Scope
     //  {5              1       4
     //  }
     //
-    int     depth;
-    int     *indices;
+    int         depth;
+    int         *indices;
+    Scope_type  scope_type;
 };
 
 // Symbols represent declared variables, tags represent structs, unions
@@ -277,9 +291,10 @@ struct Symbol_table
 {
     // 
     Scope           scope;
-    int             symbol_count;
     Symbol          *symbols;
     Symbol          *tags;
+    Symbol          *enums;
+    Type            *types;
     int             size;
     int             global_offset;
     int             child_count;
@@ -308,6 +323,7 @@ struct Node
     int             array_size;
     bool            size_mult;
     Node            *array_ident;
+    char            *typetag;
     Type_base       typespec;
     Token_kind      sclass;
     Token_kind      typequal;
@@ -368,7 +384,7 @@ bool is_sc_spec(Token_kind tk);
 bool is_typespec(Token_kind tk);
 bool is_typequal(Token_kind tk);
 Type *insert_type(Node *node, char *ts);
-void propagate_types(Node *n);
+void propagate_types(Node *p, Node *n);
 char *tstr_compact(Node *node);
 Node *new_node(Node_kind kind, char *val, bool is_expr);
 Symbol *find_symbol(Node *node, char *name);
@@ -377,6 +393,9 @@ Symbol_table *find_scope(Node *node);
 Type *find_type(char *name);
 void make_basic_types();
 Type *elem_type(Type *t);
+void set_scope(Scope *sc);
+char *scope_str(Scope sc);
+
 
 bool istype_float(Type *t);
 bool istype_double(Type *t);
@@ -398,6 +417,22 @@ Type_base to_typespec(Token_kind tk);
 char *typespec_str(Type_base tb);
 bool is_struct_or_union(Type_base t);
 Type *insert_struct_type(Type *t);
+int align(int val, int size);
+void unget_token();
+Symbol_table *enter_new_scope(bool use_last_scope);
+void leave_scope();
+char *get_decl_ident(Node *node);
+Symbol *insert_tag(Node *node, char *ident);
+
+Symbol *new_symbol(Type *type, char *ident, int offset);
+Symbol *insert_symbol(Node *node, Type *type, char *ident, bool is_param);
+
+void dcl(Node *node);
+void dirdcl(Node *node);
+void d(Node *node);
+void dd(Node *node);
+char *curr_scope_str();
+
 
 
 #endif

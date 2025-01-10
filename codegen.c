@@ -431,6 +431,13 @@ void gen_callfunction(Node *node)
     gen_adj(param_size);
 
 }
+void gen_offset(Node *node)
+{
+    printf(";%s %s %s\n", __func__, nodestr(node->kind), node->val);
+    // lhs is structure, rhs is member within
+    
+
+}
 void gen_addr(Node *node)
 {
     printf(";%s %s %s\n", __func__, nodestr(node->kind), node->val);
@@ -441,6 +448,12 @@ void gen_addr(Node *node)
     else if (node->kind == ND_UNARYOP && !strcmp(node->val, "*"))
     {
         gen_expr(node->children[0]);
+    }
+    else if (node->kind == ND_MEMBER)
+    {
+        gen_addr(node->children[0]);
+        gen_offset(node);
+        gen_add();
     }
     else
         error("Expecting lvalue\n");

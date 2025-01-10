@@ -21,7 +21,14 @@ Type    *t_float;
 Type    *t_double;
 
 
+static int scope_depth;
+static int scope_indices[100];
 
+
+
+Symbol_table    *symbol_table;
+Symbol_table    *last_symbol_table;
+Symbol_table    *curr_scope_st;
 
 
 char *get_typename(Node *node)
@@ -39,16 +46,23 @@ Type *new_type(Node *node, Node *child)
     if (ty->typespec == TK_STRUCT || ty->typespec == TK_UNION 
     || ty->typespec == TK_ENUM || ty->typespec == TK_TYPEDEF)
     {
-        ty->name    = get_typename(node);
+        ty->tag    = get_typename(node);
     }
     return ty;
 }
-bool is_named_type(Token_kind tk)
+bool is_named_type(Type_base tb)
 {
-    return      tk == TK_STRUCT 
-            ||  tk == TK_UNION 
-            ||  tk == TK_ENUM 
-            ||  tk == TK_TYPEDEF;
+    return      (tb & TB_STRUCT)
+            ||  (tb & TB_UNION)
+            // ||  (tb & TK_ENUM);
+            // ||  tk == TK_TYPEDEF;
+            ;
+}
+int align(int val, int size)
+{
+    if (size == 2) return (val & 1) ? (val & ~1) + 2 : val;
+    if (size == 4) return (val & 3) ? (val & ~3) + 4 : val;
+    return val;
 }
 void calc_tsize(Type *t)
 {
@@ -87,11 +101,12 @@ void calc_tsize(Type *t)
         case TB_UNSIGNED:           s = 2; break;
         default:                    s = 2; break;
     }
-    if (!t->derived[0])
+    if (!t->derived || !t->derived[0])
     {
         // Base type
         t->size         = s;
         t->elem_size    = t->size;
+        t->align        = s;
     }
     else if (t->derived[0] == '*')
     {
@@ -99,6 +114,7 @@ void calc_tsize(Type *t)
         t->is_pointer   = true;
         t->size         = 2;
         t->elem_size    = t->size;
+        t->align        = 2;
     }
     else if (t->derived[0] == '(')
     {
@@ -106,6 +122,7 @@ void calc_tsize(Type *t)
         t->is_function  = true;
         t->size         = 2;
         t->elem_size    = t->size;
+        t->align        = 2;
     }
     else if (t->derived[0] == '[')
     {
@@ -137,10 +154,11 @@ void calc_tsize(Type *t)
             p++;
         }
         if (p && *p == '*')
-            t->elem_size = 4;
+            t->elem_size = 2;
         else
             t->elem_size = s;
-        t->size = t->elements * t->elem_size;
+        t->size     = t->elements * t->elem_size;
+        t->align    = t->elem_size;
         int num_elems = 1;
         for(int i = t->dimensions - 1; i >= 0; i--)
         {
@@ -152,44 +170,114 @@ void calc_tsize(Type *t)
 Type *insert_type(Node *node, char *ts)
 {
     // Search type table, return location if found, otherwise insert
-    fprintf(stderr, "%s ts:%s:\n", __func__, ts);
+    fprintf(stderr, "%s ts:%s: typetag:%s\n", __func__, ts, node->typetag);
     Type *last = 0;
-    for(Type *t = types; t; t = t->next)
+    bool found = false;
+    for(Type *p = types; p; p = p->next)
     {
-        last = t;
-        if (    node->typespec == t->typespec
-            &&  node->typequal == t->typequal
-            &&  node->sclass == t->sclass
-            &&  !strcmp(ts, t->derived))
+        last = p;
+
+        // First check if there is a base type appropriate, if not, insert it
+        if (    node->typespec == p->typespec
+            &&  node->typequal == p->typequal
+            &&  node->sclass == p->sclass
+            &&  (!is_named_type(p->typespec) 
+                || (node->typetag && p->tag && !strcmp(node->typetag, p->tag))))
         {
-            // Check if named type is the same
-            // if (is_named_type(t->typespec))
-            // {
-            //     // TODO
-            // }
-            // if we're here, we have found a matching type, so return
-            fprintf(stderr, "%sFound type\n", __func__);
-            return t;
+            found = true;
+            break;
         }
     }
-    // Didn't find type in table, create a new one
-    Type *t     = calloc(1, sizeof(Type));
-    t->typespec = node->typespec;
-    t->typequal = node->typequal;
-    t->sclass   = node->sclass;
-    t->derived  = calloc(1, strlen(ts) + 1);
-    strcpy(t->derived, ts);
-    // Work out the dimensions and sizes
-    calc_tsize(t);
-    fprintf(stderr, "%s ts:%s: fts:%s:\n", __func__, ts, fulltype_str(t));
-    if (last)
-        last->next  = t;
+    Type *t = 0;
+    if (!found)
+    {
+        // Insert the base type at the end
+        t           = calloc(1, sizeof(Type));
+        t->typespec = node->typespec;
+        t->typequal = node->typequal;
+        t->sclass   = node->sclass;
+        if (node->typetag)
+            t->tag      = strdup(node->typetag);
+        if (last)
+            last->next  = t;
+        else
+            types = t;
+        calc_tsize(t);
+    }
     else
-        types = t;
-    return t;
+    {
+        t = last;
+    }
+    if (!ts || !strcmp(ts, ""))
+    {
+        // derived string is empty, the type is a base type so just return now
+        fprintf(stderr, "%s base type %s %016llx already exists %s\n", __func__, fulltype_str(t), (unsigned long long)t, t->tag);
+        return t;
+    }
+    // If we get here, this is a derived type of the base type now in t. Search for it in the types
+    for(Type *p = types; p; p = p->next)
+    {
+        last = p;
+        if (p->derived && !strcmp(p->derived, ts) && p->basetype == t)
+        {
+            fprintf(stderr, "%s derived type %s %016llx already exists %s\n", __func__, fulltype_str(t), (unsigned long long)t, t->tag);
+            return p;
+        }
+    }
+    Type *dt        = calloc(1, sizeof(Type));
+    dt->basetype    = t;
+    dt->derived     = strdup(ts);
+    last->next      = dt;
+    calc_tsize(dt);
+    fprintf(stderr, "%s ts:%s: fts:%s: %016llx\n", __func__, ts, fulltype_str(t), (unsigned long long)t);
+    return dt;
+
+
+
+
+
+
+
+    //     if (    node->typespec == t->typespec
+    //         &&  node->typequal == t->typequal
+    //         &&  node->sclass == t->sclass
+    //         &&  !strcmp(ts, t->derived)
+    //         &&  !is_named_type(t->typespec)
+    //         )
+    //     {
+    //         // if (!is_named_type(t->typespec) || (is_named_type(t->typespec) && t->basectype == node->type))
+    //         // if we're here, we have found a matching type, so return
+    //         fprintf(stderr, "%s found type %s %016llx already existing\n", __func__, fulltype_str(t), (unsigned long long)t);
+    //         return t;
+    //     }
+    //     if (is_named_type(t->typespec) && node->typetag && t->tag && !strcmp(node->typetag, t->tag))
+    //     {
+    //         // Check if named type is the same
+    //         fprintf(stderr, "%s found type %s %016llx already existing, same named type %s\n", __func__, fulltype_str(t), (unsigned long long)t, t->tag);
+    //         return t;
+    //     }
+    // }
+    // // Didn't find type in table, create a new one
+    // Type *t     = calloc(1, sizeof(Type));
+    // t->typespec = node->typespec;
+    // t->typequal = node->typequal;
+    // t->sclass   = node->sclass;
+    // if (node->typetag)
+    //     t->tag      = strdup(node->typetag);
+    // t->derived  = calloc(1, strlen(ts) + 1);
+    // strcpy(t->derived, ts);
+    // // Work out the dimensions and sizes
+    // calc_tsize(t);
+    // fprintf(stderr, "%s ts:%s: fts:%s: %016llx\n", __func__, ts, fulltype_str(t), (unsigned long long)t);
+    // if (last)
+    //     last->next  = t;
+    // else
+    //     types = t;
+    // return t;
 }
 
 static int offset;
+static int max_align;
 int calc_struct_tsize(Type *t)
 {
     fprintf(stderr, "%s\n", __func__);
@@ -201,6 +289,9 @@ int calc_struct_tsize(Type *t)
         else
         {
             calc_tsize(m);
+            if (m->align > max_align)
+                max_align = m->align;
+            offset      = align(offset, m->size);
             m->offset   = offset;
             offset      += m->size;
         }
@@ -219,9 +310,11 @@ Type *insert_struct_type(Type *t)
         types = t;
     // We need to fill in the sizes and calculate the member offsets
 
-    offset = 0;
-    int size = calc_struct_tsize(t);
-    t->size = size;
+    offset      = 0;
+    max_align   = 0;
+    int size    = calc_struct_tsize(t);
+    t->size     = size;
+    t->align    = max_align;
     return t;
 }
 
@@ -242,6 +335,7 @@ Type *elem_type(Type *t)
 
     Node *n = new_node(ND_CAST, 0, 0);
     n->typespec = t->typespec;
+    n->typetag  = t->tag;
     if (t->derived[0] == '*')
         return insert_type(n, t->derived + 1);
     
@@ -259,7 +353,6 @@ Type *find_type(char *name)
     // TODO find a typedef by name
     return 0;
 }
-
 bool istype_float(Type *t)  { return t == t_float; }
 bool istype_double(Type *t) { return t == t_double; }
 bool istype_char(Type *t)   { return t == t_char; }
@@ -281,9 +374,9 @@ bool istype_intlike(Type *t)
 bool istype_ptr(Type *t)        { return t->is_pointer;}
 bool istype_array(Type *t)      { return t->is_array;}
 bool istype_function(Type *t)   { return t->is_function;}
-
 void make_basic_types()
 {
+    fprintf(stderr, "%s\n", __func__);
     Node *n = new_node(ND_CAST, 0, 0);
     n->typespec = TB_VOID;              t_void      = insert_type(n, "");
     n->typespec = TB_CHAR;              t_char      = insert_type(n, "");
@@ -298,8 +391,6 @@ void make_basic_types()
     n->typespec = TB_FLOAT;             t_float     = insert_type(n, "");
     n->typespec = TB_DOUBLE;            t_double    = insert_type(n, "");
 }
-
-
 Type_base to_typespec(Token_kind tk)
 {
     switch(tk)
@@ -319,12 +410,10 @@ Type_base to_typespec(Token_kind tk)
         default:            return 0;
     }
 }
-
 bool is_struct_or_union(Type_base t)
 {
     return (t & TB_STRUCT) || (t & TB_UNION);
 }
-
 char *typebase_str(Type_base tb)
 {
     return 
@@ -342,7 +431,6 @@ char *typebase_str(Type_base tb)
         tb == TB_UNION      ? "union " :
                               "";
 }
-
 static char ts[1024];
 char *typespec_str(Type_base tb)
 {
@@ -355,5 +443,476 @@ char *typespec_str(Type_base tb)
     }
     return ts;
 }
+Type *add_member(Type *parent, Type *child)
+{
+    fprintf(stderr, "%s :%s: :%s:\n", __func__, fulltype_str(parent), fulltype_str(child));
+    parent->num_members++;
+    parent->members = (Type **)realloc(parent->members, parent->num_members * sizeof(Type *));
+    parent->members[parent->num_members - 1] = child;
+    return child;
+}
+Type *generate_struct_type(Node *n, int depth)
+{
+    fprintf(stderr, "%s\n", __func__);
 
 
+    if (!(n->kind == ND_DECLARATION && n->child_count >= 1 && n->children[0]->kind == ND_STRUCT))
+        error("Should be struct declaration!\n");
+
+
+    Type *top = calloc(1, sizeof(Type));
+
+    top->typespec   = TB_STRUCT;
+    top->typequal   = n->typequal;
+    top->derived    = strdup("");
+    top->sclass     = n->sclass;
+    top->tag        = n->children[0]->children[0]->val;
+    n = n->children[0];
+
+
+    char *tagname = n->children[0]->val;
+    Symbol *tag = find_tag(n, tagname);
+    if (!tag)
+        error("Tag %s not found\n", tagname);
+    else if (tag->type == t_void)
+    {
+        // There is an incomplete tag
+        fprintf(stderr, "%s this tag is incomplete, defining\n", __func__);
+        for(int i = 1; i < n->child_count; i++)
+        {
+            // Declaration
+            Node *d = n->children[i];
+            if (d->kind != ND_DECLARATION)
+                error("Should be struct member declaration!\n");
+            // There may be many declarators, each is a struct field, 
+            // or there may be another struct
+            for (int j = 0; j < d->child_count; j++)
+            {
+                Node *m = d->children[j];
+                Type *t;
+                if (m->kind == ND_STRUCT)
+                {
+                    // Recurse into struct
+                    t = generate_struct_type(d, depth + 1);
+                    // t->tag = tagname;
+                }
+                else
+                {
+                    // Construct the type of the member
+                    t           = calloc(1, sizeof(Type));
+                    t->typespec = d->typespec;
+                    t->typequal = d->typequal;
+                    t->sclass   = d->sclass;
+                    t->derived  = strdup(tstr_compact(m));
+                    t->fieldname= get_decl_ident(m);
+                }
+                add_member(top, t);
+            }
+        }
+    }
+    else
+        error("Redefinition of tag %s\n", tagname);
+
+    return top;
+}
+void add_types_and_symbols(Node *node, bool is_param)
+{
+    // This is a declaration node, get all the derived types and 
+    // variables. Put variable in symbol table structured to represent scope.
+    // Put type in type table.
+    //
+    // A declaration node will have either declarators, or a struct with declarators
+    // underneath.
+
+
+    fprintf(stderr, "%s\n", __func__);
+    char *ts = 0;
+    char *ident = 0;
+    Type *t = 0;
+    for(int i = 0; i < node->child_count; i++)
+    {
+        Node *n = node->children[i];
+        if (n->kind == ND_DECLARATOR && !n->is_struct)
+        {
+            ts      = tstr_compact(n);
+            ident   = get_decl_ident(n);
+        }
+        else if (n->kind == ND_STRUCT)
+        {
+            if (n->child_count)
+            {
+                // First child is the structure tag, if anon, it will have
+                // had a tag created for it
+                n->symbol = insert_tag(node, n->children[0]->val);
+                if (!n->struct_depth)
+                {
+                    // Generate a struct type only at the top level of a struct
+                    t = generate_struct_type(node, 0);
+                    insert_struct_type(t);
+                    n->symbol->type = t;
+                    node->type      = t;
+                    node->typetag   = strdup(t->tag);
+                }
+            }
+        }
+        if (ts)
+        {
+            // Its an actual declarator
+            fprintf(stderr, "Found %s %s\n", ts, ident);
+            Type *ty = insert_type(node, ts);
+            // ty is pointer to type in type table
+            node->type = ty;
+            // See if this is a function, if so, get the return type
+            if (ts[0] == '(')
+            {
+                fprintf(stderr, "%s this is a function, setting return type\n", __func__);
+                Type *ty = insert_type(node, ts + 2);
+                node->return_type = ty;
+            }
+
+
+            if (ident)
+            {
+                n->symbol = insert_symbol(node, ty, ident, is_param);
+
+                if (!n->is_struct && node->children[0]->kind == ND_STRUCT)
+                {
+                    // get type pointer given tag
+                    char *tag = node->children[0]->children[0]->val;
+                    Symbol *s = find_tag(node, tag);
+                    fprintf(stderr, "%s setting type to tag:%s %016llx\n", __func__, tag, (unsigned long long)s->type);
+                    n->symbol->type = s->type;
+                }
+                // n->symbol->type = t;
+            }
+        }
+    }
+}
+Symbol_table *find_scope(Node *node)
+{
+
+    // Get the offset from bp of the local variable in node.
+    // Go to scope in node, then search for variable name in that scope,
+    // and successively enclosing scopes, until found.
+    Scope sc = node->scope;
+    fprintf(stderr, "%s scope is %s\n", __func__, scope_str(sc));
+    Symbol_table *st = symbol_table;
+    if (sc.depth)
+    {
+        for(int d = 1; d <= sc.depth; d++)
+        {
+            int index = sc.indices[d - 1] - 1;
+            st = st->children[index];
+        }
+    }
+    // st now pointing to symbol table at scope.
+    return st;
+}
+Symbol *find_symbol_or_tag(Node *n, char *name, bool is_tag)
+{
+    // Get the offset from bp of the local variable in node.
+    // Go to scope in node, then search for variable name in that scope,
+    // and successively enclosing scopes, until found.
+    Symbol_table *st = find_scope(n);
+    Symbol *s;
+    bool found = false;
+    while(!found)
+    { 
+        fprintf(stderr, "Searching in scope:%s\n", scope_str(st->scope));
+        for(s = is_tag ? st->tags : st->symbols; s; s = s->next)
+        {
+            fprintf(stderr, "Ident:%s\n", s->name);
+            if (!strcmp(name, s->name))
+            {
+                found = true;
+                break;
+            }
+        }
+        if (found)
+            break;
+        // Not found in this scope, go to enclosing scope
+        fprintf(stderr, "Not found, going to enclosing scope\n");
+        if (st->parent)
+            st = st->parent;
+        else
+            break;
+    }
+    if (!found)
+        error("%s %s not found!\n", is_tag ? "Tag" : "Symbol", name);
+    return s;
+}
+Symbol *find_tag(Node *node, char *name)
+{
+    fprintf(stderr, "%s %s\n", __func__, name);
+    return find_symbol_or_tag(node, name, true);
+}
+Symbol *find_symbol(Node *node, char *name)
+{
+    fprintf(stderr, "%s %s\n", __func__, name);
+    return find_symbol_or_tag(node, name, false);
+}
+Symbol_table *new_st_scope()
+{
+    // Add a new scope to the symbol table
+    curr_scope_st->child_count++;
+    curr_scope_st->children = (Symbol_table **)realloc(curr_scope_st->children, 
+                                curr_scope_st->child_count * sizeof(Symbol_table));
+    Symbol_table *nt = calloc(1, sizeof(Symbol_table));
+    curr_scope_st->children[curr_scope_st->child_count - 1] = nt;
+    Scope *sc       = calloc(1, sizeof(Scope));
+    set_scope(sc);
+    nt->scope       = *sc;
+    nt->parent      = curr_scope_st;
+    curr_scope_st   = nt;
+    return curr_scope_st;
+}
+Symbol_table *enter_new_scope(bool use_last_scope)
+{
+    if (use_last_scope)
+    {
+        scope_depth++;
+        curr_scope_st = last_symbol_table;
+        return last_symbol_table;
+    }
+    scope_indices[scope_depth++]++;
+    scope_indices[scope_depth]      = 0;
+    last_symbol_table   = new_st_scope();
+    curr_scope_st       = last_symbol_table;
+    return last_symbol_table;
+}
+void leave_scope()
+{
+    scope_depth--;
+    curr_scope_st = curr_scope_st->parent;
+}
+void set_scope(Scope *sc)
+{
+    sc->depth   = scope_depth;
+    sc->indices = calloc(scope_depth, sizeof(int));
+    memcpy(sc->indices, scope_indices, scope_depth * sizeof(int));
+}
+char *scope_str(Scope sc)
+{
+    static char buf[1024];
+    int l = 0;
+    int d = sc.depth;
+    l = sprintf(buf, "%s:%d:", sc.scope_type == ST_COMPSTMT ? "compstmt" : "struct", d);
+    for(int i = 0; i < d; i++)
+        l += sprintf(buf + l, "%d%c", sc.indices[i], i < d - 1 ? '.' : ' ');
+    return buf;
+}
+Symbol *insert_tag(Node *node, char *ident)
+{
+    fprintf(stderr, "%s %s\n", __func__, ident);
+    // Find scope in table, the scope structure already exists from the parse process
+    Scope sc = node->scope;
+    Symbol_table *st = symbol_table;
+    if (sc.depth)
+    {
+        for(int d = 1; d <= sc.depth; d++)
+        {
+            int index = sc.indices[d - 1] - 1;
+            st = st->children[index];
+        }
+    }
+    // st now points to the current scope
+    Symbol *n   = new_symbol(t_void, ident, 0);
+    Symbol *s = 0, *ls = 0;
+    for(s = st->tags; s; s = s->next)
+        ls      = s;
+
+    if (!ls)
+        st->tags    = n;
+    else
+        ls->next    = n;
+    return n;
+}
+Symbol *new_symbol(Type *type, char *ident, int offset)
+{
+    Symbol *n   = calloc(1, sizeof(Symbol));
+    n->name     = ident;
+    n->type     = type;
+    n->offset   = offset;
+    return n;
+}
+Symbol *insert_symbol(Node *node, Type *type, char *ident, bool is_param)
+{
+    fprintf(stderr, "%s %s %s\n", __func__, fulltype_str(type), ident);
+    // If we are inserting a symbol that is a parameter, we need to use a 
+    // different offset, since this has been pushed onto the stack. We need to
+    // insert the symbols backwards, while pushing them onto the stack in 
+    // forwards order. Parameters can only occur at scope depth 1.
+
+    // if (node->is_struct)
+    //     // Symbols inside structs don't appear in the symbol table 
+    //     return 0;
+
+    Scope sc = node->scope;
+    // Find scope in table, the scope structure already exists from the parse process
+    Symbol_table *st = symbol_table;
+    int go = 0; 
+    // TODO refactor this, unify repeated logic
+    if (sc.depth)
+    {
+        for(int d = 1; d <= sc.depth; d++)
+        {
+            if (d > 1)
+                // Don't include size from globals
+                go += st->size;
+            int index = sc.indices[d - 1] - 1;
+            st = st->children[index];
+        }
+    }
+    else
+    {
+        // Treat global scope differently, we are not allocating downwards in stack space
+        // but upwards in data space
+        int offset  = st->size;
+        st->size += type->size;
+        Symbol *n   = new_symbol(type, ident, offset);
+        Symbol *s = 0, *ls = 0;
+        for(s = st->symbols; s; s = s->next)
+            ls      = s;
+        if (!ls)
+            st->symbols = n;
+        else
+            ls->next = n;
+
+        return n;
+    }
+    st->global_offset = go;
+    // We are now at the correct scope, insert the symbol at the end of the list,
+    // with offset within the current scope. This is the size of the current type,
+    // added to the previous offset for local scopes. (TODO alignment)
+
+    // Global offset is offset within the function, whatever scope level we are at.
+    // This is the enclosing scopes
+    Symbol *s = 0, *ls = 0;
+    int offset          = 0;
+    int param_offset    = 8; // There needs to be space for the link and base regs
+    int last_size = 0;
+    for(s = st->symbols; s; s = s->next)
+    {
+        if (s->is_param)
+        {
+            param_offset = s->offset;
+            last_size = s->type->size;
+        }
+        else
+            offset  = s->offset;
+        ls      = s;
+    }
+    // ls now points to last symbol in list
+    // Move offset to make space for this type
+    offset          += type->size;
+    param_offset    += last_size;
+    if (!is_param)
+        // Size is used for allocating space on stack for this
+        // scope, we don't include parameters
+        st->size        += type->size;
+    Symbol *n       = new_symbol(type, ident, is_param ? param_offset : offset);
+    n->is_param     = is_param;
+    if (!ls)
+        st->symbols = n;
+    else
+        ls->next    = n;
+    return n;
+}
+void print_type_table_entry(int depth, Type *t)
+{
+    for(int i = 0; i < depth; i++)
+        fprintf(stderr, "  ");
+
+    fprintf(stderr, "%016llx %-40s %-10s %-10s", (unsigned long long)t, fulltype_str(t), t->tag, t->fieldname);
+    fprintf(stderr, "size:%d offset:%04x align:%d ", t->size, t->offset, t->align);
+    if (t->num_members)
+    {
+        for(int i = 0; i < t->num_members; i++)
+        {
+            fprintf(stderr, "\n");
+            print_type_table_entry(depth + 1, t->members[i]);
+        }
+    }
+    if (istype_array(t))
+    {
+        fprintf(stderr, "%d", t->elem_size);
+        for(int i = 0; i < t->dimensions; i++)
+        {
+            fprintf(stderr, "[%d]", *t->dim_sizes[i]);
+        }
+    }
+    if (!depth)
+        fprintf(stderr, "\n");
+    
+}
+void print_type_table()
+{
+    Type *t;
+    fprintf(stderr, "------ Type table ------                                  Tag        Fieldname\n");
+    for(t = types; t; t = t->next)
+    {
+        print_type_table_entry(0, t);
+    }
+}
+void print_symbol_table(Symbol_table *s, int depth)
+{
+    if (depth==0)fprintf(stderr, "------ Symbol table ------\n");
+    for(int i = 0; i < depth; i++) 
+        fprintf(stderr, "  ");
+    fprintf(stderr, "Scope:%-20s   0x%04x 0x%04x\n", scope_str(s->scope), s->size, s->global_offset);
+    Symbol *sm;
+    for(sm = s->tags; sm; sm = sm->next)
+    {
+        for(int i = 0; i < depth; i++) 
+            fprintf(stderr, "  ");
+        fprintf(stderr, "%016llx %-10s tag\n", (unsigned long long)sm->type, sm->name);
+    }
+    for(sm = s->symbols; sm; sm = sm->next)
+    {
+        for(int i = 0; i < depth; i++) 
+            fprintf(stderr, "  ");
+        fprintf(stderr, "%016llx %-10s %s 0x%02x %s\n", (unsigned long long)sm->type, sm->name, 
+            sm->is_param ? "param" : depth ? "local" : "global", sm->offset, fulltype_str(sm->type));
+    }
+    for(int i = 0; i < s->child_count; i++)
+    {
+        print_symbol_table(s->children[i], depth + 1);
+    }
+}
+
+char *typestr(Node *node)
+{
+    ts[0] = 0;
+    if (node->kind == ND_DECLARATOR)
+        dcl(node);
+    return ts;
+}
+
+static char buf[1024];
+void fts(Type *t, char *p)
+{
+    if (t->basetype)
+        p += sprintf(p, "%016llx ", (unsigned long long) t->basetype);
+    p += sprintf(p, "%s%s%s", type_token_str(t->sclass), type_token_str(t->typequal), typespec_str(t->typespec));
+    if (t->num_members)
+        for(int i = 0; i < t->num_members; i++)
+            fts(t->members[i], p);
+    if (t->derived && t->derived[0])
+        p += sprintf(p, "%s", t->derived);
+}
+char *fulltype_str(Type *t)
+{
+    char *p = buf;
+    fts(t, p);
+    return buf;
+
+}
+
+char *curr_scope_str()
+{
+
+    sprintf(buf, "%d:", scope_depth); 
+    for(int i = 0; i < scope_depth; i++)
+        sprintf(buf,"%d.", scope_indices[i]);
+    return buf;
+}

@@ -13,11 +13,10 @@ void error(char *fmt, ...)
 }
 
 
-Token           *token;
-char            *user_input;
-Local           *locals;
-Symbol_table    *symbol_table;
-Symbol_table    *curr_st_scope;
+extern Token           *token;
+extern char            *user_input;
+extern Symbol_table    *symbol_table;
+extern Symbol_table    *curr_scope_st;
 
 int main(int argc, char **argv)
 {
@@ -29,15 +28,14 @@ int main(int argc, char **argv)
     
     user_input = argv[1];
     token = tokenise(user_input);
-    locals = NULL;
     print_tokens();
     symbol_table = calloc(1, sizeof(Symbol_table));
-    curr_st_scope = symbol_table;
+    curr_scope_st = symbol_table;
     
     make_basic_types();
     Node *node = program();
-    print_tree(node, 0);
-    propagate_types(node);
+    // print_tree(node, 0);
+    propagate_types(0, node);
     // get_types_and_symbols(node);
     print_tree(node, 0);
     print_symbol_table(symbol_table, 0);
