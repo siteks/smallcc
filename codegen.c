@@ -433,10 +433,9 @@ void gen_callfunction(Node *node)
 }
 void gen_offset(Node *node)
 {
-    printf(";%s %s %s\n", __func__, nodestr(node->kind), node->val);
+    printf(";%s %s %s offset:%d\n", __func__, nodestr(node->kind), node->val, node->offset);
     // lhs is structure, rhs is member within
-    
-
+    gen_imm(node->offset);
 }
 void gen_addr(Node *node)
 {
@@ -452,6 +451,7 @@ void gen_addr(Node *node)
     else if (node->kind == ND_MEMBER)
     {
         gen_addr(node->children[0]);
+        gen_push();
         gen_offset(node);
         gen_add();
     }
@@ -626,6 +626,14 @@ void gen_expr(Node *node)
         // type of the cast
         gen_expr(node->children[1]);
         gen_cast(node->children[1]->type, node->type);
+    }
+    else if (node->kind == ND_MEMBER)
+    {
+        gen_addr(node->children[0]);
+        gen_push();
+        gen_offset(node);
+        gen_add();
+        gen_ld(node->type->elem_size);
     }
 }
 void gen_return()

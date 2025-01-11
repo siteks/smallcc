@@ -716,7 +716,7 @@ Node *param_declaration()
         error("Expecting declarator in function param list\n");
 
     // At this point, we can add the symbols and types to the tables
-    add_types_and_symbols(node, true);
+    add_types_and_symbols(node, true, 0);
     return node;
 }
 Node *param_type_list()
@@ -925,7 +925,7 @@ Node *declaration(int depth)
             // it is a func definition
             if (token->kind == TK_LBRACE)
             {
-                add_types_and_symbols(node, false);
+                add_types_and_symbols(node, false, 0);
                 current_function = node;
                 // This is the first compound statement of a 
                 // function, so we need to use the scope
@@ -942,7 +942,8 @@ Node *declaration(int depth)
     // At this point, we can add the symbols and types to the tables
     // We don't add struct members but we dd add tags
     // print_tree(node, 0);
-    add_types_and_symbols(node, false);
+
+    add_types_and_symbols(node, false, depth);
     return node;
 }
 Node *comp_stmt(bool use_last_scope)
@@ -1250,10 +1251,31 @@ void propagate_types(Node *p, Node *n)
     {
         propagate_types(n, n->children[i]);
     }
+    if (!p)
+        // We are at the top of the tree, nothing further to do
+        return;
+
     if (n->kind == ND_IDENT && !n->is_struct)
     {
-        if (p && p->kind != ND_MEMBER)
+        if (p->kind != ND_MEMBER)
             n->type = find_symbol(n, n->val)->type;
+    }
+    if (n->kind == ND_MEMBER)
+    {
+        // This is a child of a member operator
+        // lhs of member is the structure, rhs is field
+        if (n->child_count != 2)
+            error("Malformed struct reference\n");
+        Node *lhs   = n->children[0];
+        Node *rhs   = n->children[1];
+        if (lhs->kind == ND_IDENT)
+        {
+            lhs->type = find_symbol(lhs, lhs->val)->type;
+        }
+        n->offset = find_offset(lhs->type, rhs->val);
+        if (n->offset < 0)
+            error("Can't find member %s in struct\n", rhs->val);
+            
     }
     if (n->is_expr)
     {

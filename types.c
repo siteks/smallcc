@@ -185,6 +185,7 @@ Type *insert_type(Node *node, char *ts)
                 || (node->typetag && p->tag && !strcmp(node->typetag, p->tag))))
         {
             found = true;
+            fprintf(stderr, "%s found matching basetype\n", __func__);
             break;
         }
     }
@@ -203,6 +204,7 @@ Type *insert_type(Node *node, char *ts)
         else
             types = t;
         calc_tsize(t);
+        fprintf(stderr, "%s inserting basetype %s\n", __func__, fulltype_str(t));
     }
     else
     {
@@ -303,7 +305,11 @@ Type *insert_struct_type(Type *t)
     fprintf(stderr, "%s\n", __func__);
     Type *last = 0;
     for(Type *i = types; i; i = i->next)
+    {
+        if (t == i)
+            return t;
         last = i;
+    }
     if (last)
         last->next  = t;
     else
@@ -445,7 +451,7 @@ char *typespec_str(Type_base tb)
 }
 Type *add_member(Type *parent, Type *child)
 {
-    fprintf(stderr, "%s :%s: :%s:\n", __func__, fulltype_str(parent), fulltype_str(child));
+    fprintf(stderr, "%s :%s: :%s: fieldname:%s\n", __func__, fulltype_str(parent), fulltype_str(child), child->fieldname);
     parent->num_members++;
     parent->members = (Type **)realloc(parent->members, parent->num_members * sizeof(Type *));
     parent->members[parent->num_members - 1] = child;
@@ -473,7 +479,11 @@ Type *generate_struct_type(Node *n, int depth)
     char *tagname = n->children[0]->val;
     Symbol *tag = find_tag(n, tagname);
     if (!tag)
+    {
+        print_type_table();
+        print_symbol_table(symbol_table, 0);
         error("Tag %s not found\n", tagname);
+    }
     else if (tag->type == t_void)
     {
         // There is an incomplete tag
@@ -494,12 +504,16 @@ Type *generate_struct_type(Node *n, int depth)
                 {
                     // Recurse into struct
                     t = generate_struct_type(d, depth + 1);
+                    m->type = t;
                     // t->tag = tagname;
                 }
                 else
                 {
                     // Construct the type of the member
                     t           = calloc(1, sizeof(Type));
+                    if (d->children[0]->kind == ND_STRUCT)
+                        // If the field is an anonymous struct, point to it
+                        t->basetype = d->children[0]->type;
                     t->typespec = d->typespec;
                     t->typequal = d->typequal;
                     t->sclass   = d->sclass;
@@ -510,12 +524,22 @@ Type *generate_struct_type(Node *n, int depth)
             }
         }
     }
-    else
+    else if (n->children[0]->child_count > 1)
+    {
+        // If the the struct has more than just a tag ident, 
+        // it is a redefinition and illegal
+        // print_type_table();
+        // print_symbol_table(symbol_table, 0);
         error("Redefinition of tag %s\n", tagname);
-
+    }
+    else
+    {
+        fprintf(stderr, "%s declarator reference to already defined tag\n", __func__);
+        return tag->type;
+    }
     return top;
 }
-void add_types_and_symbols(Node *node, bool is_param)
+void add_types_and_symbols(Node *node, bool is_param, int depth)
 {
     // This is a declaration node, get all the derived types and 
     // variables. Put variable in symbol table structured to represent scope.
@@ -532,10 +556,12 @@ void add_types_and_symbols(Node *node, bool is_param)
     for(int i = 0; i < node->child_count; i++)
     {
         Node *n = node->children[i];
-        if (n->kind == ND_DECLARATOR && !n->is_struct)
+        // if (n->kind == ND_DECLARATOR && !n->is_struct)
+        if (n->kind == ND_DECLARATOR && !depth)
         {
             ts      = tstr_compact(n);
             ident   = get_decl_ident(n);
+            fprintf(stderr, "%s declarator and not struct\n", __func__);
         }
         else if (n->kind == ND_STRUCT)
         {
@@ -547,6 +573,7 @@ void add_types_and_symbols(Node *node, bool is_param)
                 if (!n->struct_depth)
                 {
                     // Generate a struct type only at the top level of a struct
+                    fprintf(stderr, "%s creating struct or get type of tag\n", __func__);
                     t = generate_struct_type(node, 0);
                     insert_struct_type(t);
                     n->symbol->type = t;
@@ -558,7 +585,7 @@ void add_types_and_symbols(Node *node, bool is_param)
         if (ts)
         {
             // Its an actual declarator
-            fprintf(stderr, "Found %s %s\n", ts, ident);
+            fprintf(stderr, "%s found %s %s typetag:%s\n", __func__, ts, ident, node->typetag);
             Type *ty = insert_type(node, ts);
             // ty is pointer to type in type table
             node->type = ty;
@@ -638,7 +665,11 @@ Symbol *find_symbol_or_tag(Node *n, char *name, bool is_tag)
             break;
     }
     if (!found)
+    {
+        print_type_table();
+        print_symbol_table(symbol_table, 0);
         error("%s %s not found!\n", is_tag ? "Tag" : "Symbol", name);
+    }
     return s;
 }
 Symbol *find_tag(Node *node, char *name)
@@ -716,11 +747,17 @@ Symbol *insert_tag(Node *node, char *ident)
         }
     }
     // st now points to the current scope
-    Symbol *n   = new_symbol(t_void, ident, 0);
     Symbol *s = 0, *ls = 0;
     for(s = st->tags; s; s = s->next)
+    {
         ls      = s;
-
+        if (!strcmp(s->name, ident))
+        {
+            fprintf(stderr, "%s struct tag already exists in symbol table\n",__func__);
+            return s;
+        }
+    }
+    Symbol *n   = new_symbol(t_void, ident, 0);
     if (!ls)
         st->tags    = n;
     else
@@ -818,6 +855,21 @@ Symbol *insert_symbol(Node *node, Type *type, char *ident, bool is_param)
         ls->next    = n;
     return n;
 }
+
+
+int find_offset(Type *t, char *field)
+{
+    // Type should be pointing to a struct, traverse to find
+    // the field. Only look at the current level of a nested 
+    // struct, the MEMBER parsing of the tree deals with this
+    for(int i = 0; i < t->num_members; i++)
+    {
+        Type *m = t->members[i];
+        if (!strcmp(field, m->fieldname))
+            return m->offset;
+    }
+    return -1;
+}
 void print_type_table_entry(int depth, Type *t)
 {
     for(int i = 0; i < depth; i++)
@@ -889,16 +941,17 @@ char *typestr(Node *node)
 }
 
 static char buf[1024];
-void fts(Type *t, char *p)
+char *fts(Type *t, char *p)
 {
     if (t->basetype)
         p += sprintf(p, "%016llx ", (unsigned long long) t->basetype);
     p += sprintf(p, "%s%s%s", type_token_str(t->sclass), type_token_str(t->typequal), typespec_str(t->typespec));
-    if (t->num_members)
-        for(int i = 0; i < t->num_members; i++)
-            fts(t->members[i], p);
+    // if (t->num_members)
+    //     for(int i = 0; i < t->num_members; i++)
+    //         p = fts(t->members[i], p);
     if (t->derived && t->derived[0])
         p += sprintf(p, "%s", t->derived);
+    return p;
 }
 char *fulltype_str(Type *t)
 {

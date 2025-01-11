@@ -371,7 +371,7 @@ char *nodestr(Node_kind k);
 // void get_types_and_symbols(Node *node);
 void print_symbol_table(Symbol_table *s, int depth);
 void print_type_table();
-void add_types_and_symbols(Node *node, bool is_param);
+void add_types_and_symbols(Node *node, bool is_param, int depth);
 char *fulltype_str(Type *t);
 char *token_str(Token_kind tk);
 char *type_token_str(Token_kind tk);
@@ -432,6 +432,7 @@ void dirdcl(Node *node);
 void d(Node *node);
 void dd(Node *node);
 char *curr_scope_str();
+int find_offset(Type *t, char *field);
 
 
 
