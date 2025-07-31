@@ -47,6 +47,7 @@ if __name__ == "__main__":
     argparser.add_argument('-v', '--verbose', action='store_true', help='verbose')
     args = argparser.parse_args()
 
+    # print(args.verbose)
     s = runfile(args.filename, verbose=args.verbose)
     print(s)
 

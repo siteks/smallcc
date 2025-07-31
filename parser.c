@@ -177,6 +177,22 @@ extern Symbol_table *curr_st_scope;
 extern int scope_depth;
 extern int scope_indices[];
 
+static Node *primary_expr();
+static Node *mult_expr();
+static Node *add_expr();
+static Node *assign_expr();
+static Node *expr();
+static Node *stmt();
+static Node *func_def();
+static Node *declarator();
+static Node *init_declarator();
+static Node *declaration(int depth);
+
+
+
+
+
+static Node *current_function;
 static int anon_index = 0;
 static char *new_anon_label()
 {
@@ -184,6 +200,9 @@ static char *new_anon_label()
     sprintf(a, "_l%06d", anon_index++);
     return a;
 }
+
+
+
 
 
 
@@ -200,7 +219,7 @@ Node *new_node(Node_kind kind, char *val, bool is_expr)
     return node;
 }
 
-Node *add_child(Node *parent, Node *child)
+static Node *add_child(Node *parent, Node *child)
 {
     parent->child_count++;
     parent->children = (Node **)realloc(parent->children, parent->child_count * sizeof(Node *));
@@ -208,26 +227,7 @@ Node *add_child(Node *parent, Node *child)
     return child;
 }
 
-Node *current_function;
-
-Node *primary_expr();
-Node *mult_expr();
-Node *add_expr();
-Node *assign_expr();
-Node *expr();
-Node *stmt();
-Node *func_def();
-
-typedef enum
-{
-    CS_NONE,
-    CS_U,
-    CS_L,
-    CS_UL,
-    CS_F,
-    CS_OX = 0x100,
-} Const_suffix;
-Node *primary_expr()
+static Node *primary_expr()
 {
     fprintf(stderr, "%s %s \n", __func__, token->val);
     Node *node;
@@ -291,7 +291,7 @@ Node *primary_expr()
             //  Floats, double, and long float are all 32 bits
             double f = node->fval = tk->fval;
             if (f >= -3.402823466e38 && f <= 3.402823466e38)        node->type = t_float;
-            else error("Integer constant out of range");
+            else error("Float constant out of range");
         }
         // node->type = insert_type(node, "");
 
@@ -321,7 +321,7 @@ bool is_postfix(Token_kind tk)
             ||  tk == TK_INC 
             ||  tk == TK_DEC;
 }
-Node *unary_expr()
+static Node *unary_expr()
 {
     fprintf(stderr, "%s %s\n", __func__, token->val);
     // Node *node = postfix_expr();
@@ -343,7 +343,7 @@ Node *unary_expr()
         if (node->kind == ND_IDENT)
         {
             // set the symbol
-            node->symbol = find_symbol(node, node->val);
+            node->symbol = find_symbol(node, node->val, NS_IDENT);
         }
     }
     // postfix-expr
@@ -418,7 +418,7 @@ Node *unary_expr()
                 // struct_node = n;
                 // node = n;
                 Node *n = new_node(ND_MEMBER, 0, true);
-                add_child(n, node);
+                add_child(n, pex_node);
                 add_child(n, new_node(ND_IDENT, expect(TK_IDENT), true));
                 node = n;
                 break;
@@ -468,7 +468,7 @@ Node *type_name()
     fprintf(stderr, "%s ts:%s:\n", __func__, tstr_compact(node));
     return node;
 }
-Node *cast_expr()
+static Node *cast_expr()
 {
     fprintf(stderr, "%s %s\n", __func__, token->val);
     if (token->kind != TK_LPAREN)
@@ -503,7 +503,7 @@ Node *cast_expr()
         return unary_expr();
     }
 }
-Node *mult_expr()
+static Node *mult_expr()
 {
     fprintf(stderr, "%s %s\n", __func__, token->val);
     Node *node = cast_expr();
@@ -525,7 +525,7 @@ void insert_scale(Node *n, int child, int size)
     add_child(sc, n->children[child]);
     n->children[child] = sc;
 }
-Node *add_expr()
+static Node *add_expr()
 {
     fprintf(stderr, "%s %s\n", __func__, token->val);
     Node *node = mult_expr();
@@ -538,7 +538,7 @@ Node *add_expr()
     }
     return node;
 }
-Node *shift_expr()
+static Node *shift_expr()
 {
     fprintf(stderr, "%s %s\n", __func__, token->val);
     Node *node = add_expr();
@@ -551,7 +551,7 @@ Node *shift_expr()
     }
     return node;
 }
-Node *rel_expr()
+static Node *rel_expr()
 {
     fprintf(stderr, "%s %s\n", __func__, token->val);
     Node *node = shift_expr();
@@ -564,7 +564,7 @@ Node *rel_expr()
     }
     return node;
 }
-Node *equal_expr()
+static Node *equal_expr()
 {
     fprintf(stderr, "%s %s\n", __func__, token->val);
     Node *node = rel_expr();
@@ -577,7 +577,7 @@ Node *equal_expr()
     }
     return node;
 }
-Node *bitand_expr()
+static Node *bitand_expr()
 {
     fprintf(stderr, "%s %s\n", __func__, token->val);
     Node *node = equal_expr();
@@ -590,7 +590,7 @@ Node *bitand_expr()
     }
     return node;
 }
-Node *bitxor_expr()
+static Node *bitxor_expr()
 {
     fprintf(stderr, "%s %s\n", __func__, token->val);
     Node *node = bitand_expr();
@@ -603,7 +603,7 @@ Node *bitxor_expr()
     }
     return node;
 }
-Node *bitor_expr()
+static Node *bitor_expr()
 {
     fprintf(stderr, "%s %s\n", __func__, token->val);
     Node *node = bitxor_expr();
@@ -616,7 +616,7 @@ Node *bitor_expr()
     }
     return node;
 }
-Node *logand_expr()
+static Node *logand_expr()
 {
     fprintf(stderr, "%s %s\n", __func__, token->val);
     Node *node = bitor_expr();
@@ -629,7 +629,7 @@ Node *logand_expr()
     }
     return node;
 }
-Node *logor_expr()
+static Node *logor_expr()
 {
     fprintf(stderr, "%s %s\n", __func__, token->val);
     Node *node = logand_expr();
@@ -642,7 +642,7 @@ Node *logor_expr()
     }
     return node;
 }
-Node *assign_expr()
+static Node *assign_expr()
 {
     fprintf(stderr, "%s %s\n", __func__, token->val);
     Node *node = logor_expr();
@@ -688,7 +688,7 @@ bool is_typequal(Token_kind tk)
         || (tk == TK_VOLATILE);
 }
 
-Node *param_declaration()
+static Node *param_declaration()
 {
 
     fprintf(stderr, "%s\n", __func__);
@@ -719,7 +719,7 @@ Node *param_declaration()
     add_types_and_symbols(node, true, 0);
     return node;
 }
-Node *param_type_list()
+static Node *param_type_list()
 {
     fprintf(stderr, "%s\n", __func__);
     Node *node = new_node(ND_PTYPE_LIST, 0, false);
@@ -733,12 +733,12 @@ Node *param_type_list()
     leave_scope();
     return node;
 }
-Node *constant_expr()
+static Node *constant_expr()
 {
     fprintf(stderr, "%s\n", __func__);
     return equal_expr();
 }
-Node *direct_decl()
+static Node *direct_decl()
 {
     fprintf(stderr, "%s\n", __func__);
     // <direct-declarator> ::= <identifier> <direct-decl-tail>*
@@ -784,7 +784,7 @@ Node *direct_decl()
     }
     return node;
 }
-Node *declarator()
+static Node *declarator()
 {
     fprintf(stderr, "%s\n", __func__);
     // <declarator> ::= {<pointer>}? <direct-declarator>
@@ -806,8 +806,8 @@ Node *declarator()
     add_child(node, direct_decl());
     return node;
 }
-Node *initializer();
-Node *initializer_list()
+static Node *initializer();
+static Node *initializer_list()
 {
     Node *node = new_node(ND_INITLIST, 0, false);
     add_child(node, initializer());
@@ -818,7 +818,7 @@ Node *initializer_list()
     }
     return node;
 }
-Node *initializer()
+static Node *initializer()
 {
     fprintf(stderr, "%s\n", __func__);
     // <initializer> ::= <assignment-expression>
@@ -837,7 +837,7 @@ Node *initializer()
         node = assign_expr();
     return node;
 }
-Node *init_declarator()
+static Node *init_declarator()
 {
     fprintf(stderr, "%s\n", __func__);
     Node *node;
@@ -849,15 +849,15 @@ Node *init_declarator()
     }
     return node;
 }
-Node *comp_stmt(bool use_last_scope);
-void mark_struct(Node *n)
+static Node *comp_stmt(bool use_last_scope);
+static void mark_struct(Node *n)
 {
     n->is_struct = true;
     for(int i = 0; i < n->child_count; i++)
         mark_struct(n->children[i]);
 }
 
-void struct_decl(Node *node, int depth)
+static void struct_decl(Node *node, int depth)
 {
     // struct-or-union-specifier ::= struct-or-union identifier "{" struct-declaration+ "}"
     //                             | struct-or-union "{" struct-declaration+ "}"
@@ -897,7 +897,7 @@ void struct_decl(Node *node, int depth)
     }
 }
 
-Node *declaration(int depth)
+static Node *declaration(int depth)
 {
     fprintf(stderr, "%s\n", __func__);
     // <declaration> ::=  {<declaration-specifier>}+ {<init-declarator>}* ;
@@ -940,13 +940,13 @@ Node *declaration(int depth)
 
     expect(TK_SEMICOLON);
     // At this point, we can add the symbols and types to the tables
-    // We don't add struct members but we dd add tags
+    // We don't add struct members but we do add tags
     // print_tree(node, 0);
 
     add_types_and_symbols(node, false, depth);
     return node;
 }
-Node *comp_stmt(bool use_last_scope)
+static Node *comp_stmt(bool use_last_scope)
 {
     fprintf(stderr, "%s\n", __func__);
     Node *node      = new_node(ND_COMPSTMT, 0, false);
@@ -968,7 +968,7 @@ Node *comp_stmt(bool use_last_scope)
     leave_scope();
     return node;
 }
-Node *stmt()
+static Node *stmt()
 {
     fprintf(stderr, "%s\n", __func__);
     Node *node = new_node(ND_STMT, 0, false);
@@ -1143,6 +1143,49 @@ char *tstr_compact(Node *node)
         d(node->children[0]);
     return ts;
 }
+char buf[1024];
+char *node_str(Node *node)
+{
+    buf[0] = 0;
+    char *p = buf;
+    if (!node)
+        return buf;
+    p += sprintf(p, "%s: %5s %s ch:%d sc:%s fts:%s: t:%016llx ", 
+        nodestr(node->kind), 
+        node->is_array ? "array" : 
+        node->is_func_defn ? "fdef " : 
+        node->is_function ? "func " : 
+        node->is_struct ? "struct " : "     ", 
+        node->val, 
+        node->child_count, 
+        scope_str(node->scope), 
+        node->type ? fulltype_str(node->type) : "", 
+        (unsigned long long)node->type);
+    if (node->kind == ND_DECLARATION)
+    {
+        p += sprintf(p, "sclass:%s typequal:%s typespec:%s ", 
+            type_token_str(node->sclass), 
+            type_token_str(node->typequal), 
+            typespec_str(node->typespec));
+        for(int j = 0; j < node->child_count; j++)
+            if (node->children[j]->kind == ND_DECLARATOR && node->children[j]->symbol)
+                p += sprintf(p, "%s <%s> | ", 
+                    fulltype_str(node->children[j]->symbol->type), 
+                    tstr_compact(node->children[j]));
+    }
+    if (node->kind == ND_DECLARATOR || node->kind == ND_DIRECT_DECL)
+    {
+        p += sprintf(p, "%s %d* %s ", 
+            node->val, 
+            node->pointer_level, 
+            node->is_function ? "func" : 
+            node->is_array ? "array" : "");
+        if (node->is_array) 
+            p += sprintf(p, "%d", node->array_size);
+    }
+    return buf;
+}
+
 void print_tree(Node *node, int depth)
 {
     if (depth==0)fprintf(stderr, "------ Parse tree ------\n");
@@ -1150,31 +1193,11 @@ void print_tree(Node *node, int depth)
         return;
     for(int i = 0; i < depth; i++) 
         fprintf(stderr, "  ");
-    fprintf(stderr, "%s: %5s %s ch:%d sc:%s fts:%s: t:%016llx ", nodestr(node->kind), 
-        node->is_array ? "array" : node->is_func_defn ? "fdef " : node->is_function ? "func " : node->is_struct ? "struct " : "     ", 
-        node->val, node->child_count, scope_str(node->scope), node->type ? fulltype_str(node->type) : "", (unsigned long long)node->type);
-    if (node->kind == ND_DECLARATION)
-    {
-        fprintf(stderr, "sclass:%s typequal:%s typespec:%s ", 
-            type_token_str(node->sclass), type_token_str(node->typequal), typespec_str(node->typespec));
-        for(int j = 0; j < node->child_count; j++)
-            if (node->children[j]->kind == ND_DECLARATOR && node->children[j]->symbol)
-                fprintf(stderr, "%s <%s> | ", 
-                    fulltype_str(node->children[j]->symbol->type), 
-                    tstr_compact(node->children[j]));
-    }
-    if (node->kind == ND_DECLARATOR || node->kind == ND_DIRECT_DECL)
-    {
-        fprintf(stderr, "%s %d* %s ", node->val, node->pointer_level, node->is_function ? "func" : node->is_array ? "array" : "");
-        if (node->is_array) fprintf(stderr, "%d", node->array_size);
-    }
+    fprintf(stderr, "%s", node_str(node));
     fprintf(stderr, "\n");
     for(int i = 0; i < node->child_count; i++)
         print_tree(node->children[i], depth + 1);
 }
-
-
-
 
 
 char *get_decl_ident(Node *node)
@@ -1247,35 +1270,46 @@ void propagate_types(Node *p, Node *n)
 {
     // Traverse expressions in tree, propagating types from literals and 
     // variables up to unary and binary operators
+    fprintf(stderr, "%s\n", __func__);
     for(int i = 0; i < n->child_count; i++)
     {
         propagate_types(n, n->children[i]);
     }
     if (!p)
+    {
         // We are at the top of the tree, nothing further to do
+        fprintf(stderr, "%s finished\n", __func__);
         return;
-
+    }
+    fprintf(stderr, "Before: %s\n", node_str(n));
     if (n->kind == ND_IDENT && !n->is_struct)
     {
         if (p->kind != ND_MEMBER)
-            n->type = find_symbol(n, n->val)->type;
+            n->type = find_symbol(n, n->val, NS_IDENT)->type;
     }
     if (n->kind == ND_MEMBER)
     {
         // This is a child of a member operator
-        // lhs of member is the structure, rhs is field
+        // lhs of member op is the structure, rhs is field
         if (n->child_count != 2)
             error("Malformed struct reference\n");
         Node *lhs   = n->children[0];
         Node *rhs   = n->children[1];
         if (lhs->kind == ND_IDENT)
         {
-            lhs->type = find_symbol(lhs, lhs->val)->type;
+            // If the lhs is an ident (rather than a member operator), it must be
+            // in the ident namespace
+            lhs->type = find_symbol(lhs, lhs->val, NS_IDENT)->type;
         }
-        n->offset = find_offset(lhs->type, rhs->val);
+        fprintf(stderr, "%s looking in lhs type:%016llx for field %s\n", __func__, (unsigned long long)lhs->type, rhs->val);
+        Type *base = 0;
+        n->offset = find_offset(lhs->type, rhs->val, &base);
         if (n->offset < 0)
             error("Can't find member %s in struct\n", rhs->val);
-            
+        fprintf(stderr, "%s found member %s with offset %d basetype %016llx\n", __func__, 
+            rhs->val, n->offset, (unsigned long long)base); 
+        // Member now has type pointing to inner type
+        n->type = base;
     }
     if (n->is_expr)
     {
@@ -1302,5 +1336,6 @@ void propagate_types(Node *p, Node *n)
         if (n->type != n->children[0]->type)
             insert_cast(n, 0, n->type);
     }
+    fprintf(stderr, "After : %s\n", node_str(n));
 }
 

@@ -32,6 +32,6 @@ lasttest: mycc
 
 
 clean:
-	rm -f 9cc *.o *~ tmp*
+	rm -f mycc *.o *~ tmp*
 
 .PHONY: test clean

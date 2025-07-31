@@ -3,6 +3,7 @@
 assert() {
     expected="$1"
     input="$2"
+    echo "Input is:$input"
     ./mycc "$input" > tmp.s
     actual=`./cpu3/sim.py tmp.s |tail -1`
     # echo $actual

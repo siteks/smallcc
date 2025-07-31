@@ -53,11 +53,14 @@ import sys
 #   and
 #   or
 #   xor
+#   sxb
+#   sxw
 #
 #   immb    byte    r0 = val
 #   adj     byte    sp += byte
 #
 #   immw    word    r0 = val
+#   immwh   word    r0 = (r0 & 0xffff) | (val << 16) 
 #   jl      word    lr = pc; pc = word; 
 #   j       word    pc = word
 #   jz      word    if !r0: pc = word
@@ -141,23 +144,24 @@ def sext(b, w):
 
 class Mem:
     def __init__(self):
-        self.mem    = np.full(65536, 0xff, np.byte)
+        self.mem    = np.full(65536, 0xff, np.ubyte)
         self.trace = ''
 
     def read8(self, addr, trace=True):
         addr &= 0xffff
-        self.trace += 'r8[%04x]=>%02x   ' % (addr, self.mem[addr] & 0xff) if trace else ''
-        return self.mem[addr] & 0xff
+        self.trace += 'r8[%04x]=>%02x   ' % (addr, int(self.mem[addr])) if trace else ''
+        return int(self.mem[addr])
 
     def read16(self, addr, trace=True):
         addr &= 0xffff
-        d = (self.mem[addr] & 0xff) | ((self.mem[addr + 1] & 0xff) << 8)
+        d = int(self.mem[addr]) | (int(self.mem[addr + 1]) << 8)
+        print(d, type(d))
         self.trace += 'r16[%04x]=>%04x ' % (addr, d) if trace else ''
         return d
 
     def read32(self, addr, trace=True):
         addr &= 0xffff
-        d = (self.mem[addr] & 0xff) | ((self.mem[addr + 1] & 0xff) << 8) | ((self.mem[addr + 2] & 0xff) << 16)| ((self.mem[addr + 3] & 0xff) << 24)
+        d = int(self.mem[addr]) | (int(self.mem[addr + 1]) << 8) | (int(self.mem[addr + 2]) << 16)| (int(self.mem[addr + 3]) << 24)
         self.trace += 'r32[%04x]=>%08x ' % (addr, d) if trace else ''
         return d
 
@@ -242,18 +246,21 @@ class CPU:
         ilen    = 1
         imm     = 0
         if ins & 0xc0 == 0x40:
-            imm = self.mem.read8(s.pc, trace=False)
+            imm = self.mem.read8(s.pc, trace=False) + 0
+            # print(imm, type(imm))
             imm = sexb(imm)
             s.pc += 1
             ilen = 2
         elif ins & 0xc0 == 0x80:
             imm = self.mem.read16(s.pc, trace=False)
+            # print(imm, type(imm))
             imm = sexw(imm)
             s.pc += 2
             ilen = 3
 
         fmt = ilen - 1
         
+        # print(imm, type(imm))
         # print('%02x %d %04x' % (ins, fmt, imm))
         i = G.rptable[(ins, fmt)]
         # print('%04x %x %s' % (oldpc, ins, i))

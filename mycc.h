@@ -53,7 +53,6 @@ typedef enum
     TK_LOGOR,
     TK_BITOR,
     TK_BITXOR,
-
     TK_AUTO,
     TK_BREAK,
     TK_CASE,
@@ -164,22 +163,15 @@ typedef enum
     ND_MEMBER,
     ND_UNDEFINED,
 } Node_kind;
-
-
-// typedef enum
-// {
-//     AUTO        = 0x1,
-//     REGISTER    = 0x2,
-//     STATIC      = 0x4,
-//     EXTERN      = 0x8,
-//     CONST       = 0x10,
-//     VOLATILE    = 0x20,
-//     TYPEDEF     = 0x40,
-//     STRUCT      = 0x80,
-//     UNION       = 0x100,
-//     ENUM        = 0x200,
-// } Type_attr;
-
+typedef enum
+{
+    CS_NONE,
+    CS_U,
+    CS_L,
+    CS_UL,
+    CS_F,
+    CS_OX = 0x100,
+} Const_suffix;
 typedef enum
 {
     TB_DERIVED  = 0,
@@ -196,6 +188,106 @@ typedef enum
     TB_STRUCT   = 0x400,
     TB_UNION    = 0x800,
 } Type_base;
+// --------------------------------------------------------
+// New type system.
+// All types are stored exactly once in the type table.
+// Derived types unwrap a layer of the declarator per
+// type entry. So:
+// int **a;
+// would result in an entry for 'int',
+// an entry for 'pointer', with pointee being 'int'
+// an entry for 'pointer', with pointee being the above
+// Type qualifiers 'const' and 'volatile' belong in the type table
+// because they alter the nature of the type.
+// Function prototypes are also types, and belong here
+// Storage class does not belong here, but with the symbol
+typedef enum
+{
+    TB2_VOID,
+    TB2_CHAR,
+    TB2_UCHAR,
+    TB2_SHORT,
+    TB2_USHORT,
+    TB2_INT,
+    TB2_UINT,
+    TB2_LONG,
+    TB2_ULONG,
+    TB2_FLOAT,
+    TB2_DOUBLE,
+    TB2_POINTER,
+    TB2_ARRAY,
+    TB2_FUNCTION,
+    TB2_STRUCT,
+    TB2_ENUM
+} Type2_base;
+typedef enum
+{
+    TQ_CONST,
+    TQ_VOLATILE
+} Type2_qual;
+
+typedef struct Type2 Type2;
+typedef struct Field Field;
+typedef struct Param Param;
+typedef struct Symbol Symbol;
+
+// Linked list of structure members
+struct Field 
+{
+    char    *name;
+    Type2    *type;
+    int     offset;
+    Field   *next;
+};
+
+// Linked list of function parameters
+struct Param
+{
+    char    *name;
+    Type2    *type;
+    Param   *next;
+};
+
+struct Type2
+{
+    Type2_base   base;
+    Type2_qual   qual;
+    int         size;
+    int         align;
+    union 
+    {
+        struct 
+        {
+            Type2    *pointee;
+        }       ptr;
+        struct 
+        {
+            Type2    *elem;
+            int     count;
+        }       arr;
+        struct
+        {
+            Type2    *ret;
+            Param   *params;
+            bool    is_varidic;
+        }       fn;
+        struct
+        {
+            Symbol  *tag;
+            Field   *members;
+            bool    is_union;
+        }       composite;
+        struct 
+        {
+            Symbol  *tag;
+            // FIXME record the enums here..
+        }       enu;
+        
+    }           u;
+    Type2        *next;
+};
+
+
 
 
 // Base types have no derived string. All derived types point to a base type
@@ -232,6 +324,13 @@ typedef enum
     ST_COMPSTMT,
     ST_STRUCT,
 } Scope_type;
+typedef enum
+{
+    NS_IDENT,
+    NS_TAG,
+    NS_MEMBER,
+    NS_LABEL
+} Namespace;
 
 typedef struct Scope Scope;
 struct Scope
@@ -275,32 +374,54 @@ struct Scope
     Scope_type  scope_type;
 };
 
-// Symbols represent declared variables, tags represent structs, unions
-// symbols within tags represent member names.
-typedef struct Symbol Symbol;
+// There is a separate symbol list at each scope for each 
+// namespace.
 struct Symbol
 {
     char    *name;
+    // Point to type, null if n/a
     Type    *type;
+    // Offset of the symbol. Meaning depends on namespace and scope
     int     offset;
+    // Indicates this symbol is a function parameter, offsets work
+    // backwards, since the value will have been pushed onto the stack
+    // before the function is entered
     bool    is_param;
+
     Symbol  *next;
 };
+
+// The symbol table is a tree structure, where each node represents
+// a scope
 typedef struct Symbol_table Symbol_table;
 struct Symbol_table
 {
-    // 
     Scope           scope;
-    Symbol          *symbols;
+    Symbol          *idents;
     Symbol          *tags;
-    Symbol          *enums;
-    Type            *types;
+    Symbol          *members;
+    Symbol          *labels;
+    // Type            *types;
     int             size;
     int             global_offset;
     int             child_count;
     Symbol_table    **children;
     Symbol_table    *parent;
 };
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 typedef struct Node Node;
 struct Node
 {
@@ -331,6 +452,7 @@ struct Node
     Symbol_table    *symtable;
     Symbol          *symbol;
     Type            *type;
+    Type2           *type2;
 
 };
 
@@ -369,32 +491,20 @@ void gen_pop();
 void gen_stmt(Node *node);
 char *nodestr(Node_kind k);
 // void get_types_and_symbols(Node *node);
-void print_symbol_table(Symbol_table *s, int depth);
-void print_type_table();
-void add_types_and_symbols(Node *node, bool is_param, int depth);
 char *fulltype_str(Type *t);
 char *token_str(Token_kind tk);
-char *type_token_str(Token_kind tk);
 bool is_type_name(Token_kind tk);
-Node *declarator();
-Node *init_declarator();
-Node *declaration(int depth);
+// Node *declarator();
+// Node *init_declarator();
+// Node *declaration(int depth);
 
 bool is_sc_spec(Token_kind tk);
 bool is_typespec(Token_kind tk);
 bool is_typequal(Token_kind tk);
-Type *insert_type(Node *node, char *ts);
 void propagate_types(Node *p, Node *n);
 char *tstr_compact(Node *node);
 Node *new_node(Node_kind kind, char *val, bool is_expr);
-Symbol *find_symbol(Node *node, char *name);
-Symbol *find_tag(Node *node, char *name);
-Symbol_table *find_scope(Node *node);
-Type *find_type(char *name);
-void make_basic_types();
-Type *elem_type(Type *t);
-void set_scope(Scope *sc);
-char *scope_str(Scope sc);
+// Symbol_table *find_scope(Node *node);
 
 
 bool istype_float(Type *t);
@@ -413,27 +523,51 @@ bool istype_array(Type *t);
 bool istype_function(Type *t);
 bool istype_intlike(Type *t);
 
-Type_base to_typespec(Token_kind tk);
-char *typespec_str(Type_base tb);
-bool is_struct_or_union(Type_base t);
-Type *insert_struct_type(Type *t);
-int align(int val, int size);
+// bool is_struct_or_union(Type_base t);
+// Type *insert_struct_type(Type *t);
+// int align(int val, int size);
 void unget_token();
-Symbol_table *enter_new_scope(bool use_last_scope);
-void leave_scope();
 char *get_decl_ident(Node *node);
-Symbol *insert_tag(Node *node, char *ident);
+// Symbol *insert_tag(Node *node, char *ident);
 
-Symbol *new_symbol(Type *type, char *ident, int offset);
-Symbol *insert_symbol(Node *node, Type *type, char *ident, bool is_param);
+// Symbol *new_symbol(Type *type, char *ident, int offset);
 
 void dcl(Node *node);
 void dirdcl(Node *node);
 void d(Node *node);
 void dd(Node *node);
-char *curr_scope_str();
-int find_offset(Type *t, char *field);
 
+// -----------------------------------------------------
+// Interface to types.c
+
+// Populate type table
+void make_basic_types();
+
+// Starting at scope of node, search for symbol in given namespace.
+// If not found, search enclosing scopes.
+Symbol *find_symbol(Node *node, char *name, Namespace nspace);
+
+
+void set_scope(Scope *sc);
+void leave_scope();
+Symbol_table *enter_new_scope(bool use_last_scope);
+char *scope_str(Scope sc);
+char *curr_scope_str();
+
+Type *insert_type(Node *node, char *ts);
+void add_types_and_symbols(Node *node, bool is_param, int depth);
+Type *find_type(char *name);
+Type *elem_type(Type *t);
+int find_offset(Type *t, char *field, Type **it);
+
+void print_symbol_table(Symbol_table *s, int depth);
+void print_type_table();
+char *typespec_str(Type_base tb);
+char *type_token_str(Token_kind tk);
+
+// Symbol *insert_ident(Node *node, Type *type, char *ident, bool is_param);
+
+Type_base to_typespec(Token_kind tk);
 
 
 #endif

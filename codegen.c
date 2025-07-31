@@ -29,7 +29,7 @@ int find_local_addr(Node *node, char *name)
     while(!found)
     { 
         fprintf(stderr, "Searching in scope:%s\n", scope_str(st->scope));
-        for(s = st->symbols; s; s = s->next)
+        for(s = st->idents; s; s = s->next)
         {
             fprintf(stderr, "Ident:%s\n", s->name);
             if (!strcmp(name, s->name))
