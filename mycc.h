@@ -28,6 +28,7 @@ typedef enum
     TK_RBRACKET,
     TK_COMMA,
     TK_SEMICOLON,
+    TK_COLON,
     TK_EQ,
     TK_NE,
     TK_GE,
@@ -161,6 +162,14 @@ typedef enum
     ND_STRUCT,
     ND_UNION,
     ND_MEMBER,
+    ND_FORSTMT,
+    ND_DOWHILESTMT,
+    ND_SWITCHSTMT,
+    ND_CASESTMT,
+    ND_DEFAULTSTMT,
+    ND_BREAKSTMT,
+    ND_CONTINUESTMT,
+    ND_EMPTY,
     ND_UNDEFINED,
 } Node_kind;
 typedef enum

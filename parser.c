@@ -989,6 +989,76 @@ static Node *stmt()
         expect(TK_RPAREN);
         add_child(node, stmt());
     }
+    else if (token->kind == TK_FOR)
+    {
+        node->kind = ND_FORSTMT;
+        expect(TK_FOR);
+        expect(TK_LPAREN);
+        // init (optional expression)
+        if (token->kind == TK_SEMICOLON)
+            add_child(node, new_node(ND_EMPTY, 0, false));
+        else
+            add_child(node, expr());
+        expect(TK_SEMICOLON);
+        // condition (optional; absent = infinite loop)
+        if (token->kind == TK_SEMICOLON)
+            add_child(node, new_node(ND_EMPTY, 0, false));
+        else
+            add_child(node, expr());
+        expect(TK_SEMICOLON);
+        // increment (optional)
+        if (token->kind == TK_RPAREN)
+            add_child(node, new_node(ND_EMPTY, 0, false));
+        else
+            add_child(node, expr());
+        expect(TK_RPAREN);
+        add_child(node, stmt());          // body
+    }
+    else if (token->kind == TK_DO)
+    {
+        node->kind = ND_DOWHILESTMT;
+        expect(TK_DO);
+        add_child(node, stmt());          // body
+        expect(TK_WHILE);
+        expect(TK_LPAREN);
+        add_child(node, expr());          // condition
+        expect(TK_RPAREN);
+        expect(TK_SEMICOLON);
+    }
+    else if (token->kind == TK_SWITCH)
+    {
+        node->kind = ND_SWITCHSTMT;
+        expect(TK_SWITCH);
+        expect(TK_LPAREN);
+        add_child(node, expr());          // selector
+        expect(TK_RPAREN);
+        add_child(node, comp_stmt(false));// body (always a compound)
+    }
+    else if (token->kind == TK_CASE)
+    {
+        node->kind = ND_CASESTMT;
+        expect(TK_CASE);
+        node->ival = expect_number();
+        expect(TK_COLON);
+    }
+    else if (token->kind == TK_DEFAULT)
+    {
+        node->kind = ND_DEFAULTSTMT;
+        expect(TK_DEFAULT);
+        expect(TK_COLON);
+    }
+    else if (token->kind == TK_BREAK)
+    {
+        node->kind = ND_BREAKSTMT;
+        expect(TK_BREAK);
+        expect(TK_SEMICOLON);
+    }
+    else if (token->kind == TK_CONTINUE)
+    {
+        node->kind = ND_CONTINUESTMT;
+        expect(TK_CONTINUE);
+        expect(TK_SEMICOLON);
+    }
     else if (token->kind == TK_RETURN)
     {
         node->kind = ND_RETURNSTMT;
@@ -1049,9 +1119,17 @@ char *nodestr(Node_kind k)
         case ND_TYPE_NAME:  return "TYPE_NAME   ";
         case ND_ARRAY_DECL: return "ARRAY_DECL  ";
         case ND_FUNC_DECL:  return "FUNC_DECL   ";
-        case ND_MEMBER:     return "MEMBER      ";
-        case ND_UNDEFINED:  return "##FIXME##   ";
-        default:            return "unknown     ";
+        case ND_MEMBER:      return "MEMBER      ";
+        case ND_FORSTMT:     return "FORSTMT     ";
+        case ND_DOWHILESTMT: return "DOWHILESTMT ";
+        case ND_SWITCHSTMT:  return "SWITCHSTMT  ";
+        case ND_CASESTMT:    return "CASESTMT    ";
+        case ND_DEFAULTSTMT: return "DEFAULTSTMT ";
+        case ND_BREAKSTMT:   return "BREAKSTMT   ";
+        case ND_CONTINUESTMT:return "CONTINUESTMT";
+        case ND_EMPTY:       return "EMPTY       ";
+        case ND_UNDEFINED:   return "##FIXME##   ";
+        default:             return "unknown     ";
     }
 }
 

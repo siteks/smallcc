@@ -83,6 +83,7 @@ char *token_str(Token_kind tk)
         tk == TK_RBRACKET   ? "RBRACKET " :
         tk == TK_COMMA      ? "COMMA    " :
         tk == TK_SEMICOLON  ? "SEMICOLON" :
+        tk == TK_COLON      ? "COLON    " :
         tk == TK_EQ         ? "EQ       " :
         tk == TK_NE         ? "NE       " :
         tk == TK_GE         ? "GE       " :
@@ -199,6 +200,19 @@ bool at_eof()
     return token->kind == TK_EOF;
 }
 
+int expect_number()
+{
+    if (token->kind == TK_CONSTINT)
+    {
+        int val     = (int)token->ival;
+        last_token  = token;
+        token       = token->next;
+        return val;
+    }
+    error("Expected integer constant, got '%s'\n", token->val);
+    return 0;
+}
+
 Token *new_token(Token_kind kind, Token *cur, char *str, int len)
 {
     Token *tok  = calloc(1, sizeof(Token));
@@ -273,6 +287,7 @@ Token *tokenise(char *p)
             case '<': cur = new_token(TK_LT,        cur, p++, 1); continue;
             case '=': cur = new_token(TK_ASSIGN,    cur, p++, 1); continue;
             case ';': cur = new_token(TK_SEMICOLON, cur, p++, 1); continue;
+            case ':': cur = new_token(TK_COLON,     cur, p++, 1); continue;
             case '{': cur = new_token(TK_LBRACE,    cur, p++, 1); continue;
             case '}': cur = new_token(TK_RBRACE,    cur, p++, 1); continue;
             case '&': cur = new_token(TK_AMPERSAND, cur, p++, 1); continue;

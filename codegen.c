@@ -67,6 +67,9 @@ int find_local_addr(Node *node, char *name)
 
 
 static int labels;
+static int break_labels[64];
+static int cont_labels[64];
+static int loop_depth = 0;
 
 //--------------------------------------------------------------------------------
 // Pseudoinstructions
@@ -671,14 +674,69 @@ void gen_whilestmt(Node *node)
 {
     printf(";%s\n", __func__);
     // structure is expr, stmt
-    int lloop   = labels++;
-    int lbreak  = labels++;
+    int lloop   = new_label();
+    int lbreak  = new_label();
+    break_labels[loop_depth] = lbreak;
+    cont_labels[loop_depth]  = lloop;
+    loop_depth++;
     gen_label(lloop);
     gen_expr(node->children[0]);
     gen_jz(lbreak);
     gen_stmt(node->children[1]);
     gen_j(lloop);
     gen_label(lbreak);
+    loop_depth--;
+}
+void gen_forstmt(Node *node)
+{
+    printf(";%s\n", __func__);
+    // children: [init, cond, inc, body]
+    if (node->children[0]->kind != ND_EMPTY)
+        gen_expr(node->children[0]);
+    int lloop  = new_label();
+    int lcont  = new_label();
+    int lbreak = new_label();
+    break_labels[loop_depth] = lbreak;
+    cont_labels[loop_depth]  = lcont;
+    loop_depth++;
+    gen_label(lloop);
+    if (node->children[1]->kind != ND_EMPTY) {
+        gen_expr(node->children[1]);
+        gen_jz(lbreak);
+    }
+    gen_stmt(node->children[3]);
+    gen_label(lcont);
+    if (node->children[2]->kind != ND_EMPTY)
+        gen_expr(node->children[2]);
+    gen_j(lloop);
+    gen_label(lbreak);
+    loop_depth--;
+}
+void gen_dowhilestmt(Node *node)
+{
+    printf(";%s\n", __func__);
+    // children: [body, cond]
+    int lloop  = new_label();
+    int lcont  = new_label();
+    int lbreak = new_label();
+    break_labels[loop_depth] = lbreak;
+    cont_labels[loop_depth]  = lcont;
+    loop_depth++;
+    gen_label(lloop);
+    gen_stmt(node->children[0]);
+    gen_label(lcont);
+    gen_expr(node->children[1]);
+    gen_jnz(lloop);
+    gen_label(lbreak);
+    loop_depth--;
+}
+void gen_breakstmt(Node *node)
+{
+    gen_j(break_labels[loop_depth - 1]);
+}
+void gen_continuestmt(Node *node)
+{
+    gen_j(cont_labels[loop_depth - 1]);
 }
 void gen_exprstmt(Node *node)
 {
@@ -938,17 +996,70 @@ void gen_compstmt(Node *node)
     // Release the space back
     gen_adj(node->symtable->size);
 }
+void gen_decl(Node *node);
+void gen_switchstmt(Node *node)
+{
+    printf(";%s\n", __func__);
+    Node *selector = node->children[0];
+    Node *body     = node->children[1]; // ND_COMPSTMT
+    int lbreak     = new_label();
+    int ldefault   = -1;
+    // Phase 1: assign labels to cases and emit comparisons
+    for (int i = 0; i < body->child_count; i++) {
+        Node *ch = body->children[i];
+        if (ch->kind == ND_CASESTMT) {
+            int lcase   = new_label();
+            ch->offset  = lcase;
+            gen_expr(selector);
+            gen_push();
+            gen_imm((int)ch->ival);
+            gen_eq();
+            gen_jnz(lcase);
+        } else if (ch->kind == ND_DEFAULTSTMT) {
+            int ldef   = new_label();
+            ch->offset = ldef;
+            ldefault   = ldef;
+        }
+    }
+    if (ldefault >= 0) gen_j(ldefault);
+    else               gen_j(lbreak);
+    // Phase 2: emit body with case labels
+    break_labels[loop_depth] = lbreak;
+    cont_labels[loop_depth]  = -1;
+    loop_depth++;
+    gen_adj(-body->symtable->size);
+    for (int i = 0; i < body->child_count; i++) {
+        Node *ch = body->children[i];
+        if (ch->kind == ND_CASESTMT || ch->kind == ND_DEFAULTSTMT)
+            gen_label(ch->offset);
+        else if (ch->kind == ND_DECLARATION)
+            gen_decl(ch);
+        else
+            gen_stmt(ch);
+    }
+    gen_adj(body->symtable->size);
+    loop_depth--;
+    gen_label(lbreak);
+}
 void gen_stmt(Node *node)
 {
     printf(";%s\n", __func__);
     switch(node->kind)
     {
-    case ND_EXPRSTMT:   gen_exprstmt(node); return;
-    case ND_COMPSTMT:   gen_compstmt(node); return;
-    case ND_IFSTMT:     gen_ifstmt(node); return;
-    case ND_WHILESTMT:  gen_whilestmt(node); return;
-    case ND_RETURNSTMT: gen_returnstmt(node); return;
-    case ND_STMT:       gen_stmt(node->children[0]); return;
+    case ND_EXPRSTMT:    gen_exprstmt(node);    return;
+    case ND_COMPSTMT:    gen_compstmt(node);    return;
+    case ND_IFSTMT:      gen_ifstmt(node);      return;
+    case ND_WHILESTMT:   gen_whilestmt(node);   return;
+    case ND_FORSTMT:     gen_forstmt(node);     return;
+    case ND_DOWHILESTMT: gen_dowhilestmt(node); return;
+    case ND_SWITCHSTMT:  gen_switchstmt(node);  return;
+    case ND_BREAKSTMT:   gen_breakstmt(node);   return;
+    case ND_CONTINUESTMT:gen_continuestmt(node);return;
+    case ND_CASESTMT:
+    case ND_DEFAULTSTMT:
+    case ND_EMPTY:                              return;
+    case ND_RETURNSTMT:  gen_returnstmt(node);  return;
+    case ND_STMT:        gen_stmt(node->children[0]); return;
     default:;
     }
 }

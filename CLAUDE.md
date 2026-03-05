@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```bash
 make mycc           # Build the compiler
 make test_all       # Run all test suites
-make test_struct    # Run a specific test suite (also: test_init, test_ops, test_logops, test_func, test_longs, test_array)
+make test_struct    # Run a specific test suite (also: test_init, test_ops, test_logops, test_func, test_longs, test_array, test_loops)
 make clean          # Remove binaries and temp files
 ```
 
@@ -75,7 +75,7 @@ struct Token {
 
 ### Token Kinds
 
-- **Delimiters**: `TK_LPAREN ( ) RPAREN LBRACE RBRACE LBRACKET RBRACKET COMMA SEMICOLON DOT ARROW`
+- **Delimiters**: `TK_LPAREN ( ) RPAREN LBRACE RBRACE LBRACKET RBRACKET COMMA SEMICOLON COLON DOT ARROW`
 - **Operators** (2-char first, then 1-char): `== != >= <= ++ -- && || >> <<  ->` then `= + - * / & ~ ! | ^ < >`
 - **Literals**: `TK_CONSTINT`, `TK_CONSTFLT`, `TK_CHARACTER`, `TK_IDENT`
 - **Keywords** (32): `auto break case char const continue default do double else enum extern float for goto if int long register return short signed sizeof static struct switch typedef union unsigned void volatile while`
@@ -123,10 +123,18 @@ direct-decl-suffix  → "[" constant-expr? "]"
 init-declarator     → declarator ("=" initializer)?
 initializer         → assign-expr | "{" initializer-list "}"
 
-statement           → expr-stmt | compound-stmt | if-stmt | while-stmt | return-stmt
+statement           → expr-stmt | compound-stmt | if-stmt | while-stmt | for-stmt
+                    | do-stmt | switch-stmt | break-stmt | continue-stmt | return-stmt
 compound-stmt       → "{" declaration* statement* "}"
 if-stmt             → "if" "(" expr ")" stmt ("else" stmt)?
 while-stmt          → "while" "(" expr ")" stmt
+for-stmt            → "for" "(" expr? ";" expr? ";" expr? ")" stmt
+do-stmt             → "do" stmt "while" "(" expr ")" ";"
+switch-stmt         → "switch" "(" expr ")" compound-stmt
+case-label          → "case" integer-constant ":"    (parsed as stmt inside compound)
+default-label       → "default" ":"                  (parsed as stmt inside compound)
+break-stmt          → "break" ";"
+continue-stmt       → "continue" ";"
 return-stmt         → "return" expr? ";"
 
 expr                → assign-expr ("," assign-expr)*
@@ -154,7 +162,7 @@ postfix-suffix      → "[" expr "]"
 primary-expr        → ident | constant | "(" expr ")"
 ```
 
-**Not yet implemented:** `do`, `for`, `switch`/`case`, `goto`, `sizeof`, `typedef`, `enum` bodies, `register`/`extern`/`static` semantics, string literals.
+**Not yet implemented:** `goto`, `sizeof`, `typedef`, `enum` bodies, `register`/`extern`/`static` semantics, string literals.
 
 ### AST Node Kinds
 
@@ -175,6 +183,14 @@ ND_COMPSTMT      // "{}" block — children: declarations and statements
 ND_EXPRSTMT      // expression statement
 ND_IFSTMT        // if — children: [cond, then] or [cond, then, else]
 ND_WHILESTMT     // while — children: [cond, body]
+ND_FORSTMT       // for — children: [init, cond, inc, body] (ND_EMPTY for absent parts)
+ND_DOWHILESTMT   // do-while — children: [body, cond]
+ND_SWITCHSTMT    // switch — children: [selector, body_compstmt]
+ND_CASESTMT      // case N: — ival holds the constant; no children
+ND_DEFAULTSTMT   // default: — no children
+ND_BREAKSTMT     // break; — no children
+ND_CONTINUESTMT  // continue; — no children
+ND_EMPTY         // absent for-loop part (init/cond/inc omitted)
 ND_RETURNSTMT    // return — children: [expr] or empty
 ND_STMT          // generic wrapper
 ND_ASSIGN        // "=" — children: [lhs, rhs]
@@ -483,6 +499,16 @@ L1: immw 0
 L2:
 ```
 
+**Break/continue label stacks** (`codegen.c` file scope):
+```c
+static int break_labels[64];   // target label for break at each loop nesting depth
+static int cont_labels[64];    // target label for continue at each loop nesting depth
+static int loop_depth = 0;     // current nesting depth (incremented on loop entry)
+```
+`gen_whilestmt`, `gen_forstmt`, `gen_dowhilestmt`, and `gen_switchstmt` push their break/continue targets before generating the body and pop them after. `gen_breakstmt`/`gen_continuestmt` emit `j break_labels[loop_depth-1]` / `j cont_labels[loop_depth-1]`.
+
+**Switch dispatch** (`gen_switchstmt`): two-phase — phase 1 re-evaluates the selector expression for each `case` label, emitting `push; eq; jnz lcase` comparisons; phase 2 emits the compound-statement body verbatim, inserting `gen_label` at each `ND_CASESTMT`/`ND_DEFAULTSTMT` node.
+
 ### Cast Generation (`gen_cast`)
 
 Casts are no-ops when src and dst have the same size. Otherwise:
@@ -659,3 +685,132 @@ main:
     adj     4         ; reclaim locals
     ret               ; function return
 ```
+
+---
+
+## C89 Compliance Status
+
+Preprocessor excluded. Features are assessed against ANSI C89/ISO C90.
+
+**Deliberate deviations from C89:**
+- **K&R (old-style) function definitions are not supported** — only ANSI prototype-style definitions are accepted.
+- **`//` line comments are supported** — a C99/C++ extension not present in C89.
+
+### Statements
+
+| Feature | Status | Notes |
+|---|---|---|
+| `if` / `if-else` | ✅ | |
+| `while` | ✅ | |
+| `do-while` | ✅ | |
+| `for` | ✅ | init/cond/inc all optional (ND_EMPTY for absent parts) |
+| `switch` / `case` / `default` | ✅ | fall-through supported; selector re-evaluated per case |
+| `break` | ✅ | works inside `while`, `for`, `do-while`, `switch` |
+| `continue` | ✅ | works inside `while`, `for`, `do-while` |
+| `goto` | ❌ | Token exists; no parser or codegen |
+| Labeled statements (`lbl:`) | ❌ | |
+| `return` | ✅ | Auto-casts to declared return type |
+| Compound statement `{ }` | ✅ | |
+
+### Expressions and Operators
+
+| Feature | Status | Notes |
+|---|---|---|
+| Arithmetic `+ - * /` | ✅ | |
+| Modulo `%` | ❌ | Not tokenised, parsed, or in codegen |
+| Compound assignment `+= -= *= /= %= &= \|= ^= <<= >>=` | ❌ | Not tokenised or parsed |
+| Ternary `? :` | ❌ | Not tokenised or parsed |
+| Comma operator `,` (in expressions) | ❌ | Comma is only parsed as a separator |
+| `sizeof` | ❌ | `TK_SIZEOF` tokenised; not parsed |
+| Pre/post `++ --` | ✅ | |
+| Unary `+ - ~ !` | ✅ | |
+| Address-of `&` | ✅ | |
+| Dereference `*` | ✅ | |
+| Relational `< <= > >= == !=` | ✅ | |
+| Logical `&& \|\|` (short-circuit) | ✅ | |
+| Bitwise `& \| ^ << >>` | ✅ | |
+| Cast `(type)expr` | ✅ | |
+| Array subscript `a[i]` | ✅ | Rewritten to pointer arithmetic |
+| Struct member `.` | ✅ | Including nested structs |
+| Pointer member `->` | ❌ | `TK_ARROW` tokenised; not parsed |
+| Function call | ✅ | Including recursion |
+| Assignment `=` | ✅ | |
+
+### Types
+
+| Feature | Status | Notes |
+|---|---|---|
+| `char` / `unsigned char` | ✅ | 1 byte |
+| `short` / `unsigned short` | ✅ | 2 bytes |
+| `int` / `unsigned int` | ✅ | 2 bytes on target |
+| `long` / `unsigned long` | ✅ | 4 bytes |
+| `float` | ⚠️ | Parsed and typed; codegen emits integer ops (no FP arithmetic) |
+| `double` | ⚠️ | Same as float |
+| `void` | ✅ | |
+| Pointers | ✅ | Including pointer arithmetic |
+| Arrays (1-D and N-D) | ✅ | |
+| `struct` | ✅ | Including nested structs and correct member offsets |
+| `union` | ⚠️ | Parsed; member offsets set to 0, but member access codegen not distinct from struct |
+| `enum` | ❌ | Keyword tokenised; body not parsed; constants not supported |
+| `typedef` | ❌ | Keyword tokenised; not functional |
+| Function pointers | ⚠️ | Can be declared; calling through a function-pointer variable not supported |
+| Bit fields in structs | ❌ | |
+| `const` / `volatile` qualifiers | ⚠️ | Parsed and stored; semantics not enforced |
+
+### Declarations and Linkage
+
+| Feature | Status | Notes |
+|---|---|---|
+| Multiple declarators (`int a, b;`) | ✅ | |
+| Scalar initializer (`int x = 5;`) | ✅ | |
+| Array initializer (`int a[] = {1,2,3};`) | ✅ | Including multi-dim |
+| Struct/union initializer | ❌ | |
+| `auto` | ⚠️ | Parsed; no semantic difference from default local |
+| `register` | ⚠️ | Parsed; ignored (no register allocator) |
+| `static` | ⚠️ | Parsed; internal-linkage and persistent-storage semantics not enforced |
+| `extern` | ⚠️ | Parsed; external-linkage semantics not enforced |
+| Forward declarations | ⚠️ | Functions can be declared before definition, but semantic checking is minimal |
+| K&R (old-style) function definitions | N/A | Deliberately not supported; ANSI prototype style only |
+
+### Literals and Constants
+
+| Feature | Status | Notes |
+|---|---|---|
+| Decimal integer constants | ✅ | |
+| Hex constants (`0x…`) | ✅ | |
+| Octal constants (`0…`) | ✅ | |
+| Integer suffixes `u/U`, `l/L`, `ul/UL` | ✅ | |
+| Floating-point constants | ✅ | Parsed; no FP codegen |
+| Character constants (`'a'`, escape sequences) | ✅ | |
+| String literals (`"…"`) | ❌ | Not tokenised or parsed |
+
+### Functions and Calling Convention
+
+| Feature | Status | Notes |
+|---|---|---|
+| Function definitions with prototypes | ✅ | |
+| Parameter passing (value) | ✅ | |
+| Return values | ✅ | |
+| Recursion | ✅ | |
+| Variadic functions (`...`) | ❌ | `is_variadic` flag exists in type; no `va_list` / `va_start` / `va_arg` / `va_end` |
+| Implicit `int` return type | ❌ | Return type must be stated explicitly |
+| Implicit function declaration | ❌ | Callee must be declared before call |
+
+### Type Conversion and Promotion
+
+| Feature | Status | Notes |
+|---|---|---|
+| Integer promotions (char/short → int in expressions) | ⚠️ | Partial; not uniformly applied |
+| Usual arithmetic conversions (mixed-type operands) | ⚠️ | Basic widening casts emitted; full C89 hierarchy not guaranteed |
+| Pointer ↔ integer conversions | ✅ | Used in tests (e.g. `a = 0x2000`) |
+| Floating-point conversions | ❌ | No FP arithmetic in codegen |
+
+### Summary
+
+**Implemented and working**: basic scalar types, pointers, 1-D/N-D arrays, structs, `if`/`while`/`for`/`do-while`, `switch`/`case`/`default`, `break`, `continue`, all arithmetic and bitwise operators except `%`, all comparison and logical operators, pre/post increment, address-of, dereference, struct member access (`.`), explicit casts, array subscripting, function definitions and calls, integer constants (decimal/hex/octal).
+
+**Partially working**: unions (layout correct, but not semantically distinct from struct in codegen), `const`/`volatile` (stored, not enforced), storage classes (parsed, not enforced), `float`/`double` (types only, no FP arithmetic).
+
+**Not yet implemented**: `goto`, labels, `%`, all compound assignments (`+=` etc.), ternary `?:`, `sizeof`, `->`, `enum`, `typedef`, string literals, struct/union initializers, variadic functions, bit fields.
+
+**Extensions beyond C89**: `//` line comments.
