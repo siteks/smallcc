@@ -815,8 +815,6 @@ Preprocessor excluded. Features are assessed against ANSI C89/ISO C90.
 | Return values | ✅ | |
 | Recursion | ✅ | |
 | Variadic functions (`...`) | ❌ | `is_variadic` flag exists in type; no `va_list` / `va_start` / `va_arg` / `va_end` |
-| Implicit `int` return type | ❌ | Return type must be stated explicitly |
-| Implicit function declaration | ❌ | Callee must be declared before call |
 
 ### Type Conversion and Promotion
 
