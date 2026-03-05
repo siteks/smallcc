@@ -297,6 +297,7 @@ Token *tokenise(char *p)
             if (!strncmp(p, "&=", 2)) {cur = new_token(TK_AMP_ASSIGN,    cur, p, 2); p += 2; continue;}
             if (!strncmp(p, "|=", 2)) {cur = new_token(TK_BITOR_ASSIGN,  cur, p, 2); p += 2; continue;}
             if (!strncmp(p, "^=", 2)) {cur = new_token(TK_BITXOR_ASSIGN, cur, p, 2); p += 2; continue;}
+            if (!strncmp(p, "%=", 2)) {cur = new_token(TK_PERCENT_ASSIGN, cur, p, 2); p += 2; continue;}
         }
         // Single character tokens
         switch (*p) 
@@ -324,6 +325,8 @@ Token *tokenise(char *p)
             // case '&': cur = new_token(TK_BITAND,    cur, p++, 1); continue;
             case '|': cur = new_token(TK_BITOR,     cur, p++, 1); continue;
             case '^': cur = new_token(TK_BITXOR,    cur, p++, 1); continue;
+            case '%': cur = new_token(TK_PERCENT,   cur, p++, 1); continue;
+            case '?': cur = new_token(TK_QUESTION,  cur, p++, 1); continue;
         }
         // Keywords and identifiers
         if (isalpha(*p) || *p == '_')

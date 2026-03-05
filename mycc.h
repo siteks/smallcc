@@ -63,6 +63,9 @@ typedef enum
     TK_BITXOR_ASSIGN,
     TK_SHIFTL_ASSIGN,
     TK_SHIFTR_ASSIGN,
+    TK_PERCENT,
+    TK_QUESTION,
+    TK_PERCENT_ASSIGN,
     TK_AUTO,
     TK_BREAK,
     TK_CASE,
@@ -181,6 +184,7 @@ typedef enum
     ND_EMPTY,
     ND_LABELSTMT,
     ND_GOTOSTMT,
+    ND_TERNARY,
     ND_UNDEFINED,
 } Node_kind;
 typedef enum

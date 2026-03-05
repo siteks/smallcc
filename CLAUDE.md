@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```bash
 make mycc           # Build the compiler
 make test_all       # Run all test suites
-make test_struct    # Run a specific test suite (also: test_init, test_ops, test_logops, test_func, test_longs, test_array, test_loops, test_goto, test_struct_init, test_floats, test_compound)
+make test_struct    # Run a specific test suite (also: test_init, test_ops, test_logops, test_func, test_longs, test_array, test_loops, test_goto, test_struct_init, test_floats, test_compound, test_remaining)
 make clean          # Remove binaries and temp files
 ```
 
@@ -164,7 +164,7 @@ postfix-suffix      → "[" expr "]"
 primary-expr        → ident | constant | "(" expr ")"
 ```
 
-**Not yet implemented:** `sizeof`, `typedef`, `enum` bodies, `register`/`extern`/`static` semantics, string literals.
+**Not yet implemented:** `typedef`, `enum` bodies, `register`/`extern`/`static` semantics, string literals. `sizeof(complex_expr)` not supported (only type names and simple idents).
 
 ### AST Node Kinds
 
@@ -739,11 +739,11 @@ Preprocessor excluded. Features are assessed against ANSI C89/ISO C90.
 | Feature | Status | Notes |
 |---|---|---|
 | Arithmetic `+ - * /` | ✅ | |
-| Modulo `%` | ❌ | Not tokenised, parsed, or in codegen |
-| Compound assignment `+= -= *= /= &= \|= ^= <<= >>=` | ✅ | Desugared to `lhs = lhs op rhs` in parser; `%=` blocked on `%` |
-| Ternary `? :` | ❌ | Not tokenised or parsed |
-| Comma operator `,` (in expressions) | ❌ | Comma is only parsed as a separator |
-| `sizeof` | ❌ | `TK_SIZEOF` tokenised; not parsed |
+| Modulo `%` | ✅ | |
+| Compound assignment `+= -= *= /= %= &= \|= ^= <<= >>=` | ✅ | Desugared to `lhs = lhs op rhs` in parser |
+| Ternary `? :` | ✅ | ND_TERNARY node; right-associative via `cond_expr()` |
+| Comma operator `,` (in expressions) | ✅ | `expr()` loops on commas; function args use `assign_expr()` |
+| `sizeof` | ✅ | `sizeof(type-name)` and `sizeof(ident)`; complex exprs not supported |
 | Pre/post `++ --` | ✅ | |
 | Unary `+ - ~ !` | ✅ | |
 | Address-of `&` | ✅ | |
@@ -754,8 +754,8 @@ Preprocessor excluded. Features are assessed against ANSI C89/ISO C90.
 | Cast `(type)expr` | ✅ | |
 | Array subscript `a[i]` | ✅ | Rewritten to pointer arithmetic |
 | Struct member `.` | ✅ | Including nested structs |
-| Pointer member `->` | ❌ | `TK_ARROW` tokenised; not parsed |
-| Function call | ✅ | Including recursion |
+| Pointer member `->` | ✅ | ND_MEMBER with val `"->"`, pointer dereferenced in gen_addr |
+| Function call | ✅ | Including recursion; multiple args supported |
 | Assignment `=` | ✅ | |
 
 ### Types
@@ -827,10 +827,10 @@ Preprocessor excluded. Features are assessed against ANSI C89/ISO C90.
 
 ### Summary
 
-**Implemented and working**: basic scalar types, pointers, 1-D/N-D arrays, structs, `float`/`double` (IEEE 754 arithmetic, comparisons, int↔float casts), `if`/`while`/`for`/`do-while`, `switch`/`case`/`default`, `break`, `continue`, `goto`, labeled statements, all arithmetic and bitwise operators except `%`, all comparison and logical operators, pre/post increment, address-of, dereference, struct member access (`.`), explicit casts, array subscripting, function definitions and calls, integer constants (decimal/hex/octal), floating-point constants, compound assignment (`+=` `-=` `*=` `/=` `&=` `|=` `^=` `<<=` `>>=`).
+**Implemented and working**: basic scalar types, pointers, 1-D/N-D arrays, structs, `float`/`double` (IEEE 754 arithmetic, comparisons, int↔float casts), `if`/`while`/`for`/`do-while`, `switch`/`case`/`default`, `break`, `continue`, `goto`, labeled statements, all arithmetic and bitwise operators including `%`, all comparison and logical operators, unary `+ - ~ ! &` and dereference `*`, pre-increment/decrement, struct member access (`.` and `->`), explicit casts, array subscripting, function definitions and calls (multi-arg), integer constants (decimal/hex/octal), floating-point constants, compound assignment (`+=` `-=` `*=` `/=` `%=` `&=` `|=` `^=` `<<=` `>>=`), ternary `?:`, comma operator, `sizeof(type)`/`sizeof(ident)`.
 
 **Partially working**: unions (layout correct, but not semantically distinct from struct in codegen), `const`/`volatile` (stored, not enforced), storage classes (parsed, not enforced).
 
-**Not yet implemented**: `%`, all compound assignments (`+=` etc.), ternary `?:`, `sizeof`, `->`, `enum`, `typedef`, string literals, variadic functions, bit fields.
+**Not yet implemented**: `enum`, `typedef`, string literals, variadic functions, bit fields, post-increment/decrement (tokenised but no codegen), `sizeof(complex_expr)`.
 
 **Extensions beyond C89**: `//` line comments.

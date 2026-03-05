@@ -320,25 +320,63 @@ static Node *primary_expr()
 }
 bool is_postfix(Token_kind tk)
 {
-    return      tk == TK_LBRACKET 
-            ||  tk == TK_LPAREN 
-            ||  tk == TK_DOT 
-            ||  tk == TK_INC 
+    return      tk == TK_LBRACKET
+            ||  tk == TK_LPAREN
+            ||  tk == TK_DOT
+            ||  tk == TK_ARROW
+            ||  tk == TK_INC
             ||  tk == TK_DEC;
 }
+// Forward declarations for sizeof support
+static bool is_type_name_or_type(Token *token);
+static Node *type_name();
+
 static Node *unary_expr()
 {
     fprintf(stderr, "%s %s\n", __func__, token->val);
-    // Node *node = postfix_expr();
     Node *node = 0;
-    if  (  token->kind == TK_INC || token->kind == TK_DEC 
-            ||  token->kind == TK_AMPERSAND || token->kind == TK_STAR 
-            ||  token->kind == TK_PLUS || token->kind == TK_MINUS)
+    if (token->kind == TK_SIZEOF)
+    {
+        token = token->next;
+        node = new_node(ND_LITERAL, "0", true);
+        node->type = t_int;
+        if (token->kind == TK_LPAREN && is_type_name_or_type(token->next))
+        {
+            expect(TK_LPAREN);
+            Node *tn = type_name();
+            expect(TK_RPAREN);
+            char buf[64];
+            sprintf(buf, "%d", tn->type->size);
+            strncpy(node->val, buf, sizeof(node->val) - 1);
+        }
+        else
+        {
+            Node *inner;
+            if (token->kind == TK_LPAREN)
+            {
+                expect(TK_LPAREN);
+                inner = unary_expr();
+                expect(TK_RPAREN);
+            }
+            else
+                inner = unary_expr();
+            Type2 *t = (inner->kind == ND_IDENT && inner->symbol)
+                       ? inner->symbol->type : inner->type;
+            char buf[64];
+            sprintf(buf, "%d", t ? t->size : 0);
+            strncpy(node->val, buf, sizeof(node->val) - 1);
+        }
+        return node;
+    }
+    else if (token->kind == TK_INC || token->kind == TK_DEC
+            ||  token->kind == TK_AMPERSAND || token->kind == TK_STAR
+            ||  token->kind == TK_PLUS || token->kind == TK_MINUS
+            ||  token->kind == TK_BANG || token->kind == TK_TWIDDLE)
     {
         node = new_node(ND_UNARYOP, expect(token->kind), true);
         add_child(node, unary_expr());
     }
-    else if (token->kind == TK_IDENT 
+    else if (token->kind == TK_IDENT
             || token->kind == TK_CONSTINT 
             || token->kind == TK_CONSTFLT 
             || token->kind == TK_CHARACTER
@@ -406,22 +444,29 @@ static Node *unary_expr()
                 expect(TK_LPAREN);
                 pex_node->is_function = true;
                 if (token->kind != TK_RPAREN)
-                    add_child(node, expr());
+                {
+                    add_child(node, assign_expr());
+                    while (token->kind == TK_COMMA)
+                    {
+                        token = token->next;
+                        add_child(node, assign_expr());
+                    }
+                }
                 expect(TK_RPAREN);
                 break;
             case(TK_DOT):
             {
-                // Member access. The primary expression is a struct (possibly
-                // dereferenced pointer) and then there are one or more member 
-                // references
                 expect(token->kind);
-
-                // Node *n = new_node(ND_MEMBER, 0, true);
-                // add_child(n, struct_node);
-                // add_child(n, new_node(ND_IDENT, expect(TK_IDENT), true));
-                // struct_node = n;
-                // node = n;
-                Node *n = new_node(ND_MEMBER, 0, true);
+                Node *n = new_node(ND_MEMBER, ".", true);
+                add_child(n, node);
+                add_child(n, new_node(ND_IDENT, expect(TK_IDENT), true));
+                node = n;
+                break;
+            }
+            case(TK_ARROW):
+            {
+                expect(TK_ARROW);
+                Node *n = new_node(ND_MEMBER, "->", true);
                 add_child(n, node);
                 add_child(n, new_node(ND_IDENT, expect(TK_IDENT), true));
                 node = n;
@@ -434,11 +479,11 @@ static Node *unary_expr()
     }
     return node;
 }
-bool is_type_name_or_type(Token *token)
+static bool is_type_name_or_type(Token *token)
 {
     return is_type_name(token->kind);
 }
-Node *type_name()
+static Node *type_name()
 {
     fprintf(stderr, "%s\n", __func__);
     // type-name ::= <specifier-qualifier>+ <abstract-declarator>?
@@ -511,7 +556,7 @@ static Node *mult_expr()
 {
     fprintf(stderr, "%s %s\n", __func__, token->val);
     Node *node = cast_expr();
-    while (token->kind == TK_STAR || token->kind == TK_SLASH)
+    while (token->kind == TK_STAR || token->kind == TK_SLASH || token->kind == TK_PERCENT)
     {
         Node *enode = new_node(ND_BINOP, expect(token->kind), true);
         add_child(enode, node);
@@ -646,10 +691,25 @@ static Node *logor_expr()
     }
     return node;
 }
-static Node *assign_expr()
+static Node *assign_expr();
+static Node *cond_expr()
 {
     fprintf(stderr, "%s %s\n", __func__, token->val);
     Node *node = logor_expr();
+    if (token->kind != TK_QUESTION)
+        return node;
+    token = token->next;    // consume '?'
+    Node *tnode = new_node(ND_TERNARY, "?:", true);
+    add_child(tnode, node);
+    add_child(tnode, expr());
+    expect(TK_COLON);
+    add_child(tnode, cond_expr());
+    return tnode;
+}
+static Node *assign_expr()
+{
+    fprintf(stderr, "%s %s\n", __func__, token->val);
+    Node *node = cond_expr();
     if (token->kind == TK_ASSIGN)
     {
         Node *anode = new_node(ND_ASSIGN, expect(TK_ASSIGN), true);
@@ -667,8 +727,9 @@ static Node *assign_expr()
     else if (ctk == TK_AMP_ASSIGN)    op = "&";
     else if (ctk == TK_BITOR_ASSIGN)  op = "|";
     else if (ctk == TK_BITXOR_ASSIGN) op = "^";
-    else if (ctk == TK_SHIFTL_ASSIGN) op = "<<";
-    else if (ctk == TK_SHIFTR_ASSIGN) op = ">>";
+    else if (ctk == TK_SHIFTL_ASSIGN)   op = "<<";
+    else if (ctk == TK_SHIFTR_ASSIGN)   op = ">>";
+    else if (ctk == TK_PERCENT_ASSIGN)  op = "%";
     if (op)
     {
         char *tok_val = token->val;
@@ -688,7 +749,16 @@ static Node *assign_expr()
 Node *expr()
 {
     fprintf(stderr, "%s %s\n", __func__, token->val);
-    return assign_expr();
+    Node *node = assign_expr();
+    while (token->kind == TK_COMMA)
+    {
+        token = token->next;
+        Node *enode = new_node(ND_BINOP, ",", true);
+        add_child(enode, node);
+        add_child(enode, assign_expr());
+        node = enode;
+    }
+    return node;
 }
 bool is_sc_spec(Token_kind tk)
 {
@@ -1195,6 +1265,7 @@ char *nodestr(Node_kind k)
         case ND_EMPTY:       return "EMPTY       ";
         case ND_LABELSTMT:   return "LABELSTMT   ";
         case ND_GOTOSTMT:    return "GOTOSTMT    ";
+        case ND_TERNARY:     return "TERNARY     ";
         case ND_UNDEFINED:   return "##FIXME##   ";
         default:             return "unknown     ";
     }
@@ -1398,6 +1469,15 @@ Type2 *check_unary_operand(Node *n)
     // For dereference, the result type is the pointed-to/element type, not the pointer/array type
     if (!strcmp(n->val, "*"))
         return elem_type(lhs->type);
+    // Address-of: result is pointer to lhs type
+    if (!strcmp(n->val, "&"))
+        return get_pointer_type(lhs->type);
+    // Logical not: result is always int
+    if (!strcmp(n->val, "!"))
+        return t_int;
+    // Bitwise not: result is lhs type (integer)
+    if (!strcmp(n->val, "~"))
+        return lhs->type;
     return lhs->type;
 }
 bool is_unscaled_ptr(Node *n)
@@ -1439,9 +1519,17 @@ void propagate_types(Node *p, Node *n)
             // in the ident namespace
             lhs->type = find_symbol(lhs, lhs->val, NS_IDENT)->type;
         }
-        fprintf(stderr, "%s looking in lhs type:%016llx for field %s\n", __func__, (unsigned long long)lhs->type, rhs->val);
+        // For ->, dereference the pointer to get the struct type
+        Type2 *struct_type = lhs->type;
+        if (!strcmp(n->val, "->"))
+        {
+            if (!istype_ptr(struct_type))
+                error("'->' requires pointer type\n");
+            struct_type = struct_type->u.ptr.pointee;
+        }
+        fprintf(stderr, "%s looking in lhs type:%016llx for field %s\n", __func__, (unsigned long long)struct_type, rhs->val);
         Type2 *base = 0;
-        n->offset = find_offset(lhs->type, rhs->val, &base);
+        n->offset = find_offset(struct_type, rhs->val, &base);
         if (n->offset < 0)
             error("Can't find member %s in struct\n", rhs->val);
         fprintf(stderr, "%s found member %s with offset %d basetype %016llx\n", __func__,
@@ -1451,8 +1539,20 @@ void propagate_types(Node *p, Node *n)
     }
     if (n->is_expr)
     {
+        if (n->kind == ND_TERNARY)
+        {
+            // Result type is the common type of then/else branches
+            n->type = n->children[1]->type;
+        }
         if (n->kind == ND_BINOP)
         {
+            if (!strcmp(n->val, ","))
+            {
+                // Comma: result type is the right operand's type
+                n->type = n->children[1]->type;
+            }
+            else
+            {
             n->type = check_operands(n);
             // Comparison and logical operators always yield int, regardless of operand types
             if (!strcmp(n->val, "<")  || !strcmp(n->val, "<=") ||
@@ -1467,6 +1567,7 @@ void propagate_types(Node *p, Node *n)
                 insert_scale(n, 1, elem_type(n->children[0]->type)->size);
             else if (is_unscaled_ptr(n->children[1]) && istype_intlike(n->children[0]->type))
                 insert_scale(n, 0, elem_type(n->children[1]->type)->size);
+            }   // end else (non-comma binop)
         }
         if (n->kind == ND_UNARYOP)
         {

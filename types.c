@@ -414,20 +414,10 @@ void add_types_and_symbols(Node *node, bool is_param, int depth)
     if (node->kind != ND_DECLARATION)
         error("Node should be ND_DECLARATION\n");
 
-    char *ts    = 0;
-    char *ident = 0;
-    Node *decl_n = 0;  // the declarator child
-
+    // First pass: handle struct definitions and determine base type
     for (int i = 0; i < node->child_count; i++) {
         Node *n = node->children[i];
-
-        if (n->kind == ND_DECLARATOR && !depth) {
-            ts     = tstr_compact(n);
-            ident  = get_decl_ident(n);
-            decl_n = n;
-            fprintf(stderr, "%s declarator ts:'%s' ident:'%s'\n",
-                __func__, ts, ident ? ident : "");
-        } else if (n->kind == ND_STRUCT) {
+        if (n->kind == ND_STRUCT) {
             if (n->child_count == 1) {
                 if (node->child_count == 1) {
                     // Standalone incomplete struct (e.g. "struct foo;")
@@ -455,29 +445,41 @@ void add_types_and_symbols(Node *node, bool is_param, int depth)
         }
     }
 
-    if (ts) {
-        // Build the Type2 for this declaration
-        Type2 *base;
-        if (node->typespec & (TB_STRUCT | TB_UNION)) {
-            base = (node->type && node->type->base == TB2_STRUCT) ? node->type : t_void;
-        } else {
-            base = typespec_to_base(node->typespec);
-        }
-        Type2 *ty = apply_derivation(base, ts);
-        node->type = ty;
+    // Determine base type for declarators
+    Type2 *base;
+    if (node->typespec & (TB_STRUCT | TB_UNION)) {
+        base = (node->type && node->type->base == TB2_STRUCT) ? node->type : t_void;
+    } else {
+        base = typespec_to_base(node->typespec);
+    }
 
+    // Second pass: process every ND_DECLARATOR child
+    bool first_decl = true;
+    for (int i = 0; i < node->child_count; i++) {
+        Node *n = node->children[i];
+        if (n->kind != ND_DECLARATOR || depth)
+            continue;
+
+        char *ts    = tstr_compact(n);
+        char *ident = get_decl_ident(n);
+        fprintf(stderr, "%s declarator ts:'%s' ident:'%s'\n",
+            __func__, ts, ident ? ident : "");
+
+        Type2 *ty = apply_derivation(base, ts);
+        if (first_decl) {
+            node->type = ty;
+            first_decl = false;
+        }
         fprintf(stderr, "%s final type %s\n", __func__, fulltype_str(ty));
 
-        if (ident && decl_n) {
-            decl_n->symbol = insert_ident(node, ty, ident, is_param);
+        if (ident) {
+            n->symbol = insert_ident(node, ty, ident, is_param);
 
             // For struct-typed variables, ensure symbol points to struct type
-            if (!decl_n->is_struct && node->child_count > 0
+            if (!n->is_struct && node->child_count > 0
                 && node->children[0]->kind == ND_STRUCT) {
-                char *stag = node->children[0]->children[0]->val;
-                Symbol *s  = find_symbol(node, stag, NS_TAG);
-                fprintf(stderr, "%s setting sym type from tag:%s\n", __func__, stag);
-                decl_n->symbol->type = ty;  // ty already wraps struct base
+                fprintf(stderr, "%s setting sym type from tag\n", __func__);
+                n->symbol->type = ty;  // ty already wraps struct base
             }
         }
     }

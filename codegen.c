@@ -243,6 +243,10 @@ void gen_div()
 {
     printf("    div\n");
 }
+void gen_mod()
+{
+    printf("    mod\n");
+}
 void gen_eq()
 {
     printf("    eq\n");
@@ -494,7 +498,10 @@ void gen_addr(Node *node)
     }
     else if (node->kind == ND_MEMBER)
     {
-        gen_addr(node->children[0]);
+        if (!strcmp(node->val, "->"))
+            gen_expr(node->children[0]);    // load pointer value
+        else
+            gen_addr(node->children[0]);    // struct base address
         gen_push();
         gen_offset(node);
         gen_add();
@@ -610,6 +617,12 @@ void gen_expr(Node *node)
     printf(";%s %s %s\n", __func__, nodestr(node->kind), node->val);
     if (node->kind == ND_BINOP)
     {
+        if (!strcmp(node->val, ","))
+        {
+            gen_expr(node->children[0]);    // evaluate for side effects
+            gen_expr(node->children[1]);    // result is rhs
+            return;
+        }
         gen_expr(node->children[0]);
         gen_push();
         gen_expr(node->children[1]);
@@ -641,6 +654,7 @@ void gen_expr(Node *node)
         if (!strcmp(node->val, "|"))    {gen_bitor(); return;}
         if (!strcmp(node->val, "^"))    {gen_bitxor(); return;}
         if (!strcmp(node->val, "&"))    {gen_bitand(); return;}
+        if (!strcmp(node->val, "%"))    {gen_mod(); return;}
         error("%s not handled in codegen", node->val);
     }
     else if (node->kind == ND_LITERAL)
@@ -660,8 +674,8 @@ void gen_expr(Node *node)
         else
         {
             gen_varaddr(node);
-            // Don't fetch from address if pointer or array
-            if (!istype_array(node->symbol->type) && !istype_ptr(node->symbol->type))
+            // Don't fetch from address if array (array name IS the address)
+            if (!istype_array(node->symbol->type))
                 gen_ld(node->symbol->type->size);
         }
     }
@@ -693,6 +707,24 @@ void gen_expr(Node *node)
             gen_expr(node->children[0]);
             gen_ld(elem_type(node->type)->size);
         }
+        else if (!strcmp(node->val, "&"))
+        {
+            gen_addr(node->children[0]);
+        }
+        else if (!strcmp(node->val, "!"))
+        {
+            gen_expr(node->children[0]);
+            gen_push();
+            gen_imm(0);
+            gen_eq();
+        }
+        else if (!strcmp(node->val, "~"))
+        {
+            gen_expr(node->children[0]);
+            gen_push();
+            gen_imm(0xffffffff);
+            gen_bitxor();
+        }
     }
     else if (node->kind == ND_ASSIGN)
     {
@@ -715,11 +747,20 @@ void gen_expr(Node *node)
     }
     else if (node->kind == ND_MEMBER)
     {
-        gen_addr(node->children[0]);
-        gen_push();
-        gen_offset(node);
-        gen_add();
+        gen_addr(node);         // handles both . and ->
         gen_ld(node->type->size);
+    }
+    else if (node->kind == ND_TERNARY)
+    {
+        int l_else = new_label();
+        int l_end  = new_label();
+        gen_expr(node->children[0]);
+        gen_jz(l_else);
+        gen_expr(node->children[1]);
+        gen_j(l_end);
+        gen_label(l_else);
+        gen_expr(node->children[2]);
+        gen_label(l_end);
     }
 }
 void gen_return()
