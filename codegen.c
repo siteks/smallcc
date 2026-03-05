@@ -354,6 +354,25 @@ void gen_sxw()
 {
     printf("    sxw\n");
 }
+void gen_fadd() { printf("    fadd\n"); }
+void gen_fsub() { printf("    fsub\n"); }
+void gen_fmul() { printf("    fmul\n"); }
+void gen_fdiv() { printf("    fdiv\n"); }
+void gen_flt()  { printf("    flt\n"); }
+void gen_fle()  { printf("    fle\n"); }
+void gen_fgt()  { printf("    fgt\n"); }
+void gen_fge()  { printf("    fge\n"); }
+void gen_itof() { printf("    itof\n"); }
+void gen_ftoi() { printf("    ftoi\n"); }
+
+void gen_imm_float(double val)
+{
+    float f = (float)val;
+    unsigned int bits;
+    memcpy(&bits, &f, sizeof(bits));
+    printf("    immw    0x%04x\n", bits & 0xffff);
+    printf("    immwh   0x%04x\n", (bits >> 16) & 0xffff);
+}
 void gen_assign()
 {
 }
@@ -507,6 +526,24 @@ void gen_cast(Type2 *src, Type2 *dst)
     // Value in reg is in src type, needs to be converted to dst type
     if (src == dst)
         return;
+    if (istype_intlike(src) && (istype_float(dst) || istype_double(dst)))
+    {
+        if (src->size == 1) gen_sxb();
+        else if (src->size == 2) gen_sxw();
+        gen_itof();
+        return;
+    }
+    if ((istype_float(src) || istype_double(src)) && istype_intlike(dst))
+    {
+        gen_ftoi();
+        if (dst->size < 4)
+        {
+            gen_push();
+            gen_imm(dst->size == 1 ? 0xff : 0xffff);
+            gen_bitand();
+        }
+        return;
+    }
     if (src->size == 1 && dst->size == 1)
         return;
     if (src->size == 2 && dst->size == 2)
@@ -576,6 +613,17 @@ void gen_expr(Node *node)
         gen_expr(node->children[0]);
         gen_push();
         gen_expr(node->children[1]);
+        if (istype_float(node->children[0]->type) || istype_double(node->children[0]->type))
+        {
+            if (!strcmp(node->val, "+"))   { gen_fadd(); return; }
+            if (!strcmp(node->val, "-"))   { gen_fsub(); return; }
+            if (!strcmp(node->val, "*"))   { gen_fmul(); return; }
+            if (!strcmp(node->val, "/"))   { gen_fdiv(); return; }
+            if (!strcmp(node->val, "<"))   { gen_flt();  return; }
+            if (!strcmp(node->val, "<="))  { gen_fle();  return; }
+            if (!strcmp(node->val, ">"))   { gen_fgt();  return; }
+            if (!strcmp(node->val, ">="))  { gen_fge();  return; }
+        }
         if (!strcmp(node->val, "+"))    {gen_add(); return;}
         if (!strcmp(node->val, "-"))    {gen_sub(); return;}
         if (!strcmp(node->val, "*"))    {gen_mul(); return;}
@@ -597,7 +645,10 @@ void gen_expr(Node *node)
     }
     else if (node->kind == ND_LITERAL)
     {
-        gen_imm((int)strtol(node->val, 0, 0));
+        if (istype_float(node->type) || istype_double(node->type))
+            gen_imm_float(node->fval);
+        else
+            gen_imm((int)strtol(node->val, 0, 0));
     }
     else if (node->kind == ND_IDENT)
     {
@@ -620,12 +671,22 @@ void gen_expr(Node *node)
         {
             gen_expr(node->children[0]);
         }      
-        else if (!strcmp(node->val, "-"))    
+        else if (!strcmp(node->val, "-"))
         {
-            gen_imm(0);
-            gen_push();
-            gen_expr(node->children[0]);
-            gen_sub();
+            if (istype_float(node->children[0]->type) || istype_double(node->children[0]->type))
+            {
+                gen_imm_float(0.0);
+                gen_push();
+                gen_expr(node->children[0]);
+                gen_fsub();
+            }
+            else
+            {
+                gen_imm(0);
+                gen_push();
+                gen_expr(node->children[0]);
+                gen_sub();
+            }
         }
         else if (!strcmp(node->val, "*"))
         {
@@ -879,6 +940,60 @@ int int_constexpr(Node *n)
         return int_binop(n);
     return strtol(n->val, 0, 0);
 }
+
+// Write struct field initializers for a local struct.
+// vaddr: lea argument for struct base (negative, e.g. -4 for bp-4)
+// st: the struct/union Type2
+static void gen_struct_inits(Node *n, int vaddr, Type2 *st)
+{
+    Field *f = st->u.composite.members;
+    for (int i = 0; i < n->child_count && f; i++, f = f->next)
+    {
+        Node *child = n->children[i];
+        if (child->kind == ND_INITLIST)
+        {
+            if (f->type->base == TB2_STRUCT)
+                gen_struct_inits(child, vaddr + f->offset, f->type);
+        }
+        else if (is_constexpr(child))
+        {
+            gen_lea(vaddr + f->offset);
+            gen_push();
+            gen_expr(child);
+            gen_st(f->type->size);
+        }
+    }
+}
+
+// Fill a byte buffer with struct field initializers for a global struct.
+// base: byte offset of struct base within the data buffer
+// st: the struct/union Type2
+static void gen_struct_mem_inits(char *data, Node *n, Type2 *st, int base)
+{
+    Field *f = st->u.composite.members;
+    for (int i = 0; i < n->child_count && f; i++, f = f->next)
+    {
+        Node *child = n->children[i];
+        if (child->kind == ND_INITLIST)
+        {
+            if (f->type->base == TB2_STRUCT)
+                gen_struct_mem_inits(data, child, f->type, base + f->offset);
+        }
+        else if (is_constexpr(child))
+        {
+            int val = int_constexpr(child);
+            data[base + f->offset] = val & 0xff;
+            if (f->type->size > 1)
+                data[base + f->offset + 1] = (val >> 8) & 0xff;
+            if (f->type->size > 2)
+            {
+                data[base + f->offset + 2] = (val >> 16) & 0xff;
+                data[base + f->offset + 3] = (val >> 24) & 0xff;
+            }
+        }
+    }
+}
+
 void gen_initlist(Node *n, Symbol *s)
 {
     // Address of variable to be initialised is on the stack
@@ -887,9 +1002,15 @@ void gen_initlist(Node *n, Symbol *s)
     int constexpr = count_constexpr(n);
     if (n->scope.depth)
     {
-        if (!array_dimensions(t))
+        if (t->base == TB2_STRUCT)
         {
-            // Scalar object, just take the first element of the list. There should be 
+            int vaddr = -find_local_addr(n, s->name);
+            gen_fill(vaddr, t->size);
+            gen_struct_inits(n, vaddr, t);
+        }
+        else if (!array_dimensions(t))
+        {
+            // Scalar object, just take the first element of the list. There should be
             // only one element
             if (constexpr != 1)
                 error("Should be exactly one constexpr in initialiser\n");
@@ -914,15 +1035,31 @@ void gen_initlist(Node *n, Symbol *s)
     }
     else
     {
-        if (!array_dimensions(t))
+        if (t->base == TB2_STRUCT)
         {
-            // Scalar object, just take the first element of the list. There should be 
+            char *data = calloc(1, t->size);
+            gen_struct_mem_inits(data, n, t, 0);
+            gen_bytes(data, t->size);
+        }
+        else if (!array_dimensions(t))
+        {
+            // Scalar object, just take the first element of the list. There should be
             // only one element
             if (constexpr != 1)
                 error("Should be exactly one constexpr in initialiser\n");
             Node *l;
             for(l = n; !is_constexpr(l); l = l->children[0]);
-            gen_word(int_constexpr(l));
+            if (istype_float(t) || istype_double(t))
+            {
+                float f = (float)l->fval;
+                char bytes[4];
+                memcpy(bytes, &f, 4);
+                gen_bytes(bytes, 4);
+            }
+            else
+            {
+                gen_word(int_constexpr(l));
+            }
         }
         else if (constexpr)
         {
@@ -990,8 +1127,18 @@ void gen_decl(Node *node)
                     // TODO string initialiser goes here
                     else
                     {
-                        int val = int_constexpr(n->children[1]);
-                        gen_word(val);
+                        if (istype_float(n->symbol->type) || istype_double(n->symbol->type))
+                        {
+                            float f = (float)n->children[1]->fval;
+                            char bytes[4];
+                            memcpy(bytes, &f, 4);
+                            gen_bytes(bytes, 4);
+                        }
+                        else
+                        {
+                            int val = int_constexpr(n->children[1]);
+                            gen_word(val);
+                        }
                     }
                 }
                 else

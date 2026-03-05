@@ -1414,8 +1414,14 @@ void propagate_types(Node *p, Node *n)
         if (n->kind == ND_BINOP)
         {
             n->type = check_operands(n);
-            
-            // See if either node is a pointer and the other an int of some sort. If so, we need to 
+            // Comparison and logical operators always yield int, regardless of operand types
+            if (!strcmp(n->val, "<")  || !strcmp(n->val, "<=") ||
+                !strcmp(n->val, ">")  || !strcmp(n->val, ">=") ||
+                !strcmp(n->val, "==") || !strcmp(n->val, "!=") ||
+                !strcmp(n->val, "&&") || !strcmp(n->val, "||"))
+                n->type = t_int;
+
+            // See if either node is a pointer and the other an int of some sort. If so, we need to
             // scale the int by the size of the pointed to type
             if (is_unscaled_ptr(n->children[0]) && istype_intlike(n->children[1]->type))
                 insert_scale(n, 1, elem_type(n->children[0]->type)->size);

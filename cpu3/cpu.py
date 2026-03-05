@@ -2,6 +2,7 @@
 
 
 import re
+import struct
 import numpy as np
 
 import sys
@@ -68,6 +69,15 @@ import sys
 #   enter   word    *--sp = lr; *--sp = bp; bp = sp; sp -= word;
 #   lea     word    r0 = bp + val
 
+def f2b(f):
+    """Convert Python float to 32-bit IEEE 754 bit pattern (unsigned int)."""
+    return struct.unpack('<I', struct.pack('<f', float(f)))[0]
+
+def b2f(b):
+    """Convert 32-bit IEEE 754 bit pattern to Python float."""
+    return struct.unpack('<f', struct.pack('<I', int(b) & 0xffffffff))[0]
+
+
 class G:
 
     directive = {
@@ -112,6 +122,16 @@ class G:
         'xor'   :   (0x1b, 0),
         'sxb'   :   (0x1c, 0),
         'sxw'   :   (0x1d, 0),
+        'fadd'  :   (0x20, 0),
+        'fsub'  :   (0x21, 0),
+        'fmul'  :   (0x22, 0),
+        'fdiv'  :   (0x23, 0),
+        'flt'   :   (0x24, 0),
+        'fle'   :   (0x25, 0),
+        'fgt'   :   (0x26, 0),
+        'fge'   :   (0x27, 0),
+        'itof'  :   (0x28, 0),
+        'ftoi'  :   (0x29, 0),
         # Instructions with 8 bit operand
         'immb'  :   (0x40, 1),
         'adj'   :   (0x41, 1),
@@ -301,6 +321,19 @@ class CPU:
 
         elif    i == 'sxb':     s.r0 = 0xffffff00 | s.r0 if s.r0 & 0x80 else 0xff & s.r0
         elif    i == 'sxw':     s.r0 = 0xffff0000 | s.r0 if s.r0 & 0x8000 else 0xffff & s.r0
+        elif i == 'fadd': lf = b2f(m.read32(s.sp)); s.sp += 4; s.r0 = f2b(lf + b2f(s.r0))
+        elif i == 'fsub': lf = b2f(m.read32(s.sp)); s.sp += 4; s.r0 = f2b(lf - b2f(s.r0))
+        elif i == 'fmul': lf = b2f(m.read32(s.sp)); s.sp += 4; s.r0 = f2b(lf * b2f(s.r0))
+        elif i == 'fdiv': lf = b2f(m.read32(s.sp)); s.sp += 4; s.r0 = f2b(lf / b2f(s.r0))
+        elif i == 'flt':  lf = b2f(m.read32(s.sp)); s.sp += 4; s.r0 = 1 if lf < b2f(s.r0) else 0
+        elif i == 'fle':  lf = b2f(m.read32(s.sp)); s.sp += 4; s.r0 = 1 if lf <= b2f(s.r0) else 0
+        elif i == 'fgt':  lf = b2f(m.read32(s.sp)); s.sp += 4; s.r0 = 1 if lf > b2f(s.r0) else 0
+        elif i == 'fge':  lf = b2f(m.read32(s.sp)); s.sp += 4; s.r0 = 1 if lf >= b2f(s.r0) else 0
+        elif i == 'itof':
+            iv = s.r0 if s.r0 < 0x80000000 else s.r0 - 0x100000000
+            s.r0 = f2b(float(iv))
+        elif i == 'ftoi':
+            s.r0 = int(b2f(s.r0)) & 0xffffffff
         elif    i == 'immb':    s.r0 = imm
         elif    i == 'adj':     s.sp += imm
 

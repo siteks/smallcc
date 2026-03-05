@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```bash
 make mycc           # Build the compiler
 make test_all       # Run all test suites
-make test_struct    # Run a specific test suite (also: test_init, test_ops, test_logops, test_func, test_longs, test_array, test_loops, test_goto)
+make test_struct    # Run a specific test suite (also: test_init, test_ops, test_logops, test_func, test_longs, test_array, test_loops, test_goto, test_struct_init, test_floats)
 make clean          # Remove binaries and temp files
 ```
 
@@ -253,7 +253,7 @@ Post-order (children first) tree walk. For each node:
 
 - `ND_IDENT` (not struct member): `node->type = find_symbol(…)->type`
 - `ND_MEMBER`: looks up field in `lhs->type->u.composite.members`, sets `node->offset` and `node->type`
-- `ND_BINOP` (is_expr): calls `check_operands()` → inserts arithmetic-conversion casts, returns lhs type
+- `ND_BINOP` (is_expr): calls `check_operands()` → inserts arithmetic-conversion casts, returns lhs type; then comparison/logical operators (`< <= > >= == != && ||`) force `node->type = t_int` regardless of operand type
 - `ND_UNARYOP` (is_expr): calls `check_unary_operand()` → for `*` returns `elem_type(child->type)`; preserves parser-set types (guards with `if (node->type == t_void)`)
 - `ND_RETURNSTMT`: inserts a cast if return type differs from expression type
 
@@ -528,16 +528,18 @@ Casts are no-ops when src and dst have the same size. Otherwise:
 | int → char (truncate) | `push; immw 0xff; and` |
 | uchar/ushort → larger | zero-extend (no-op, top bits assumed 0) |
 | int/ptr → long (zero-extend) | `push; immw 0; push; …` (builds 32-bit) |
+| int-like → float/double | `sxb` or `sxw` (sign-extend to 32 bits) then `itof` |
+| float/double → int-like | `ftoi` then `push; immw mask; and` if size < 4 |
 
 ### Global Variable Initialization
 
-**Scalars**: emits `word value` (or `long` for 4-byte types) in the data section.
+**Scalars**: emits `word value` (or `long` for 4-byte integer types) in the data section. Float scalars emit 4 bytes of IEEE 754 representation via `gen_bytes`.
 
 **Arrays** (global): `gen_mem_inits()` recursively fills a `char data[]` byte buffer, then `gen_bytes()` emits one `byte` directive per byte.
 
 **Arrays** (local): `gen_fill(vaddr, size)` zeroes all bytes, then `gen_inits()` recursively emits `lea; push; immw; sw/sl` sequences for non-zero initializers.
 
-Struct initializers are not yet supported.
+**Structs**: `gen_struct_inits` (local) and `gen_struct_mem_inits` (global) write each field; nested structs recurse. Partial initializers leave remaining fields zeroed.
 
 ### Two-Pass Code Generation
 
@@ -608,6 +610,18 @@ Three formats:
 | 0x1b | `xor` | r0 = mem32[sp] ^ r0; sp += 4 |
 | 0x1c | `sxb` | r0 = sign_extend_8(r0) |
 | 0x1d | `sxw` | r0 = sign_extend_16(r0) |
+| 0x20 | `fadd` | r0 = float_bits(float(stack) + float(r0)); sp += 4 |
+| 0x21 | `fsub` | r0 = float_bits(float(stack) - float(r0)); sp += 4 |
+| 0x22 | `fmul` | r0 = float_bits(float(stack) * float(r0)); sp += 4 |
+| 0x23 | `fdiv` | r0 = float_bits(float(stack) / float(r0)); sp += 4 |
+| 0x24 | `flt` | r0 = (float(stack) < float(r0)) ? 1 : 0; sp += 4 |
+| 0x25 | `fle` | r0 = (float(stack) <= float(r0)) ? 1 : 0; sp += 4 |
+| 0x26 | `fgt` | r0 = (float(stack) > float(r0)) ? 1 : 0; sp += 4 |
+| 0x27 | `fge` | r0 = (float(stack) >= float(r0)) ? 1 : 0; sp += 4 |
+| 0x28 | `itof` | r0 = float_bits(float(signed32(r0))) |
+| 0x29 | `ftoi` | r0 = int(float(r0)) truncated toward zero |
+
+Float operands are 32-bit IEEE 754 single-precision values stored as raw bit patterns in r0 and on the stack. `float_bits(f)` means the IEEE 754 bit pattern of `f`. `float(x)` means interpret the bit pattern `x` as IEEE 754.
 
 **Stack-binary convention**: all `add`, `sub`, `mul`, `div`, `mod`, `shl`, `shr`, comparisons, and bitwise ops pop their left operand from the stack (`mem32[sp]`) and use r0 as right operand, writing the result to r0 and incrementing sp by 4.
 
@@ -750,8 +764,8 @@ Preprocessor excluded. Features are assessed against ANSI C89/ISO C90.
 | `short` / `unsigned short` | ✅ | 2 bytes |
 | `int` / `unsigned int` | ✅ | 2 bytes on target |
 | `long` / `unsigned long` | ✅ | 4 bytes |
-| `float` | ⚠️ | Parsed and typed; codegen emits integer ops (no FP arithmetic) |
-| `double` | ⚠️ | Same as float |
+| `float` | ✅ | 4-byte IEEE 754; arithmetic, comparisons, and int↔float casts work |
+| `double` | ✅ | Treated identically to `float` (no 64-bit FP distinction on target) |
 | `void` | ✅ | |
 | Pointers | ✅ | Including pointer arithmetic |
 | Arrays (1-D and N-D) | ✅ | |
@@ -770,7 +784,7 @@ Preprocessor excluded. Features are assessed against ANSI C89/ISO C90.
 | Multiple declarators (`int a, b;`) | ✅ | |
 | Scalar initializer (`int x = 5;`) | ✅ | |
 | Array initializer (`int a[] = {1,2,3};`) | ✅ | Including multi-dim |
-| Struct/union initializer | ❌ | |
+| Struct/union initializer | ✅ | Flat and nested; partial init zero-fills remainder |
 | `auto` | ⚠️ | Parsed; no semantic difference from default local |
 | `register` | ⚠️ | Parsed; ignored (no register allocator) |
 | `static` | ⚠️ | Parsed; internal-linkage and persistent-storage semantics not enforced |
@@ -786,7 +800,7 @@ Preprocessor excluded. Features are assessed against ANSI C89/ISO C90.
 | Hex constants (`0x…`) | ✅ | |
 | Octal constants (`0…`) | ✅ | |
 | Integer suffixes `u/U`, `l/L`, `ul/UL` | ✅ | |
-| Floating-point constants | ✅ | Parsed; no FP codegen |
+| Floating-point constants | ✅ | Parsed and emitted as IEEE 754 via `immw`/`immwh` pair |
 | Character constants (`'a'`, escape sequences) | ✅ | |
 | String literals (`"…"`) | ❌ | Not tokenised or parsed |
 
@@ -809,14 +823,14 @@ Preprocessor excluded. Features are assessed against ANSI C89/ISO C90.
 | Integer promotions (char/short → int in expressions) | ⚠️ | Partial; not uniformly applied |
 | Usual arithmetic conversions (mixed-type operands) | ⚠️ | Basic widening casts emitted; full C89 hierarchy not guaranteed |
 | Pointer ↔ integer conversions | ✅ | Used in tests (e.g. `a = 0x2000`) |
-| Floating-point conversions | ❌ | No FP arithmetic in codegen |
+| Floating-point conversions | ✅ | `itof`/`ftoi` opcodes; int→float sign-extends first |
 
 ### Summary
 
-**Implemented and working**: basic scalar types, pointers, 1-D/N-D arrays, structs, `if`/`while`/`for`/`do-while`, `switch`/`case`/`default`, `break`, `continue`, `goto`, labeled statements, all arithmetic and bitwise operators except `%`, all comparison and logical operators, pre/post increment, address-of, dereference, struct member access (`.`), explicit casts, array subscripting, function definitions and calls, integer constants (decimal/hex/octal).
+**Implemented and working**: basic scalar types, pointers, 1-D/N-D arrays, structs, `float`/`double` (IEEE 754 arithmetic, comparisons, int↔float casts), `if`/`while`/`for`/`do-while`, `switch`/`case`/`default`, `break`, `continue`, `goto`, labeled statements, all arithmetic and bitwise operators except `%`, all comparison and logical operators, pre/post increment, address-of, dereference, struct member access (`.`), explicit casts, array subscripting, function definitions and calls, integer constants (decimal/hex/octal), floating-point constants.
 
-**Partially working**: unions (layout correct, but not semantically distinct from struct in codegen), `const`/`volatile` (stored, not enforced), storage classes (parsed, not enforced), `float`/`double` (types only, no FP arithmetic).
+**Partially working**: unions (layout correct, but not semantically distinct from struct in codegen), `const`/`volatile` (stored, not enforced), storage classes (parsed, not enforced).
 
-**Not yet implemented**: `%`, all compound assignments (`+=` etc.), ternary `?:`, `sizeof`, `->`, `enum`, `typedef`, string literals, struct/union initializers, variadic functions, bit fields.
+**Not yet implemented**: `%`, all compound assignments (`+=` etc.), ternary `?:`, `sizeof`, `->`, `enum`, `typedef`, string literals, variadic functions, bit fields.
 
 **Extensions beyond C89**: `//` line comments.
