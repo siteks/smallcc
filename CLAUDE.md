@@ -715,6 +715,8 @@ Preprocessor excluded. Features are assessed against ANSI C89/ISO C90.
 **Deliberate deviations from C89:**
 - **K&R (old-style) function definitions are not supported** — only ANSI prototype-style definitions are accepted.
 - **`//` line comments are supported** — a C99/C++ extension not present in C89.
+- **Implicit `int` return type is not allowed** — every function must explicitly state its return type.
+- **Implicit function declarations are not allowed** — a function must be declared or defined before it is called.
 
 ### Statements
 
