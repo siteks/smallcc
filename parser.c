@@ -210,6 +210,20 @@ Node *new_node(Node_kind kind, char *val, bool is_expr)
     return node;
 }
 
+static Node *copy_node(Node *n)
+{
+    if (!n) return NULL;
+    Node *c = malloc(sizeof(Node));
+    *c = *n;
+    if (n->child_count)
+    {
+        c->children = malloc(n->child_count * sizeof(Node *));
+        for (int i = 0; i < n->child_count; i++)
+            c->children[i] = copy_node(n->children[i]);
+    }
+    return c;
+}
+
 static Node *add_child(Node *parent, Node *child)
 {
     parent->child_count++;
@@ -640,7 +654,33 @@ static Node *assign_expr()
     {
         Node *anode = new_node(ND_ASSIGN, expect(TK_ASSIGN), true);
         add_child(anode, node);
-        add_child(anode, logor_expr());
+        add_child(anode, assign_expr());
+        return anode;
+    }
+    // Compound assignment: desugar a op= b  →  a = a op b
+    char *op = NULL;
+    Token_kind ctk = token->kind;
+    if      (ctk == TK_PLUS_ASSIGN)   op = "+";
+    else if (ctk == TK_MINUS_ASSIGN)  op = "-";
+    else if (ctk == TK_STAR_ASSIGN)   op = "*";
+    else if (ctk == TK_SLASH_ASSIGN)  op = "/";
+    else if (ctk == TK_AMP_ASSIGN)    op = "&";
+    else if (ctk == TK_BITOR_ASSIGN)  op = "|";
+    else if (ctk == TK_BITXOR_ASSIGN) op = "^";
+    else if (ctk == TK_SHIFTL_ASSIGN) op = "<<";
+    else if (ctk == TK_SHIFTR_ASSIGN) op = ">>";
+    if (op)
+    {
+        char *tok_val = token->val;
+        token = token->next;        // consume compound token
+        Node *rhs   = assign_expr();
+        Node *binop = new_node(ND_BINOP, tok_val, true);
+        strncpy(binop->val, op, sizeof(binop->val) - 1);
+        add_child(binop, copy_node(node));
+        add_child(binop, rhs);
+        Node *anode = new_node(ND_ASSIGN, tok_val, true);
+        add_child(anode, node);
+        add_child(anode, binop);
         return anode;
     }
     return node;

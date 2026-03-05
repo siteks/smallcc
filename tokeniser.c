@@ -270,6 +270,12 @@ Token *tokenise(char *p)
             p++;
             continue;
         }
+        if (strlen(p) >= 3)
+        {
+            // Three character tokens (must come before two-character checks)
+            if (!strncmp(p, "<<=", 3)) {cur = new_token(TK_SHIFTL_ASSIGN, cur, p, 3); p += 3; continue;}
+            if (!strncmp(p, ">>=", 3)) {cur = new_token(TK_SHIFTR_ASSIGN, cur, p, 3); p += 3; continue;}
+        }
         if (strlen(p) >= 2)
         {
             // Two character tokens
@@ -284,6 +290,13 @@ Token *tokenise(char *p)
             if (!strncmp(p, ">>", 2)) {cur = new_token(TK_SHIFTR, cur, p, 2); p += 2; continue;}
             if (!strncmp(p, "<<", 2)) {cur = new_token(TK_SHIFTL, cur, p, 2); p += 2; continue;}
             if (!strncmp(p, "->", 2)) {cur = new_token(TK_ARROW, cur, p, 2); p += 2; continue;}
+            if (!strncmp(p, "+=", 2)) {cur = new_token(TK_PLUS_ASSIGN,   cur, p, 2); p += 2; continue;}
+            if (!strncmp(p, "-=", 2)) {cur = new_token(TK_MINUS_ASSIGN,  cur, p, 2); p += 2; continue;}
+            if (!strncmp(p, "*=", 2)) {cur = new_token(TK_STAR_ASSIGN,   cur, p, 2); p += 2; continue;}
+            if (!strncmp(p, "/=", 2)) {cur = new_token(TK_SLASH_ASSIGN,  cur, p, 2); p += 2; continue;}
+            if (!strncmp(p, "&=", 2)) {cur = new_token(TK_AMP_ASSIGN,    cur, p, 2); p += 2; continue;}
+            if (!strncmp(p, "|=", 2)) {cur = new_token(TK_BITOR_ASSIGN,  cur, p, 2); p += 2; continue;}
+            if (!strncmp(p, "^=", 2)) {cur = new_token(TK_BITXOR_ASSIGN, cur, p, 2); p += 2; continue;}
         }
         // Single character tokens
         switch (*p) 

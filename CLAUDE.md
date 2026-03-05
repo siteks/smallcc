@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```bash
 make mycc           # Build the compiler
 make test_all       # Run all test suites
-make test_struct    # Run a specific test suite (also: test_init, test_ops, test_logops, test_func, test_longs, test_array, test_loops, test_goto, test_struct_init, test_floats)
+make test_struct    # Run a specific test suite (also: test_init, test_ops, test_logops, test_func, test_longs, test_array, test_loops, test_goto, test_struct_init, test_floats, test_compound)
 make clean          # Remove binaries and temp files
 ```
 
@@ -740,7 +740,7 @@ Preprocessor excluded. Features are assessed against ANSI C89/ISO C90.
 |---|---|---|
 | Arithmetic `+ - * /` | ✅ | |
 | Modulo `%` | ❌ | Not tokenised, parsed, or in codegen |
-| Compound assignment `+= -= *= /= %= &= \|= ^= <<= >>=` | ❌ | Not tokenised or parsed |
+| Compound assignment `+= -= *= /= &= \|= ^= <<= >>=` | ✅ | Desugared to `lhs = lhs op rhs` in parser; `%=` blocked on `%` |
 | Ternary `? :` | ❌ | Not tokenised or parsed |
 | Comma operator `,` (in expressions) | ❌ | Comma is only parsed as a separator |
 | `sizeof` | ❌ | `TK_SIZEOF` tokenised; not parsed |
@@ -827,7 +827,7 @@ Preprocessor excluded. Features are assessed against ANSI C89/ISO C90.
 
 ### Summary
 
-**Implemented and working**: basic scalar types, pointers, 1-D/N-D arrays, structs, `float`/`double` (IEEE 754 arithmetic, comparisons, int↔float casts), `if`/`while`/`for`/`do-while`, `switch`/`case`/`default`, `break`, `continue`, `goto`, labeled statements, all arithmetic and bitwise operators except `%`, all comparison and logical operators, pre/post increment, address-of, dereference, struct member access (`.`), explicit casts, array subscripting, function definitions and calls, integer constants (decimal/hex/octal), floating-point constants.
+**Implemented and working**: basic scalar types, pointers, 1-D/N-D arrays, structs, `float`/`double` (IEEE 754 arithmetic, comparisons, int↔float casts), `if`/`while`/`for`/`do-while`, `switch`/`case`/`default`, `break`, `continue`, `goto`, labeled statements, all arithmetic and bitwise operators except `%`, all comparison and logical operators, pre/post increment, address-of, dereference, struct member access (`.`), explicit casts, array subscripting, function definitions and calls, integer constants (decimal/hex/octal), floating-point constants, compound assignment (`+=` `-=` `*=` `/=` `&=` `|=` `^=` `<<=` `>>=`).
 
 **Partially working**: unions (layout correct, but not semantically distinct from struct in codegen), `const`/`volatile` (stored, not enforced), storage classes (parsed, not enforced).
 

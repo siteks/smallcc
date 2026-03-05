@@ -305,7 +305,7 @@ class CPU:
         elif    i == 'add':     s.r0 = m.read32(s.sp) + s.r0; s.sp += 4
         elif    i == 'sub':     s.r0 = m.read32(s.sp) - s.r0; s.sp += 4
         elif    i == 'mul':     s.r0 = m.read32(s.sp) * s.r0; s.sp += 4
-        elif    i == 'div':     s.r0 = m.read32(s.sp) / s.r0; s.sp += 4
+        elif    i == 'div':     s.r0 = int(m.read32(s.sp) / s.r0); s.sp += 4
         elif    i == 'mod':     s.r0 = m.read32(s.sp) % s.r0; s.sp += 4
         elif    i == 'shl':     s.r0 = m.read32(s.sp) << s.r0; s.sp += 4
         elif    i == 'shr':     s.r0 = m.read32(s.sp) >> s.r0; s.sp += 4
