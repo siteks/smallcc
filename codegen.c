@@ -458,7 +458,7 @@ void gen_addr(Node *node)
     else
         error("Expecting lvalue\n");
 }
-void gen_cast(Type *src, Type *dst)
+void gen_cast(Type2 *src, Type2 *dst)
 {
     //                  dest
     //          uc  c   s   us  e   i   u   l   ul  p   f   d
@@ -560,6 +560,7 @@ void gen_expr(Node *node)
         if (!strcmp(node->val, ">"))    {gen_gt(); return;}
         if (!strcmp(node->val, ">="))   {gen_ge(); return;}
         if (!strcmp(node->val, "=="))   {gen_eq(); return;}
+        if (!strcmp(node->val, "!="))   {gen_ne(); return;}
         if (!strcmp(node->val, ">>"))   {gen_shiftr(); return;}
         if (!strcmp(node->val, "<<"))   {gen_shiftl(); return;}
         if (!strcmp(node->val, "||"))   {gen_logor(); return;}
@@ -604,8 +605,7 @@ void gen_expr(Node *node)
         else if (!strcmp(node->val, "*"))
         {
             gen_expr(node->children[0]);
-            // TODO!! size
-            gen_ld(node->type->elem_size);
+            gen_ld(elem_type(node->type)->size);
         }
     }
     else if (node->kind == ND_ASSIGN)
@@ -633,7 +633,7 @@ void gen_expr(Node *node)
         gen_push();
         gen_offset(node);
         gen_add();
-        gen_ld(node->type->elem_size);
+        gen_ld(node->type->size);
     }
 }
 void gen_return()
@@ -702,6 +702,14 @@ int count_constexpr(Node *n)
 void gen_inits(Node *n, Symbol *s, int vaddr, int offset, int depth)
 {
     printf(";%s %s vaddr:%d os:%d depth:%d\n", __func__, nodestr(n->kind),vaddr,offset, depth);
+    // Compute the element size (innermost) and row stride at current depth
+    int elem_sz = array_elem_type(s->type)->size;
+    // stride at this depth = size of elem at depth levels down
+    Type2 *arr_at = s->type;
+    for (int _d = 0; _d < depth && arr_at->base == TB2_ARRAY; _d++)
+        arr_at = arr_at->u.arr.elem;
+    int row_stride = (arr_at->base == TB2_ARRAY) ? arr_at->u.arr.elem->size : elem_sz;
+
     // Recurse through initlist
     int ptr = offset;
     for(int i = 0; i < n->child_count; i++)
@@ -710,8 +718,8 @@ void gen_inits(Node *n, Symbol *s, int vaddr, int offset, int depth)
             gen_lea(vaddr + ptr);
             gen_push();
             gen_expr(n->children[i]);
-            gen_st(s->type->elem_size);
-            ptr += s->type->elem_size;
+            gen_st(elem_sz);
+            ptr += elem_sz;
         }
         else
         {
@@ -719,10 +727,10 @@ void gen_inits(Node *n, Symbol *s, int vaddr, int offset, int depth)
             int new_offset = offset;
             if (ptr != offset)
                 // If we've done anything on this row, advance to next row
-                new_offset = offset + *s->type->elems_per_row[depth] * s->type->elem_size;
+                new_offset = offset + row_stride;
             gen_inits(n->children[i], s, vaddr, new_offset, depth + 1);
             // Now out of level, we move on a whole row
-            offset =  new_offset + *s->type->elems_per_row[depth] * s->type->elem_size;
+            offset = new_offset + row_stride;
             fprintf(stderr, "out of inits, now inc offset to %d\n", offset);
             ptr = offset;
         }
@@ -732,6 +740,13 @@ int int_constexpr(Node *n);
 void gen_mem_inits(char *data, Node *n, Symbol *s, int vaddr, int offset, int depth)
 {
     printf(";%s %s os:%d depth:%d\n", __func__, nodestr(n->kind),offset, depth);
+    // Compute element size and row stride at current depth
+    int elem_sz = array_elem_type(s->type)->size;
+    Type2 *arr_at = s->type;
+    for (int _d = 0; _d < depth && arr_at->base == TB2_ARRAY; _d++)
+        arr_at = arr_at->u.arr.elem;
+    int row_stride = (arr_at->base == TB2_ARRAY) ? arr_at->u.arr.elem->size : elem_sz;
+
     // Recurse through initlist
     int ptr = offset;
     for(int i = 0; i < n->child_count; i++)
@@ -739,8 +754,9 @@ void gen_mem_inits(char *data, Node *n, Symbol *s, int vaddr, int offset, int de
         {
             int val = int_constexpr(n->children[i]);
             data[vaddr + ptr]       = val & 0xff;
-            data[vaddr + ptr + 1]   = (val >> 8) & 0xff;
-            ptr += s->type->elem_size;
+            if (elem_sz > 1)
+                data[vaddr + ptr + 1]   = (val >> 8) & 0xff;
+            ptr += elem_sz;
         }
         else
         {
@@ -748,14 +764,13 @@ void gen_mem_inits(char *data, Node *n, Symbol *s, int vaddr, int offset, int de
             int new_offset = offset;
             if (ptr != offset)
                 // If we've done anything on this row, advance to next row
-                new_offset = offset + *s->type->elems_per_row[depth] * s->type->elem_size;
+                new_offset = offset + row_stride;
             gen_mem_inits(data, n->children[i], s, vaddr, new_offset, depth + 1);
             // Now out of level, we move on a whole row
-            offset =  new_offset + *s->type->elems_per_row[depth] * s->type->elem_size;
+            offset = new_offset + row_stride;
             fprintf(stderr, "out of inits, now inc offset to %d\n", offset);
             ptr = offset;
         }
-
 }
 
 int int_unaryop(Node *n)
@@ -787,12 +802,12 @@ int int_constexpr(Node *n)
 void gen_initlist(Node *n, Symbol *s)
 {
     // Address of variable to be initialised is on the stack
-    Type *t = s->type;
+    Type2 *t = s->type;
 
     int constexpr = count_constexpr(n);
     if (n->scope.depth)
     {
-        if (!t->dimensions)
+        if (!array_dimensions(t))
         {
             // Scalar object, just take the first element of the list. There should be 
             // only one element
@@ -810,7 +825,7 @@ void gen_initlist(Node *n, Symbol *s)
         {
             // Fill the whole variable with zero, then add in init values.
             // Optimisation would be to create a data area and copy the data over..
-            // 
+            //
             // Offset here is what you apply to lea to get address
             int vaddr = -find_local_addr(n, s->name);
             gen_fill(vaddr, t->size);
@@ -819,7 +834,7 @@ void gen_initlist(Node *n, Symbol *s)
     }
     else
     {
-        if (!t->dimensions)
+        if (!array_dimensions(t))
         {
             // Scalar object, just take the first element of the list. There should be 
             // only one element

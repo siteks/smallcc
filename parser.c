@@ -155,22 +155,13 @@
 //                  | "return" expression? ";"
 extern Token        *token;
 extern Local        *locals;
-extern Type         *types;
+extern Type2        *types;
 extern Symbol_table *symbol_table;
 
 
 
 
-extern Type *t_void;
-extern Type *t_char;
-extern Type *t_short;
-extern Type *t_enum;
-extern Type *t_int;
-extern Type *t_uint;
-extern Type *t_long;
-extern Type *t_ulong;
-extern Type *t_float;
-extern Type *t_double;
+// t_void, t_int etc. declared in mycc.h as extern Type2*
 
 
 extern Symbol_table *curr_st_scope;
@@ -363,35 +354,34 @@ static Node *unary_expr()
                     if (!s)
                         error("No ident before left bracket\n");
                     expect(token->kind);
-                    Node *e1    = node;
+                    Node *e1 = node;
                     Node *add;
-                    // Only dereference at the outer calculation, put
-                    // unary '+' which has no effect in for symmetry
-                    if (array_depth == s->type->dimensions - 1)
-                    {
-                        node    = new_node(ND_UNARYOP, "*", true);
-                        // Get the type element
-                        node->type = elem_type(s->type);
+                    // Walk type chain to current array depth
+                    Type2 *arr_at_depth = s->type;
+                    for (int _d = 0; _d < array_depth; _d++) {
+                        if (arr_at_depth->base != TB2_ARRAY)
+                            error("Too many dimensions for array type %s\n", fulltype_str(s->type));
+                        arr_at_depth = arr_at_depth->u.arr.elem;
                     }
-                    else
-                    {
-                        node    = new_node(ND_UNARYOP, "+", true);
-                        // Mark this node so we don't double count when inserting
-                        // scaling for pointer arithmetic
+                    if (arr_at_depth->base != TB2_ARRAY)
+                        error("Too many dimensions for array type %s\n", fulltype_str(s->type));
+                    bool last_dim = (arr_at_depth->u.arr.elem->base != TB2_ARRAY);
+                    if (last_dim) {
+                        node = new_node(ND_UNARYOP, "*", true);
+                        node->type = arr_at_depth->u.arr.elem;
+                    } else {
+                        node = new_node(ND_UNARYOP, "+", true);
                         node->is_array_deref = true;
                     }
-                    add         = add_child(node, new_node(ND_BINOP, "+", true));
+                    add = add_child(node, new_node(ND_BINOP, "+", true));
                     add_child(add, e1);
-                    Node *mul   = new_node(ND_BINOP, "*", true);
-                    // Get array dimension
-                    if (array_depth >= s->type->dimensions)
-                        error("Too many dimensions for array type %s\n", fulltype_str(s->type));
-                    int mult = s->type->elem_size;
-                    mult *= *s->type->elems_per_row[array_depth];
+                    Node *mul = new_node(ND_BINOP, "*", true);
+                    // stride = size of element at this array depth
+                    int mult = arr_at_depth->u.arr.elem->size;
                     array_depth++;
-                    char buf[64]; 
+                    char buf[64];
                     sprintf(buf, "%d", mult);
-                    Node *dsize     = add_child(mul, new_node(ND_LITERAL, buf, true));
+                    add_child(mul, new_node(ND_LITERAL, buf, true));
                     add_child(mul, expr());
                     add_child(add, mul);
                     expect(TK_RBRACKET);
@@ -418,7 +408,7 @@ static Node *unary_expr()
                 // struct_node = n;
                 // node = n;
                 Node *n = new_node(ND_MEMBER, 0, true);
-                add_child(n, pex_node);
+                add_child(n, node);
                 add_child(n, new_node(ND_IDENT, expect(TK_IDENT), true));
                 node = n;
                 break;
@@ -432,7 +422,7 @@ static Node *unary_expr()
 }
 bool is_type_name_or_type(Token *token)
 {
-    return is_type_name(token->kind) || (token->kind == TK_IDENT && find_type(token->val));
+    return is_type_name(token->kind);
 }
 Node *type_name()
 {
@@ -464,7 +454,7 @@ Node *type_name()
         add_child(node, declarator());
     }
     // add_types_and_symbols(node, false);
-    node->type = insert_type(node, tstr_compact(node));
+    node->type = type2_from_ts(node, tstr_compact(node));
     fprintf(stderr, "%s ts:%s:\n", __func__, tstr_compact(node));
     return node;
 }
@@ -1213,7 +1203,7 @@ char *get_decl_ident(Node *node)
 
 
 
-void insert_cast(Node *n, int child, Type *t)
+void insert_cast(Node *n, int child, Type2 *t)
 {
     fprintf(stderr, "%s %s\n", __func__, fulltype_str(t));
     Node *c = new_node(ND_CAST, 0, true);
@@ -1224,7 +1214,7 @@ void insert_cast(Node *n, int child, Type *t)
     c->type = t;
     n->children[child] = c;
 }
-Type *check_operands(Node *n)
+Type2 *check_operands(Node *n)
 {
     // Perform the 'usual arithmetic conversions'
     // Check against the rules, and insert a cast to perform the conversion
@@ -1250,7 +1240,7 @@ Type *check_operands(Node *n)
 
     return lhs->type;
 }
-Type *check_unary_operand(Node *n)
+Type2 *check_unary_operand(Node *n)
 {
     // Perform the 'usual arithmetic conversions'
     // Check against the rules, and insert a cast to perform the conversion
@@ -1260,11 +1250,14 @@ Type *check_unary_operand(Node *n)
     fprintf(stderr, "%s %016llx\n", __func__, (unsigned long long)lhs->type);
     if (istype_char(lhs->type))                                         insert_cast(n, 0, t_int);
 
+    // For dereference, the result type is the pointed-to/element type, not the pointer/array type
+    if (!strcmp(n->val, "*"))
+        return elem_type(lhs->type);
     return lhs->type;
 }
 bool is_unscaled_ptr(Node *n)
 {
-    return (n->type->is_pointer || n->type->is_array) && !n->is_array_deref;
+    return n->type && (n->type->base == TB2_POINTER || n->type->base == TB2_ARRAY) && !n->is_array_deref;
 }
 void propagate_types(Node *p, Node *n)
 {
@@ -1302,12 +1295,12 @@ void propagate_types(Node *p, Node *n)
             lhs->type = find_symbol(lhs, lhs->val, NS_IDENT)->type;
         }
         fprintf(stderr, "%s looking in lhs type:%016llx for field %s\n", __func__, (unsigned long long)lhs->type, rhs->val);
-        Type *base = 0;
+        Type2 *base = 0;
         n->offset = find_offset(lhs->type, rhs->val, &base);
         if (n->offset < 0)
             error("Can't find member %s in struct\n", rhs->val);
-        fprintf(stderr, "%s found member %s with offset %d basetype %016llx\n", __func__, 
-            rhs->val, n->offset, (unsigned long long)base); 
+        fprintf(stderr, "%s found member %s with offset %d basetype %016llx\n", __func__,
+            rhs->val, n->offset, (unsigned long long)base);
         // Member now has type pointing to inner type
         n->type = base;
     }
@@ -1320,18 +1313,20 @@ void propagate_types(Node *p, Node *n)
             // See if either node is a pointer and the other an int of some sort. If so, we need to 
             // scale the int by the size of the pointed to type
             if (is_unscaled_ptr(n->children[0]) && istype_intlike(n->children[1]->type))
-                insert_scale(n, 1, n->children[0]->type->elem_size);
+                insert_scale(n, 1, elem_type(n->children[0]->type)->size);
             else if (is_unscaled_ptr(n->children[1]) && istype_intlike(n->children[0]->type))
-                insert_scale(n, 0, n->children[1]->type->elem_size);
+                insert_scale(n, 0, elem_type(n->children[1]->type)->size);
         }
         if (n->kind == ND_UNARYOP)
         {
-            n->type = check_unary_operand(n);
+            Type2 *t = check_unary_operand(n);
+            if (n->type == t_void)  // preserve non-void types already set by parser (e.g. array subscripts)
+                n->type = t;
         }
     }
     if (n->kind == ND_RETURNSTMT && n->child_count)
     {
-        n->type = current_function->return_type;
+        n->type = current_function->type->u.fn.ret;
         fprintf(stderr, "%s found return stmt with expr, type of func:%s:\n", __func__, fulltype_str(n->type));
         if (n->type != n->children[0]->type)
             insert_cast(n, 0, n->type);
