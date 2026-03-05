@@ -213,6 +213,19 @@ int expect_number()
     return 0;
 }
 
+char *expect_ident()
+{
+    if (token->kind == TK_IDENT)
+    {
+        char *val   = token->val;
+        last_token  = token;
+        token       = token->next;
+        return val;
+    }
+    error("Expected identifier, got '%s'\n", token->val);
+    return 0;
+}
+
 Token *new_token(Token_kind kind, Token *cur, char *str, int len)
 {
     Token *tok  = calloc(1, sizeof(Token));

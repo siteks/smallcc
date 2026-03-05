@@ -71,6 +71,28 @@ static int break_labels[64];
 static int cont_labels[64];
 static int loop_depth = 0;
 
+int new_label();
+
+typedef struct
+{
+    char name[64];
+    int  id;
+} LabelEntry;
+static LabelEntry label_table[64];
+static int        label_table_size;
+
+static void collect_labels(Node *node)
+{
+    if (node->kind == ND_LABELSTMT)
+    {
+        label_table[label_table_size].id = new_label();
+        strncpy(label_table[label_table_size].name, node->val, 63);
+        label_table_size++;
+    }
+    for (int i = 0; i < node->child_count; i++)
+        collect_labels(node->children[i]);
+}
+
 //--------------------------------------------------------------------------------
 // Pseudoinstructions
 //
@@ -996,6 +1018,32 @@ void gen_compstmt(Node *node)
     // Release the space back
     gen_adj(node->symtable->size);
 }
+void gen_labelstmt(Node *node)
+{
+    for (int i = 0; i < label_table_size; i++)
+    {
+        if (!strcmp(node->val, label_table[i].name))
+        {
+            gen_label(label_table[i].id);
+            if (node->child_count)
+                gen_stmt(node->children[0]);
+            return;
+        }
+    }
+    error("label '%s' not found\n", node->val);
+}
+void gen_gotostmt(Node *node)
+{
+    for (int i = 0; i < label_table_size; i++)
+    {
+        if (!strcmp(node->val, label_table[i].name))
+        {
+            gen_j(label_table[i].id);
+            return;
+        }
+    }
+    error("goto: label '%s' not found\n", node->val);
+}
 void gen_decl(Node *node);
 void gen_switchstmt(Node *node)
 {
@@ -1055,6 +1103,8 @@ void gen_stmt(Node *node)
     case ND_SWITCHSTMT:  gen_switchstmt(node);  return;
     case ND_BREAKSTMT:   gen_breakstmt(node);   return;
     case ND_CONTINUESTMT:gen_continuestmt(node);return;
+    case ND_LABELSTMT:   gen_labelstmt(node);   return;
+    case ND_GOTOSTMT:    gen_gotostmt(node);    return;
     case ND_CASESTMT:
     case ND_DEFAULTSTMT:
     case ND_EMPTY:                              return;
@@ -1071,6 +1121,8 @@ void gen_function(Node *node)
 {
     printf(";%s\n", __func__);
     printf("%s:\n", node->children[0]->symbol->name);
+    label_table_size = 0;
+    collect_labels(node->children[1]);
     gen_param_list(node->children[0]);
     gen_stmt(node->children[1]);
     gen_return();

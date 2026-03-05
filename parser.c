@@ -1059,6 +1059,31 @@ static Node *stmt()
         expect(TK_CONTINUE);
         expect(TK_SEMICOLON);
     }
+    else if (token->kind == TK_GOTO)
+    {
+        node->kind = ND_GOTOSTMT;
+        expect(TK_GOTO);
+        strncpy(node->val, expect_ident(), 63);
+        expect(TK_SEMICOLON);
+    }
+    else if (token->kind == TK_IDENT)
+    {
+        char *name = expect(TK_IDENT);
+        if (token->kind == TK_COLON)
+        {
+            node->kind = ND_LABELSTMT;
+            strncpy(node->val, name, 63);
+            expect(TK_COLON);
+            add_child(node, stmt());
+        }
+        else
+        {
+            unget_token();
+            node->kind = ND_EXPRSTMT;
+            add_child(node, expr());
+            expect(TK_SEMICOLON);
+        }
+    }
     else if (token->kind == TK_RETURN)
     {
         node->kind = ND_RETURNSTMT;
@@ -1128,6 +1153,8 @@ char *nodestr(Node_kind k)
         case ND_BREAKSTMT:   return "BREAKSTMT   ";
         case ND_CONTINUESTMT:return "CONTINUESTMT";
         case ND_EMPTY:       return "EMPTY       ";
+        case ND_LABELSTMT:   return "LABELSTMT   ";
+        case ND_GOTOSTMT:    return "GOTOSTMT    ";
         case ND_UNDEFINED:   return "##FIXME##   ";
         default:             return "unknown     ";
     }

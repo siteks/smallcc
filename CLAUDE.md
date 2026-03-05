@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```bash
 make mycc           # Build the compiler
 make test_all       # Run all test suites
-make test_struct    # Run a specific test suite (also: test_init, test_ops, test_logops, test_func, test_longs, test_array, test_loops)
+make test_struct    # Run a specific test suite (also: test_init, test_ops, test_logops, test_func, test_longs, test_array, test_loops, test_goto)
 make clean          # Remove binaries and temp files
 ```
 
@@ -135,6 +135,8 @@ case-label          → "case" integer-constant ":"    (parsed as stmt inside co
 default-label       → "default" ":"                  (parsed as stmt inside compound)
 break-stmt          → "break" ";"
 continue-stmt       → "continue" ";"
+goto-stmt           → "goto" ident ";"
+label-stmt          → ident ":" stmt
 return-stmt         → "return" expr? ";"
 
 expr                → assign-expr ("," assign-expr)*
@@ -162,7 +164,7 @@ postfix-suffix      → "[" expr "]"
 primary-expr        → ident | constant | "(" expr ")"
 ```
 
-**Not yet implemented:** `goto`, `sizeof`, `typedef`, `enum` bodies, `register`/`extern`/`static` semantics, string literals.
+**Not yet implemented:** `sizeof`, `typedef`, `enum` bodies, `register`/`extern`/`static` semantics, string literals.
 
 ### AST Node Kinds
 
@@ -190,6 +192,8 @@ ND_CASESTMT      // case N: — ival holds the constant; no children
 ND_DEFAULTSTMT   // default: — no children
 ND_BREAKSTMT     // break; — no children
 ND_CONTINUESTMT  // continue; — no children
+ND_GOTOSTMT      // goto ident; — val = target label name
+ND_LABELSTMT     // ident: stmt — val = label name; child[0] = statement
 ND_EMPTY         // absent for-loop part (init/cond/inc omitted)
 ND_RETURNSTMT    // return — children: [expr] or empty
 ND_STMT          // generic wrapper
@@ -509,6 +513,8 @@ static int loop_depth = 0;     // current nesting depth (incremented on loop ent
 
 **Switch dispatch** (`gen_switchstmt`): two-phase — phase 1 re-evaluates the selector expression for each `case` label, emitting `push; eq; jnz lcase` comparisons; phase 2 emits the compound-statement body verbatim, inserting `gen_label` at each `ND_CASESTMT`/`ND_DEFAULTSTMT` node.
 
+**Goto/label resolution** (`gen_function`): before emitting a function body, `collect_labels()` walks the AST and calls `new_label()` for every `ND_LABELSTMT`, storing `(name, id)` pairs in `label_table[64]`. Both `gen_gotostmt` and `gen_labelstmt` look up the name in this table, so forward jumps resolve correctly.
+
 ### Cast Generation (`gen_cast`)
 
 Casts are no-ops when src and dst have the same size. Otherwise:
@@ -707,8 +713,8 @@ Preprocessor excluded. Features are assessed against ANSI C89/ISO C90.
 | `switch` / `case` / `default` | ✅ | fall-through supported; selector re-evaluated per case |
 | `break` | ✅ | works inside `while`, `for`, `do-while`, `switch` |
 | `continue` | ✅ | works inside `while`, `for`, `do-while` |
-| `goto` | ❌ | Token exists; no parser or codegen |
-| Labeled statements (`lbl:`) | ❌ | |
+| `goto` | ✅ | function-scoped labels; forward and backward jumps |
+| Labeled statements (`lbl:`) | ✅ | pre-scan assigns numeric label IDs before codegen |
 | `return` | ✅ | Auto-casts to declared return type |
 | Compound statement `{ }` | ✅ | |
 
@@ -807,10 +813,10 @@ Preprocessor excluded. Features are assessed against ANSI C89/ISO C90.
 
 ### Summary
 
-**Implemented and working**: basic scalar types, pointers, 1-D/N-D arrays, structs, `if`/`while`/`for`/`do-while`, `switch`/`case`/`default`, `break`, `continue`, all arithmetic and bitwise operators except `%`, all comparison and logical operators, pre/post increment, address-of, dereference, struct member access (`.`), explicit casts, array subscripting, function definitions and calls, integer constants (decimal/hex/octal).
+**Implemented and working**: basic scalar types, pointers, 1-D/N-D arrays, structs, `if`/`while`/`for`/`do-while`, `switch`/`case`/`default`, `break`, `continue`, `goto`, labeled statements, all arithmetic and bitwise operators except `%`, all comparison and logical operators, pre/post increment, address-of, dereference, struct member access (`.`), explicit casts, array subscripting, function definitions and calls, integer constants (decimal/hex/octal).
 
 **Partially working**: unions (layout correct, but not semantically distinct from struct in codegen), `const`/`volatile` (stored, not enforced), storage classes (parsed, not enforced), `float`/`double` (types only, no FP arithmetic).
 
-**Not yet implemented**: `goto`, labels, `%`, all compound assignments (`+=` etc.), ternary `?:`, `sizeof`, `->`, `enum`, `typedef`, string literals, struct/union initializers, variadic functions, bit fields.
+**Not yet implemented**: `%`, all compound assignments (`+=` etc.), ternary `?:`, `sizeof`, `->`, `enum`, `typedef`, string literals, struct/union initializers, variadic functions, bit fields.
 
 **Extensions beyond C89**: `//` line comments.

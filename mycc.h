@@ -170,6 +170,8 @@ typedef enum
     ND_BREAKSTMT,
     ND_CONTINUESTMT,
     ND_EMPTY,
+    ND_LABELSTMT,
+    ND_GOTOSTMT,
     ND_UNDEFINED,
 } Node_kind;
 typedef enum
