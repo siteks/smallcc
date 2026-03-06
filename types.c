@@ -392,7 +392,7 @@ static Type2 *generate_struct_type2(Node *decl_node, int depth)
         st->base    = TB2_STRUCT;
         st->u.composite.tag      = tag;
         st->u.composite.members  = fields;
-        st->u.composite.is_union = false;
+        st->u.composite.is_union = !!(decl_node->typespec & TB_UNION);
         calc_struct_layout(st);
         append_type(st);
         tag->type = st;

@@ -772,7 +772,7 @@ Preprocessor excluded. Features are assessed against ANSI C89/ISO C90.
 | Pointers | ✅ | Including pointer arithmetic |
 | Arrays (1-D and N-D) | ✅ | |
 | `struct` | ✅ | Including nested structs and correct member offsets |
-| `union` | ⚠️ | Parsed; member offsets set to 0, but member access codegen not distinct from struct |
+| `union` | ✅ | All members at offset 0; `is_union` flag in Type2 sets size = max member size |
 | `enum` | ❌ | Keyword tokenised; body not parsed; constants not supported |
 | `typedef` | ❌ | Keyword tokenised; not functional |
 | Function pointers | ⚠️ | Can be declared; calling through a function-pointer variable not supported |
@@ -827,10 +827,10 @@ Preprocessor excluded. Features are assessed against ANSI C89/ISO C90.
 
 ### Summary
 
-**Implemented and working**: basic scalar types, pointers, 1-D/N-D arrays, structs, `float`/`double` (IEEE 754 arithmetic, comparisons, int↔float casts), `if`/`while`/`for`/`do-while`, `switch`/`case`/`default`, `break`, `continue`, `goto`, labeled statements, all arithmetic and bitwise operators including `%`, all comparison and logical operators, unary `+ - ~ ! &` and dereference `*`, pre-increment/decrement, struct member access (`.` and `->`), explicit casts, array subscripting, function definitions and calls (multi-arg), integer constants (decimal/hex/octal), floating-point constants, compound assignment (`+=` `-=` `*=` `/=` `%=` `&=` `|=` `^=` `<<=` `>>=`), ternary `?:`, comma operator, `sizeof(type)`/`sizeof(ident)`.
+**Implemented and working**: basic scalar types, pointers, 1-D/N-D arrays, structs, unions, `float`/`double` (IEEE 754 arithmetic, comparisons, int↔float casts), `if`/`while`/`for`/`do-while`, `switch`/`case`/`default`, `break`, `continue`, `goto`, labeled statements, all arithmetic and bitwise operators including `%`, all comparison and logical operators, unary `+ - ~ ! &` and dereference `*`, pre/post-increment/decrement, struct/union member access (`.` and `->`), explicit casts, array subscripting, function definitions and calls (multi-arg), integer constants (decimal/hex/octal), floating-point constants, compound assignment (`+=` `-=` `*=` `/=` `%=` `&=` `|=` `^=` `<<=` `>>=`), ternary `?:`, comma operator, `sizeof(type)`/`sizeof(ident)`.
 
-**Partially working**: unions (layout correct, but not semantically distinct from struct in codegen), `const`/`volatile` (stored, not enforced), storage classes (parsed, not enforced).
+**Partially working**: `const`/`volatile` (stored, not enforced), storage classes (parsed, not enforced).
 
-**Not yet implemented**: `enum`, `typedef`, string literals, variadic functions, bit fields, post-increment/decrement (tokenised but no codegen), `sizeof(complex_expr)`.
+**Not yet implemented**: `enum`, `typedef`, string literals, variadic functions, bit fields, `sizeof(complex_expr)`.
 
 **Extensions beyond C89**: `//` line comments.

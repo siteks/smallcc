@@ -969,7 +969,7 @@ static void struct_decl(Node *node, int depth)
         // Declarations using incomplete types are only valid if a pointer
         n = add_child(node, new_node(ND_STRUCT, 0, false));
         n->struct_depth = depth;
-        n->typespec |= TB_STRUCT;
+        n->typespec |= (node->typespec & TB_UNION) ? TB_UNION : TB_STRUCT;
         Node *i = add_child(n, new_node(ND_IDENT, expect(TK_IDENT), false));
         i->is_struct = true;
     }
@@ -1011,7 +1011,7 @@ static Node *declaration(int depth)
         if (is_typequal(token->kind))   node->typequal = token->kind;
         expect(token->kind);
     }
-    if (node->typespec & TB_STRUCT)
+    if (node->typespec & (TB_STRUCT | TB_UNION))
     {
         struct_decl(node, depth);
     }
