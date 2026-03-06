@@ -75,6 +75,7 @@ char *token_str(Token_kind tk)
         tk == TK_CONSTFLT   ? "CONSTFLT " :
         tk == TK_CONSTINT   ? "CONSTINT " :
         tk == TK_CHARACTER  ? "CHARACTER" :
+        tk == TK_STRING     ? "STRING   " :
         tk == TK_LPAREN     ? "LPAREN   " :
         tk == TK_RPAREN     ? "RPAREN   " :
         tk == TK_LBRACE     ? "LBRACE   " :
@@ -135,7 +136,8 @@ char *token_str(Token_kind tk)
         tk == TK_VOID       ? "void     " :
         tk == TK_VOLATILE   ? "volatile " :
         tk == TK_WHILE      ? "while    " :
-        tk == TK_INVALID    ? "INVALID  " : 
+        tk == TK_INVALID    ? "INVALID  " :
+        tk == TK_ELLIPSIS   ? "ELLIPSIS " :
                               "UNKNOWN  ";
 }
 char *type_token_str(Token_kind tk)
@@ -251,6 +253,43 @@ bool ishex(char a)
 {
     return isdigit(a) || (a >= 'a' && a <= 'f') || (a >= 'A' && a <= 'F');
 }
+
+// Decode one character (possibly an escape sequence) at *src.
+// Writes the decoded byte to *out and returns number of source chars consumed.
+static int decode_string_char(const char *src, char *out)
+{
+    if (*src != '\\') { *out = *src; return 1; }
+    src++;
+    switch (*src)
+    {
+        case 'a':  *out = '\a'; return 2;
+        case 'b':  *out = '\b'; return 2;
+        case 'f':  *out = '\f'; return 2;
+        case 'n':  *out = '\n'; return 2;
+        case 'r':  *out = '\r'; return 2;
+        case 't':  *out = '\t'; return 2;
+        case 'v':  *out = '\v'; return 2;
+        case '\\': *out = '\\'; return 2;
+        case '?':  *out = '?';  return 2;
+        case '\'': *out = '\''; return 2;
+        case '"':  *out = '"';  return 2;
+        case 'x':
+        {
+            char *q;
+            *out = (char)strtol(src + 1, &q, 16);
+            return 2 + (int)(q - (src + 1));
+        }
+        default:
+            if (*src >= '0' && *src <= '7')
+            {
+                char *q;
+                *out = (char)strtol(src, &q, 8);
+                return 1 + (int)(q - src);
+            }
+            *out = *src;
+            return 2;
+    }
+}
 bool isoct(char a)
 {
     return a >= '0' && a <= '7';
@@ -275,6 +314,7 @@ Token *tokenise(char *p)
             // Three character tokens (must come before two-character checks)
             if (!strncmp(p, "<<=", 3)) {cur = new_token(TK_SHIFTL_ASSIGN, cur, p, 3); p += 3; continue;}
             if (!strncmp(p, ">>=", 3)) {cur = new_token(TK_SHIFTR_ASSIGN, cur, p, 3); p += 3; continue;}
+            if (!strncmp(p, "...", 3)) {cur = new_token(TK_ELLIPSIS,      cur, p, 3); p += 3; continue;}
         }
         if (strlen(p) >= 2)
         {
@@ -453,6 +493,40 @@ Token *tokenise(char *p)
                     if (found) continue;
                 }
             }
+        }
+
+        if (*p == '"')
+        {
+            char *start = p;
+            p++;  // skip opening "
+            int cap = 64, len = 0;
+            char *buf = malloc(cap);
+            // Handle adjacent string literals: "abc" "def" → "abcdef"
+            do
+            {
+                while (*p && *p != '"')
+                {
+                    if (len + 2 >= cap) { cap *= 2; buf = realloc(buf, cap); }
+                    char c;
+                    int adv = decode_string_char(p, &c);
+                    buf[len++] = c;
+                    p += adv;
+                }
+                if (*p == '"') p++;  // skip closing "
+                // Skip whitespace and check for another string literal
+                char *q = p;
+                while (isspace(*q)) q++;
+                if (*q == '"') { p = q + 1; } else break;
+            } while (1);
+            buf[len] = 0;
+            Token *strtok = calloc(1, sizeof(Token));
+            strtok->kind = TK_STRING;
+            strtok->val  = buf;
+            strtok->ival = len;
+            strtok->loc  = start - user_input;
+            cur->next = strtok;
+            cur = strtok;
+            continue;
         }
 
         error("Unexpected input %s\n", p);

@@ -26,7 +26,8 @@ Symbol_table    *symbol_table;
 Symbol_table    *last_symbol_table;
 Symbol_table    *curr_scope_st;
 
-static Symbol *insert_tag(Node *node, char *ident);
+Symbol *insert_tag(Node *node, char *ident);
+static Symbol *insert_typedef(Node *node, Type2 *type, char *ident);
 static Symbol *new_symbol(Type2 *type, char *ident, int offset);
 static Symbol *insert_ident(Node *node, Type2 *type, char *ident, bool is_param);
 static Type2  *generate_struct_type2(Node *decl_node, int depth);
@@ -114,7 +115,7 @@ Type2 *get_array_type(Type2 *elem, int count)
 Type2 *get_function_type(Type2 *ret, Param *params, bool is_variadic)
 {
     for (Type2 *p = types; p; p = p->next)
-        if (p->base == TB2_FUNCTION && p->u.fn.ret == ret)
+        if (p->base == TB2_FUNCTION && p->u.fn.ret == ret && p->u.fn.is_variadic == is_variadic)
             return p;
 
     Type2 *t = calloc(1, sizeof(Type2));
@@ -143,6 +144,20 @@ Type2 *get_struct_type(Symbol *tag, Field *members, bool is_union)
     return t;
 }
 
+Type2 *get_enum_type(Symbol *tag)
+{
+    for (Type2 *p = types; p; p = p->next)
+        if (p->base == TB2_ENUM && p->u.enu.tag == tag)
+            return p;
+    Type2 *t     = calloc(1, sizeof(Type2));
+    t->base      = TB2_ENUM;
+    t->u.enu.tag = tag;
+    t->size      = 2;
+    t->align     = 2;
+    append_type(t);
+    return t;
+}
+
 // ---------------------------------------------------------------
 // Apply derivation string to base type, building Type2 chain.
 // Processed left-to-right, built inside-out:
@@ -164,8 +179,10 @@ static Type2 *apply_derivation(Type2 *base, const char *ts)
         Type2 *inner = apply_derivation(base, ts + 1);
         return get_pointer_type(inner);
     } else if (ts[0] == '(') {
-        Type2 *inner = apply_derivation(base, ts + 2);
-        return get_function_type(inner, NULL, false);
+        bool variadic = (ts[1] == '.');
+        const char *rest = variadic ? ts + 5 : ts + 2;
+        Type2 *inner = apply_derivation(base, rest);
+        return get_function_type(inner, NULL, variadic);
     }
     return base;
 }
@@ -205,6 +222,8 @@ Type2 *type2_from_ts(Node *node, char *ts)
     Type2 *base;
     if (node->typespec & (TB_STRUCT | TB_UNION)) {
         base = (node->type && node->type != t_void) ? node->type : t_void;
+    } else if (node->typespec & TB_ENUM) {
+        base = (node->type && node->type->base == TB2_ENUM) ? node->type : t_int;
     } else {
         base = typespec_to_base(node->typespec);
     }
@@ -265,6 +284,18 @@ bool istype_intlike(Type2 *t)
 // ---------------------------------------------------------------
 // make_basic_types
 // ---------------------------------------------------------------
+static void insert_builtin(char *name, Type2 *type)
+{
+    Symbol *sym = calloc(1, sizeof(Symbol));
+    sym->name = name;
+    sym->type = type;
+    sym->offset = 0;
+    Symbol *s = symbol_table->idents, *ls = NULL;
+    for (; s; s = s->next) ls = s;
+    if (!ls) symbol_table->idents = sym;
+    else     ls->next             = sym;
+}
+
 void make_basic_types()
 {
     fprintf(stderr, "%s\n", __func__);
@@ -279,6 +310,11 @@ void make_basic_types()
     t_ulong  = get_basic_type(TB2_ULONG);
     t_float  = get_basic_type(TB2_FLOAT);
     t_double = get_basic_type(TB2_DOUBLE);
+
+    // Builtin functions pre-declared in global scope
+    Param *p = calloc(1, sizeof(Param));
+    p->type  = t_int;
+    insert_builtin("putchar", get_function_type(t_int, p, false));
 }
 
 // ---------------------------------------------------------------
@@ -447,8 +483,12 @@ void add_types_and_symbols(Node *node, bool is_param, int depth)
 
     // Determine base type for declarators
     Type2 *base;
-    if (node->typespec & (TB_STRUCT | TB_UNION)) {
+    if (node->typespec & TB_TYPEDEF) {
+        base = node->type;
+    } else if (node->typespec & (TB_STRUCT | TB_UNION)) {
         base = (node->type && node->type->base == TB2_STRUCT) ? node->type : t_void;
+    } else if (node->typespec & TB_ENUM) {
+        base = (node->type && node->type->base == TB2_ENUM) ? node->type : t_int;
     } else {
         base = typespec_to_base(node->typespec);
     }
@@ -466,6 +506,10 @@ void add_types_and_symbols(Node *node, bool is_param, int depth)
             __func__, ts, ident ? ident : "");
 
         Type2 *ty = apply_derivation(base, ts);
+        // char s[] = "hello" — fix up zero-size array from string literal init
+        if (ty->base == TB2_ARRAY && ty->u.arr.count == 0
+            && n->child_count == 2 && n->children[1]->strval)
+            ty = get_array_type(ty->u.arr.elem, n->children[1]->strval_len + 1);
         if (first_decl) {
             node->type = ty;
             first_decl = false;
@@ -473,7 +517,10 @@ void add_types_and_symbols(Node *node, bool is_param, int depth)
         fprintf(stderr, "%s final type %s\n", __func__, fulltype_str(ty));
 
         if (ident) {
-            n->symbol = insert_ident(node, ty, ident, is_param);
+            if (node->sclass == TK_TYPEDEF)
+                n->symbol = insert_typedef(node, ty, ident);
+            else
+                n->symbol = insert_ident(node, ty, ident, is_param);
 
             // For struct-typed variables, ensure symbol points to struct type
             if (!n->is_struct && node->child_count > 0
@@ -509,10 +556,11 @@ Symbol *find_symbol(Node *n, char *name, Namespace nspace)
     bool found = false;
     while (!found) {
         fprintf(stderr, "Searching in scope:%s\n", scope_str(st->scope));
-        s =     nspace == NS_IDENT  ? st->idents
-            :   nspace == NS_TAG    ? st->tags
-            :   nspace == NS_MEMBER ? st->members
-            :                         st->labels;
+        s =     nspace == NS_IDENT   ? st->idents
+            :   nspace == NS_TAG     ? st->tags
+            :   nspace == NS_MEMBER  ? st->members
+            :   nspace == NS_TYPEDEF ? st->typedefs
+            :                          st->labels;
         for (; s; s = s->next) {
             fprintf(stderr, "Name:%s\n", s->name);
             if (!strcmp(name, s->name)) { found = true; break; }
@@ -586,7 +634,7 @@ char *scope_str(Scope sc)
     return buf;
 }
 
-static Symbol *insert_tag(Node *node, char *ident)
+Symbol *insert_tag(Node *node, char *ident)
 {
     fprintf(stderr, "%s %s\n", __func__, ident);
     Scope sc = node->scope;
@@ -609,6 +657,69 @@ static Symbol *insert_tag(Node *node, char *ident)
     if (!ls) st->tags  = sym;
     else     ls->next  = sym;
     return sym;
+}
+
+Symbol *insert_enum_const(Node *node, Type2 *ety, char *ident, int value)
+{
+    fprintf(stderr, "%s %s = %d\n", __func__, ident, value);
+    Scope sc = node->scope;
+    Symbol_table *st = symbol_table;
+    if (sc.depth)
+        for (int d = 1; d <= sc.depth; d++) {
+            int index = sc.indices[d - 1] - 1;
+            st = st->children[index];
+        }
+    Symbol *sym = new_symbol(ety, ident, value);
+    sym->is_enum_const = true;
+    Symbol *s = 0, *ls = 0;
+    for (s = st->idents; s; s = s->next) ls = s;
+    if (!ls) st->idents = sym;
+    else     ls->next   = sym;
+    return sym;
+}
+
+static Symbol *insert_typedef(Node *node, Type2 *type, char *ident)
+{
+    fprintf(stderr, "%s %s\n", __func__, ident);
+    Scope sc = node->scope;
+    Symbol_table *st = symbol_table;
+    if (sc.depth)
+    {
+        for (int d = 1; d <= sc.depth; d++)
+        {
+            int index = sc.indices[d - 1] - 1;
+            st = st->children[index];
+        }
+    }
+    Symbol *s = 0, *ls = 0;
+    for (s = st->typedefs; s; s = s->next)
+    {
+        ls = s;
+        if (!strcmp(s->name, ident)) return s;
+    }
+    Symbol *sym = new_symbol(type, ident, 0);
+    if (!ls) st->typedefs = sym;
+    else     ls->next     = sym;
+    return sym;
+}
+
+bool is_typedef_name(char *name)
+{
+    if (!strcmp(name, "va_list")) return true;
+    for (Symbol_table *st = curr_scope_st; st; st = st->parent)
+        for (Symbol *s = st->typedefs; s; s = s->next)
+            if (!strcmp(s->name, name)) return true;
+    return false;
+}
+
+Type2 *find_typedef_type(char *name)
+{
+    if (!strcmp(name, "va_list")) return t_int;
+    for (Symbol_table *st = curr_scope_st; st; st = st->parent)
+        for (Symbol *s = st->typedefs; s; s = s->next)
+            if (!strcmp(s->name, name)) return s->type;
+    error("typedef '%s' not found\n", name);
+    return NULL;
 }
 
 static Symbol *new_symbol(Type2 *type, char *ident, int offset)
@@ -711,7 +822,7 @@ static char *fts2(Type2 *t, char *p)
             p += sprintf(p, "enum");
             break;
         default:
-            p += sprintf(p, "???(%d)", t->base);
+            p += sprintf(p, "??? (%d)", t->base);
             break;
     }
     return p;

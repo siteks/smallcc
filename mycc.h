@@ -15,96 +15,19 @@ void error(char *fmt, ...);
 // ---------------------------------------------------------------
 typedef enum
 {
-    TK_EMPTY,
-    TK_IDENT,
-    TK_CONSTFLT,
-    TK_CONSTINT,
-    TK_CHARACTER,
-    TK_LPAREN,
-    TK_RPAREN,
-    TK_LBRACE,
-    TK_RBRACE,
-    TK_LBRACKET,
-    TK_RBRACKET,
-    TK_COMMA,
-    TK_SEMICOLON,
-    TK_COLON,
-    TK_EQ,
-    TK_NE,
-    TK_GE,
-    TK_GT,
-    TK_LE,
-    TK_LT,
-    TK_SHIFTR,
-    TK_SHIFTL,
-    TK_ASSIGN,
-    TK_PLUS,
-    TK_MINUS,
-    TK_STAR,
-    TK_SLASH,
-    TK_AMPERSAND,
-    TK_TWIDDLE,
-    TK_BANG,
-    TK_EOF,
-    TK_INC,
-    TK_DEC,
-    TK_DOT,
-    TK_ARROW,
-    TK_LOGAND,
-    TK_LOGOR,
-    TK_BITOR,
-    TK_BITXOR,
-    TK_PLUS_ASSIGN,
-    TK_MINUS_ASSIGN,
-    TK_STAR_ASSIGN,
-    TK_SLASH_ASSIGN,
-    TK_AMP_ASSIGN,
-    TK_BITOR_ASSIGN,
-    TK_BITXOR_ASSIGN,
-    TK_SHIFTL_ASSIGN,
-    TK_SHIFTR_ASSIGN,
-    TK_PERCENT,
-    TK_QUESTION,
-    TK_PERCENT_ASSIGN,
-    TK_AUTO,
-    TK_BREAK,
-    TK_CASE,
-    TK_CONST,
-    TK_CONTINUE,
-    TK_DEFAULT,
-    TK_DO,
-    TK_ELSE,
-    TK_EXTERN,
-    TK_FOR,
-    TK_GOTO,
-    TK_IF,
-    TK_REGISTER,
-    TK_RETURN,
-    TK_SIZEOF,
-    TK_STATIC,
-    TK_SWITCH,
-    TK_VOLATILE,
-    TK_WHILE,
+    TK_EMPTY, TK_IDENT, TK_CONSTFLT, TK_CONSTINT, TK_CHARACTER, TK_STRING, TK_LPAREN, TK_RPAREN, TK_LBRACE,
+    TK_RBRACE, TK_LBRACKET, TK_RBRACKET, TK_COMMA, TK_SEMICOLON, TK_COLON, TK_EQ, TK_NE,
+    TK_GE, TK_GT, TK_LE, TK_LT, TK_SHIFTR, TK_SHIFTL, TK_ASSIGN, TK_PLUS,
+    TK_MINUS, TK_STAR, TK_SLASH, TK_AMPERSAND, TK_TWIDDLE, TK_BANG, TK_EOF, TK_INC,
+    TK_DEC, TK_DOT, TK_ARROW, TK_LOGAND, TK_LOGOR, TK_BITOR, TK_BITXOR, TK_PLUS_ASSIGN,
+    TK_MINUS_ASSIGN, TK_STAR_ASSIGN, TK_SLASH_ASSIGN, TK_AMP_ASSIGN, TK_BITOR_ASSIGN, TK_BITXOR_ASSIGN, TK_SHIFTL_ASSIGN, TK_SHIFTR_ASSIGN,
+    TK_PERCENT, TK_QUESTION, TK_PERCENT_ASSIGN, TK_AUTO, TK_BREAK, TK_CASE, TK_CONST, TK_CONTINUE,
+    TK_DEFAULT, TK_DO, TK_ELSE, TK_EXTERN, TK_FOR, TK_GOTO, TK_IF, TK_REGISTER,
+    TK_RETURN, TK_SIZEOF, TK_STATIC, TK_SWITCH, TK_VOLATILE, TK_WHILE,
 // Basic types
-    TK_VOID,
-    TK_CHAR,
-    TK_UCHAR,
-    TK_SHORT,
-    TK_USHORT,
-    TK_INT,
-    TK_UINT,
-    TK_LONG,
-    TK_ULONG,
-    TK_FLOAT,
-    TK_DOUBLE,
-    TK_SIGNED,
-    TK_UNSIGNED,
-    TK_STRUCT,
-    TK_UNION,
-    TK_ENUM,
-    TK_TYPEDEF,
-//
-    TK_INVALID,
+    TK_VOID, TK_CHAR, TK_UCHAR, TK_SHORT, TK_USHORT, TK_INT, TK_UINT, TK_LONG,
+    TK_ULONG, TK_FLOAT, TK_DOUBLE, TK_SIGNED, TK_UNSIGNED, TK_STRUCT, TK_UNION, TK_ENUM,
+    TK_TYPEDEF, TK_INVALID, TK_ELLIPSIS,
 } Token_kind;
 
 
@@ -145,46 +68,12 @@ void print_tokens();
 // ---------------------------------------------------------------
 typedef enum
 {
-    ND_PROGRAM,
-    ND_FUNCTION,
-    ND_PARAM_LIST,
-    ND_DECLSTMT,
-    ND_EXPRSTMT,
-    ND_COMPSTMT,
-    ND_IFSTMT,
-    ND_WHILESTMT,
-    ND_RETURNSTMT,
-    ND_STMT,
-    ND_EXPR,
-    ND_CONSTEXPR,
-    ND_BINOP,
-    ND_UNARYOP,
-    ND_CAST,
-    ND_ASSIGN,
-    ND_IDENT,
-    ND_LITERAL,
-    ND_INITLIST,
-    ND_DECLARATION,
-    ND_DECLARATOR,
-    ND_DIRECT_DECL,
-    ND_PTYPE_LIST,
-    ND_TYPE_NAME,
-    ND_ARRAY_DECL,
-    ND_FUNC_DECL,
-    ND_STRUCT,
-    ND_UNION,
-    ND_MEMBER,
-    ND_FORSTMT,
-    ND_DOWHILESTMT,
-    ND_SWITCHSTMT,
-    ND_CASESTMT,
-    ND_DEFAULTSTMT,
-    ND_BREAKSTMT,
-    ND_CONTINUESTMT,
-    ND_EMPTY,
-    ND_LABELSTMT,
-    ND_GOTOSTMT,
-    ND_TERNARY,
+    ND_PROGRAM, ND_FUNCTION, ND_PARAM_LIST, ND_DECLSTMT, ND_EXPRSTMT, ND_COMPSTMT, ND_IFSTMT, ND_WHILESTMT,
+    ND_RETURNSTMT, ND_STMT, ND_EXPR, ND_CONSTEXPR, ND_BINOP, ND_UNARYOP, ND_CAST, ND_ASSIGN,
+    ND_IDENT, ND_LITERAL, ND_INITLIST, ND_DECLARATION, ND_DECLARATOR, ND_DIRECT_DECL, ND_PTYPE_LIST, ND_TYPE_NAME,
+    ND_ARRAY_DECL, ND_FUNC_DECL, ND_STRUCT, ND_UNION, ND_MEMBER, ND_FORSTMT, ND_DOWHILESTMT, ND_SWITCHSTMT,
+    ND_CASESTMT, ND_DEFAULTSTMT, ND_BREAKSTMT, ND_CONTINUESTMT, ND_EMPTY, ND_LABELSTMT, ND_GOTOSTMT, ND_TERNARY,
+    ND_VA_START, ND_VA_ARG, ND_VA_END,
     ND_UNDEFINED,
 } Node_kind;
 typedef enum
@@ -214,6 +103,7 @@ typedef enum
     TB_UNSIGNED = 0x200,
     TB_STRUCT   = 0x400,
     TB_UNION    = 0x800,
+    TB_TYPEDEF  = 0x1000,
 } Type_base;
 
 // --------------------------------------------------------
@@ -223,22 +113,8 @@ typedef enum
 // pointer equality for derived types over the same base.
 typedef enum
 {
-    TB2_VOID,
-    TB2_CHAR,
-    TB2_UCHAR,
-    TB2_SHORT,
-    TB2_USHORT,
-    TB2_INT,
-    TB2_UINT,
-    TB2_LONG,
-    TB2_ULONG,
-    TB2_FLOAT,
-    TB2_DOUBLE,
-    TB2_POINTER,
-    TB2_ARRAY,
-    TB2_FUNCTION,
-    TB2_STRUCT,
-    TB2_ENUM
+    TB2_VOID, TB2_CHAR, TB2_UCHAR, TB2_SHORT, TB2_USHORT, TB2_INT, TB2_UINT, TB2_LONG,
+    TB2_ULONG, TB2_FLOAT, TB2_DOUBLE, TB2_POINTER, TB2_ARRAY, TB2_FUNCTION, TB2_STRUCT, TB2_ENUM
 } Type2_base;
 
 // Type qualifiers as bit flags
@@ -316,7 +192,8 @@ typedef enum
     NS_IDENT,
     NS_TAG,
     NS_MEMBER,
-    NS_LABEL
+    NS_LABEL,
+    NS_TYPEDEF
 } Namespace;
 
 typedef struct Scope Scope;
@@ -333,6 +210,7 @@ struct Symbol
     Type2   *type;
     int     offset;
     bool    is_param;
+    bool    is_enum_const;
     Symbol  *next;
 };
 
@@ -344,6 +222,7 @@ struct Symbol_table
     Symbol          *tags;
     Symbol          *members;
     Symbol          *labels;
+    Symbol          *typedefs;
     int             size;
     int             global_offset;
     int             child_count;
@@ -359,6 +238,8 @@ struct Node
     char            val[64];
     long long       ival;
     double          fval;
+    char            *strval;
+    int             strval_len;
     Node            **children;
     int             child_count;
     int             offset;
@@ -370,6 +251,7 @@ struct Node
     bool            is_struct;
     bool            is_array_deref;
     bool            is_array;
+    bool            is_variadic;
     int             array_size;
     bool            size_mult;
     Node            *array_ident;
@@ -477,12 +359,18 @@ char *type_token_str(Token_kind tk);
 
 Type_base to_typespec(Token_kind tk);
 
+bool   is_typedef_name(char *name);
+Type2 *find_typedef_type(char *name);
+
 // Factory functions for Type2
 Type2 *get_basic_type(Type2_base base);
 Type2 *get_pointer_type(Type2 *pointee);
 Type2 *get_array_type(Type2 *elem, int count);
 Type2 *get_function_type(Type2 *ret, Param *params, bool is_variadic);
 Type2 *get_struct_type(Symbol *tag, Field *members, bool is_union);
+Type2 *get_enum_type(Symbol *tag);
+Symbol *insert_tag(Node *node, char *ident);
+Symbol *insert_enum_const(Node *node, Type2 *ety, char *ident, int value);
 
 // Basic type globals
 extern Type2 *t_void;

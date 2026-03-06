@@ -49,7 +49,17 @@ int find_local_addr(Node *node, char *name)
     {
         error("Symbol %s not found!\n", name);
     }
-    int offset = st->global_offset + s->offset;
+    // Compute global_offset dynamically: sum of all non-global ancestor scope sizes.
+    // This is correct even for C99-style mixed declarations, where the parse-time
+    // st->global_offset may have been captured before later siblings were added.
+    int global_offset = 0;
+    Symbol_table *ancestor = st->parent;
+    while (ancestor && ancestor->scope.depth > 0)
+    {
+        global_offset += ancestor->size;
+        ancestor = ancestor->parent;
+    }
+    int offset = global_offset + s->offset;
     if (s->is_param)
     {
         // FIXME!! This is very hacky, but we set bit 30 to indicate that 
@@ -70,6 +80,20 @@ static int labels;
 static int break_labels[64];
 static int cont_labels[64];
 static int loop_depth = 0;
+
+typedef struct { int id; char *data; int len; } StrLit;
+static StrLit strlits[512];
+static int    strlit_count = 0;
+
+static int new_strlit(char *data, int len)
+{
+    int id = labels++;
+    strlits[strlit_count].id   = id;
+    strlits[strlit_count].data = data;
+    strlits[strlit_count].len  = len;
+    strlit_count++;
+    return id;
+}
 
 int new_label();
 
@@ -126,30 +150,60 @@ static void collect_labels(Node *node)
 //  push
 //  
 //--------------------------------------------------------------------------------
-int new_label()
-{
-    return labels++;
-}
-void gen_label(int label)
-{
-    printf("_l%d:\n", label);
-}
-void gen_symlabel(char *name)
-{
-    printf("%s:\n", name);
-}
-void gen_text()
-{
-    printf(".text\n");
-}
-void gen_data()
-{
-    // printf(".data\n");
-}
-void gen_align()
-{
-    printf("    align\n");
-}
+int new_label()                 { return labels++; }
+void gen_label(int label)       { printf("_l%d:\n", label); }
+void gen_symlabel(char *name)   { printf("%s:\n", name); }
+void gen_text()                 { printf(".text\n"); }
+void gen_data()                 { /* printf(".data\n");*/ }
+void gen_align()                { printf("    align\n"); }
+void gen_word(int d)            { printf("    word 0x%04x\n", d & 0xffff); }
+void gen_jz(int label)          { printf("    jz      _l%d\n", label); }
+void gen_jnz(int label)         { printf("    jnz     _l%d\n", label); }
+void gen_j(int label)           { printf("    j       _l%d\n", label); }
+void gen_push()                 { printf("    push\n"); }
+void gen_pop()                  { printf("    pop\n"); }
+void gen_pushw()                { printf("    pushw\n"); }
+void gen_popw()                 { printf("    popw\n"); }
+void gen_jl(char *label)        { printf("    jl %s\n", label); }
+void gen_jli()                  { printf("    jli\n"); }
+void gen_adj(int offset)        { printf("    adj %d\n", offset); }
+void gen_add()                  { printf("    add\n"); }
+void gen_sub()                  { printf("    sub\n"); }
+void gen_mul()                  { printf("    mul\n"); }
+void gen_div()                  { printf("    div\n"); }
+void gen_mod()                  { printf("    mod\n"); }
+void gen_eq()                   { printf("    eq\n"); }
+void gen_ne()                   { printf("    ne\n"); }
+void gen_lt()                   { printf("    lt\n"); }
+void gen_le()                   { printf("    le\n"); }
+void gen_gt()                   { printf("    gt\n"); }
+void gen_ge()                   { printf("    ge\n"); }
+void gen_shiftl()               { printf("    shl\n"); }
+void gen_shiftr()               { printf("    shr\n"); }
+void gen_bitor()                { printf("    or\n"); }
+void gen_bitand()               { printf("    and\n"); }
+void gen_bitxor()               { printf("    xor\n"); }
+void gen_lb()                   { printf("    lb\n"); }
+void gen_lw()                   { printf("    lw\n"); }
+void gen_ll()                   { printf("    ll\n"); }
+void gen_sb()                   { printf("    sb\n"); }
+void gen_sw()                   { printf("    sw\n"); }
+void gen_sl()                   { printf("    sl\n"); }
+void gen_sxb()                  { printf("    sxb\n"); }
+void gen_sxw()                  { printf("    sxw\n"); }
+void gen_fadd()                 { printf("    fadd\n"); }
+void gen_fsub()                 { printf("    fsub\n"); }
+void gen_fmul()                 { printf("    fmul\n"); }
+void gen_fdiv()                 { printf("    fdiv\n"); }
+void gen_flt()                  { printf("    flt\n"); }
+void gen_fle()                  { printf("    fle\n"); }
+void gen_fgt()                  { printf("    fgt\n"); }
+void gen_fge()                  { printf("    fge\n"); }
+void gen_itof()                 { printf("    itof\n"); }
+void gen_ftoi()                 { printf("    ftoi\n"); }
+void gen_assign()               { }
+void gen_lea(int o)             { printf("    lea     %d\n", o); }
+
 void gen_zeros(int bytes)
 {
     for(int i = bytes; i >= 8; i-= 8)
@@ -175,22 +229,6 @@ void gen_bytes(char *data, int size)
     if (size % 8)
         printf("\n");
 }
-void gen_word(int d)
-{
-    printf("    word 0x%04x\n", d & 0xffff);
-}
-void gen_jz(int label)
-{
-    printf("    jz      _l%d\n", label);
-}
-void gen_jnz(int label)
-{
-    printf("    jnz     _l%d\n", label);
-}
-void gen_j(int label)
-{
-    printf("    j       _l%d\n", label);
-}
 void gen_imm(int val)
 {
     printf("    immw    0x%04x\n", val);
@@ -201,83 +239,6 @@ void gen_pushi(int val)
 {
     gen_imm(val);
     printf("    push\n");
-}
-void gen_push()
-{
-    printf("    push\n");
-}
-void gen_pop()
-{
-    printf("    pop\n");
-}
-void gen_pushw()
-{
-    printf("    pushw\n");
-}
-void gen_popw()
-{
-    printf("    popw\n");
-}
-void gen_jl(char *label)
-{
-    printf("    jl %s\n", label);
-}
-void gen_adj(int offset)
-{
-    printf("    adj %d\n", offset);
-}
-void gen_add()
-{
-    printf("    add\n");
-}
-void gen_sub()
-{
-    printf("    sub\n");
-}
-void gen_mul()
-{
-    printf("    mul\n");
-}
-
-void gen_div()
-{
-    printf("    div\n");
-}
-void gen_mod()
-{
-    printf("    mod\n");
-}
-void gen_eq()
-{
-    printf("    eq\n");
-}
-void gen_ne()
-{
-    printf("    ne\n");
-}
-void gen_lt()
-{
-    printf("    lt\n");
-}
-void gen_le()
-{
-    printf("    le\n");
-}
-void gen_gt()
-{
-    printf("    gt\n");
-}
-void gen_ge()
-{
-    printf("    ge\n");
-}
-void gen_shiftl()
-{
-    printf("    shl\n");
-}
-void gen_shiftr()
-{
-    printf("    shr\n");
 }
 void gen_logor()
 {
@@ -302,42 +263,6 @@ void gen_logand()
     gen_imm(1);
     gen_label(l1);
 }
-void gen_bitor()
-{
-    printf("    or\n");
-}
-void gen_bitand()
-{
-    printf("    and\n");
-}
-void gen_bitxor()
-{
-    printf("    xor\n");
-}
-void gen_lb()
-{
-    printf("    lb\n");
-}
-void gen_lw()
-{
-    printf("    lw\n");
-}
-void gen_ll()
-{
-    printf("    ll\n");
-}
-void gen_sb()
-{
-    printf("    sb\n");
-}
-void gen_sw()
-{
-    printf("    sw\n");
-}
-void gen_sl()
-{
-    printf("    sl\n");
-}
 void gen_st(int s)
 {
     if (s == 1) gen_sb();
@@ -350,24 +275,6 @@ void gen_ld(int s)
     if (s == 2) gen_lw();
     if (s == 4) gen_ll();
 }
-void gen_sxb()
-{
-    printf("    sxb\n");
-}
-void gen_sxw()
-{
-    printf("    sxw\n");
-}
-void gen_fadd() { printf("    fadd\n"); }
-void gen_fsub() { printf("    fsub\n"); }
-void gen_fmul() { printf("    fmul\n"); }
-void gen_fdiv() { printf("    fdiv\n"); }
-void gen_flt()  { printf("    flt\n"); }
-void gen_fle()  { printf("    fle\n"); }
-void gen_fgt()  { printf("    fgt\n"); }
-void gen_fge()  { printf("    fge\n"); }
-void gen_itof() { printf("    itof\n"); }
-void gen_ftoi() { printf("    ftoi\n"); }
 
 void gen_imm_float(double val)
 {
@@ -376,13 +283,6 @@ void gen_imm_float(double val)
     memcpy(&bits, &f, sizeof(bits));
     printf("    immw    0x%04x\n", bits & 0xffff);
     printf("    immwh   0x%04x\n", (bits >> 16) & 0xffff);
-}
-void gen_assign()
-{
-}
-void gen_lea(int o)
-{
-    printf("    lea     %d\n", o);
 }
 void gen_varaddr_from_ident(Node *node, char *name)
 {
@@ -433,8 +333,57 @@ void gen_fill(int offset, int size)
 //--------------------------------------------------------------------------------
 
 void gen_expr(Node *node);
+void gen_varaddr(Node *node);
+
+// Indirect call through function pointer variable: fp(args)
+// node is the ND_IDENT for fp; all children are arguments.
+void gen_callfunction_via_ptr(Node *node)
+{
+    int param_size = 0;
+    for (int i = node->child_count - 1; i >= 0; i--)
+    {
+        gen_expr(node->children[i]);
+        int s = node->children[i]->type->size;
+        if (s == 2) gen_pushw(); else gen_push();
+        param_size += s;
+    }
+    // Load function pointer value; gen_varaddr uses bp-relative lea,
+    // which is safe even after pushing arguments.
+    gen_varaddr(node);
+    gen_ld(node->symbol->type->size);
+    gen_jli();
+    gen_adj(param_size);
+}
+
+// Indirect call through dereferenced pointer: (*fp)(args)
+// node is UNARYOP "*" with is_function=true.
+// node->children[0] = the pointer expression; children[1..] = arguments.
+void gen_callfunction_via_deref(Node *node)
+{
+    int param_size = 0;
+    for (int i = node->child_count - 1; i >= 1; i--)
+    {
+        gen_expr(node->children[i]);
+        int s = node->children[i]->type->size;
+        if (s == 2) gen_pushw(); else gen_push();
+        param_size += s;
+    }
+    // Evaluate pointer expression — yields function address in r0.
+    gen_expr(node->children[0]);
+    gen_jli();
+    gen_adj(param_size);
+}
+
 void gen_callfunction(Node *node)
 {
+    // putchar(c) is a CPU builtin
+    if (!strcmp(node->symbol->name, "putchar"))
+    {
+        if (node->child_count != 1) error("putchar requires 1 argument\n");
+        gen_expr(node->children[0]);
+        printf("    putchar\n");
+        return;
+    }
     // We have to call the function. This means setting up the
     // parameters on the stack.
     //
@@ -467,6 +416,8 @@ void gen_callfunction(Node *node)
     {
         gen_expr(node->children[i]);
         int s = node->children[i]->type->size;
+        // Function designators decay to pointer-sized values when passed as args
+        if (s == 0) s = 2;
         if (s == 2)
             gen_pushw();
         else
@@ -659,17 +610,39 @@ void gen_expr(Node *node)
     }
     else if (node->kind == ND_LITERAL)
     {
-        if (istype_float(node->type) || istype_double(node->type))
+        if (node->strval)
+        {
+            int sid = new_strlit(node->strval, node->strval_len);
+            printf("    immw    _l%d\n", sid);
+        }
+        else if (istype_float(node->type) || istype_double(node->type))
             gen_imm_float(node->fval);
         else
             gen_imm((int)strtol(node->val, 0, 0));
     }
     else if (node->kind == ND_IDENT)
     {
-        // This could be a function call
-        if (istype_function(node->symbol->type))
+        Symbol *sym = node->symbol;
+        if (istype_function(sym->type) && node->is_function)
         {
+            // Direct named call: myfunc(args)
             gen_callfunction(node);
+        }
+        else if (istype_function(sym->type) && !node->is_function)
+        {
+            // Function name used as a value: fp = myfunc
+            gen_varaddr_from_ident(node, sym->name);
+        }
+        else if (istype_ptr(sym->type)
+                 && sym->type->u.ptr.pointee->base == TB2_FUNCTION
+                 && node->is_function)
+        {
+            // Indirect call through function pointer variable: fp(args)
+            gen_callfunction_via_ptr(node);
+        }
+        else if (node->symbol->is_enum_const)
+        {
+            gen_imm(node->symbol->offset);
         }
         else
         {
@@ -704,8 +677,16 @@ void gen_expr(Node *node)
         }
         else if (!strcmp(node->val, "*"))
         {
-            gen_expr(node->children[0]);
-            gen_ld(elem_type(node->type)->size);
+            if (node->is_function)
+            {
+                // (*fp)(args) — indirect call through dereferenced pointer
+                gen_callfunction_via_deref(node);
+            }
+            else
+            {
+                gen_expr(node->children[0]);
+                gen_ld(elem_type(node->type)->size);
+            }
         }
         else if (!strcmp(node->val, "&"))
         {
@@ -724,6 +705,51 @@ void gen_expr(Node *node)
             gen_push();
             gen_imm(0xffffffff);
             gen_bitxor();
+        }
+        // Prefix increment/decrement: ++x / --x
+        // Result: new value of x
+        else if (!strcmp(node->val, "++") || !strcmp(node->val, "--"))
+        {
+            int is_inc = !strcmp(node->val, "++");
+            Node *child = node->children[0];
+            int sz = child->type ? child->type->size : 2;
+            gen_addr(child);
+            gen_push();         // stack: [&x]
+            gen_expr(child);
+            gen_push();         // stack: [&x, x]
+            gen_imm(1);
+            if (is_inc) gen_add(); else gen_sub();  // r0 = x±1, stack: [&x]
+            switch (sz)
+            {
+                case 1: gen_sb(); break;
+                case 2: gen_sw(); break;
+                default: gen_sl(); break;
+            }
+            // r0 still holds x±1 (sw/sb/sl don't modify r0)
+        }
+        // Postfix increment/decrement: x++ / x--
+        // Result: old value of x
+        else if (!strcmp(node->val, "post++") || !strcmp(node->val, "post--"))
+        {
+            int is_inc = !strcmp(node->val, "post++");
+            Node *child = node->children[0];
+            int sz = child->type ? child->type->size : 2;
+            gen_expr(child);    // r0 = old_x
+            gen_push();         // stack: [old_x]
+            gen_addr(child);    // r0 = &x
+            gen_push();         // stack: [old_x, &x]
+            gen_expr(child);    // r0 = x (reload)
+            gen_push();         // stack: [old_x, &x, x]
+            gen_imm(1);
+            if (is_inc) gen_add(); else gen_sub();  // r0 = x±1, stack: [old_x, &x]
+            switch (sz)
+            {
+                case 1: gen_sb(); break;
+                case 2: gen_sw(); break;
+                default: gen_sl(); break;
+            }
+            // stack: [old_x], r0 = x±1
+            gen_pop();          // r0 = old_x, stack: []
         }
     }
     else if (node->kind == ND_ASSIGN)
@@ -761,6 +787,47 @@ void gen_expr(Node *node)
         gen_label(l_else);
         gen_expr(node->children[2]);
         gen_label(l_end);
+    }
+    else if (node->kind == ND_VA_START)
+    {
+        // va_start(ap, last_param)
+        // ap = bp + last_param_offset + last_param_size
+        Node *ap_node  = node->children[0];
+        Node *lp_node  = node->children[1];
+        int param_off  = lp_node->symbol->offset;
+        int param_size = lp_node->symbol->type->size;
+        gen_addr(ap_node);                       // r0 = &ap
+        gen_push();                              // stack: [&ap]
+        gen_lea(param_off + param_size);         // r0 = bp + first_vararg_offset
+        gen_sw();                                // mem[&ap] = first_vararg_addr
+    }
+    else if (node->kind == ND_VA_ARG)
+    {
+        // va_arg(ap, T) where T has size s
+        // Returns *old_ap, advances ap by s
+        int s         = node->type->size;
+        Node *ap_node = node->children[0];
+        // Save old ap value
+        gen_addr(ap_node);    // r0 = &ap
+        gen_ld(2);            // r0 = ap (current vararg pointer)
+        gen_push();           // stack: [old_ap]
+        // Advance ap: ap = ap + s
+        gen_addr(ap_node);    // r0 = &ap
+        gen_push();           // stack: [old_ap, &ap]
+        gen_addr(ap_node);    // r0 = &ap
+        gen_ld(2);            // r0 = ap
+        gen_push();           // stack: [old_ap, &ap, ap]
+        gen_imm(s);           // r0 = s
+        gen_add();            // r0 = ap + s; stack: [old_ap, &ap]
+        gen_sw();             // mem[&ap] = ap + s; stack: [old_ap]
+        // Load vararg from old_ap
+        gen_pop();            // r0 = old_ap; stack: []
+        gen_ld(s);            // r0 = *(old_ap) = vararg value
+    }
+    else if (node->kind == ND_VA_END)
+    {
+        // va_end is a no-op
+        (void)node;
     }
 }
 void gen_return()
@@ -811,11 +878,17 @@ void gen_whilestmt(Node *node)
     gen_label(lbreak);
     loop_depth--;
 }
+void gen_decl(Node *node);  // forward declaration
 void gen_forstmt(Node *node)
 {
     printf(";%s\n", __func__);
     // children: [init, cond, inc, body]
-    if (node->children[0]->kind != ND_EMPTY)
+    // If the init was a declaration, node->symtable holds the for-init scope.
+    if (node->symtable)
+        gen_adj(-node->symtable->size);
+    if (node->children[0]->kind == ND_DECLARATION)
+        gen_decl(node->children[0]);
+    else if (node->children[0]->kind != ND_EMPTY)
         gen_expr(node->children[0]);
     int lloop  = new_label();
     int lcont  = new_label();
@@ -835,6 +908,8 @@ void gen_forstmt(Node *node)
     gen_j(lloop);
     gen_label(lbreak);
     loop_depth--;
+    if (node->symtable)
+        gen_adj(node->symtable->size);
 }
 void gen_dowhilestmt(Node *node)
 {
@@ -979,6 +1054,8 @@ int int_constexpr(Node *n)
         return int_unaryop(n);
     if (n->kind == ND_BINOP)
         return int_binop(n);
+    if (n->kind == ND_IDENT && n->symbol && n->symbol->is_enum_const)
+        return n->symbol->offset;
     return strtol(n->val, 0, 0);
 }
 
@@ -1115,6 +1192,7 @@ void gen_initlist(Node *n, Symbol *s)
 void gen_decl(Node *node)
 {
     printf(";%s %s\n", __func__, node->val);
+    if (node->sclass == TK_TYPEDEF) return;
     // The symbol table has all the details needed for declarations.
     // Space is reserved at the start of the compound statement
 
@@ -1135,7 +1213,20 @@ void gen_decl(Node *node)
                 {
                     gen_initlist(n->children[1], n->symbol);
                 }
-                // TODO string initialiser goes here
+                else if (n->children[1]->strval && istype_array(n->symbol->type))
+                {
+                    // Local char array init from string literal: store bytes one by one
+                    int vaddr = -find_local_addr(n, n->symbol->name);
+                    char *str = n->children[1]->strval;
+                    int   len = n->children[1]->strval_len + 1;
+                    for (int i = 0; i < len; i++)
+                    {
+                        gen_lea(vaddr + i);
+                        gen_push();
+                        gen_imm((unsigned char)str[i]);
+                        gen_sb();
+                    }
+                }
                 else
                 {
                     gen_varaddr_from_ident(n, n->symbol->name);
@@ -1165,7 +1256,17 @@ void gen_decl(Node *node)
                     {
                         gen_initlist(n->children[1], n->symbol);
                     }
-                    // TODO string initialiser goes here
+                    else if (n->children[1]->strval && istype_array(n->symbol->type))
+                    {
+                        // char s[] = "hello" — emit bytes directly
+                        gen_bytes(n->children[1]->strval, n->children[1]->strval_len + 1);
+                    }
+                    else if (n->children[1]->strval)
+                    {
+                        // char *p = "hello" — emit pointer to deferred string data
+                        int sid = new_strlit(n->children[1]->strval, n->children[1]->strval_len);
+                        printf("    word    _l%d\n", sid);
+                    }
                     else
                     {
                         if (istype_float(n->symbol->type) || istype_double(n->symbol->type))
@@ -1337,6 +1438,13 @@ void gen_code(Node *node)
     {
         if (node->children[i]->kind == ND_DECLARATION && !node->children[i]->is_func_defn)
             gen_decl(node->children[i]);
+    }
+    // Pass 3: emit deferred string literal data
+    for (int i = 0; i < strlit_count; i++)
+    {
+        gen_align();
+        gen_label(strlits[i].id);
+        gen_bytes(strlits[i].data, strlits[i].len + 1);
     }
 }
 

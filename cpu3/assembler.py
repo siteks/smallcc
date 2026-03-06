@@ -167,18 +167,27 @@ class Assembler(object):
 
                             else:
                                 # byte or word directive, accept any number of args
+                                # Values may be numeric literals or label references
+                                def resolve_tok(tok):
+                                    try:
+                                        return int(tok, 0)
+                                    except ValueError:
+                                        if passes == 'assemble' and tok in self.symbols:
+                                            return self.symbols[tok].addr
+                                        return 0  # placeholder in 'labels' pass
                                 f = actual.split()[1:]
                                 i.length = G.directive[ins] * len(f)
-                                
+
                                 if G.directive[ins] == 1:
-                                    i.ins = [int(f[j],0) & 0xff for j in range(len(f))]
+                                    i.ins = [resolve_tok(f[j]) & 0xff for j in range(len(f))]
                                 else:
                                     i.ins = []
                                     for j in range(len(f) * 2):
+                                        v = resolve_tok(f[j>>1])
                                         if j % 2 == 0:
-                                            i.ins.append(int(f[j>>1],0) & 0xff)
+                                            i.ins.append(v & 0xff)
                                         else:
-                                            i.ins.append((int(f[j>>1],0)>>8) & 0xff)
+                                            i.ins.append((v >> 8) & 0xff)
 
                                 print(i.ins)
                             fmt = 99

@@ -2,7 +2,7 @@
 CFLAGS=-std=c11 -g
 
 mycc: mycc.c tokeniser.c parser.c types.c codegen.c
-test_all: mycc test_init test_ops test_logops test_func test_longs test_array test_struct test_loops test_goto test_struct_init test_floats test_compound test_remaining
+test_all: mycc test_init test_ops test_logops test_func test_longs test_array test_struct test_loops test_goto test_struct_init test_floats test_compound test_remaining test_typedef test_strings test_enum test_variadic test_funcptr
 
 test_init: mycc
 	(source ./test.sh && source tests/test_init.sh)
@@ -42,6 +42,21 @@ test_compound:mycc
 
 test_remaining:mycc
 	(source ./test.sh && source tests/test_remaining.sh)
+
+test_typedef:mycc
+	(source ./test.sh && source tests/test_typedef.sh)
+
+test_strings:mycc
+	(source ./test.sh && source tests/test_strings.sh)
+
+test_enum:mycc
+	(source ./test.sh && source tests/test_enum.sh)
+
+test_variadic:mycc
+	(source ./test.sh && source tests/test_variadic.sh)
+
+test_funcptr:mycc
+	(source ./test.sh && source tests/test_funcptr.sh)
 
 lasttest: mycc
 	(cat test.sh >tmp && echo `tail -1 tests/test1.sh` >>tmp && source tmp)

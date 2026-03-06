@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```bash
 make mycc           # Build the compiler
 make test_all       # Run all test suites
-make test_struct    # Run a specific test suite (also: test_init, test_ops, test_logops, test_func, test_longs, test_array, test_loops, test_goto, test_struct_init, test_floats, test_compound, test_remaining)
+make test_struct    # Run a specific test suite (also: test_init, test_ops, test_logops, test_func, test_longs, test_array, test_loops, test_goto, test_struct_init, test_floats, test_compound, test_remaining, test_typedef, test_strings, test_enum, test_variadic, test_funcptr)
 make clean          # Remove binaries and temp files
 ```
 
@@ -68,27 +68,29 @@ struct Token {
     Token       *next;
     char        *val;   // text of the token
     double      fval;   // parsed float value
-    long long   ival;   // parsed integer value
+    long long   ival;   // parsed integer value (also string literal length for TK_STRING)
     int         loc;    // character position in source
 };
 ```
 
 ### Token Kinds
 
-- **Delimiters**: `TK_LPAREN ( ) RPAREN LBRACE RBRACE LBRACKET RBRACKET COMMA SEMICOLON COLON DOT ARROW`
-- **Operators** (2-char first, then 1-char): `== != >= <= ++ -- && || >> <<  ->` then `= + - * / & ~ ! | ^ < >`
-- **Literals**: `TK_CONSTINT`, `TK_CONSTFLT`, `TK_CHARACTER`, `TK_IDENT`
+- **Delimiters**: `TK_LPAREN TK_RPAREN TK_LBRACE TK_RBRACE TK_LBRACKET TK_RBRACKET TK_COMMA TK_SEMICOLON TK_COLON TK_DOT TK_ARROW`
+- **Operators** (2-char checked before 1-char): `TK_EQ(==) TK_NE(!=) TK_GE(>=) TK_LE(<=) TK_INC(++) TK_DEC(--) TK_LOGAND(&&) TK_LOGOR(||) TK_SHIFTR(>>) TK_SHIFTL(<<) TK_ARROW(->)` then single-char: `TK_ASSIGN(=) TK_PLUS TK_MINUS TK_STAR TK_SLASH TK_AMPERSAND TK_TWIDDLE(~) TK_BANG(!) TK_BITOR(|) TK_BITXOR(^) TK_LT TK_GT TK_PERCENT TK_QUESTION`
+- **Compound assignment**: `TK_PLUS_ASSIGN TK_MINUS_ASSIGN TK_STAR_ASSIGN TK_SLASH_ASSIGN TK_AMP_ASSIGN TK_BITOR_ASSIGN TK_BITXOR_ASSIGN TK_SHIFTL_ASSIGN TK_SHIFTR_ASSIGN TK_PERCENT_ASSIGN`
+- **Literals**: `TK_CONSTINT`, `TK_CONSTFLT`, `TK_CHARACTER`, `TK_STRING`, `TK_IDENT`
 - **Keywords** (32): `auto break case char const continue default do double else enum extern float for goto if int long register return short signed sizeof static struct switch typedef union unsigned void volatile while`
-- `TK_EOF` — end of input
+- **Other**: `TK_ELLIPSIS` (`...` — variadic parameter marker), `TK_EOF`
 
 ### Lexing Rules
 
 - Whitespace is skipped.
 - Two-character tokens are checked before single-character tokens.
 - Identifiers/keywords: `[a-zA-Z_][a-zA-Z0-9_]*`, then matched against `keywords[]` table.
-- Integer constants: `strtol()` with optional `u/U`, `l/L`, or `ul/UL` suffix; hex (`0x…`) recognised.
+- Integer constants: `strtol()` with optional `u/U`, `l/L`, or `ul/UL` suffix; hex (`0x…`) and octal (`0…`) recognised.
 - Float constants: `strtod()` with optional `f/F` suffix.
 - Character constants: `'x'` with escape sequences `\a \b \f \n \r \t \v \\ \? \' \" \xhh \ooo`.
+- String literals: `"…"` decoded into `val` (with C escape sequences); `ival` holds the decoded byte count (excluding null terminator). Adjacent string literals are concatenated in the tokeniser loop. The `val` buffer is heap-allocated.
 
 ---
 
@@ -107,6 +109,7 @@ decl-specifier      → storage-class | type-specifier | type-qualifier
 storage-class       → auto | register | static | extern | typedef
 type-specifier      → void | char | short | int | long | float | double
                     | signed | unsigned | struct-or-union-specifier | enum-specifier
+                    | typedef-name
 type-qualifier      → const | volatile
 
 struct-or-union-specifier
@@ -120,15 +123,17 @@ direct-declarator   → ident direct-decl-suffix*
 direct-decl-suffix  → "[" constant-expr? "]"
                     | "(" param-type-list ")"
 
+param-declaration   → decl-specifier+ declarator?   (abstract declarators accepted)
+
 init-declarator     → declarator ("=" initializer)?
 initializer         → assign-expr | "{" initializer-list "}"
 
 statement           → expr-stmt | compound-stmt | if-stmt | while-stmt | for-stmt
                     | do-stmt | switch-stmt | break-stmt | continue-stmt | return-stmt
-compound-stmt       → "{" declaration* statement* "}"
+compound-stmt       → "{" (declaration | statement)* "}"
 if-stmt             → "if" "(" expr ")" stmt ("else" stmt)?
 while-stmt          → "while" "(" expr ")" stmt
-for-stmt            → "for" "(" expr? ";" expr? ";" expr? ")" stmt
+for-stmt            → "for" "(" (declaration | expr?) ";" expr? ";" expr? ")" stmt
 do-stmt             → "do" stmt "while" "(" expr ")" ";"
 switch-stmt         → "switch" "(" expr ")" compound-stmt
 case-label          → "case" integer-constant ":"    (parsed as stmt inside compound)
@@ -140,7 +145,8 @@ label-stmt          → ident ":" stmt
 return-stmt         → "return" expr? ";"
 
 expr                → assign-expr ("," assign-expr)*
-assign-expr         → unary-expr "=" assign-expr | logor-expr
+assign-expr         → unary-expr "=" assign-expr | cond-expr
+cond-expr           → logor-expr ("?" expr ":" cond-expr)?
 logor-expr          → logand-expr ("||" logand-expr)*
 logand-expr         → bitor-expr ("&&" bitor-expr)*
 bitor-expr          → bitxor-expr ("|" bitxor-expr)*
@@ -161,10 +167,12 @@ postfix-suffix      → "[" expr "]"
                     | "." ident
                     | "->" ident
                     | "++" | "--"
-primary-expr        → ident | constant | "(" expr ")"
+primary-expr        → ident | constant | string-literal | "(" expr ")"
 ```
 
-**Not yet implemented:** `typedef`, `enum` bodies, `register`/`extern`/`static` semantics, string literals. `sizeof(complex_expr)` not supported (only type names and simple idents).
+**Not yet implemented:** `register`/`extern`/`static` semantics. `sizeof(complex_expr)` not supported (only type names and simple idents).
+
+**Abstract declarators** in parameter lists are fully supported: `int foo(int, int)` (unnamed params) and `int (*fp)(int, int)` (function-pointer params with inner unnamed params) are both accepted.
 
 ### AST Node Kinds
 
@@ -180,12 +188,13 @@ ND_PTYPE_LIST    // parameter type list
 ND_TYPE_NAME     // type name in a cast
 ND_STRUCT        // struct/union specifier
 ND_UNION         // (unused; structs cover both)
-ND_MEMBER        // "." member access — children: [struct_expr, field_ident]
+ND_MEMBER        // "." or "->" member access — children: [struct_expr, field_ident]
 ND_COMPSTMT      // "{}" block — children: declarations and statements
 ND_EXPRSTMT      // expression statement
 ND_IFSTMT        // if — children: [cond, then] or [cond, then, else]
 ND_WHILESTMT     // while — children: [cond, body]
 ND_FORSTMT       // for — children: [init, cond, inc, body] (ND_EMPTY for absent parts)
+                 //   if init is a declaration, node->symtable holds its implicit scope
 ND_DOWHILESTMT   // do-while — children: [body, cond]
 ND_SWITCHSTMT    // switch — children: [selector, body_compstmt]
 ND_CASESTMT      // case N: — ival holds the constant; no children
@@ -199,12 +208,16 @@ ND_RETURNSTMT    // return — children: [expr] or empty
 ND_STMT          // generic wrapper
 ND_ASSIGN        // "=" — children: [lhs, rhs]
 ND_BINOP         // binary op (val = "+", "-", "*", "/", "==", etc.)
-ND_UNARYOP       // unary op (val = "+", "-", "*") — child: [operand]
+ND_UNARYOP       // unary op (val = "+", "-", "*", "&", "~", "!", "++", "--", "post++", "post--")
 ND_CAST          // explicit cast — children: [ND_DECLARATION type placeholder, expr]
+ND_TERNARY       // "?:" — children: [cond, then_expr, else_expr]
 ND_IDENT         // variable or function reference (val = name)
-ND_LITERAL       // integer or float constant
+ND_LITERAL       // integer, float, or string constant
 ND_INITLIST      // initializer list "{…}"
 ND_CONSTEXPR     // constant expression
+ND_VA_START      // va_start(ap, last) — children: [ap, last]
+ND_VA_ARG        // va_arg(ap, type) — child: [ap]; node->type = requested type
+ND_VA_END        // va_end(ap) — no-op
 ND_PARAM_LIST    // (unused directly)
 ND_DECLSTMT      // (unused directly)
 ND_EXPR          // (unused directly)
@@ -219,13 +232,20 @@ struct Node {
     char         val[64];       // operator or name string
     long long    ival;          // integer constant value
     double       fval;          // float constant value
+    char         *strval;       // heap-allocated decoded string literal content (NULL if not a string)
+    int          strval_len;    // byte length of strval (excluding null terminator)
     Node       **children;
     int          child_count;
     int          offset;        // struct member byte offset (ND_MEMBER)
+    int          pointer_level; // number of pointer stars in declarator
     int          struct_depth;  // nesting depth for struct definitions
     bool         is_expr;       // node participates in type propagation
     bool         is_func_defn;  // true for function definitions (not just decls)
+    bool         is_function;   // true when ident/unaryop has postfix "(args)" applied —
+                                //   marks this node as a call site (or dereference-call)
     bool         is_array_deref;// true for array subscript UNARYOP "+" (no load)
+    bool         is_array;      // true for ND_ARRAY_DECL nodes
+    bool         is_variadic;   // true for variadic function/param-type-list
     int          array_size;    // size of array declared
     Type_base    typespec;      // parser-internal bitmask (TB_INT | TB_UNSIGNED etc.)
     Token_kind   sclass;        // storage class specifier
@@ -242,20 +262,27 @@ struct Node {
 
 `E1[E2]` is rewritten in the parser (not in a separate pass) as pointer arithmetic:
 
-- **Not the last dimension** (e.g., `a[i]` where `a` is `int[3][4]`): creates `ND_UNARYOP "+"` with `is_array_deref = true` and `node->type` set to the element-at-that-depth type. No load is generated; the address is passed through.
-- **Last dimension** (e.g., `a[i]` where `a` is `int[4]`, or `a[i][j]` for the `j` part): creates `ND_UNARYOP "*"` with `node->type` set to the leaf element type. A load is generated.
+- **Pointer subscript** (base has pointer type): creates `ND_UNARYOP "*"` wrapping `ND_BINOP "+"(ptr, idx)`. `propagate_types` inserts stride scaling.
+- **Not the last array dimension** (e.g., `a[i]` where `a` is `int[3][4]`): creates `ND_UNARYOP "+"` with `is_array_deref = true` and `node->type` set to the element-at-that-depth type. No load is generated; the address is passed through.
+- **Last array dimension** (e.g., `a[i]` where `a` is `int[4]`): creates `ND_UNARYOP "*"` with `node->type` set to the leaf element type. A load is generated.
 
-The child is always `ND_BINOP "+"` with children `[base_addr, ND_BINOP "*" [stride_constant, index_expr]]`.
+For array subscripts the child is `ND_BINOP "+"` with children `[base_addr, ND_BINOP "*" [stride_constant, index_expr]]`.
 
 ### Type Propagation (`propagate_types`)
 
 Post-order (children first) tree walk. For each node:
 
-- `ND_IDENT` (not struct member): `node->type = find_symbol(…)->type`
-- `ND_MEMBER`: looks up field in `lhs->type->u.composite.members`, sets `node->offset` and `node->type`
+- `ND_IDENT` (not struct member, `is_expr == true` only): `node->type = find_symbol(…)->type`
+- `ND_MEMBER`: looks up field in `lhs->type->u.composite.members`, sets `node->offset` and `node->type`; for `"->"` the lhs pointer is automatically dereferenced
 - `ND_BINOP` (is_expr): calls `check_operands()` → inserts arithmetic-conversion casts, returns lhs type; then comparison/logical operators (`< <= > >= == != && ||`) force `node->type = t_int` regardless of operand type
 - `ND_UNARYOP` (is_expr): calls `check_unary_operand()` → for `*` returns `elem_type(child->type)`; preserves parser-set types (guards with `if (node->type == t_void)`)
 - `ND_RETURNSTMT`: inserts a cast if return type differs from expression type
+
+### Scope Tracking and `last_symbol_table`
+
+The global `last_symbol_table` always points to the most recently created scope from `enter_new_scope(false)`. `comp_stmt(true)` uses it to re-enter the scope created by `param_type_list` (so function parameters and body variables share a scope).
+
+**Important:** `param_type_list` explicitly restores `last_symbol_table = node->symtable` after `leave_scope()`. This prevents inner `param_type_list` calls (from function-pointer declarators such as `int (*fp)(int)`) from overwriting `last_symbol_table` and corrupting the outer function's scope chain.
 
 ---
 
@@ -314,8 +341,9 @@ struct Field {
 | float | 4 | 4 | `t_float` |
 | double | 4 | 4 | `t_double` |
 | pointer | 2 | 2 | — |
+| function | 0 | — | — |
 
-**Note:** The target has a 16-bit address space. `int` and pointers are 2 bytes.
+**Note:** The target has a 16-bit address space. `int` and pointers are 2 bytes. Function types have size 0; when a function designator is used as a value (e.g. passed as an argument), it decays to a pointer-sized value (2 bytes).
 
 ### Factory Functions
 
@@ -325,6 +353,7 @@ Type2 *get_pointer_type(Type2 *pointee);           // dedup by pointee pointer
 Type2 *get_array_type(Type2 *elem, int count);     // size = elem->size * count
 Type2 *get_function_type(Type2 *ret, Param *params, bool is_variadic);
 Type2 *get_struct_type(Symbol *tag, Field *members, bool is_union);
+Type2 *get_enum_type(Symbol *tag);
 ```
 
 ### Type Derivation
@@ -332,13 +361,15 @@ Type2 *get_struct_type(Symbol *tag, Field *members, bool is_union);
 `tstr_compact(Node *declarator)` returns a derivation string from a declarator node:
 - `""` — plain scalar
 - `"*"` — pointer
+- `"*()"` — pointer to function (e.g. `int (*fp)(int)`)
 - `"[N]"` — array of N elements
 - `"[N][M]"` — 2-D array (outermost first)
 - `"()"` — function
+- `"(...)"` — variadic function
 
-`apply_derivation(Type2 *base, const char *ts)` builds the Type2 chain left-to-right (outermost first), so `"[3][4]"` → `array(3, array(4, base))`.
+`apply_derivation(Type2 *base, const char *ts)` builds the Type2 chain left-to-right (outermost first), so `"[3][4]"` → `array(3, array(4, base))` and `"*()"` → `pointer(function(base))`.
 
-`type2_from_ts(Node *node, char *ts)` is the public entry point used by the parser.
+`type2_from_ts(Node *node, char *ts)` is the public entry point used by the parser. When `node->typespec & TB_TYPEDEF`, the base is taken from `node->type` directly (already resolved during parsing).
 
 ### Struct Layout
 
@@ -360,6 +391,7 @@ struct Symbol_table {
     Symbol         *tags;           // NS_TAG linked list (struct/union tags)
     Symbol         *members;        // NS_MEMBER (unused; struct members are in Type2)
     Symbol         *labels;         // NS_LABEL
+    Symbol         *typedefs;       // NS_TYPEDEF linked list (typedef names)
     int             size;           // bytes of locals in this scope
     int             global_offset;  // accumulated offset from parent scopes (for nested locals)
     int             child_count;
@@ -370,8 +402,9 @@ struct Symbol_table {
 struct Symbol {
     char   *name;
     Type2  *type;
-    int     offset;     // see addressing below
+    int     offset;       // see addressing below
     bool    is_param;
+    bool    is_enum_const; // true for enum constants (use offset as integer value, no load)
     Symbol *next;
 };
 ```
@@ -382,8 +415,9 @@ struct Symbol {
 - **Global** (`depth == 0`): `offset` is the byte position in the global data area (used as a label name in assembly).
 - **Local** (`is_param == false`): `offset` is the accumulated size of locals declared before this one in the current (and enclosing) scopes. Used as `lea -(global_offset + offset)`.
 - **Parameter** (`is_param == true`): `offset` starts at 8 (above saved lr and bp) and increases for each parameter. Used as `lea (global_offset + offset)`.
+- **Enum constant** (`is_enum_const == true`): `offset` holds the integer value; no memory address.
 
-`find_local_addr(node, name)` searches from the node's scope upward, returning `global_offset + symbol->offset`, with bit 30 set for parameters.
+`find_local_addr(node, name)` searches from the node's scope upward, returning `global_offset + symbol->offset`, with bit 30 set for parameters. Returns -1 for globals (depth 0).
 
 ### Key Helper Functions
 
@@ -393,10 +427,13 @@ Type2 *array_elem_type(Type2 *t)    // walk to innermost element type (all array
 int    array_dimensions(Type2 *t)   // count array nesting depth
 int    find_offset(Type2 *t, char *field, Type2 **out_type)  // field byte offset, -1 if not found
 Symbol *find_symbol(Node *node, char *name, Namespace ns)    // search up scope tree
+bool   is_typedef_name(char *name)   // search curr_scope_st chain for typedef name
+Type2 *find_typedef_type(char *name) // return typedef's resolved Type2*
 
 bool istype_int(Type2 *t)      // t->base == TB2_INT
 bool istype_ptr(Type2 *t)      // t->base == TB2_POINTER
 bool istype_array(Type2 *t)    // t->base == TB2_ARRAY
+bool istype_function(Type2 *t) // t->base == TB2_FUNCTION
 bool istype_intlike(Type2 *t)  // any integer or pointer type (for pointer arithmetic)
 // … etc.
 ```
@@ -410,7 +447,7 @@ Walks the annotated AST and prints assembly instructions to stdout.
 ### Stack Frame Layout
 
 ```
-  bp+8 + 4*(n-1)   param n   (last param)
+  bp+8 + 2*(n-1)   param n   (last param, 2-byte int/pointer)
        ...
   bp+8             param 0   (first param)   ← sp immediately before jl
   bp+4             return address (lr)
@@ -454,7 +491,7 @@ push
 sb/sw/sl            ; mem[stack[sp]] = r0; sp += 4
 ```
 
-**Pointer/array dereference** (`ND_UNARYOP "*"`):
+**Pointer/array dereference** (`ND_UNARYOP "*"`, non-call):
 ```asm
 ; gen_expr(child) → r0 = address to load from
 lb/lw/ll            ; r0 = mem[r0]  (size from elem_type(node->type)->size)
@@ -469,14 +506,41 @@ add
 lb/lw/ll            ; load member value
 ```
 
-**Function call** (`ND_IDENT` + `ND_FUNC_DECL`):
+**Direct function call** (`ND_IDENT` with `is_function=true` and function type):
 ```asm
 ; push arguments right-to-left (last arg first)
-; gen_expr(arg[n-1]) → push
+; gen_expr(arg[n-1]) → pushw/push
 ; ...
 ; gen_expr(arg[0]) → pushw/push
 jl    func_name
 adj   param_total_bytes   ; caller cleans up parameters
+```
+Function designators used as values (e.g. `fp = myfunc`) emit only `immw func_name` (no call).
+
+**Indirect call through function pointer variable** (`fp(args)` where `fp` has `ptr(fn)` type):
+```asm
+; push arguments right-to-left
+; gen_expr(arg[n-1]) → pushw/push
+; ...
+; gen_expr(arg[0]) → pushw/push
+lea   fp_offset     ; or immw fp for globals
+lw                  ; load function pointer value into r0
+jli                 ; indirect call: lr = pc; pc = r0
+adj   param_total_bytes
+```
+
+**Indirect call through dereferenced pointer** (`(*fp)(args)`):
+```asm
+; push arguments right-to-left (children[1..n-1])
+; gen_expr(children[0]) → r0 = function address (evaluating the pointer expr)
+jli
+adj   param_total_bytes
+```
+
+**`putchar(c)`** — special CPU builtin, handled directly in `gen_callfunction`:
+```asm
+; gen_expr(c) → r0
+putchar             ; opcode 0x1e; writes r0 & 0xff to stdout; does not modify r0
 ```
 
 **Logical OR** (`||`):
@@ -541,12 +605,13 @@ Casts are no-ops when src and dst have the same size. Otherwise:
 
 **Structs**: `gen_struct_inits` (local) and `gen_struct_mem_inits` (global) write each field; nested structs recurse. Partial initializers leave remaining fields zeroed.
 
-### Two-Pass Code Generation
+### Three-Pass Code Generation
 
-`gen_code()` makes two passes over the top-level declaration list:
+`gen_code()` makes three passes over the top-level declaration list:
 
-1. **Pass 1**: emit function definitions (`.text` section — though no explicit section directive is emitted; functions follow the preamble inline).
-2. **Pass 2**: emit global variable declarations (implicitly in a data area after the code).
+1. **Pass 1**: emit function definitions (follows the preamble inline in the text area).
+2. **Pass 2**: emit global variable declarations (data area after the code).
+3. **Pass 3**: emit deferred string literal data (`_l0:`, `_l1:` etc.), each as a sequence of `byte` directives followed by a null terminator.
 
 ---
 
@@ -610,6 +675,8 @@ Three formats:
 | 0x1b | `xor` | r0 = mem32[sp] ^ r0; sp += 4 |
 | 0x1c | `sxb` | r0 = sign_extend_8(r0) |
 | 0x1d | `sxw` | r0 = sign_extend_16(r0) |
+| 0x1e | `putchar` | sys.stdout.write(chr(r0 & 0xff)); r0 unchanged |
+| 0x1f | `jli` | lr = pc; pc = r0 & 0xffff  *(indirect call via r0)* |
 | 0x20 | `fadd` | r0 = float_bits(float(stack) + float(r0)); sp += 4 |
 | 0x21 | `fsub` | r0 = float_bits(float(stack) - float(r0)); sp += 4 |
 | 0x22 | `fmul` | r0 = float_bits(float(stack) * float(r0)); sp += 4 |
@@ -626,6 +693,8 @@ Float operands are 32-bit IEEE 754 single-precision values stored as raw bit pat
 **Stack-binary convention**: all `add`, `sub`, `mul`, `div`, `mod`, `shl`, `shr`, comparisons, and bitwise ops pop their left operand from the stack (`mem32[sp]`) and use r0 as right operand, writing the result to r0 and incrementing sp by 4.
 
 **Store convention**: `sb`, `sw`, `sl` pop a 32-bit address from the stack and write r0 to that address.
+
+**CPU builtins**: `putchar` (0x1e) and `jli` (0x1f) are in the gap between the integer ops and the float ops. `putchar` is pre-declared as a global builtin symbol by `make_basic_types()` via `insert_builtin()` in `types.c`; the compiler emits it directly without a call frame. `jli` is used for all indirect function-pointer calls.
 
 #### Format 1 — Signed 8-bit Operand
 
@@ -652,7 +721,9 @@ Float operands are 32-bit IEEE 754 single-precision values stored as raw bit pat
 
 **Loading a 32-bit constant**: use `immw` (lower 16 bits) followed by `immwh` (upper 16 bits). The compiler's `gen_imm(val)` emits this pair when `val > 0xffff`.
 
-**Function call**: `jl` saves the return address in `lr`, then jumps. `enter` saves `lr` and `bp` on the stack and sets `bp` for the new frame. On return, `ret` restores the frame.
+**Direct function call**: `jl` saves the return address in `lr`, then jumps. `enter` saves `lr` and `bp` on the stack and sets `bp` for the new frame. On return, `ret` restores the frame.
+
+**Indirect function call**: load the function pointer into r0, then `jli` (same save/jump semantics as `jl` but target is r0 not an immediate).
 
 ### Assembly Syntax
 
@@ -667,14 +738,14 @@ label:              ; defines a label at current address
 
 ; Directives:
     byte  v1 v2 ...    ; emit one byte per value
-    word  v1 v2 ...    ; emit one 16-bit word per value
+    word  v1 v2 ...    ; emit one 16-bit word per value (labels allowed as values)
     long  v1 v2 ...    ; emit one 32-bit long per value
     allocb N           ; reserve N zero bytes
     allocw N           ; reserve N zero words (word-aligned)
     align              ; align to next word boundary
 ```
 
-Comments start with `;`. Labels and instruction names are case-sensitive.
+Comments start with `;`. Labels and instruction names are case-sensitive. The assembler resolves labels in `word` and `byte` directives (not only in instruction operands).
 
 ### Typical Assembly Output
 
@@ -717,6 +788,9 @@ Preprocessor excluded. Features are assessed against ANSI C89/ISO C90.
 - **`//` line comments are supported** — a C99/C++ extension not present in C89.
 - **Implicit `int` return type is not allowed** — every function must explicitly state its return type.
 - **Implicit function declarations are not allowed** — a function must be declared or defined before it is called.
+- **Bit fields in structs are not supported** — the syntax `type name : width;` is not parsed. Bit fields are rarely used in practice and add significant complexity (platform-specific packing, masking, alignment) for minimal benefit on this target.
+- **Declarations may appear anywhere in a block** — C99 extension. In C89, all declarations within a `{}` block must precede all statements. This compiler accepts declarations interleaved with statements (e.g. `int a=1; a++; int b=a*2;`). Note: all locals are still allocated upfront at scope entry (single `adj -N`), so a variable's storage exists from the start of the block even if its declaration appears later in the source.
+- **`for`-init declarations** — C99 extension. `for (int i = 0; i < n; i++)` is supported. The loop variable is scoped to the for statement (condition, increment, and body). Implemented by creating an implicit hidden scope for the init declaration; `gen_forstmt` wraps the loop in `adj -N`/`adj +N`.
 
 ### Statements
 
@@ -725,7 +799,7 @@ Preprocessor excluded. Features are assessed against ANSI C89/ISO C90.
 | `if` / `if-else` | ✅ | |
 | `while` | ✅ | |
 | `do-while` | ✅ | |
-| `for` | ✅ | init/cond/inc all optional (ND_EMPTY for absent parts) |
+| `for` | ✅ | init/cond/inc all optional (ND_EMPTY for absent parts); init may be a declaration (C99) |
 | `switch` / `case` / `default` | ✅ | fall-through supported; selector re-evaluated per case |
 | `break` | ✅ | works inside `while`, `for`, `do-while`, `switch` |
 | `continue` | ✅ | works inside `while`, `for`, `do-while` |
@@ -773,10 +847,10 @@ Preprocessor excluded. Features are assessed against ANSI C89/ISO C90.
 | Arrays (1-D and N-D) | ✅ | |
 | `struct` | ✅ | Including nested structs and correct member offsets |
 | `union` | ✅ | All members at offset 0; `is_union` flag in Type2 sets size = max member size |
-| `enum` | ❌ | Keyword tokenised; body not parsed; constants not supported |
-| `typedef` | ❌ | Keyword tokenised; not functional |
-| Function pointers | ⚠️ | Can be declared; calling through a function-pointer variable not supported |
-| Bit fields in structs | ❌ | |
+| `enum` | ✅ | Tagged and anonymous enums; implicit/explicit/negative values; enum variables; sizeof(enum); case labels with enum constants |
+| `typedef` | ✅ | Scalar, pointer, struct/union aliases; lexical scoping with shadowing |
+| Function pointers | ✅ | Declare, assign, call via `fp(args)` and `(*fp)(args)`; pass as arguments; use as parameters (`int (*f)(int)`) |
+| Bit fields in structs | N/A | Deliberately not supported — see deviations |
 | `const` / `volatile` qualifiers | ⚠️ | Parsed and stored; semantics not enforced |
 
 ### Declarations and Linkage
@@ -787,6 +861,7 @@ Preprocessor excluded. Features are assessed against ANSI C89/ISO C90.
 | Scalar initializer (`int x = 5;`) | ✅ | |
 | Array initializer (`int a[] = {1,2,3};`) | ✅ | Including multi-dim |
 | Struct/union initializer | ✅ | Flat and nested; partial init zero-fills remainder |
+| `typedef` declarations | ✅ | Stored in `NS_TYPEDEF` per scope; `gen_decl` skips typedef nodes |
 | `auto` | ⚠️ | Parsed; no semantic difference from default local |
 | `register` | ⚠️ | Parsed; ignored (no register allocator) |
 | `static` | ⚠️ | Parsed; internal-linkage and persistent-storage semantics not enforced |
@@ -804,7 +879,7 @@ Preprocessor excluded. Features are assessed against ANSI C89/ISO C90.
 | Integer suffixes `u/U`, `l/L`, `ul/UL` | ✅ | |
 | Floating-point constants | ✅ | Parsed and emitted as IEEE 754 via `immw`/`immwh` pair |
 | Character constants (`'a'`, escape sequences) | ✅ | |
-| String literals (`"…"`) | ❌ | Not tokenised or parsed |
+| String literals (`"…"`) | ✅ | `TK_STRING` token; escape decoding; adjacent concatenation; `char*` type; deferred data emission in codegen pass 3; `char s[]`/`char s[N]` init; assembler extended to resolve labels in `word` directives |
 
 ### Functions and Calling Convention
 
@@ -814,23 +889,34 @@ Preprocessor excluded. Features are assessed against ANSI C89/ISO C90.
 | Parameter passing (value) | ✅ | |
 | Return values | ✅ | |
 | Recursion | ✅ | |
-| Variadic functions (`...`) | ❌ | `is_variadic` flag exists in type; no `va_list` / `va_start` / `va_arg` / `va_end` |
+| Variadic functions (`...`) | ✅ | `va_list` (typedef'd to `int`), `va_start`, `va_arg`, `va_end`; `putchar` CPU builtin (opcode 0x1e) |
 
 ### Type Conversion and Promotion
 
 | Feature | Status | Notes |
 |---|---|---|
-| Integer promotions (char/short → int in expressions) | ⚠️ | Partial; not uniformly applied |
-| Usual arithmetic conversions (mixed-type operands) | ⚠️ | Basic widening casts emitted; full C89 hierarchy not guaranteed |
+| Integer promotions (char/short → int in expressions) | ✅ | Applied in `check_operands` and `check_unary_operand` for all binary and most unary ops |
+| Usual arithmetic conversions (mixed-type operands) | ✅ | Full C89 rank hierarchy: float > ulong > long > uint > int |
 | Pointer ↔ integer conversions | ✅ | Used in tests (e.g. `a = 0x2000`) |
 | Floating-point conversions | ✅ | `itof`/`ftoi` opcodes; int→float sign-extends first |
+| Function-to-pointer decay | ✅ | Function designators used as values or passed as arguments decay to pointer-sized (2 bytes) |
+
+#### Target-Dependent Arithmetic Notes (revisit if porting to a wider target)
+
+These behaviors are correct for the current 16-bit target (`sizeof(int) == sizeof(short) == 2`) but would need changes for a 32-bit target (`sizeof(int) == 4`, `sizeof(short) == 2`):
+
+- **`unsigned short` promotes to `unsigned int`** — on this target `int` is 2 bytes and cannot represent unsigned short values above 32767, so C89 §3.2.1.1 requires promotion to `unsigned int`. On a 32-bit target `int` can represent all `unsigned short` values, so the promotion would be to `int` instead of `unsigned int`. Both are size-2 here, so no code is generated either way.
+- **`short → int` is a no-op** — both are 2 bytes on this target; no code is generated. On a 32-bit target this would emit `sxw` (sign-extend to 32 bits).
+- **`unsigned char → int` is a no-op** — zero-extension from 8 to 16 bits is assumed already done; on a 32-bit target it would zero-extend to 32 bits.
+- **Function argument promotion is not applied** — C89 §3.3.2.2 says each argument is converted to the declared parameter type. No casts are inserted at call sites for narrow types (`char`, `short`). Harmless here because all integer types ≤ 2 bytes and the calling convention pushes 2-byte slots regardless. On a 32-bit target where arguments occupy 4-byte slots, narrow arguments would need widening casts before the `push`.
+- **`int` vs `unsigned int` arithmetic** — both are 2 bytes; only sign-interpretation differs (comparisons, right-shift, division). Mixed `int`/`uint` arithmetic converts to `uint` per the conversions, but the bit patterns are identical for `+`, `-`, `*`.
 
 ### Summary
 
-**Implemented and working**: basic scalar types, pointers, 1-D/N-D arrays, structs, unions, `float`/`double` (IEEE 754 arithmetic, comparisons, int↔float casts), `if`/`while`/`for`/`do-while`, `switch`/`case`/`default`, `break`, `continue`, `goto`, labeled statements, all arithmetic and bitwise operators including `%`, all comparison and logical operators, unary `+ - ~ ! &` and dereference `*`, pre/post-increment/decrement, struct/union member access (`.` and `->`), explicit casts, array subscripting, function definitions and calls (multi-arg), integer constants (decimal/hex/octal), floating-point constants, compound assignment (`+=` `-=` `*=` `/=` `%=` `&=` `|=` `^=` `<<=` `>>=`), ternary `?:`, comma operator, `sizeof(type)`/`sizeof(ident)`.
+**Implemented and working**: basic scalar types, pointers, 1-D/N-D arrays, structs, unions, `float`/`double` (IEEE 754 arithmetic, comparisons, int↔float casts), `if`/`while`/`for`/`do-while`, `switch`/`case`/`default`, `break`, `continue`, `goto`, labeled statements, all arithmetic and bitwise operators including `%`, all comparison and logical operators, unary `+ - ~ ! &` and dereference `*`, pre/post-increment/decrement, struct/union member access (`.` and `->`), explicit casts, array subscripting, function definitions and calls (multi-arg, recursive), integer constants (decimal/hex/octal), floating-point constants, string literals, compound assignment (`+=` `-=` `*=` `/=` `%=` `&=` `|=` `^=` `<<=` `>>=`), ternary `?:`, comma operator, `sizeof(type)`/`sizeof(ident)`, `typedef` (scalar/pointer/struct aliases with lexical scoping), `enum` (tagged/anonymous, implicit/explicit/negative values, enum variables, enum constants in expressions and case labels), variadic functions (`va_list`/`va_start`/`va_arg`/`va_end`), function pointers (declare, assign, call via `fp(args)` and `(*fp)(args)`, pass as arguments and parameters).
 
-**Partially working**: `const`/`volatile` (stored, not enforced), storage classes (parsed, not enforced).
+**Partially working**: `const`/`volatile` (stored, not enforced), storage classes (parsed, not enforced), integer promotions in function arguments (not applied at call sites; harmless on this target — see Target-Dependent Arithmetic Notes).
 
-**Not yet implemented**: `enum`, `typedef`, string literals, variadic functions, bit fields, `sizeof(complex_expr)`.
+**Not yet implemented**: bit fields (deliberate), `sizeof(complex_expr)`, calling through a function-pointer stored in a struct field or array element.
 
-**Extensions beyond C89**: `//` line comments.
+**Extensions beyond C89**: `//` line comments; declarations anywhere in a block (C99); `for`-init declarations (C99).

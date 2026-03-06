@@ -132,7 +132,7 @@
 // enumerator ::= identifier
 //              | identifier "=" constant-expression
 // typedef-name ::= identifier
-// compound-statement ::= "{" declaration* statement* "}"
+// compound-statement ::= "{" (declaration | statement)* "}"
 // statement ::= labeled-statement
 //             | expression-statement
 //             | compound-statement
@@ -148,7 +148,7 @@
 //                       | switch "(" expression ")" statement
 // iteration-statement ::= "while" "(" expression ")" statement
 //                       | "do" statement "while" "(" expression ")" ";"
-//                       | "for" "(" expression? ";" expression? ";" expression? ")" statement
+//                       | "for" "(" (declaration | expression?) ";" expression? ";" expression? ")" statement
 // jump-statement ::= "goto" identifier ";"
 //                  | "continue" ";"
 //                  | "break" ";"
@@ -165,10 +165,14 @@ extern Symbol_table *symbol_table;
 
 
 extern Symbol_table *curr_st_scope;
+extern Symbol_table *curr_scope_st;
+extern Symbol_table *last_symbol_table;
 extern int scope_depth;
 extern int scope_indices[];
 
 static Node *primary_expr();
+static Node *unary_expr();
+static Node *type_name();
 static Node *mult_expr();
 static Node *add_expr();
 static Node *assign_expr();
@@ -236,7 +240,41 @@ static Node *primary_expr()
 {
     fprintf(stderr, "%s %s \n", __func__, token->val);
     Node *node;
-    if (token->kind == TK_IDENT)
+    if (token->kind == TK_IDENT && !strcmp(token->val, "va_start"))
+    {
+        expect(TK_IDENT);
+        expect(TK_LPAREN);
+        node = new_node(ND_VA_START, "va_start", true);
+        node->type = t_void;
+        add_child(node, assign_expr());   // ap
+        expect(TK_COMMA);
+        add_child(node, assign_expr());   // last named param
+        expect(TK_RPAREN);
+        return node;
+    }
+    else if (token->kind == TK_IDENT && !strcmp(token->val, "va_arg"))
+    {
+        expect(TK_IDENT);
+        expect(TK_LPAREN);
+        node = new_node(ND_VA_ARG, "va_arg", true);
+        add_child(node, assign_expr());   // ap
+        expect(TK_COMMA);
+        Node *tn = type_name();           // type to fetch
+        node->type = tn->type;
+        expect(TK_RPAREN);
+        return node;
+    }
+    else if (token->kind == TK_IDENT && !strcmp(token->val, "va_end"))
+    {
+        expect(TK_IDENT);
+        expect(TK_LPAREN);
+        node = new_node(ND_VA_END, "va_end", true);
+        node->type = t_void;
+        add_child(node, assign_expr());   // ap
+        expect(TK_RPAREN);
+        return node;
+    }
+    else if (token->kind == TK_IDENT)
     {
         node = new_node(ND_IDENT, expect(TK_IDENT), true);
     }
@@ -304,11 +342,19 @@ static Node *primary_expr()
     else if (token->kind == TK_CHARACTER)
     {
         char c[64];
-        sprintf(c, "%d", (int)token->val[0]); 
+        sprintf(c, "%d", (int)token->val[0]);
         expect(TK_CHARACTER);
         fprintf(stderr, "%s %s\n", c, token->val);
         node = new_node(ND_LITERAL, c, true);
         node->type = t_char;
+    }
+    else if (token->kind == TK_STRING)
+    {
+        node = new_node(ND_LITERAL, "<string>", true);
+        node->strval     = token->val;
+        node->strval_len = (int)token->ival;
+        node->type       = get_pointer_type(t_char);
+        expect(TK_STRING);
     }
     else
     {
@@ -330,6 +376,8 @@ bool is_postfix(Token_kind tk)
 // Forward declarations for sizeof support
 static bool is_type_name_or_type(Token *token);
 static Node *type_name();
+static void struct_decl(Node *node, int depth);
+static void enum_decl(Node *node);
 
 static Node *unary_expr()
 {
@@ -377,9 +425,10 @@ static Node *unary_expr()
         add_child(node, unary_expr());
     }
     else if (token->kind == TK_IDENT
-            || token->kind == TK_CONSTINT 
-            || token->kind == TK_CONSTFLT 
+            || token->kind == TK_CONSTINT
+            || token->kind == TK_CONSTFLT
             || token->kind == TK_CHARACTER
+            || token->kind == TK_STRING
             || token->kind == TK_LPAREN)
     {
         node = primary_expr();
@@ -403,6 +452,31 @@ static Node *unary_expr()
                 // rewrite as per A.7.3.1: E1[E2] equiv *((E1) + (E2))
                 // e1[e2][e3] as *(e1 + e2 * size(d2) + e3)
                 {
+                    // Determine type at current subscript depth
+                    Type2 *sub_type = s ? s->type : node->type;
+                    for (int _d = 0; _d < array_depth; _d++) {
+                        if (sub_type->base == TB2_ARRAY)
+                            sub_type = sub_type->u.arr.elem;
+                        else if (sub_type->base == TB2_POINTER)
+                            sub_type = sub_type->u.ptr.pointee;
+                    }
+                    if (sub_type->base == TB2_POINTER)
+                    {
+                        // Pointer subscript: ptr[idx] → *(ptr + idx)
+                        // propagate_types will insert the stride scaling via insert_scale
+                        expect(TK_LBRACKET);
+                        Node *e1  = node;
+                        Node *idx = expr();
+                        expect(TK_RBRACKET);
+                        Type2 *elem = sub_type->u.ptr.pointee;
+                        Node *add_node = new_node(ND_BINOP, "+", true);
+                        add_child(add_node, e1);
+                        add_child(add_node, idx);
+                        node = new_node(ND_UNARYOP, "*", true);
+                        node->type = elem;
+                        add_child(node, add_node);
+                        break;
+                    }
                     if (!s)
                         error("No ident before left bracket\n");
                     expect(token->kind);
@@ -474,6 +548,14 @@ static Node *unary_expr()
             }
             case(TK_INC):
             case(TK_DEC):
+            {
+                char *op = (token->kind == TK_INC) ? "post++" : "post--";
+                token = token->next;
+                Node *n = new_node(ND_UNARYOP, op, true);
+                add_child(n, node);
+                node = n;
+                break;
+            }
             default:break;
         }
     }
@@ -481,7 +563,8 @@ static Node *unary_expr()
 }
 static bool is_type_name_or_type(Token *token)
 {
-    return is_type_name(token->kind);
+    return is_type_name(token->kind)
+        || (token->kind == TK_IDENT && is_typedef_name(token->val));
 }
 static Node *type_name()
 {
@@ -501,12 +584,27 @@ static Node *type_name()
     //     return new_node(ND_TYPE_NAME, expect(token->kind));
     // }
     Node *node = new_node(ND_DECLARATION, 0, true);
+    if (token->kind == TK_IDENT && is_typedef_name(token->val))
+    {
+        node->type = find_typedef_type(token->val);
+        expect(TK_IDENT);
+        if (token->kind == TK_STAR)
+        {
+            expect(TK_STAR);
+            node->type = get_pointer_type(node->type);
+        }
+        return node;
+    }
     while(is_sc_spec(token->kind) || is_typespec(token->kind) || is_typequal(token->kind))
     {
         if (is_sc_spec(token->kind))    node->sclass = token->kind;
         if (is_typespec(token->kind))   node->typespec |= to_typespec(token->kind);
         if (is_typequal(token->kind))   node->typequal = token->kind;
         expect(token->kind);
+    }
+    if (node->typespec & TB_ENUM)
+    {
+        enum_decl(node);
     }
     while(token->kind != TK_RPAREN)
     {
@@ -780,7 +878,8 @@ bool is_typespec(Token_kind tk)
         || (tk == TK_SIGNED)
         || (tk == TK_UNSIGNED)
         || (tk == TK_STRUCT)
-        || (tk == TK_UNION);
+        || (tk == TK_UNION)
+        || (tk == TK_ENUM);
 }
 bool is_typequal(Token_kind tk)
 {
@@ -807,13 +906,19 @@ static Node *param_declaration()
         if (is_typequal(token->kind))   node->typequal = token->kind;
         expect(token->kind);
     }
-    if (token->kind == TK_STAR || token->kind == TK_IDENT)
+    if (node->typespec & (TB_STRUCT | TB_UNION))
+    {
+        struct_decl(node, 0);
+    }
+    else if (node->typespec & TB_ENUM)
+    {
+        enum_decl(node);
+    }
+    if (token->kind == TK_STAR || token->kind == TK_IDENT || token->kind == TK_LPAREN)
     {
         Node *n = add_child(node, declarator());
-        // add_types_and_symbols(n);
     }
-    else
-        error("Expecting declarator in function param list\n");
+    // else: abstract declarator (no name) — valid in C89
 
     // At this point, we can add the symbols and types to the tables
     add_types_and_symbols(node, true, 0);
@@ -828,9 +933,20 @@ static Node *param_type_list()
     {
         add_child(node, param_declaration());
         if (token->kind == TK_COMMA)
-            expect(token->kind);
+        {
+            expect(TK_COMMA);
+            if (token->kind == TK_ELLIPSIS)
+            {
+                expect(TK_ELLIPSIS);
+                node->is_variadic = true;
+                break;
+            }
+        }
     }
     leave_scope();
+    // Restore last_symbol_table to this scope so that nested param_type_list
+    // calls (inside function-pointer declarators) do not overwrite it.
+    last_symbol_table = node->symtable;
     return node;
 }
 static Node *constant_expr()
@@ -997,6 +1113,53 @@ static void struct_decl(Node *node, int depth)
     }
 }
 
+static void enum_decl(Node *node)
+{
+    // Optional tag name
+    char *tagname = NULL;
+    if (token->kind == TK_IDENT)
+    {
+        tagname = strdup(token->val);
+        expect(TK_IDENT);
+    }
+    if (!tagname)
+        tagname = strdup(new_anon_label());
+    node->typetag = tagname;
+
+    if (token->kind == TK_LBRACE)
+    {
+        // Full definition: insert tag, parse body
+        Symbol *tag_sym = insert_tag(node, tagname);
+        Type2  *ety     = get_enum_type(tag_sym);
+        tag_sym->type   = ety;
+        node->type      = ety;
+        expect(TK_LBRACE);
+        int next_val = 0;
+        while (token->kind != TK_RBRACE)
+        {
+            char *ename = strdup(expect(TK_IDENT));
+            if (token->kind == TK_ASSIGN)
+            {
+                expect(TK_ASSIGN);
+                int sign = 1;
+                if (token->kind == TK_MINUS) { sign = -1; expect(TK_MINUS); }
+                next_val = sign * (int)token->ival;
+                expect(TK_CONSTINT);
+            }
+            insert_enum_const(node, ety, ename, next_val++);
+            if (token->kind == TK_COMMA)
+                expect(TK_COMMA);
+        }
+        expect(TK_RBRACE);
+    }
+    else
+    {
+        // Tag-only reference
+        Symbol *tag_sym = find_symbol(node, tagname, NS_TAG);
+        node->type = tag_sym ? tag_sym->type : t_int;
+    }
+}
+
 static Node *declaration(int depth)
 {
     fprintf(stderr, "%s\n", __func__);
@@ -1004,16 +1167,26 @@ static Node *declaration(int depth)
     Node *node = new_node(ND_DECLARATION, 0, false);
     // At least one decl_spec
     // TODO storage class defaults A.8.1
-    while(is_sc_spec(token->kind) || is_typespec(token->kind) || is_typequal(token->kind))
+    while(is_sc_spec(token->kind) || is_typespec(token->kind) || is_typequal(token->kind)
+          || (token->kind == TK_IDENT && is_typedef_name(token->val) && node->typespec == 0))
     {
         if (is_sc_spec(token->kind))    node->sclass = token->kind;
         if (is_typespec(token->kind))   node->typespec |= to_typespec(token->kind);
         if (is_typequal(token->kind))   node->typequal = token->kind;
+        if (token->kind == TK_IDENT && is_typedef_name(token->val))
+        {
+            node->typespec |= TB_TYPEDEF;
+            node->type      = find_typedef_type(token->val);
+        }
         expect(token->kind);
     }
     if (node->typespec & (TB_STRUCT | TB_UNION))
     {
         struct_decl(node, depth);
+    }
+    else if (node->typespec & TB_ENUM)
+    {
+        enum_decl(node);
     }
     while(token->kind != TK_SEMICOLON)
     {
@@ -1054,15 +1227,17 @@ static Node *comp_stmt(bool use_last_scope)
     fprintf(stderr, "%s\n", curr_scope_str());
     if (token->kind == TK_LBRACE)
     {
-        // <compound-statement> ::= { {<declaration>}* {<statement>}* }
+        // <compound-statement> ::= { {<declaration-or-statement>}* }
+        // C99 extension: declarations may appear anywhere in a block.
         expect(TK_LBRACE);
-        while (is_sc_spec(token->kind) || is_typespec(token->kind) || is_typequal(token->kind))
-        {
-            // TODO Add defined types
-            add_child(node, declaration(0));
-        }
         while (token->kind != TK_RBRACE)
-            add_child(node, stmt());
+        {
+            if (is_sc_spec(token->kind) || is_typespec(token->kind) || is_typequal(token->kind)
+                || (token->kind == TK_IDENT && is_typedef_name(token->val)))
+                add_child(node, declaration(0));
+            else
+                add_child(node, stmt());
+        }
         expect(TK_RBRACE);
     }
     leave_scope();
@@ -1104,12 +1279,25 @@ static Node *stmt()
         node->kind = ND_FORSTMT;
         expect(TK_FOR);
         expect(TK_LPAREN);
-        // init (optional expression)
-        if (token->kind == TK_SEMICOLON)
+        // init: optional declaration (C99) or expression
+        if (is_sc_spec(token->kind) || is_typespec(token->kind) || is_typequal(token->kind)
+            || (token->kind == TK_IDENT && is_typedef_name(token->val)))
+        {
+            // C99 for-init declaration: for (int i = 0; ...).
+            // Enter an implicit scope so the variable is confined to the loop.
+            node->symtable = enter_new_scope(false);
+            add_child(node, declaration(0));   // declaration() consumes the ';'
+        }
+        else if (token->kind == TK_SEMICOLON)
+        {
             add_child(node, new_node(ND_EMPTY, 0, false));
+            expect(TK_SEMICOLON);
+        }
         else
+        {
             add_child(node, expr());
-        expect(TK_SEMICOLON);
+            expect(TK_SEMICOLON);
+        }
         // condition (optional; absent = infinite loop)
         if (token->kind == TK_SEMICOLON)
             add_child(node, new_node(ND_EMPTY, 0, false));
@@ -1123,6 +1311,8 @@ static Node *stmt()
             add_child(node, expr());
         expect(TK_RPAREN);
         add_child(node, stmt());          // body
+        if (node->symtable)
+            leave_scope();
     }
     else if (token->kind == TK_DO)
     {
@@ -1148,7 +1338,18 @@ static Node *stmt()
     {
         node->kind = ND_CASESTMT;
         expect(TK_CASE);
-        node->ival = expect_number();
+        if (token->kind == TK_IDENT)
+        {
+            Symbol *s = find_symbol(node, token->val, NS_IDENT);
+            if (!s || !istype_enum(s->type))
+                error("Expected integer constant in case\n");
+            node->ival = (long long)s->offset;
+            expect(TK_IDENT);
+        }
+        else
+        {
+            node->ival = (long long)expect_number();
+        }
         expect(TK_COLON);
     }
     else if (token->kind == TK_DEFAULT)
@@ -1266,6 +1467,9 @@ char *nodestr(Node_kind k)
         case ND_LABELSTMT:   return "LABELSTMT   ";
         case ND_GOTOSTMT:    return "GOTOSTMT    ";
         case ND_TERNARY:     return "TERNARY     ";
+        case ND_VA_START:    return "VA_START    ";
+        case ND_VA_ARG:      return "VA_ARG      ";
+        case ND_VA_END:      return "VA_END      ";
         case ND_UNDEFINED:   return "##FIXME##   ";
         default:             return "unknown     ";
     }
@@ -1335,7 +1539,8 @@ void dd(Node *node)
             }
             else if (n->is_function)
             {
-                strcat(ts, "()");
+                bool variadic = (n->child_count > 0 && n->children[0]->is_variadic);
+                strcat(ts, variadic ? "(...)" : "()");
             }
         }
     }
@@ -1432,53 +1637,85 @@ void insert_cast(Node *n, int child, Type2 *t)
 }
 Type2 *check_operands(Node *n)
 {
-    // Perform the 'usual arithmetic conversions'
-    // Check against the rules, and insert a cast to perform the conversion
-    // Ignore the float promotion, we are keeping all float types the same 32 bits
-    //
+    // Perform the 'usual arithmetic conversions' (C89 §3.2.1.5).
+    // Promotions use the *original* lhs/rhs types for checks; insert_cast
+    // replaces n->children[], so we return n->children[0]->type at the end
+    // to get the post-cast result type (not lhs->type which stays pre-cast).
     Node *lhs = n->children[0];
     Node *rhs = n->children[1];
     fprintf(stderr, "%s %016llx %016llx\n", __func__, (unsigned long long)lhs->type, (unsigned long long)rhs->type);
+
+    // Float/double: one side pulls the other up
     if (istype_float(lhs->type) && !istype_float(rhs->type))            insert_cast(n, 1, t_float);
     else if (!istype_float(lhs->type) && istype_float(rhs->type))       insert_cast(n, 0, t_float);
+
+    // Integer promotions (C89 §3.2.1.1):
+    //   char/uchar/short → int;  ushort → uint (int can't represent all ushort
+    //   values on a 16-bit target where sizeof(int)==sizeof(short)==2);
+    //   enum → int.
+    // NOTE: on a 32-bit target, sizeof(int)==4 so int CAN represent all ushort
+    // values; ushort would then promote to int rather than uint.  Also,
+    // short→int would generate sxw (a real widening), not a no-op.
     if (istype_char(lhs->type))                                         insert_cast(n, 0, t_int);
     if (istype_char(rhs->type))                                         insert_cast(n, 1, t_int);
+    if (istype_uchar(lhs->type))                                        insert_cast(n, 0, t_int);
+    if (istype_uchar(rhs->type))                                        insert_cast(n, 1, t_int);
     if (istype_short(lhs->type))                                        insert_cast(n, 0, t_int);
     if (istype_short(rhs->type))                                        insert_cast(n, 1, t_int);
+    if (istype_ushort(lhs->type))                                       insert_cast(n, 0, t_uint);
+    if (istype_ushort(rhs->type))                                       insert_cast(n, 1, t_uint);
     if (istype_enum(lhs->type))                                         insert_cast(n, 0, t_int);
     if (istype_enum(rhs->type))                                         insert_cast(n, 1, t_int);
+
+    // Usual arithmetic conversions — rank hierarchy (C89 §3.2.1.5):
     if (istype_ulong(lhs->type) && !istype_ulong(rhs->type))            insert_cast(n, 1, t_ulong);
-    else if (!istype_ulong(lhs->type) && istype_ulong(rhs->type))       insert_cast(n, 1, t_ulong);
+    else if (!istype_ulong(lhs->type) && istype_ulong(rhs->type))       insert_cast(n, 0, t_ulong);
     else if (istype_long(lhs->type) && istype_uint(rhs->type))          insert_cast(n, 1, t_long);
     else if (istype_uint(lhs->type) && istype_long(rhs->type))          insert_cast(n, 0, t_long);
     else if (istype_long(lhs->type) && !istype_long(rhs->type))         insert_cast(n, 1, t_long);
     else if (!istype_long(lhs->type) && istype_long(rhs->type))         insert_cast(n, 0, t_long);
+    else if (istype_uint(lhs->type) && !istype_uint(rhs->type))         insert_cast(n, 1, t_uint);
+    else if (!istype_uint(lhs->type) && istype_uint(rhs->type))         insert_cast(n, 0, t_uint);
 
-    return lhs->type;
+    // Return the post-cast type of the left child (both children now have the
+    // same type after conversions, so either would give the same answer).
+    return n->children[0]->type;
 }
 Type2 *check_unary_operand(Node *n)
 {
-    // Perform the 'usual arithmetic conversions'
-    // Check against the rules, and insert a cast to perform the conversion
-    // Ignore the float promotion, we are keeping all float types the same 32 bits
-    //
+    // Integer promotions for unary operands (C89 §3.2.1.1).
+    // & and * do not evaluate/promote their operand in the usual sense:
+    //   & takes an address (no value conversion), * dereferences a pointer.
+    // NOTE: function argument promotion is not applied here; harmless on this
+    // 16-bit target (all narrow integers ≤ 2 bytes share the calling convention
+    // slot size), but would need revisiting for a 32-bit target.
     Node *lhs = n->children[0];
     fprintf(stderr, "%s %016llx\n", __func__, (unsigned long long)lhs->type);
-    if (istype_char(lhs->type))                                         insert_cast(n, 0, t_int);
 
-    // For dereference, the result type is the pointed-to/element type, not the pointer/array type
+    // For dereference, the result type is the element type; no promotion of the pointer.
     if (!strcmp(n->val, "*"))
         return elem_type(lhs->type);
-    // Address-of: result is pointer to lhs type
+    // Address-of: take address of the original object; no promotion.
     if (!strcmp(n->val, "&"))
         return get_pointer_type(lhs->type);
-    // Logical not: result is always int
+    // Increment/decrement: result type is the operand type, no promotion.
+    if (!strcmp(n->val, "++") || !strcmp(n->val, "--") ||
+        !strcmp(n->val, "post++") || !strcmp(n->val, "post--"))
+        return lhs->type;
+
+    // For all other unary ops (+, -, ~, !): promote narrow integer types.
+    if (istype_char(lhs->type))    insert_cast(n, 0, t_int);
+    if (istype_uchar(lhs->type))   insert_cast(n, 0, t_int);
+    if (istype_short(lhs->type))   insert_cast(n, 0, t_int);
+    if (istype_ushort(lhs->type))  insert_cast(n, 0, t_uint);
+    if (istype_enum(lhs->type))    insert_cast(n, 0, t_int);
+
+    // Logical not always yields int regardless of operand type.
     if (!strcmp(n->val, "!"))
         return t_int;
-    // Bitwise not: result is lhs type (integer)
-    if (!strcmp(n->val, "~"))
-        return lhs->type;
-    return lhs->type;
+
+    // Result type is the (possibly promoted) operand type.
+    return n->children[0]->type;
 }
 bool is_unscaled_ptr(Node *n)
 {
@@ -1500,7 +1737,7 @@ void propagate_types(Node *p, Node *n)
         return;
     }
     fprintf(stderr, "Before: %s\n", node_str(n));
-    if (n->kind == ND_IDENT && !n->is_struct)
+    if (n->kind == ND_IDENT && !n->is_struct && n->is_expr)
     {
         if (p->kind != ND_MEMBER)
             n->type = find_symbol(n, n->val, NS_IDENT)->type;

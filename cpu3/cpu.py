@@ -122,6 +122,8 @@ class G:
         'xor'   :   (0x1b, 0),
         'sxb'   :   (0x1c, 0),
         'sxw'   :   (0x1d, 0),
+        'putchar':  (0x1e, 0),
+        'jli'   :   (0x1f, 0),
         'fadd'  :   (0x20, 0),
         'fsub'  :   (0x21, 0),
         'fmul'  :   (0x22, 0),
@@ -321,6 +323,8 @@ class CPU:
 
         elif    i == 'sxb':     s.r0 = 0xffffff00 | s.r0 if s.r0 & 0x80 else 0xff & s.r0
         elif    i == 'sxw':     s.r0 = 0xffff0000 | s.r0 if s.r0 & 0x8000 else 0xffff & s.r0
+        elif    i == 'putchar': sys.stdout.write(chr(s.r0 & 0xff)); sys.stdout.flush()
+        elif    i == 'jli':     s.lr = s.pc; s.pc = s.r0 & 0xffff
         elif i == 'fadd': lf = b2f(m.read32(s.sp)); s.sp += 4; s.r0 = f2b(lf + b2f(s.r0))
         elif i == 'fsub': lf = b2f(m.read32(s.sp)); s.sp += 4; s.r0 = f2b(lf - b2f(s.r0))
         elif i == 'fmul': lf = b2f(m.read32(s.sp)); s.sp += 4; s.r0 = f2b(lf * b2f(s.r0))
