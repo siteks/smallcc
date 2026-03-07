@@ -8,7 +8,18 @@
 #include <stdlib.h>
 #include <string.h>
 
-void error(char *fmt, ...);
+void error(const char *fmt, ...);
+
+// ===============================================================
+// Module Context Structs - groups related global state
+// ===============================================================
+
+// Forward declarations for context structs (defined at end of header)
+struct TypeContext;
+struct TokenContext;
+struct ParserContext;
+struct CodegenContext;
+struct ExternContext;
 
 // ---------------------------------------------------------------
 // Tokeniser
@@ -28,13 +39,15 @@ typedef enum
     TK_VOID, TK_CHAR, TK_UCHAR, TK_SHORT, TK_USHORT, TK_INT, TK_UINT, TK_LONG,
     TK_ULONG, TK_FLOAT, TK_DOUBLE, TK_SIGNED, TK_UNSIGNED, TK_STRUCT, TK_UNION, TK_ENUM,
     TK_TYPEDEF, TK_INVALID, TK_ELLIPSIS,
+    // The following are not real tokens - used only for op_kind to distinguish postfix
+    TK_POST_INC, TK_POST_DEC,
 } Token_kind;
 
 
 struct Keyword
 {
     char        *keyword;
-    Token_kind  token;
+    Token_kind  kind;   // renamed from 'token' to avoid conflict with token_ctx.current macro
 };
 typedef struct Token Token;
 
@@ -68,10 +81,10 @@ void print_tokens();
 // ---------------------------------------------------------------
 typedef enum
 {
-    ND_PROGRAM, ND_FUNCTION, ND_PARAM_LIST, ND_DECLSTMT, ND_EXPRSTMT, ND_COMPSTMT, ND_IFSTMT, ND_WHILESTMT,
-    ND_RETURNSTMT, ND_STMT, ND_EXPR, ND_CONSTEXPR, ND_BINOP, ND_UNARYOP, ND_CAST, ND_ASSIGN,
+    ND_PROGRAM, ND_EXPRSTMT, ND_COMPSTMT, ND_IFSTMT, ND_WHILESTMT,
+    ND_RETURNSTMT, ND_STMT, ND_BINOP, ND_UNARYOP, ND_CAST, ND_ASSIGN, ND_COMPOUND_ASSIGN,
     ND_IDENT, ND_LITERAL, ND_INITLIST, ND_DECLARATION, ND_DECLARATOR, ND_DIRECT_DECL, ND_PTYPE_LIST, ND_TYPE_NAME,
-    ND_ARRAY_DECL, ND_FUNC_DECL, ND_STRUCT, ND_UNION, ND_MEMBER, ND_FORSTMT, ND_DOWHILESTMT, ND_SWITCHSTMT,
+    ND_ARRAY_DECL, ND_FUNC_DECL, ND_STRUCT, ND_MEMBER, ND_FORSTMT, ND_DOWHILESTMT, ND_SWITCHSTMT,
     ND_CASESTMT, ND_DEFAULTSTMT, ND_BREAKSTMT, ND_CONTINUESTMT, ND_EMPTY, ND_LABELSTMT, ND_GOTOSTMT, ND_TERNARY,
     ND_VA_START, ND_VA_ARG, ND_VA_END,
     ND_UNDEFINED,
@@ -86,43 +99,43 @@ typedef enum
     CS_OX = 0x100,
 } Const_suffix;
 
-// Type_base is kept as a parser-internal accumulator for type specifier keywords.
-// It is NOT the type representation — that is Type2.
+// Decl_spec is kept as a parser-internal accumulator for type specifier keywords.
+// It is NOT the type representation — that is Type.
 typedef enum
 {
-    TB_DERIVED  = 0,
-    TB_VOID     = 0x1,
-    TB_CHAR     = 0x2,
-    TB_SHORT    = 0x4,
-    TB_ENUM     = 0x8,
-    TB_INT      = 0x10,
-    TB_LONG     = 0x20,
-    TB_FLOAT    = 0x40,
-    TB_DOUBLE   = 0x80,
-    TB_SIGNED   = 0x100,
-    TB_UNSIGNED = 0x200,
-    TB_STRUCT   = 0x400,
-    TB_UNION    = 0x800,
-    TB_TYPEDEF  = 0x1000,
-} Type_base;
+    DS_DERIVED  = 0,
+    DS_VOID     = 0x1,
+    DS_CHAR     = 0x2,
+    DS_SHORT    = 0x4,
+    DS_ENUM     = 0x8,
+    DS_INT      = 0x10,
+    DS_LONG     = 0x20,
+    DS_FLOAT    = 0x40,
+    DS_DOUBLE   = 0x80,
+    DS_SIGNED   = 0x100,
+    DS_UNSIGNED = 0x200,
+    DS_STRUCT   = 0x400,
+    DS_UNION    = 0x800,
+    DS_TYPEDEF  = 0x1000,
+} Decl_spec;
 
 // --------------------------------------------------------
-// Type system (Type2): the sole type representation.
+// Type system (Type): the sole type representation.
 // All types are stored once in a global linked list.
 // Factory functions (get_pointer_type etc.) intern types by
 // pointer equality for derived types over the same base.
 typedef enum
 {
-    TB2_VOID, TB2_CHAR, TB2_UCHAR, TB2_SHORT, TB2_USHORT, TB2_INT, TB2_UINT, TB2_LONG,
-    TB2_ULONG, TB2_FLOAT, TB2_DOUBLE, TB2_POINTER, TB2_ARRAY, TB2_FUNCTION, TB2_STRUCT, TB2_ENUM
-} Type2_base;
+    TB_VOID, TB_CHAR, TB_UCHAR, TB_SHORT, TB_USHORT, TB_INT, TB_UINT, TB_LONG,
+    TB_ULONG, TB_FLOAT, TB_DOUBLE, TB_POINTER, TB_ARRAY, TB_FUNCTION, TB_STRUCT, TB_ENUM
+} Type_base;
 
 // Type qualifiers as bit flags
 #define TQ_CONST    0x1
 #define TQ_VOLATILE 0x2
-typedef int Type2_qual;
+typedef int Type_qual;
 
-typedef struct Type2 Type2;
+typedef struct Type Type;
 typedef struct Field Field;
 typedef struct Param Param;
 typedef struct Symbol Symbol;
@@ -130,8 +143,8 @@ typedef struct Symbol Symbol;
 // Linked list of structure members
 struct Field
 {
-    char    *name;
-    Type2   *type;
+    const char *name;
+    Type   *type;
     int     offset;
     Field   *next;
 };
@@ -139,31 +152,31 @@ struct Field
 // Linked list of function parameters
 struct Param
 {
-    char    *name;
-    Type2   *type;
+    const char *name;
+    Type   *type;
     Param   *next;
 };
 
-struct Type2
+struct Type
 {
-    Type2_base   base;
-    Type2_qual   qual;
+    Type_base   base;
+    Type_qual   qual;
     int         size;
     int         align;
     union
     {
         struct
         {
-            Type2    *pointee;
+            Type    *pointee;
         }       ptr;
         struct
         {
-            Type2    *elem;
+            Type    *elem;
             int     count;
         }       arr;
         struct
         {
-            Type2    *ret;
+            Type    *ret;
             Param   *params;
             bool    is_variadic;
         }       fn;
@@ -179,7 +192,7 @@ struct Type2
         }       enu;
 
     }           u;
-    Type2        *next;
+    Type        *next;
 };
 
 typedef enum
@@ -191,7 +204,6 @@ typedef enum
 {
     NS_IDENT,
     NS_TAG,
-    NS_MEMBER,
     NS_LABEL,
     NS_TYPEDEF
 } Namespace;
@@ -206,8 +218,8 @@ struct Scope
 
 struct Symbol
 {
-    char    *name;
-    Type2   *type;
+    const char *name;
+    Type   *type;
     int     offset;
     bool    is_param;
     bool    is_enum_const;
@@ -224,7 +236,6 @@ struct Symbol_table
     Scope           scope;
     Symbol          *idents;
     Symbol          *tags;
-    Symbol          *members;
     Symbol          *labels;
     Symbol          *typedefs;
     int             size;
@@ -248,35 +259,22 @@ struct Node
     int             child_count;
     int             offset;
     int             pointer_level;
-    int             struct_depth;
     bool            is_expr;
     bool            is_func_defn;
     bool            is_function;
-    bool            is_struct;
     bool            is_array_deref;
     bool            is_variadic;
-    Type_base       typespec;
+    Decl_spec       typespec;
     Token_kind      sclass;
-    Token_kind      typequal;
+    Token_kind      op_kind;    // for ND_BINOP/UNARYOP/MEMBER: identifies the operator
     Symbol_table    *st;
     Symbol_table    *symtable;
     Symbol          *symbol;
-    Type2           *type;
+    Type           *type;
 };
-
-typedef struct Local Local;
-struct Local
-{
-    Local   *next;
-    char    *name;
-    int     len;
-    int     offset;
-};
-
 
 Node *program();
 void print_tree(Node *node, int depth);
-void print_locals();
 
 // ---------------------------------------------------------------
 // Code gen
@@ -284,13 +282,12 @@ void print_locals();
 
 void gen_code(Node *node, int tu_index);
 void reset_codegen(void);
-void gen_preamble(int offset);
-void gen_postamble();
+void gen_preamble(void);
 void gen_pop();
 void gen_stmt(Node *node);
-char *nodestr(Node_kind k);
-char *fulltype_str(Type2 *t);
-char *token_str(Token_kind tk);
+const char *nodestr(Node_kind k);
+const char *fulltype_str(Type *t);
+const char *token_str(Token_kind tk);
 bool is_type_name(Token_kind tk);
 
 bool is_sc_spec(Token_kind tk);
@@ -300,25 +297,25 @@ void propagate_types(Node *p, Node *n);
 Node *new_node(Node_kind kind, char *val, bool is_expr);
 
 
-bool istype_float(Type2 *t);
-bool istype_double(Type2 *t);
-bool istype_fp(Type2 *t);      // float or double
-bool istype_char(Type2 *t);
-bool istype_uchar(Type2 *t);
-bool istype_short(Type2 *t);
-bool istype_ushort(Type2 *t);
-bool istype_enum(Type2 *t);
-bool istype_int(Type2 *t);
-bool istype_uint(Type2 *t);
-bool istype_long(Type2 *t);
-bool istype_ulong(Type2 *t);
-bool istype_ptr(Type2 *t);
-bool istype_array(Type2 *t);
-bool istype_function(Type2 *t);
-bool istype_intlike(Type2 *t);
+bool istype_float(Type *t);
+bool istype_double(Type *t);
+bool istype_fp(Type *t);      // float or double
+bool istype_char(Type *t);
+bool istype_uchar(Type *t);
+bool istype_short(Type *t);
+bool istype_ushort(Type *t);
+bool istype_enum(Type *t);
+bool istype_int(Type *t);
+bool istype_uint(Type *t);
+bool istype_long(Type *t);
+bool istype_ulong(Type *t);
+bool istype_ptr(Type *t);
+bool istype_array(Type *t);
+bool istype_function(Type *t);
+bool istype_intlike(Type *t);
 
 void unget_token();
-char *get_decl_ident(Node *node);
+const char *get_decl_ident(Node *node);
 
 
 // -----------------------------------------------------
@@ -328,63 +325,143 @@ char *get_decl_ident(Node *node);
 void make_basic_types();
 
 void reset_types_state(void);
-void insert_extern_sym(char *name, Type2 *type);
+void insert_extern_sym(const char *name, Type *type);
 void reset_parser(void);
 
 extern int current_global_tu;
 
 // Starting at scope of node, search for symbol in given namespace.
-Symbol *find_symbol(Node *node, char *name, Namespace nspace);
+Symbol *find_symbol(Node *node, const char *name, Namespace nspace);
 
 void set_scope(Scope *sc);
 void leave_scope();
 Symbol_table *enter_new_scope(bool use_last_scope);
-char *scope_str(Scope sc);
-char *curr_scope_str();
+const char *scope_str(Scope sc);
+const char *curr_scope_str();
 
-// Build a Type2* from a declaration-context node (typespec + optional declarator child).
-Type2 *type2_from_decl_node(Node *node);
+// Build a Type* from a declaration-context node (typespec + optional declarator child).
+Type *type2_from_decl_node(Node *node);
 
 void add_types_and_symbols(Node *node, bool is_param, int depth);
-Type2 *elem_type(Type2 *t);
-int find_offset(Type2 *t, char *field, Type2 **it);
+Type *elem_type(Type *t);
+int find_offset(Type *t, char *field, Type **it);
 
 // Array helpers
-int array_dimensions(Type2 *t);
-Type2 *array_elem_type(Type2 *t);
+int array_dimensions(Type *t);
+Type *array_elem_type(Type *t);
 
 void print_symbol_table(Symbol_table *s, int depth);
 void print_type_table();
-char *typespec_str(Type_base tb);
-char *type_token_str(Token_kind tk);
 
-Type_base to_typespec(Token_kind tk);
+Decl_spec to_typespec(Token_kind tk);
 
 bool   is_typedef_name(char *name);
-Type2 *find_typedef_type(char *name);
+Type *find_typedef_type(char *name);
 
-// Factory functions for Type2
-Type2 *get_basic_type(Type2_base base);
-Type2 *get_pointer_type(Type2 *pointee);
-Type2 *get_array_type(Type2 *elem, int count);
-Type2 *get_function_type(Type2 *ret, Param *params, bool is_variadic);
-Type2 *get_struct_type(Symbol *tag, Field *members, bool is_union);
-Type2 *get_enum_type(Symbol *tag);
+// Factory functions for Type
+Type *get_basic_type(Type_base base);
+Type *get_pointer_type(Type *pointee);
+Type *get_array_type(Type *elem, int count);
+Type *get_function_type(Type *ret, Param *params, bool is_variadic);
+Type *get_struct_type(Symbol *tag, Field *members, bool is_union);
+Type *get_enum_type(Symbol *tag);
 Symbol *insert_tag(Node *node, char *ident);
-Symbol *insert_enum_const(Node *node, Type2 *ety, char *ident, int value);
+Symbol *insert_enum_const(Node *node, Type *ety, char *ident, int value);
 
-// Basic type globals
-extern Type2 *t_void;
-extern Type2 *t_char;
-extern Type2 *t_uchar;
-extern Type2 *t_short;
-extern Type2 *t_ushort;
-extern Type2 *t_int;
-extern Type2 *t_uint;
-extern Type2 *t_long;
-extern Type2 *t_ulong;
-extern Type2 *t_float;
-extern Type2 *t_double;
+// ===============================================================
+// Context Struct Definitions (must come after type definitions)
+// ===============================================================
 
+typedef struct TypeContext {
+    Type *type_list;            // linked list of all interned types
+    // Basic type singletons
+    Type *t_void;
+    Type *t_char;
+    Type *t_uchar;
+    Type *t_short;
+    Type *t_ushort;
+    Type *t_int;
+    Type *t_uint;
+    Type *t_long;
+    Type *t_ulong;
+    Type *t_float;
+    Type *t_double;
+    // Per-TU state
+    int current_tu;
+    int local_static_counter;   // NOT reset between TUs
+    // Scope tracking
+    int scope_depth;
+    int scope_indices[100];
+    // Symbol table hierarchy
+    Symbol_table *symbol_table;
+    Symbol_table *curr_scope_st;
+    Symbol_table *last_symbol_table;
+    // Type formatting buffer
+    char ft_buf[512];
+} TypeContext;
+
+typedef struct TokenContext {
+    Token *current;             // current token
+    Token *last;                // for unget_token
+    char *user_input;           // input source string
+} TokenContext;
+
+typedef struct ParserContext {
+    Node *current_function;     // function being parsed
+    int anon_index;             // anonymous label counter (monotonic across TUs)
+} ParserContext;
+
+// Helper types for CodegenContext
+typedef struct { int id; char *data; int len; } StrLit;
+typedef struct { int id; Symbol *sym; Node *decl_node; } LocalStaticEntry;
+typedef struct { char name[64]; int label_id; } LabelEntry;
+
+typedef struct CodegenContext {
+    int label_counter;          // label counter (monotonic across TUs)
+    int loop_depth;             // current loop nesting level
+    int break_labels[64];       // break target stack
+    int cont_labels[64];        // continue target stack
+    // String literals
+    StrLit strlits[512];
+    int strlit_count;
+    // Local static variables
+    LocalStaticEntry local_statics[512];
+    int local_static_count;
+    // Goto labels
+    LabelEntry label_table[64];
+    int label_table_size;
+} CodegenContext;
+
+typedef struct ExternContext {
+    struct ExternSym { const char *name; Type *type; } syms[1024];
+    int count;
+} ExternContext;
+
+// Global context instances (defined in respective .c files)
+extern TypeContext type_ctx;
+extern TokenContext token_ctx;
+extern ParserContext parser_ctx;
+extern CodegenContext codegen_ctx;
+extern ExternContext extern_ctx;
+
+// Convenience macros for basic types (for backward compatibility)
+#define t_void   (type_ctx.t_void)
+#define t_char   (type_ctx.t_char)
+#define t_uchar  (type_ctx.t_uchar)
+#define t_short  (type_ctx.t_short)
+#define t_ushort (type_ctx.t_ushort)
+#define t_int    (type_ctx.t_int)
+#define t_uint   (type_ctx.t_uint)
+#define t_long   (type_ctx.t_long)
+#define t_ulong  (type_ctx.t_ulong)
+#define t_float  (type_ctx.t_float)
+#define t_double (type_ctx.t_double)
+
+// Legacy current_global_tu macro
+#define current_global_tu (type_ctx.current_tu)
+
+// Convenience macros for tokenizer globals
+#define token (token_ctx.current)
+#define user_input (token_ctx.user_input)
 
 #endif

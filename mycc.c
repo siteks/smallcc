@@ -2,7 +2,7 @@
 #include "mycc.h"
 
 
-void error(char *fmt, ...)
+void error(const char *fmt, ...)
 {
     va_list ap;
     va_start(ap, fmt);
@@ -28,35 +28,39 @@ static char *read_file(const char *path)
 }
 
 
-extern Token           *token;
-extern char            *user_input;
-extern Symbol_table    *symbol_table;
-extern Symbol_table    *curr_scope_st;
-
-typedef struct { char *name; Type2 *type; } ExternSym;
-static ExternSym extern_syms[1024];
-static int       extern_sym_count = 0;
+// Cross-TU context instance
+ExternContext extern_ctx;
 
 static void harvest_globals(void)
 {
-    for (Symbol *s = symbol_table->idents; s; s = s->next)
+    for (Symbol *s = type_ctx.symbol_table->idents; s; s = s->next)
     {
         if (s->is_static || s->is_extern_decl) continue;
         if (!strcmp(s->name, "putchar")) continue;
         bool already = false;
-        for (int i = 0; i < extern_sym_count; i++)
-            if (!strcmp(extern_syms[i].name, s->name)) { already = true; break; }
+        for (int i = 0; i < extern_ctx.count; i++)
+            if (!strcmp(extern_ctx.syms[i].name, s->name)) { already = true; break; }
         if (!already)
         {
-            extern_syms[extern_sym_count].name = s->name;
-            extern_syms[extern_sym_count].type = s->type;
-            extern_sym_count++;
+            extern_ctx.syms[extern_ctx.count].name = s->name;
+            extern_ctx.syms[extern_ctx.count].type = s->type;
+            extern_ctx.count++;
         }
     }
 }
 
 static void reset_tu(int tu)
 {
+    // Zero-initialize all context structs on first call
+    static bool initialized = false;
+    if (!initialized) {
+        memset(&type_ctx, 0, sizeof(type_ctx));
+        memset(&token_ctx, 0, sizeof(token_ctx));
+        memset(&parser_ctx, 0, sizeof(parser_ctx));
+        memset(&codegen_ctx, 0, sizeof(codegen_ctx));
+        memset(&extern_ctx, 0, sizeof(extern_ctx));
+        initialized = true;
+    }
     current_global_tu = tu;
     reset_codegen();
     reset_parser();
@@ -65,8 +69,8 @@ static void reset_tu(int tu)
 
 static void prepopulate_extern_syms(void)
 {
-    for (int i = 0; i < extern_sym_count; i++)
-        insert_extern_sym(extern_syms[i].name, extern_syms[i].type);
+    for (int i = 0; i < extern_ctx.count; i++)
+        insert_extern_sym(extern_ctx.syms[i].name, extern_ctx.syms[i].type);
 }
 
 int main(int argc, char **argv)
@@ -102,11 +106,11 @@ int main(int argc, char **argv)
         print_tokens();
         Node *node = program();
         print_tree(node, 0);
-        print_symbol_table(symbol_table, 0);
+        print_symbol_table(type_ctx.symbol_table, 0);
         print_type_table();
         propagate_types(0, node);
         print_tree(node, 0);
-        print_symbol_table(symbol_table, 0);
+        print_symbol_table(type_ctx.symbol_table, 0);
         print_type_table();
 
         gen_code(node, tu);

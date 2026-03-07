@@ -8,9 +8,8 @@
 
 #include "mycc.h"
 
-
-Token *token;
-char *user_input;
+// Tokenizer context instance
+TokenContext token_ctx;
 
 struct Keyword keywords[] = 
 {
@@ -67,7 +66,7 @@ bool is_type_name(Token_kind tk)
         ||  tk == TK_SIGNED;
 }
 
-char *token_str(Token_kind tk)
+const char *token_str(Token_kind tk)
 {
     return 
         tk == TK_EMPTY      ? "EMPTY    " :
@@ -140,37 +139,13 @@ char *token_str(Token_kind tk)
         tk == TK_ELLIPSIS   ? "ELLIPSIS " :
                               "UNKNOWN  ";
 }
-char *type_token_str(Token_kind tk)
-{
-    return 
-        tk == TK_AUTO       ? "auto " :
-        tk == TK_CHAR       ? "char " :
-        tk == TK_CONST      ? "const " :
-        tk == TK_DOUBLE     ? "double " :
-        tk == TK_ENUM       ? "enum " :
-        tk == TK_EXTERN     ? "extern " :
-        tk == TK_FLOAT      ? "float " :
-        tk == TK_INT        ? "int " :
-        tk == TK_LONG       ? "long " :
-        tk == TK_REGISTER   ? "register " :
-        tk == TK_SHORT      ? "short " :
-        tk == TK_SIGNED     ? "signed " :
-        tk == TK_STATIC     ? "static " :
-        tk == TK_STRUCT     ? "struct " :
-        tk == TK_TYPEDEF    ? "typedef " :
-        tk == TK_UNION      ? "union " :
-        tk == TK_UNSIGNED   ? "unsigned " :
-        tk == TK_VOID       ? "void " :
-        tk == TK_VOLATILE   ? "volatile " :
-                              "";
-}
 
-static Token *last_token = 0;
+// Note: token_ctx.last is part of TokenContext
 void unget_token()
 {
     // Go back to the last token
-    if (last_token)
-        token = last_token;
+    if (token_ctx.last)
+        token = token_ctx.last;
     else
         error("No last token to go back to!\n");
 }
@@ -180,7 +155,7 @@ char *expect(Token_kind tk)
     if (token->kind == tk)
     {
         char *val   = token->val;
-        last_token  = token;
+        token_ctx.last  = token;
         token       = token->next;
         return val;
     }
@@ -207,7 +182,7 @@ int expect_number()
     if (token->kind == TK_CONSTINT)
     {
         int val     = (int)token->ival;
-        last_token  = token;
+        token_ctx.last  = token;
         token       = token->next;
         return val;
     }
@@ -220,7 +195,7 @@ char *expect_ident()
     if (token->kind == TK_IDENT)
     {
         char *val   = token->val;
-        last_token  = token;
+        token_ctx.last  = token;
         token       = token->next;
         return val;
     }
@@ -242,10 +217,10 @@ Token *new_token(Token_kind kind, Token *cur, char *str, int len)
 Token_kind find_token(char *str, int l)
 {
     // fprintf(stderr, "%s %s %d\n", __func__, str, l);
-    for(int i = 0; keywords[i].token != TK_INVALID; i++)
+    for(int i = 0; keywords[i].kind != TK_INVALID; i++)
     {
         if (strlen(keywords[i].keyword) == l && !strncmp(str, keywords[i].keyword, l))
-            return keywords[i].token;
+            return keywords[i].kind;
     }
     return TK_IDENT;
 }
@@ -289,10 +264,6 @@ static int decode_string_char(const char *src, char *out)
             *out = *src;
             return 2;
     }
-}
-bool isoct(char a)
-{
-    return a >= '0' && a <= '7';
 }
 Token *tokenise(char *p)
 {
@@ -419,80 +390,13 @@ Token *tokenise(char *p)
         }
         if (*p == '\'')
         {
-            // Character constant
-            // 'x'      character x
-            // '\y'     special escape character
-            // '\ooo'   octal character (1 to 3 oct digits)
-            // '\xhh    hex character (1 to 2 hex digits)
-            if (strlen(p) >= 3) // Single normal character
-            {
-                if (p[1] != '\\' && p[2] == '\'') 
-                {
-                    // not an escape and correctly formed
-                    cur = new_token(TK_CHARACTER, cur, p + 1, 1); 
-                    p += 3; 
-                    continue;
-                }
-            }
-            if (strlen(p) >= 4) // Possibly escape
-            {
-                if (p[1] == '\\')
-                {
-                    if (!strncmp(p + 2, "a", 1))     {cur = new_token(TK_CHARACTER, cur, "\a", 1); p += 4; continue;}
-                    if (!strncmp(p + 2, "b", 1))     {cur = new_token(TK_CHARACTER, cur, "\b", 1); p += 4; continue;}
-                    if (!strncmp(p + 2, "f", 1))     {cur = new_token(TK_CHARACTER, cur, "\f", 1); p += 4; continue;}
-                    if (!strncmp(p + 2, "n", 1))     {cur = new_token(TK_CHARACTER, cur, "\n", 1); p += 4; continue;}
-                    if (!strncmp(p + 2, "r", 1))     {cur = new_token(TK_CHARACTER, cur, "\r", 1); p += 4; continue;}
-                    if (!strncmp(p + 2, "t", 1))     {cur = new_token(TK_CHARACTER, cur, "\t", 1); p += 4; continue;}
-                    if (!strncmp(p + 2, "v", 1))     {cur = new_token(TK_CHARACTER, cur, "\v", 1); p += 4; continue;}
-                    if (!strncmp(p + 2, "\\", 1))    {cur = new_token(TK_CHARACTER, cur, "\\", 1); p += 4; continue;}
-                    if (!strncmp(p + 2, "?", 1))     {cur = new_token(TK_CHARACTER, cur, "\?", 1); p += 4; continue;}
-                    if (!strncmp(p + 2, "'", 1))     {cur = new_token(TK_CHARACTER, cur, "\'", 1); p += 4; continue;}
-                    if (!strncmp(p + 2, "\"", 1))    {cur = new_token(TK_CHARACTER, cur, "\"", 1); p += 4; continue;}
-                    // 1 and 2 digit hex
-                    if (p[2] == 'x' && strlen(p) >= 5 && p[4] == '\'' && ishex(p[3]))
-                    {
-                        // Single digit hex
-                        char *q;
-                        char val = strtol(p + 3, &q, 16);
-                        if (q == p + 4)
-                        {
-                            cur = new_token(TK_CHARACTER, cur, &val, 1); 
-                            p += 5; 
-                            continue;
-                        }
-                    }
-                    if (p[2] == 'x' && strlen(p) >= 6 && p[5] == '\'' && ishex(p[3]) && ishex(p[4]))
-                    {
-                        // Single digit hex
-                        char *q;
-                        char val = strtol(p + 3, &q, 16);
-                        if (q == p + 5)
-                        {
-                            cur = new_token(TK_CHARACTER, cur, &val, 1); 
-                            p += 6; 
-                            continue;
-                        }
-                    }
-                    // 1, 2, 3 digit octal
-                    bool found = false;
-                    for(int i = 0; i < 3; i++)
-                        if (strlen(p) >= 4 + i)
-                            if (isoct(p[2 + i]))
-                                if (p[3 + i] == '\'')
-                                {
-                                    char *q, val = strtol(p + 2, &q, 8);
-                                    if (q == p + 3 + i)
-                                    {
-                                        cur = new_token(TK_CHARACTER, cur, &val, 1); 
-                                        p += 4 + i; 
-                                        found = true;
-                                        break;
-                                    }
-                                }
-                    if (found) continue;
-                }
-            }
+            char ch;
+            int adv = decode_string_char(p + 1, &ch);
+            if (p[1 + adv] != '\'')
+                error("Unterminated character constant\n");
+            cur = new_token(TK_CHARACTER, cur, &ch, 1);
+            p += 1 + adv + 1;  // opening quote + char/escape + closing quote
+            continue;
         }
 
         if (*p == '"')
