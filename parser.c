@@ -182,6 +182,11 @@ static Node *func_def();
 static Node *declarator();
 static Node *init_declarator();
 static Node *declaration(int depth);
+// Additional forwards needed by unary_expr (sizeof, cast)
+static bool is_type_name_or_type(Token *token);
+static void struct_decl(Node *node, int depth);
+static void enum_decl(Node *node);
+static void parse_decl_specifiers(Node *node);
 
 
 
@@ -214,7 +219,7 @@ Node *new_node(Node_kind kind, char *val, bool is_expr)
     node->kind = kind;
     node->is_expr = is_expr;
     node->type = t_void;
-    set_scope(&node->scope);
+    node->st   = curr_scope_st;
     if (val)
         strncpy(node->val, val, 63);
     return node;
@@ -379,12 +384,6 @@ bool is_postfix(Token_kind tk)
             ||  tk == TK_INC
             ||  tk == TK_DEC;
 }
-// Forward declarations for sizeof support
-static bool is_type_name_or_type(Token *token);
-static Node *type_name();
-static void struct_decl(Node *node, int depth);
-static void enum_decl(Node *node);
-
 static Node *unary_expr()
 {
     fprintf(stderr, "%s %s\n", __func__, token->val);
@@ -603,13 +602,7 @@ static Node *type_name()
         }
         return node;
     }
-    while(is_sc_spec(token->kind) || is_typespec(token->kind) || is_typequal(token->kind))
-    {
-        if (is_sc_spec(token->kind))    node->sclass = token->kind;
-        if (is_typespec(token->kind))   node->typespec |= to_typespec(token->kind);
-        if (is_typequal(token->kind))   node->typequal = token->kind;
-        expect(token->kind);
-    }
+    parse_decl_specifiers(node);
     if (node->typespec & TB_ENUM)
     {
         enum_decl(node);
@@ -618,9 +611,8 @@ static Node *type_name()
     {
         add_child(node, declarator());
     }
-    // add_types_and_symbols(node, false);
-    node->type = type2_from_ts(node, tstr_compact(node));
-    fprintf(stderr, "%s ts:%s:\n", __func__, tstr_compact(node));
+    node->type = type2_from_decl_node(node);
+    fprintf(stderr, "%s type:%s\n", __func__, fulltype_str(node->type));
     return node;
 }
 static Node *cast_expr()
@@ -895,6 +887,17 @@ bool is_typequal(Token_kind tk)
         || (tk == TK_VOLATILE);
 }
 
+static void parse_decl_specifiers(Node *node)
+{
+    while (is_sc_spec(token->kind) || is_typespec(token->kind) || is_typequal(token->kind))
+    {
+        if (is_sc_spec(token->kind))  node->sclass   = token->kind;
+        if (is_typespec(token->kind)) node->typespec |= to_typespec(token->kind);
+        if (is_typequal(token->kind)) node->typequal  = token->kind;
+        expect(token->kind);
+    }
+}
+
 static Node *param_declaration()
 {
 
@@ -907,13 +910,7 @@ static Node *param_declaration()
     Node *node = new_node(ND_DECLARATION, 0, false);
     // At least one decl_spec
     // TODO storage class defaults A.8.1
-    while(is_sc_spec(token->kind) || is_typespec(token->kind) || is_typequal(token->kind))
-    {
-        if (is_sc_spec(token->kind))    node->sclass = token->kind;
-        if (is_typespec(token->kind))   node->typespec |= to_typespec(token->kind);
-        if (is_typequal(token->kind))   node->typequal = token->kind;
-        expect(token->kind);
-    }
+    parse_decl_specifiers(node);
     if (node->typespec & (TB_STRUCT | TB_UNION))
     {
         struct_decl(node, 0);
@@ -987,7 +984,6 @@ static Node *direct_decl()
         {
             add_child(node, new_node(ND_ARRAY_DECL, expect(TK_LBRACKET), false));
             Node *n = node->children[node->child_count - 1];
-            n->is_array = true;
             if (token->kind != TK_RBRACKET)
             {
                 add_child(n, constant_expr());
@@ -1132,7 +1128,6 @@ static void enum_decl(Node *node)
     }
     if (!tagname)
         tagname = strdup(new_anon_label());
-    node->typetag = tagname;
 
     if (token->kind == TK_LBRACE)
     {
@@ -1483,85 +1478,6 @@ char *nodestr(Node_kind k)
     }
 }
 
-// This is lifted from K&R
-char ts[1024];
-char vn[1024];
-void dcl(Node *node)
-{
-    dirdcl(node->children[0]);
-    for(int i = 0; i < node->pointer_level; i++)
-        strcat(ts, " pointer to");
-}
-void dirdcl(Node *node)
-{
-    if (node->child_count && node->children[0]->kind == ND_DECLARATOR)
-    {
-        dcl(node->children[0]);
-    }
-    if (node->kind == ND_DIRECT_DECL)
-    {
-        for(int i = 0; i < node->child_count; i++)
-        {
-            Node *n = node->children[i];
-            if (n->is_array)
-            {
-                char b[64];
-                if (n->child_count == 1 && n->children[0]->kind == ND_LITERAL)
-                    sprintf(b, " array %s of", n->children[0]->val);
-                else
-                    sprintf(b, " array of");
-                strcat(ts, b);
-            }
-            else if (n->is_function)
-            {
-                strcat(ts, " function returning");
-            }
-        }
-    }
-}
-void d(Node *node)
-{
-    dd(node->children[0]);
-    for(int i = 0; i < node->pointer_level; i++)
-        strcat(ts, "*");
-}
-void dd(Node *node)
-{
-    if (node->child_count && node->children[0]->kind == ND_DECLARATOR)
-    {
-        d(node->children[0]);
-    }
-    if (node->kind == ND_DIRECT_DECL)
-    {
-        for(int i = 0; i < node->child_count; i++)
-        {
-            Node *n = node->children[i];
-            if (n->is_array)
-            {
-                char b[64];
-                if (n->child_count == 1 && n->children[0]->kind == ND_LITERAL)
-                    sprintf(b, "[%s]", n->children[0]->val);
-                else
-                    sprintf(b, "[]");
-                strcat(ts, b);
-            }
-            else if (n->is_function)
-            {
-                bool variadic = (n->child_count > 0 && n->children[0]->is_variadic);
-                strcat(ts, variadic ? "(...)" : "()");
-            }
-        }
-    }
-}
-char *tstr_compact(Node *node)
-{
-    ts[0] = 0;
-    if (node->kind == ND_DECLARATOR)
-        d(node);
-    if (node->child_count && node->children[0]->kind == ND_DECLARATOR)
-        d(node->children[0]);
-    return ts;
-}
 char buf[1024];
 char *node_str(Node *node)
 {
@@ -1571,13 +1487,13 @@ char *node_str(Node *node)
         return buf;
     p += sprintf(p, "%s: %5s %s ch:%d sc:%s fts:%s: t:%016llx ", 
         nodestr(node->kind), 
-        node->is_array ? "array" : 
-        node->is_func_defn ? "fdef " : 
+        node->kind == ND_ARRAY_DECL ? "array" :
+        node->is_func_defn ? "fdef " :
         node->is_function ? "func " : 
         node->is_struct ? "struct " : "     ", 
         node->val, 
         node->child_count, 
-        scope_str(node->scope), 
+        node->st ? scope_str(node->st->scope) : "(nil)",
         node->type ? fulltype_str(node->type) : "", 
         (unsigned long long)node->type);
     if (node->kind == ND_DECLARATION)
@@ -1588,19 +1504,16 @@ char *node_str(Node *node)
             typespec_str(node->typespec));
         for(int j = 0; j < node->child_count; j++)
             if (node->children[j]->kind == ND_DECLARATOR && node->children[j]->symbol)
-                p += sprintf(p, "%s <%s> | ", 
-                    fulltype_str(node->children[j]->symbol->type), 
-                    tstr_compact(node->children[j]));
+                p += sprintf(p, "%s | ",
+                    fulltype_str(node->children[j]->symbol->type));
     }
     if (node->kind == ND_DECLARATOR || node->kind == ND_DIRECT_DECL)
     {
         p += sprintf(p, "%s %d* %s ", 
             node->val, 
             node->pointer_level, 
-            node->is_function ? "func" : 
-            node->is_array ? "array" : "");
-        if (node->is_array) 
-            p += sprintf(p, "%d", node->array_size);
+            node->is_function ? "func" :
+            node->kind == ND_ARRAY_DECL ? "array" : "");
     }
     return buf;
 }

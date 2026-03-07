@@ -55,6 +55,14 @@ static void harvest_globals(void)
     }
 }
 
+static void reset_tu(int tu)
+{
+    current_global_tu = tu;
+    reset_codegen();
+    reset_parser();
+    reset_types_state();
+}
+
 static void prepopulate_extern_syms(void)
 {
     for (int i = 0; i < extern_sym_count; i++)
@@ -85,10 +93,7 @@ int main(int argc, char **argv)
     {
         char *source = file_mode ? read_file(argv[tu + 1]) : argv[1];
 
-        reset_codegen();
-        reset_parser();
-        reset_types_state();
-        current_global_tu = tu;
+        reset_tu(tu);
         make_basic_types();
         prepopulate_extern_syms();
 

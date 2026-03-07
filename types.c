@@ -34,7 +34,8 @@ static Symbol *insert_typedef(Node *node, Type2 *type, char *ident);
 static Symbol *new_symbol(Type2 *type, char *ident, int offset);
 static Symbol *insert_ident(Node *node, Type2 *type, char *ident, bool is_param);
 static Type2  *generate_struct_type2(Node *decl_node, int depth);
-static Type2  *apply_derivation(Type2 *base, const char *ts);
+static Type2  *type_from_declarator(Node *decl, Type2 *base);
+static Type2  *type_from_direct_decl(Node *dd, Type2 *base);
 static Type2  *typespec_to_base(Type_base typespec);
 
 // ---------------------------------------------------------------
@@ -162,32 +163,53 @@ Type2 *get_enum_type(Symbol *tag)
 }
 
 // ---------------------------------------------------------------
-// Apply derivation string to base type, building Type2 chain.
-// Processed left-to-right, built inside-out:
-//   "[3][4]" -> array(3, array(4, base))
-//   "*"      -> pointer(base)
-//   "()"     -> function(ret=base)
+// Direct AST → Type2 conversion (replaces tstr_compact + apply_derivation).
+//
+// type_from_declarator: walk an ND_DECLARATOR node.
+//   pointer stars on this level are applied to 'base' first (innermost),
+//   then the direct-decl's array/function suffixes wrap outward.
+//
+// type_from_direct_decl: walk an ND_DIRECT_DECL node.
+//   Suffixes are applied right-to-left so the leftmost is outermost.
+//   A grouped inner declarator (e.g. (*fp)) is handled by recursing.
 // ---------------------------------------------------------------
-static Type2 *apply_derivation(Type2 *base, const char *ts)
+static Type2 *type_from_declarator(Node *decl, Type2 *base)
 {
-    if (!ts || !ts[0]) return base;
+    Type2 *t = base;
+    for (int i = 0; i < decl->pointer_level; i++)
+        t = get_pointer_type(t);
+    return type_from_direct_decl(decl->children[0], t);
+}
 
-    if (ts[0] == '[') {
-        char *end;
-        int count = (int)strtol(ts + 1, &end, 0);
-        if (*end == ']') end++;
-        Type2 *inner = apply_derivation(base, end);
-        return get_array_type(inner, count);
-    } else if (ts[0] == '*') {
-        Type2 *inner = apply_derivation(base, ts + 1);
-        return get_pointer_type(inner);
-    } else if (ts[0] == '(') {
-        bool variadic = (ts[1] == '.');
-        const char *rest = variadic ? ts + 5 : ts + 2;
-        Type2 *inner = apply_derivation(base, rest);
-        return get_function_type(inner, NULL, variadic);
+static Type2 *type_from_direct_decl(Node *dd, Type2 *base)
+{
+    // Skip the leading ident or grouped inner declarator
+    int first = (dd->child_count
+                 && (dd->children[0]->kind == ND_IDENT
+                     || dd->children[0]->kind == ND_DECLARATOR)) ? 1 : 0;
+
+    // Apply array/function suffixes right-to-left (rightmost = innermost)
+    Type2 *t = base;
+    for (int i = dd->child_count - 1; i >= first; i--)
+    {
+        Node *s = dd->children[i];
+        if (s->kind == ND_ARRAY_DECL)
+        {
+            int count = (s->child_count && s->children[0]->kind == ND_LITERAL)
+                        ? (int)s->children[0]->ival : 0;
+            t = get_array_type(t, count);
+        }
+        else if (s->is_function)
+        {
+            bool variadic = s->child_count && s->children[0]->is_variadic;
+            t = get_function_type(t, NULL, variadic);
+        }
     }
-    return base;
+
+    // Grouped inner declarator (e.g. (*fp)): recurse with accumulated type as new base
+    if (first && dd->children[0]->kind == ND_DECLARATOR)
+        return type_from_declarator(dd->children[0], t);
+    return t;
 }
 
 // ---------------------------------------------------------------
@@ -218,19 +240,24 @@ static Type2 *typespec_to_base(Type_base typespec)
     }
 }
 
-// Exported: build Type2 from node's typespec + derivation string.
-// For struct/union, node->type must already be set to the struct type.
-Type2 *type2_from_ts(Node *node, char *ts)
+// Exported: build Type2 from a declaration-context node (ND_DECLARATION or similar).
+// Determines the base type from typespec, then applies the first declarator child
+// if present (used by type_name() for casts/sizeof).
+Type2 *type2_from_decl_node(Node *node)
 {
     Type2 *base;
-    if (node->typespec & (TB_STRUCT | TB_UNION)) {
+    if (node->typespec & TB_TYPEDEF) {
+        base = node->type;
+    } else if (node->typespec & (TB_STRUCT | TB_UNION)) {
         base = (node->type && node->type != t_void) ? node->type : t_void;
     } else if (node->typespec & TB_ENUM) {
         base = (node->type && node->type->base == TB2_ENUM) ? node->type : t_int;
     } else {
         base = typespec_to_base(node->typespec);
     }
-    return apply_derivation(base, ts);
+    if (node->child_count && node->children[0]->kind == ND_DECLARATOR)
+        return type_from_declarator(node->children[0], base);
+    return base;
 }
 
 // ---------------------------------------------------------------
@@ -262,6 +289,7 @@ Type2 *elem_type(Type2 *t)
 // ---------------------------------------------------------------
 bool istype_float(Type2 *t)    { return t && t->base == TB2_FLOAT; }
 bool istype_double(Type2 *t)   { return t && t->base == TB2_DOUBLE; }
+bool istype_fp(Type2 *t)       { return istype_float(t) || istype_double(t); }
 bool istype_char(Type2 *t)     { return t && t->base == TB2_CHAR; }
 bool istype_uchar(Type2 *t)    { return t && t->base == TB2_UCHAR; }
 bool istype_short(Type2 *t)    { return t && t->base == TB2_SHORT; }
@@ -439,8 +467,7 @@ static Type2 *generate_struct_type2(Node *decl_node, int depth)
                     base = typespec_to_base(d->typespec);
                 }
 
-                char *ts   = tstr_compact(m);
-                Type2 *mty = apply_derivation(base, ts);
+                Type2 *mty  = type_from_declarator(m, base);
                 char *fname = get_decl_ident(m);
 
                 Field *f    = calloc(1, sizeof(Field));
@@ -496,7 +523,6 @@ void add_types_and_symbols(Node *node, bool is_param, int depth)
                     // "struct foo" as type specifier with a declarator
                     Symbol *s   = find_symbol(node, n->children[0]->val, NS_TAG);
                     node->type  = s->type;
-                    node->typetag = n->children[0]->val;
                 }
             } else if (n->child_count > 1) {
                 // Full struct definition with body
@@ -506,7 +532,6 @@ void add_types_and_symbols(Node *node, bool is_param, int depth)
                     Type2 *t    = generate_struct_type2(node, 0);
                     n->symbol->type = t;
                     node->type  = t;
-                    node->typetag = n->children[0]->val;
                 }
             }
         }
@@ -531,12 +556,10 @@ void add_types_and_symbols(Node *node, bool is_param, int depth)
         if (n->kind != ND_DECLARATOR || depth)
             continue;
 
-        char *ts    = tstr_compact(n);
         char *ident = get_decl_ident(n);
-        fprintf(stderr, "%s declarator ts:'%s' ident:'%s'\n",
-            __func__, ts, ident ? ident : "");
-
-        Type2 *ty = apply_derivation(base, ts);
+        Type2 *ty   = type_from_declarator(n, base);
+        fprintf(stderr, "%s declarator ident:'%s' type:%s\n",
+            __func__, ident ? ident : "", fulltype_str(ty));
         // char s[] = "hello" — fix up zero-size array from string literal init
         if (ty->base == TB2_ARRAY && ty->u.arr.count == 0
             && n->child_count == 2 && n->children[1]->strval)
@@ -566,18 +589,9 @@ void add_types_and_symbols(Node *node, bool is_param, int depth)
 // ---------------------------------------------------------------
 // Symbol table
 // ---------------------------------------------------------------
-static Symbol_table *find_scope(Node *node)
+Symbol_table *find_scope(Node *node)
 {
-    Scope sc = node->scope;
-    fprintf(stderr, "%s scope is %s\n", __func__, scope_str(sc));
-    Symbol_table *st = symbol_table;
-    if (sc.depth) {
-        for (int d = 1; d <= sc.depth; d++) {
-            int index = sc.indices[d - 1] - 1;
-            st = st->children[index];
-        }
-    }
-    return st;
+    return node->st;
 }
 
 Symbol *find_symbol(Node *n, char *name, Namespace nspace)
@@ -668,14 +682,7 @@ char *scope_str(Scope sc)
 Symbol *insert_tag(Node *node, char *ident)
 {
     fprintf(stderr, "%s %s\n", __func__, ident);
-    Scope sc = node->scope;
-    Symbol_table *st = symbol_table;
-    if (sc.depth) {
-        for (int d = 1; d <= sc.depth; d++) {
-            int index = sc.indices[d - 1] - 1;
-            st = st->children[index];
-        }
-    }
+    Symbol_table *st = find_scope(node);
     Symbol *s = 0, *ls = 0;
     for (s = st->tags; s; s = s->next) {
         ls = s;
@@ -693,13 +700,7 @@ Symbol *insert_tag(Node *node, char *ident)
 Symbol *insert_enum_const(Node *node, Type2 *ety, char *ident, int value)
 {
     fprintf(stderr, "%s %s = %d\n", __func__, ident, value);
-    Scope sc = node->scope;
-    Symbol_table *st = symbol_table;
-    if (sc.depth)
-        for (int d = 1; d <= sc.depth; d++) {
-            int index = sc.indices[d - 1] - 1;
-            st = st->children[index];
-        }
+    Symbol_table *st = find_scope(node);
     Symbol *sym = new_symbol(ety, ident, value);
     sym->is_enum_const = true;
     Symbol *s = 0, *ls = 0;
@@ -712,16 +713,7 @@ Symbol *insert_enum_const(Node *node, Type2 *ety, char *ident, int value)
 static Symbol *insert_typedef(Node *node, Type2 *type, char *ident)
 {
     fprintf(stderr, "%s %s\n", __func__, ident);
-    Scope sc = node->scope;
-    Symbol_table *st = symbol_table;
-    if (sc.depth)
-    {
-        for (int d = 1; d <= sc.depth; d++)
-        {
-            int index = sc.indices[d - 1] - 1;
-            st = st->children[index];
-        }
-    }
+    Symbol_table *st = find_scope(node);
     Symbol *s = 0, *ls = 0;
     for (s = st->typedefs; s; s = s->next)
     {
@@ -765,33 +757,29 @@ static Symbol *new_symbol(Type2 *type, char *ident, int offset)
 static Symbol *insert_ident(Node *node, Type2 *type, char *ident, bool is_param)
 {
     fprintf(stderr, "%s %s %s\n", __func__, fulltype_str(type), ident);
-    Scope sc = node->scope;
-    Symbol_table *st = symbol_table;
+    Symbol_table *st = node->st;
     int go = 0;
 
-    if (sc.depth) {
+    if (st->scope.depth) {
         if (node->sclass == TK_STATIC)
         {
             // Local static: persistent storage in data section, not on stack.
-            Symbol_table *lst = symbol_table;
-            for (int d = 1; d <= sc.depth; d++) {
-                int index = sc.indices[d - 1] - 1;
-                lst = lst->children[index];
-            }
             Symbol *n          = new_symbol(type, ident, local_static_counter++);
             n->is_static       = true;
             n->is_local_static = true;
-            // Do NOT increment lst->size — not on the stack.
+            // Do NOT increment st->size — not on the stack.
             Symbol *s = NULL, *ls = NULL;
-            for (s = lst->idents; s; s = s->next) ls = s;
-            if (!ls) lst->idents = n;
-            else     ls->next    = n;
+            for (s = st->idents; s; s = s->next) ls = s;
+            if (!ls) st->idents = n;
+            else     ls->next   = n;
             return n;
         }
-        for (int d = 1; d <= sc.depth; d++) {
-            if (d > 1) go += st->size;
-            int index = sc.indices[d - 1] - 1;
-            st = st->children[index];
+        // Compute go: sum of sizes of all non-global ancestor scopes
+        Symbol_table *ancestor = st->parent;
+        while (ancestor && ancestor->scope.depth > 0)
+        {
+            go += ancestor->size;
+            ancestor = ancestor->parent;
         }
     } else {
         // Global scope — check for existing entry first (dedup for pre-populated externs)

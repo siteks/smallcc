@@ -254,16 +254,11 @@ struct Node
     bool            is_function;
     bool            is_struct;
     bool            is_array_deref;
-    bool            is_array;
     bool            is_variadic;
-    int             array_size;
-    bool            size_mult;
-    Node            *array_ident;
-    char            *typetag;
     Type_base       typespec;
     Token_kind      sclass;
     Token_kind      typequal;
-    Scope           scope;
+    Symbol_table    *st;
     Symbol_table    *symtable;
     Symbol          *symbol;
     Type2           *type;
@@ -302,12 +297,12 @@ bool is_sc_spec(Token_kind tk);
 bool is_typespec(Token_kind tk);
 bool is_typequal(Token_kind tk);
 void propagate_types(Node *p, Node *n);
-char *tstr_compact(Node *node);
 Node *new_node(Node_kind kind, char *val, bool is_expr);
 
 
 bool istype_float(Type2 *t);
 bool istype_double(Type2 *t);
+bool istype_fp(Type2 *t);      // float or double
 bool istype_char(Type2 *t);
 bool istype_uchar(Type2 *t);
 bool istype_short(Type2 *t);
@@ -325,10 +320,6 @@ bool istype_intlike(Type2 *t);
 void unget_token();
 char *get_decl_ident(Node *node);
 
-void dcl(Node *node);
-void dirdcl(Node *node);
-void d(Node *node);
-void dd(Node *node);
 
 // -----------------------------------------------------
 // Interface to types.c
@@ -351,9 +342,8 @@ Symbol_table *enter_new_scope(bool use_last_scope);
 char *scope_str(Scope sc);
 char *curr_scope_str();
 
-// Build a Type2* from a declaration node's typespec + a derivation string ts.
-// For struct types, pass the struct's Type2* as base (or NULL for non-struct).
-Type2 *type2_from_ts(Node *node, char *ts);
+// Build a Type2* from a declaration-context node (typespec + optional declarator child).
+Type2 *type2_from_decl_node(Node *node);
 
 void add_types_and_symbols(Node *node, bool is_param, int depth);
 Type2 *elem_type(Type2 *t);

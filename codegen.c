@@ -5,31 +5,23 @@
 
 extern Symbol_table *symbol_table;
 char *scope_str(Scope sc);
+Symbol_table *find_scope(Node *node);
 
 
-int find_local_addr(Node *node, char *name)
+typedef struct { int offset; bool is_param; } LocalAddr;
+static LocalAddr find_local_addr(Node *node, char *name)
 {
     // Get the offset from bp of the local variable in node.
     // Go to scope in node, then search for variable name in that scope,
     // and successively enclosing scopes, until found.
-    Scope sc = node->scope;
-    fprintf(stderr, "%s scope is %s\n", __func__, scope_str(sc));
-    Symbol_table *st = symbol_table;
-    if (sc.depth)
-    {
-        for(int d = 1; d <= sc.depth; d++)
-        {
-            int index = sc.indices[d - 1] - 1;
-            st = st->children[index];
-        }
-    }
-    // st now pointing to symbol table at scope.
+    fprintf(stderr, "%s scope is %s\n", __func__, scope_str(node->st->scope));
+    Symbol_table *st = find_scope(node);
     Symbol *s;
     bool found = false;
-    while(!found)
-    { 
+    while (!found)
+    {
         fprintf(stderr, "Searching in scope:%s\n", scope_str(st->scope));
-        for(s = st->idents; s; s = s->next)
+        for (s = st->idents; s; s = s->next)
         {
             fprintf(stderr, "Ident:%s\n", s->name);
             if (!strcmp(name, s->name))
@@ -46,11 +38,10 @@ int find_local_addr(Node *node, char *name)
             st = st->parent;
     }
     if (!found)
-    {
         error("Symbol %s not found!\n", name);
-    }
+
     if (s->is_local_static)
-        return -1;
+        return (LocalAddr){ -1, false };
 
     // Compute global_offset dynamically: sum of all non-global ancestor scope sizes.
     // This is correct even for C99-style mixed declarations, where the parse-time
@@ -63,19 +54,12 @@ int find_local_addr(Node *node, char *name)
         ancestor = ancestor->parent;
     }
     int offset = global_offset + s->offset;
-    if (s->is_param)
-    {
-        // FIXME!! This is very hacky, but we set bit 30 to indicate that 
-        // this is a param, and the offset is in the opposite direction to a
-        // local
-        offset |= 0x40000000;
-    }
     if (!st->scope.depth)
         // If at top scope, addresses are labels
         offset = -1;
-    printf(";%s ident:%s at scope:%s %s got offset %d\n", __func__, name, scope_str(st->scope), 
-        s->is_param ? "is param" : "", offset&0xffff);
-    return offset;
+    printf(";%s ident:%s at scope:%s %s got offset %d\n", __func__, name, scope_str(st->scope),
+        s->is_param ? "is param" : "", offset & 0xffff);
+    return (LocalAddr){ offset, s->is_param };
 }
 
 
@@ -83,7 +67,6 @@ static int labels;
 static int break_labels[64];
 static int cont_labels[64];
 static int loop_depth = 0;
-static int current_tu = 0;
 
 typedef struct { int id; char *data; int len; } StrLit;
 static StrLit strlits[512];
@@ -305,8 +288,8 @@ void gen_imm_float(double val)
 }
 void gen_varaddr_from_ident(Node *node, char *name)
 {
-    int offset = find_local_addr(node, name);
-    if (offset < 0)
+    LocalAddr la = find_local_addr(node, name);
+    if (la.offset < 0)
     {
         Symbol *sym = node->symbol;
         if (sym && sym->is_local_static)
@@ -316,13 +299,12 @@ void gen_varaddr_from_ident(Node *node, char *name)
         else
             printf("    immw    %s\n", name);
     }
+    else if (la.is_param)
+        // Function parameter: above bp
+        printf("    lea     %d\n", la.offset);
     else
-        if (offset & 0x40000000)
-            // This is a function parameter
-            printf("    lea     %d\n", offset & 0xffff);
-        else
-            // This is a local variable
-            printf("    lea     %d\n", -(offset & 0xffff));
+        // Local variable: below bp
+        printf("    lea     %d\n", -la.offset);
 }
 void gen_varaddr(Node *node)
 {
@@ -518,14 +500,14 @@ void gen_cast(Type2 *src, Type2 *dst)
     // Value in reg is in src type, needs to be converted to dst type
     if (src == dst)
         return;
-    if (istype_intlike(src) && (istype_float(dst) || istype_double(dst)))
+    if (istype_intlike(src) && istype_fp(dst))
     {
         if (src->size == 1) gen_sxb();
         else if (src->size == 2) gen_sxw();
         gen_itof();
         return;
     }
-    if ((istype_float(src) || istype_double(src)) && istype_intlike(dst))
+    if (istype_fp(src) && istype_intlike(dst))
     {
         gen_ftoi();
         if (dst->size < 4)
@@ -543,7 +525,7 @@ void gen_cast(Type2 *src, Type2 *dst)
     if (istype_uchar(src) && dst->size == 2)
         // Zero extend, assume already zero in top 8 bits
         return;
-    if ((istype_float(src) || istype_double(src)) && (istype_float(dst) || istype_double(dst)))
+    if (istype_fp(src) && istype_fp(dst))
         // floats and doubles are the same
         return;
     if ((istype_long(src) || istype_ulong(src)) && dst->size == 2)
@@ -611,7 +593,7 @@ void gen_expr(Node *node)
         gen_expr(node->children[0]);
         gen_push();
         gen_expr(node->children[1]);
-        if (istype_float(node->children[0]->type) || istype_double(node->children[0]->type))
+        if (istype_fp(node->children[0]->type))
         {
             if (!strcmp(node->val, "+"))   { gen_fadd(); return; }
             if (!strcmp(node->val, "-"))   { gen_fsub(); return; }
@@ -649,7 +631,7 @@ void gen_expr(Node *node)
             int sid = new_strlit(node->strval, node->strval_len);
             printf("    immw    _l%d\n", sid);
         }
-        else if (istype_float(node->type) || istype_double(node->type))
+        else if (istype_fp(node->type))
             gen_imm_float(node->fval);
         else
             gen_imm((int)strtol(node->val, 0, 0));
@@ -694,7 +676,7 @@ void gen_expr(Node *node)
         }      
         else if (!strcmp(node->val, "-"))
         {
-            if (istype_float(node->children[0]->type) || istype_double(node->children[0]->type))
+            if (istype_fp(node->children[0]->type))
             {
                 gen_imm_float(0.0);
                 gen_push();
@@ -899,17 +881,21 @@ void gen_ifstmt(Node *node)
 {
     printf(";%s\n", __func__);
     // Structure is expr, stmt, [stmt]
+    int l_else = new_label();
     gen_expr(node->children[0]);
-    int label = new_label();
-    gen_jz(label);
+    gen_jz(l_else);
     gen_stmt(node->children[1]);
-    gen_label(label);
     if (node->child_count == 3)
     {
+        int l_end = new_label();
+        gen_j(l_end);
+        gen_label(l_else);
         printf(";else clause\n");
         gen_stmt(node->children[2]);
+        gen_label(l_end);
     }
-    
+    else
+        gen_label(l_else);
 }
 void gen_whilestmt(Node *node)
 {
@@ -1168,11 +1154,11 @@ void gen_initlist(Node *n, Symbol *s)
     Type2 *t = s->type;
 
     int constexpr = count_constexpr(n);
-    if (n->scope.depth)
+    if (n->st->scope.depth)
     {
         if (t->base == TB2_STRUCT)
         {
-            int vaddr = -find_local_addr(n, s->name);
+            int vaddr = -find_local_addr(n, s->name).offset;
             gen_fill(vaddr, t->size);
             gen_struct_inits(n, vaddr, t);
         }
@@ -1184,7 +1170,6 @@ void gen_initlist(Node *n, Symbol *s)
                 error("Should be exactly one constexpr in initialiser\n");
             Node *l;
             for(l = n; !is_constexpr(l); l = l->children[0]);
-            // gen_varaddr_from_ident(n, n->symbol->name);
             gen_varaddr_from_ident(n, s->name);
             gen_push();
             gen_expr(l);
@@ -1196,7 +1181,7 @@ void gen_initlist(Node *n, Symbol *s)
             // Optimisation would be to create a data area and copy the data over..
             //
             // Offset here is what you apply to lea to get address
-            int vaddr = -find_local_addr(n, s->name);
+            int vaddr = -find_local_addr(n, s->name).offset;
             gen_fill(vaddr, t->size);
             gen_inits(n, s, vaddr, 0, 0);
         }
@@ -1217,7 +1202,7 @@ void gen_initlist(Node *n, Symbol *s)
                 error("Should be exactly one constexpr in initialiser\n");
             Node *l;
             for(l = n; !is_constexpr(l); l = l->children[0]);
-            if (istype_float(t) || istype_double(t))
+            if (istype_fp(t))
             {
                 float f = (float)l->fval;
                 char bytes[4];
@@ -1252,7 +1237,7 @@ void gen_decl(Node *node)
     {
         Node *n = node->children[i];
         // Different treatment if at scope 0
-        if (n->scope.depth)
+        if (n->st->scope.depth)
         {
             if (n->kind == ND_DECLARATOR && n->symbol && n->symbol->is_local_static)
             {
@@ -1274,7 +1259,7 @@ void gen_decl(Node *node)
                 else if (n->children[1]->strval && istype_array(n->symbol->type))
                 {
                     // Local char array init from string literal: store bytes one by one
-                    int vaddr = -find_local_addr(n, n->symbol->name);
+                    int vaddr = -find_local_addr(n, n->symbol->name).offset;
                     char *str = n->children[1]->strval;
                     int   len = n->children[1]->strval_len + 1;
                     for (int i = 0; i < len; i++)
@@ -1337,7 +1322,7 @@ void gen_decl(Node *node)
                     }
                     else
                     {
-                        if (istype_float(n->symbol->type) || istype_double(n->symbol->type))
+                        if (istype_fp(n->symbol->type))
                         {
                             float f = (float)n->children[1]->fval;
                             char bytes[4];
@@ -1401,7 +1386,6 @@ void gen_gotostmt(Node *node)
     }
     error("goto: label '%s' not found\n", node->val);
 }
-void gen_decl(Node *node);
 void gen_switchstmt(Node *node)
 {
     printf(";%s\n", __func__);
@@ -1488,16 +1472,9 @@ void gen_function(Node *node)
     gen_stmt(node->children[1]);
     gen_return();
 }
-void gen_globals(Node *node)
-{
-
-}
 void gen_code(Node *node, int tu_index)
 {
-    current_tu = tu_index;
     printf(";%s\n", __func__);
-    
-    gen_globals(node);
 
     // Do two passes, one to get the globals allocated space, then the functions
     // gen_text();
@@ -1531,7 +1508,7 @@ void gen_code(Node *node, int tu_index)
                 int sid = new_strlit(init->strval, init->strval_len);
                 printf("    word    _l%d\n", sid);
             }
-            else if (istype_float(e->sym->type) || istype_double(e->sym->type))
+            else if (istype_fp(e->sym->type))
             {
                 float f = (float)n->children[1]->fval;
                 char bytes[4];

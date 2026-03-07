@@ -46,3 +46,7 @@ assert 9 "int main(){return (1+2)*3;}"
 assert 2 "int main(){return 1<<1;}"
 assert 16 "int main(){return 1<<4;}"
 assert 523 "int main(){return 0x105a>>3;}"
+# if-else with non-terminating then-branch
+assert 1 "int main(){int a; if (1) a=1; else a=2; return a;}"
+assert 2 "int main(){int a; if (0) a=1; else a=2; return a;}"
+assert 3 "int main(){int a=0; if (1) a=1; if (0) a=2; else a=3; return a;}"
