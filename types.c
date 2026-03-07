@@ -26,6 +26,9 @@ Symbol_table    *symbol_table;
 Symbol_table    *last_symbol_table;
 Symbol_table    *curr_scope_st;
 
+int current_global_tu = 0;
+static int local_static_counter = 0;  // NOT reset between TUs
+
 Symbol *insert_tag(Node *node, char *ident);
 static Symbol *insert_typedef(Node *node, Type2 *type, char *ident);
 static Symbol *new_symbol(Type2 *type, char *ident, int offset);
@@ -279,6 +282,34 @@ bool istype_intlike(Type2 *t)
         || t->base == TB2_INT   || t->base == TB2_UINT
         || t->base == TB2_LONG  || t->base == TB2_ULONG
         || t->base == TB2_ENUM;
+}
+
+// ---------------------------------------------------------------
+// Per-TU reset and extern symbol injection
+// ---------------------------------------------------------------
+void reset_types_state(void)
+{
+    symbol_table      = calloc(1, sizeof(Symbol_table));
+    curr_scope_st     = symbol_table;
+    last_symbol_table = symbol_table;
+    scope_depth       = 0;
+    memset(scope_indices, 0, sizeof(scope_indices));
+}
+
+void insert_extern_sym(char *name, Type2 *type)
+{
+    // Skip if already present (e.g. putchar from make_basic_types)
+    for (Symbol *s = symbol_table->idents; s; s = s->next)
+        if (!strcmp(s->name, name)) return;
+
+    Symbol *sym         = calloc(1, sizeof(Symbol));
+    sym->name           = name;
+    sym->type           = type;
+    sym->is_extern_decl = true;
+    Symbol *s = symbol_table->idents, *ls = NULL;
+    for (; s; s = s->next) ls = s;
+    if (!ls) symbol_table->idents = sym;
+    else     ls->next             = sym;
 }
 
 // ---------------------------------------------------------------
@@ -739,17 +770,67 @@ static Symbol *insert_ident(Node *node, Type2 *type, char *ident, bool is_param)
     int go = 0;
 
     if (sc.depth) {
+        if (node->sclass == TK_STATIC)
+        {
+            // Local static: persistent storage in data section, not on stack.
+            Symbol_table *lst = symbol_table;
+            for (int d = 1; d <= sc.depth; d++) {
+                int index = sc.indices[d - 1] - 1;
+                lst = lst->children[index];
+            }
+            Symbol *n          = new_symbol(type, ident, local_static_counter++);
+            n->is_static       = true;
+            n->is_local_static = true;
+            // Do NOT increment lst->size — not on the stack.
+            Symbol *s = NULL, *ls = NULL;
+            for (s = lst->idents; s; s = s->next) ls = s;
+            if (!ls) lst->idents = n;
+            else     ls->next    = n;
+            return n;
+        }
         for (int d = 1; d <= sc.depth; d++) {
             if (d > 1) go += st->size;
             int index = sc.indices[d - 1] - 1;
             st = st->children[index];
         }
     } else {
-        // Global scope
-        int offset = st->size;
-        st->size  += type->size;
-        Symbol *n  = new_symbol(type, ident, offset);
-        Symbol *s = 0, *ls = 0;
+        // Global scope — check for existing entry first (dedup for pre-populated externs)
+        for (Symbol *s = st->idents; s; s = s->next)
+        {
+            if (!strcmp(s->name, ident))
+            {
+                if (node->sclass != TK_EXTERN)
+                {
+                    // Real definition: upgrade pre-populated extern entry
+                    s->is_extern_decl = false;
+                    s->type           = type;
+                    if (!istype_function(type))
+                    {
+                        s->offset  = st->size;
+                        st->size  += type->size;
+                    }
+                    if (node->sclass == TK_STATIC)
+                    {
+                        s->is_static = true;
+                        s->tu_index  = current_global_tu;
+                    }
+                }
+                return s;
+            }
+        }
+        // Fresh symbol
+        bool is_extern = (node->sclass == TK_EXTERN);
+        bool is_fn     = istype_function(type);
+        int  offset    = st->size;
+        if (!is_extern && !is_fn) st->size += type->size;
+        Symbol *n         = new_symbol(type, ident, is_extern || is_fn ? 0 : offset);
+        n->is_extern_decl = is_extern;
+        if (node->sclass == TK_STATIC)
+        {
+            n->is_static = true;
+            n->tu_index  = current_global_tu;
+        }
+        Symbol *s = NULL, *ls = NULL;
         for (s = st->idents; s; s = s->next) ls = s;
         if (!ls) st->idents = n;
         else     ls->next   = n;

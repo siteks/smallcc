@@ -16,7 +16,12 @@ To run the compiler directly (input is a C source string, output is assembly to 
 ./mycc "int main(){return 5+3;}"
 ```
 
-To run the full pipeline (compiler + simulator):
+To compile multiple `.c` files as separate translation units and link them in-memory:
+```bash
+./mycc file1.c file2.c > out.s && ./cpu3/sim.py out.s
+```
+
+To run the full pipeline (compiler + simulator) with a string:
 ```bash
 ./mycc "int main(){return 5+3;}" > tmp.s && ./cpu3/sim.py tmp.s
 ```
@@ -27,32 +32,43 @@ Tests use `cpu3/sim.py` to execute generated assembly and check the value left i
 
 ## Compiler Architecture
 
-This is a single-pass C89 subset compiler. Source code is taken as a command-line string argument and assembly is written to stdout.
+This is a single-pass C89 subset compiler. Input is either a C source string (command-line argument) or one or more `.c` files. Assembly is written to stdout.
 
 ### Compilation Pipeline
 
+For each translation unit (single TU when given a string; one per `.c` file when given files):
+
 ```
-./mycc "C code"
-  → tokenise()              [tokeniser.c]   Token linked list
-  → program()               [parser.c]      AST (Node tree)
-  → make_basic_types()      [types.c]       Populate global type table
-  → add_types_and_symbols() [types.c]       Build symbol table tree + assign types
-  → propagate_types()       [parser.c]      Annotate AST nodes with resolved Type2*
-  → gen_code()              [codegen.c]     Emit assembly to stdout
+./mycc "C code"            (string mode: one TU)
+./mycc a.c b.c ...         (file mode: one TU per file, in order)
+
+Per-TU loop [mycc.c]:
+  reset_codegen()           [codegen.c]     Clear per-TU codegen state
+  reset_parser()            [parser.c]      Clear per-TU parser state
+  reset_types_state()       [types.c]       Fresh symbol/scope tables (type list preserved)
+  make_basic_types()        [types.c]       Populate/reuse global type table
+  prepopulate_extern_syms() [mycc.c]        Inject globals from previous TUs
+  tokenise()                [tokeniser.c]   Token linked list
+  program()                 [parser.c]      AST (Node tree)
+  propagate_types()         [parser.c]      Annotate AST nodes with resolved Type2*
+  gen_code(node, tu_index)  [codegen.c]     Emit assembly to stdout
+  harvest_globals()         [mycc.c]        Collect non-static globals for next TU
+
+Preamble (ssp / jl main / halt) is emitted once before the loop.
 ```
 
-Orchestrated by `mycc.c`. Every phase prints debug information to stderr (token list, AST before/after type propagation, symbol table, type table). The fixed preamble (`ssp 0x1000 / jl main / halt`) is printed before `gen_code` is called.
+Every phase prints debug information to stderr (token list, AST before/after type propagation, symbol table, type table).
 
 ### Source Files
 
 | File | Role |
 |---|---|
 | `mycc.h` | All shared structs, enums, and function prototypes |
-| `mycc.c` | Entry point; orchestrates the pipeline |
+| `mycc.c` | Entry point; per-TU loop; `ExternSym` table; `harvest_globals`/`prepopulate_extern_syms` |
 | `tokeniser.c` | Lexer — produces a `Token` linked list |
 | `parser.c` | Recursive-descent parser — builds AST; also contains `propagate_types` and `check_operands` |
-| `types.c` | Type table, symbol table, struct layout, `add_types_and_symbols`, `generate_struct_type2` |
-| `codegen.c` | AST walk; emits assembly pseudoinstructions |
+| `types.c` | Type table, symbol table, struct layout, `add_types_and_symbols`, `reset_types_state`, `insert_extern_sym` |
+| `codegen.c` | AST walk; emits assembly pseudoinstructions; `reset_codegen`; static label mangling |
 
 ---
 
@@ -170,7 +186,7 @@ postfix-suffix      → "[" expr "]"
 primary-expr        → ident | constant | string-literal | "(" expr ")"
 ```
 
-**Not yet implemented:** `register`/`extern`/`static` semantics. `sizeof(complex_expr)` not supported (only type names and simple idents).
+**Not yet implemented:** `register` semantics (no register allocator). `sizeof(complex_expr)` not supported (only type names and simple idents). Calling through a function-pointer stored in an array element is not implemented.
 
 **Abstract declarators** in parameter lists are fully supported: `int foo(int, int)` (unnamed params) and `int (*fp)(int, int)` (function-pointer params with inner unnamed params) are both accepted.
 
@@ -273,7 +289,7 @@ For array subscripts the child is `ND_BINOP "+"` with children `[base_addr, ND_B
 Post-order (children first) tree walk. For each node:
 
 - `ND_IDENT` (not struct member, `is_expr == true` only): `node->type = find_symbol(…)->type`
-- `ND_MEMBER`: looks up field in `lhs->type->u.composite.members`, sets `node->offset` and `node->type`; for `"->"` the lhs pointer is automatically dereferenced
+- `ND_MEMBER`: looks up field in `lhs->type->u.composite.members`, sets `node->offset` and `node->type`; for `"->"` the lhs pointer is automatically dereferenced; when `is_function=true` (call through member fn-ptr), `node->type` is resolved to the function's return type
 - `ND_BINOP` (is_expr): calls `check_operands()` → inserts arithmetic-conversion casts, returns lhs type; then comparison/logical operators (`< <= > >= == != && ||`) force `node->type = t_int` regardless of operand type
 - `ND_UNARYOP` (is_expr): calls `check_unary_operand()` → for `*` returns `elem_type(child->type)`; preserves parser-set types (guards with `if (node->type == t_void)`)
 - `ND_RETURNSTMT`: inserts a cast if return type differs from expression type
@@ -402,9 +418,12 @@ struct Symbol_table {
 struct Symbol {
     char   *name;
     Type2  *type;
-    int     offset;       // see addressing below
+    int     offset;        // see addressing below
     bool    is_param;
     bool    is_enum_const; // true for enum constants (use offset as integer value, no load)
+    bool    is_static;     // file-scope static — label mangled to _s{tu_index}_{name}
+    int     tu_index;      // TU that defined this static (set by insert_ident)
+    bool    is_extern_decl;// extern declaration — no data allocation; upgraded on definition
     Symbol *next;
 };
 ```
@@ -467,7 +486,9 @@ Locals within a compound statement are allocated with `adj -size` on entry and r
 ### Variable Addressing
 
 `gen_varaddr_from_ident(node, name)`:
-- **Global**: `immw label_name` (symbolic address)
+- **Global (non-static)**: `immw label_name` (symbolic address)
+- **Global (static)**: `immw _s{tu_index}_{name}` (mangled to be TU-private)
+- **Local static**: `immw _ls{id}` (persistent data-section label; `id` from `local_static_counter`)
 - **Parameter**: `lea positive_offset` (above bp)
 - **Local**: `lea -offset` (below bp)
 
@@ -497,13 +518,25 @@ sb/sw/sl            ; mem[stack[sp]] = r0; sp += 4
 lb/lw/ll            ; r0 = mem[r0]  (size from elem_type(node->type)->size)
 ```
 
-**Struct member access** (`ND_MEMBER`):
+**Struct member access** (`ND_MEMBER`, `is_function=false`):
 ```asm
 ; gen_addr(struct_expr) → r0 = struct base address
 push
 immw member_offset
 add
 lb/lw/ll            ; load member value
+```
+
+**Call through struct member function pointer** (`ND_MEMBER`, `is_function=true`; covers `s.fp(args)` and `s->fp(args)`):
+```asm
+; push arguments right-to-left (children[2..])
+; gen_expr(arg[n-1]) → pushw/push
+; ...
+; gen_expr(arg[0]) → pushw/push
+; gen_addr(node) → r0 = address of fn-ptr field (struct_base + member_offset)
+lw                  ; load function pointer value (2 bytes)
+jli                 ; indirect call
+adj   param_total_bytes
 ```
 
 **Direct function call** (`ND_IDENT` with `is_function=true` and function type):
@@ -607,11 +640,78 @@ Casts are no-ops when src and dst have the same size. Otherwise:
 
 ### Three-Pass Code Generation
 
-`gen_code()` makes three passes over the top-level declaration list:
+`gen_code(node, tu_index)` sets `current_tu` then makes three passes over the top-level declaration list for the current TU:
 
 1. **Pass 1**: emit function definitions (follows the preamble inline in the text area).
-2. **Pass 2**: emit global variable declarations (data area after the code).
-3. **Pass 3**: emit deferred string literal data (`_l0:`, `_l1:` etc.), each as a sequence of `byte` directives followed by a null terminator.
+2. **Pass 2**: emit global variable declarations (data area after the code). `extern` declarations and bare function prototypes are skipped (no data emitted). Static globals use the mangled label `_s{tu_index}_{name}`.
+3. **Pass 2b**: emit local static variable data collected during pass 1 (`_ls0:`, `_ls1:` etc.). `local_static_counter` is monotonically increasing across TUs. Labels are assigned at symbol-table build time; data is emitted after all global vars.
+4. **Pass 3**: emit deferred string literal data (`_l0:`, `_l1:` etc.), each as a sequence of `byte` directives followed by a null terminator. The `labels` counter and string literal IDs are monotonically increasing across TUs to prevent collisions.
+
+---
+
+## Per-Translation-Unit Compilation (`mycc.c` + `types.c` + `codegen.c`)
+
+The compiler supports true per-TU compilation when invoked with `.c` file arguments. Each file is compiled independently with its own symbol table; the combined assembly is emitted as a single stream to stdout. The assembler resolves all label references, so cross-TU calls work without object files.
+
+### Input Modes
+
+- **String mode** (`./mycc "C code"`): single TU; `tu_index = 0`. Identical to previous behaviour.
+- **File mode** (`./mycc a.c b.c ...`): detected by `fopen(argv[1])` succeeding. One TU per file, compiled in argument order. The preamble is emitted once before the loop.
+
+### Per-TU State Reset
+
+At the start of each TU, three reset functions are called:
+
+```c
+reset_codegen()      // clears strlit_count, loop_depth, label_table_size
+                     // does NOT reset 'labels' — monotonically increasing across TUs
+reset_parser()       // clears current_function
+                     // does NOT reset anon_index — monotonically increasing across TUs
+reset_types_state()  // allocates a fresh symbol_table / curr_scope_st / last_symbol_table
+                     // resets scope_depth and scope_indices
+                     // does NOT touch the 'types' linked list or t_int/t_void singletons
+                     // (Type2* pointers from previous TUs remain valid)
+```
+
+After reset, `make_basic_types()` re-populates the basic type singletons (they are found in the existing `types` list and reused, not duplicated).
+
+### Extern Symbol Table (`mycc.c`)
+
+A flat `ExternSym[]` array accumulates non-static global symbols after each TU:
+
+```c
+typedef struct { char *name; Type2 *type; } ExternSym;
+static ExternSym extern_syms[1024];
+static int       extern_sym_count = 0;
+```
+
+**`harvest_globals()`** (called after `gen_code`): walks `symbol_table->idents` of the just-compiled TU and appends any symbol that is not `is_static`, not `is_extern_decl`, and not `putchar`. Deduplication prevents double-adding.
+
+**`prepopulate_extern_syms()`** (called before each TU's `program()`): calls `insert_extern_sym()` for each accumulated symbol. This makes previously-defined globals visible to the new TU without requiring explicit `extern` declarations.
+
+**`insert_extern_sym()`** (in `types.c`): inserts a symbol into the fresh global scope with `is_extern_decl = true` and no data allocation (`st->size` is not incremented). Skipped if the name is already present (e.g. `putchar`).
+
+### Static Symbol Mangling
+
+File-scope `static` symbols are TU-private. The label name in emitted assembly is mangled from `foo` to `_s{tu_index}_foo` in three sites in `codegen.c`:
+
+| Site | Code |
+|---|---|
+| `gen_function` (function label) | `printf("_s%d_%s:\n", fsym->tu_index, fsym->name)` |
+| `gen_callfunction` (direct call) | `gen_jl("_s{tu_index}_{name}")` |
+| `gen_varaddr_from_ident` (global address) | `printf("    immw    _s%d_%s\n", sym->tu_index, sym->name)` |
+
+`is_static` and `tu_index` are set on the `Symbol` by `insert_ident()` in `types.c` when `node->sclass == TK_STATIC` at global scope.
+
+### Extern Declaration Handling
+
+When `insert_ident()` sees `node->sclass == TK_EXTERN` at global scope it:
+- Does **not** increment `st->size` (no data allocated).
+- Sets `sym->is_extern_decl = true`.
+
+When a real definition arrives for the same name (in the same or a later TU), `insert_ident()` finds the existing entry and upgrades it: clears `is_extern_decl`, updates the type, and allocates data offset.
+
+`gen_decl()` skips entire `extern` declarations (`node->sclass == TK_EXTERN → return`) and bare function prototypes (`istype_function(n->symbol->type) → continue`) so no spurious labels or data are emitted.
 
 ---
 
@@ -694,7 +794,7 @@ Float operands are 32-bit IEEE 754 single-precision values stored as raw bit pat
 
 **Store convention**: `sb`, `sw`, `sl` pop a 32-bit address from the stack and write r0 to that address.
 
-**CPU builtins**: `putchar` (0x1e) and `jli` (0x1f) are in the gap between the integer ops and the float ops. `putchar` is pre-declared as a global builtin symbol by `make_basic_types()` via `insert_builtin()` in `types.c`; the compiler emits it directly without a call frame. `jli` is used for all indirect function-pointer calls.
+**CPU builtin**: `putchar` (0x1e) is pre-declared as a global builtin symbol by `make_basic_types()` via `insert_builtin()` in `types.c`; the compiler emits the opcode directly without a call frame.
 
 #### Format 1 — Signed 8-bit Operand
 
@@ -849,7 +949,7 @@ Preprocessor excluded. Features are assessed against ANSI C89/ISO C90.
 | `union` | ✅ | All members at offset 0; `is_union` flag in Type2 sets size = max member size |
 | `enum` | ✅ | Tagged and anonymous enums; implicit/explicit/negative values; enum variables; sizeof(enum); case labels with enum constants |
 | `typedef` | ✅ | Scalar, pointer, struct/union aliases; lexical scoping with shadowing |
-| Function pointers | ✅ | Declare, assign, call via `fp(args)` and `(*fp)(args)`; pass as arguments; use as parameters (`int (*f)(int)`) |
+| Function pointers | ✅ | Declare, assign, call via `fp(args)`, `(*fp)(args)`, `s.fp(args)`, `s->fp(args)`; pass as arguments; use as parameters (`int (*f)(int)`) |
 | Bit fields in structs | N/A | Deliberately not supported — see deviations |
 | `const` / `volatile` qualifiers | ⚠️ | Parsed and stored; semantics not enforced |
 
@@ -864,9 +964,10 @@ Preprocessor excluded. Features are assessed against ANSI C89/ISO C90.
 | `typedef` declarations | ✅ | Stored in `NS_TYPEDEF` per scope; `gen_decl` skips typedef nodes |
 | `auto` | ⚠️ | Parsed; no semantic difference from default local |
 | `register` | ⚠️ | Parsed; ignored (no register allocator) |
-| `static` | ⚠️ | Parsed; internal-linkage and persistent-storage semantics not enforced |
-| `extern` | ⚠️ | Parsed; external-linkage semantics not enforced |
-| Forward declarations | ⚠️ | Functions can be declared before definition, but semantic checking is minimal |
+| `static` (file scope) | ✅ | Internal linkage: label mangled to `_s{tu_index}_{name}`; invisible to other TUs |
+| `static` (local) | ✅ | Persistent storage in data section; label `_ls{id}`; compile-time-constant initializers only |
+| `extern` | ✅ | Suppresses data allocation; real definition upgrades the symbol; cross-TU globals pre-populated automatically |
+| Forward declarations | ✅ | Functions declared before their definition resolve correctly via label references in assembly |
 | K&R (old-style) function definitions | N/A | Deliberately not supported; ANSI prototype style only |
 
 ### Literals and Constants
@@ -913,10 +1014,10 @@ These behaviors are correct for the current 16-bit target (`sizeof(int) == sizeo
 
 ### Summary
 
-**Implemented and working**: basic scalar types, pointers, 1-D/N-D arrays, structs, unions, `float`/`double` (IEEE 754 arithmetic, comparisons, int↔float casts), `if`/`while`/`for`/`do-while`, `switch`/`case`/`default`, `break`, `continue`, `goto`, labeled statements, all arithmetic and bitwise operators including `%`, all comparison and logical operators, unary `+ - ~ ! &` and dereference `*`, pre/post-increment/decrement, struct/union member access (`.` and `->`), explicit casts, array subscripting, function definitions and calls (multi-arg, recursive), integer constants (decimal/hex/octal), floating-point constants, string literals, compound assignment (`+=` `-=` `*=` `/=` `%=` `&=` `|=` `^=` `<<=` `>>=`), ternary `?:`, comma operator, `sizeof(type)`/`sizeof(ident)`, `typedef` (scalar/pointer/struct aliases with lexical scoping), `enum` (tagged/anonymous, implicit/explicit/negative values, enum variables, enum constants in expressions and case labels), variadic functions (`va_list`/`va_start`/`va_arg`/`va_end`), function pointers (declare, assign, call via `fp(args)` and `(*fp)(args)`, pass as arguments and parameters).
+**Implemented and working**: basic scalar types, pointers, 1-D/N-D arrays, structs, unions, `float`/`double` (IEEE 754 arithmetic, comparisons, int↔float casts), `if`/`while`/`for`/`do-while`, `switch`/`case`/`default`, `break`, `continue`, `goto`, labeled statements, all arithmetic and bitwise operators including `%`, all comparison and logical operators, unary `+ - ~ ! &` and dereference `*`, pre/post-increment/decrement, struct/union member access (`.` and `->`), explicit casts, array subscripting, function definitions and calls (multi-arg, recursive), integer constants (decimal/hex/octal), floating-point constants, string literals, compound assignment (`+=` `-=` `*=` `/=` `%=` `&=` `|=` `^=` `<<=` `>>=`), ternary `?:`, comma operator, `sizeof(type)`/`sizeof(ident)`, `typedef` (scalar/pointer/struct aliases with lexical scoping), `enum` (tagged/anonymous, implicit/explicit/negative values, enum variables, enum constants in expressions and case labels), variadic functions (`va_list`/`va_start`/`va_arg`/`va_end`), function pointers (declare, assign, call via `fp(args)`, `(*fp)(args)`, `s.fp(args)`, `s->fp(args)`, pass as arguments and parameters), per-TU compilation with `static` internal linkage and cross-TU `extern` resolution, `static` local variables (persistent storage in data section, compile-time-constant initializers, independent between functions).
 
-**Partially working**: `const`/`volatile` (stored, not enforced), storage classes (parsed, not enforced), integer promotions in function arguments (not applied at call sites; harmless on this target — see Target-Dependent Arithmetic Notes).
+**Partially working**: `const`/`volatile` (stored, not enforced), `auto`/`register` (parsed, ignored), integer promotions in function arguments (not applied at call sites; harmless on this target — see Target-Dependent Arithmetic Notes).
 
-**Not yet implemented**: bit fields (deliberate), `sizeof(complex_expr)`, calling through a function-pointer stored in a struct field or array element.
+**Not yet implemented**: bit fields (deliberate), `sizeof(complex_expr)`, calling through a function-pointer stored in an array element.
 
 **Extensions beyond C89**: `//` line comments; declarations anywhere in a block (C99); `for`-init declarations (C99).

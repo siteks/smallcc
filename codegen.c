@@ -49,6 +49,9 @@ int find_local_addr(Node *node, char *name)
     {
         error("Symbol %s not found!\n", name);
     }
+    if (s->is_local_static)
+        return -1;
+
     // Compute global_offset dynamically: sum of all non-global ancestor scope sizes.
     // This is correct even for C99-style mixed declarations, where the parse-time
     // st->global_offset may have been captured before later siblings were added.
@@ -80,10 +83,15 @@ static int labels;
 static int break_labels[64];
 static int cont_labels[64];
 static int loop_depth = 0;
+static int current_tu = 0;
 
 typedef struct { int id; char *data; int len; } StrLit;
 static StrLit strlits[512];
 static int    strlit_count = 0;
+
+typedef struct { int id; Symbol *sym; Node *decl_node; } LocalStaticEntry;
+static LocalStaticEntry local_statics[512];
+static int              local_static_count = 0;
 
 static int new_strlit(char *data, int len)
 {
@@ -104,6 +112,17 @@ typedef struct
 } LabelEntry;
 static LabelEntry label_table[64];
 static int        label_table_size;
+
+void reset_codegen(void)
+{
+    strlit_count      = 0;
+    local_static_count = 0;
+    loop_depth        = 0;
+    label_table_size  = 0;
+    memset(break_labels, 0, sizeof(break_labels));
+    memset(cont_labels,  0, sizeof(cont_labels));
+    // 'labels' is NOT reset — monotonically increasing across TUs.
+}
 
 static void collect_labels(Node *node)
 {
@@ -288,8 +307,15 @@ void gen_varaddr_from_ident(Node *node, char *name)
 {
     int offset = find_local_addr(node, name);
     if (offset < 0)
-        // Global, the name is a label
-        printf("    immw    %s\n", name);
+    {
+        Symbol *sym = node->symbol;
+        if (sym && sym->is_local_static)
+            printf("    immw    _ls%d\n", sym->offset);
+        else if (sym && sym->is_static)
+            printf("    immw    _s%d_%s\n", sym->tu_index, sym->name);
+        else
+            printf("    immw    %s\n", name);
+    }
     else
         if (offset & 0x40000000)
             // This is a function parameter
@@ -424,7 +450,15 @@ void gen_callfunction(Node *node)
             gen_push();
         param_size += s;
     }
-    gen_jl(node->symbol->name);
+    if (node->symbol->is_static)
+    {
+        char mangled[80];
+        snprintf(mangled, sizeof(mangled), "_s%d_%s",
+                 node->symbol->tu_index, node->symbol->name);
+        gen_jl(mangled);
+    }
+    else
+        gen_jl(node->symbol->name);
     // For the function postamble, we need to adjust the stack by the size of the
     // push parameters
     gen_adj(param_size);
@@ -770,6 +804,22 @@ void gen_expr(Node *node)
         // type of the cast
         gen_expr(node->children[1]);
         gen_cast(node->children[1]->type, node->type);
+    }
+    else if (node->kind == ND_MEMBER && node->is_function)
+    {
+        // Call through a function-pointer struct member: s.fp(args) or s->fp(args)
+        int param_size = 0;
+        for (int i = node->child_count - 1; i >= 2; i--)
+        {
+            gen_expr(node->children[i]);
+            int s = node->children[i]->type->size;
+            if (s == 2) gen_pushw(); else gen_push();
+            param_size += s;
+        }
+        gen_addr(node);     // r0 = address of the fn-ptr field
+        gen_ld(2);          // r0 = fn ptr value (pointers are 2 bytes)
+        gen_jli();
+        gen_adj(param_size);
     }
     else if (node->kind == ND_MEMBER)
     {
@@ -1193,6 +1243,7 @@ void gen_decl(Node *node)
 {
     printf(";%s %s\n", __func__, node->val);
     if (node->sclass == TK_TYPEDEF) return;
+    if (node->sclass == TK_EXTERN)  return;  // extern decl → no data emission
     // The symbol table has all the details needed for declarations.
     // Space is reserved at the start of the compound statement
 
@@ -1203,6 +1254,13 @@ void gen_decl(Node *node)
         // Different treatment if at scope 0
         if (n->scope.depth)
         {
+            if (n->kind == ND_DECLARATOR && n->symbol && n->symbol->is_local_static)
+            {
+                local_statics[local_static_count++] = (LocalStaticEntry){
+                    n->symbol->offset, n->symbol, n
+                };
+                continue;
+            }
             if (n->kind == ND_DECLARATOR && n->child_count == 2)
             {
                 // This is an initialiser.
@@ -1245,8 +1303,18 @@ void gen_decl(Node *node)
                 // Get ident from symbol table
                 if (!n->symbol)
                     error("Missing symbol!\n");
+                // Skip bare function prototypes — no data to emit
+                if (istype_function(n->symbol->type)) continue;
                 gen_align();
-                gen_symlabel(n->symbol->name);
+                if (n->symbol->is_static)
+                {
+                    char mangled[80];
+                    snprintf(mangled, sizeof(mangled), "_s%d_%s",
+                             n->symbol->tu_index, n->symbol->name);
+                    gen_symlabel(mangled);
+                }
+                else
+                    gen_symlabel(n->symbol->name);
                 // If there is no init, we make space
 
                 if (n->child_count == 2)
@@ -1409,7 +1477,11 @@ void gen_param_list(Node *node)
 void gen_function(Node *node)
 {
     printf(";%s\n", __func__);
-    printf("%s:\n", node->children[0]->symbol->name);
+    Symbol *fsym = node->children[0]->symbol;
+    if (fsym->is_static)
+        printf("_s%d_%s:\n", fsym->tu_index, fsym->name);
+    else
+        printf("%s:\n", fsym->name);
     label_table_size = 0;
     collect_labels(node->children[1]);
     gen_param_list(node->children[0]);
@@ -1420,8 +1492,9 @@ void gen_globals(Node *node)
 {
 
 }
-void gen_code(Node *node)
+void gen_code(Node *node, int tu_index)
 {
+    current_tu = tu_index;
     printf(";%s\n", __func__);
     
     gen_globals(node);
@@ -1438,6 +1511,41 @@ void gen_code(Node *node)
     {
         if (node->children[i]->kind == ND_DECLARATION && !node->children[i]->is_func_defn)
             gen_decl(node->children[i]);
+    }
+    // Pass 2b: local static data collected during pass 1 (function codegen).
+    for (int i = 0; i < local_static_count; i++)
+    {
+        LocalStaticEntry *e = &local_statics[i];
+        Node *n = e->decl_node;
+        gen_align();
+        printf("_ls%d:\n", e->id);
+        if (n->child_count == 2)
+        {
+            Node *init = n->children[1];
+            if (init->kind == ND_INITLIST)
+                gen_initlist(init, e->sym);
+            else if (init->strval && istype_array(e->sym->type))
+                gen_bytes(init->strval, init->strval_len + 1);
+            else if (init->strval)
+            {
+                int sid = new_strlit(init->strval, init->strval_len);
+                printf("    word    _l%d\n", sid);
+            }
+            else if (istype_float(e->sym->type) || istype_double(e->sym->type))
+            {
+                float f = (float)n->children[1]->fval;
+                char bytes[4];
+                memcpy(bytes, &f, 4);
+                gen_bytes(bytes, 4);
+            }
+            else
+            {
+                int val = int_constexpr(n->children[1]);
+                gen_word(val);
+            }
+        }
+        else
+            gen_zeros(e->sym->type->size);
     }
     // Pass 3: emit deferred string literal data
     for (int i = 0; i < strlit_count; i++)

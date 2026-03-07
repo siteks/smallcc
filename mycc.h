@@ -211,6 +211,10 @@ struct Symbol
     int     offset;
     bool    is_param;
     bool    is_enum_const;
+    bool    is_static;      // file-scope static → name-mangled label
+    int     tu_index;       // TU that defined this static
+    bool    is_extern_decl; // extern declaration → no data allocation
+    bool    is_local_static;// local-scope static: persistent storage, label = _ls{offset}
     Symbol  *next;
 };
 
@@ -283,7 +287,8 @@ void print_locals();
 // Code gen
 // ---------------------------------------------------------------
 
-void gen_code(Node *node);
+void gen_code(Node *node, int tu_index);
+void reset_codegen(void);
 void gen_preamble(int offset);
 void gen_postamble();
 void gen_pop();
@@ -330,6 +335,12 @@ void dd(Node *node);
 
 // Populate type table
 void make_basic_types();
+
+void reset_types_state(void);
+void insert_extern_sym(char *name, Type2 *type);
+void reset_parser(void);
+
+extern int current_global_tu;
 
 // Starting at scope of node, search for symbol in given namespace.
 Symbol *find_symbol(Node *node, char *name, Namespace nspace);

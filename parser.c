@@ -189,6 +189,12 @@ static Node *declaration(int depth);
 
 static Node *current_function;
 static int anon_index = 0;
+
+void reset_parser(void)
+{
+    current_function = NULL;
+    // anon_index intentionally NOT reset — monotonically increasing across TUs.
+}
 static char *new_anon_label()
 {
     static char a[16];
@@ -535,6 +541,7 @@ static Node *unary_expr()
                 add_child(n, node);
                 add_child(n, new_node(ND_IDENT, expect(TK_IDENT), true));
                 node = n;
+                pex_node = n;
                 break;
             }
             case(TK_ARROW):
@@ -544,6 +551,7 @@ static Node *unary_expr()
                 add_child(n, node);
                 add_child(n, new_node(ND_IDENT, expect(TK_IDENT), true));
                 node = n;
+                pex_node = n;
                 break;
             }
             case(TK_INC):
@@ -1746,7 +1754,8 @@ void propagate_types(Node *p, Node *n)
     {
         // This is a child of a member operator
         // lhs of member op is the structure, rhs is field
-        if (n->child_count != 2)
+        // child_count may be > 2 when is_function=true (args in children[2..])
+        if (n->child_count < 2)
             error("Malformed struct reference\n");
         Node *lhs   = n->children[0];
         Node *rhs   = n->children[1];
@@ -1773,6 +1782,10 @@ void propagate_types(Node *p, Node *n)
             rhs->val, n->offset, (unsigned long long)base);
         // Member now has type pointing to inner type
         n->type = base;
+        // If this is a call through a function-pointer member, resolve to return type
+        if (n->is_function && istype_ptr(n->type)
+            && istype_function(n->type->u.ptr.pointee))
+            n->type = n->type->u.ptr.pointee->u.fn.ret;
     }
     if (n->is_expr)
     {
