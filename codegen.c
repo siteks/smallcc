@@ -627,16 +627,19 @@ void gen_expr(Node *node)
     printf(";%s %s %s\n", __func__, nodestr(node->kind), node_ident_str(node));
     if (node->kind == ND_BINOP)
     {
+        // Use nu.binop fields (kept in sync by insert_cast)
+        Node *lhs = node->nu.binop.lhs;
+        Node *rhs = node->nu.binop.rhs;
         if (node->op_kind == TK_COMMA)
         {
-            gen_expr(node->children[0]);    // evaluate for side effects
-            gen_expr(node->children[1]);    // result is rhs
+            gen_expr(lhs);    // evaluate for side effects
+            gen_expr(rhs);    // result is rhs
             return;
         }
-        gen_expr(node->children[0]);
+        gen_expr(lhs);
         gen_push();
-        gen_expr(node->children[1]);
-        if (istype_fp(node->children[0]->type))
+        gen_expr(rhs);
+        if (istype_fp(lhs->type))
         {
             switch (node->op_kind)
             {
@@ -813,10 +816,13 @@ void gen_expr(Node *node)
     }
     else if (node->kind == ND_ASSIGN)
     {
-        gen_addr(node->children[0]);
+        // Use nu.binop fields (kept in sync by insert_cast)
+        Node *lhs = node->nu.binop.lhs;
+        Node *rhs = node->nu.binop.rhs;
+        gen_addr(lhs);
         gen_push();
-        gen_expr(node->children[1]);
-        gen_st(node->children[0]->type->size);
+        gen_expr(rhs);
+        gen_st(lhs->type->size);
     }
     else if (node->kind == ND_COMPOUND_ASSIGN)
     {
@@ -829,8 +835,9 @@ void gen_expr(Node *node)
         //   gen_expr(rhs)  → r0 = rhs
         //   op             → r0 = old_val op rhs; stack: [addr]
         //   store          → mem[addr] = r0; stack: []
-        Node *lhs = node->children[0];
-        Node *rhs = node->children[1];
+        // Use nu.compound_assign fields (kept in sync by insert_cast)
+        Node *lhs = node->nu.compound_assign.lhs;
+        Node *rhs = node->nu.compound_assign.rhs;
         int sz = lhs->type ? lhs->type->size : 2;
         gen_addr(lhs);
         gen_push();
@@ -869,10 +876,12 @@ void gen_expr(Node *node)
     }
     else if (node->kind == ND_CAST)
     {
-        // The type conversion is defined by the type of the expression in child 1 and the 
+        // The type conversion is defined by the type of the expression in child 1 and the
         // type of the cast
-        gen_expr(node->children[1]);
-        gen_cast(node->children[1]->type, node->type);
+        // Use nu.cast.expr (kept in sync by insert_cast)
+        Node *expr = node->nu.cast.expr ? node->nu.cast.expr : node->children[1];
+        gen_expr(expr);
+        gen_cast(expr->type, node->type);
     }
     else if (node->kind == ND_MEMBER && node->is_function)
     {
@@ -890,22 +899,27 @@ void gen_expr(Node *node)
     }
     else if (node->kind == ND_TERNARY)
     {
+        // Use nu.ternary fields (kept in sync by insert_cast)
+        Node *cond  = node->nu.ternary.cond;
+        Node *then_ = node->nu.ternary.then_;
+        Node *else_ = node->nu.ternary.else_;
         int l_else = new_label();
         int l_end  = new_label();
-        gen_expr(node->children[0]);
+        gen_expr(cond);
         gen_jz(l_else);
-        gen_expr(node->children[1]);
+        gen_expr(then_);
         gen_j(l_end);
         gen_label(l_else);
-        gen_expr(node->children[2]);
+        gen_expr(else_);
         gen_label(l_end);
     }
     else if (node->kind == ND_VA_START)
     {
         // va_start(ap, last_param)
         // ap = bp + last_param_offset + last_param_size
-        Node *ap_node  = node->children[0];
-        Node *lp_node  = node->children[1];
+        // Use nu.vastart fields (kept in sync by insert_cast)
+        Node *ap_node  = node->nu.vastart.ap;
+        Node *lp_node  = node->nu.vastart.last;
         int param_off  = lp_node->symbol->offset;
         int param_size = lp_node->symbol->type->size;
         gen_addr(ap_node);                       // r0 = &ap
@@ -918,7 +932,8 @@ void gen_expr(Node *node)
         // va_arg(ap, T) where T has size s
         // Returns *old_ap, advances ap by s
         int s         = node->type->size;
-        Node *ap_node = node->children[0];
+        // Use nu.vaarg.ap (kept in sync by insert_cast)
+        Node *ap_node = node->nu.vaarg.ap;
         // Save old ap value
         gen_addr(ap_node);    // r0 = &ap
         gen_ld(2);            // r0 = ap (current vararg pointer)

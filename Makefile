@@ -58,11 +58,6 @@ test_variadic:mycc
 test_funcptr:mycc
 	(source ./test.sh && source tests/test_funcptr.sh)
 
-lasttest: mycc
-	(cat test.sh >tmp && echo `tail -1 tests/test1.sh` >>tmp && source tmp)
-
-
-
 
 clean:
 	rm -f mycc *.o *~ tmp*

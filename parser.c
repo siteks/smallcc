@@ -241,6 +241,8 @@ static Node *primary_expr()
         expect(TK_COMMA);
         add_child(node, assign_expr());   // last named param
         expect(TK_RPAREN);
+        node->nu.vastart.ap = node->children[0];
+        node->nu.vastart.last = node->children[1];
         return node;
     }
     else if (token_ctx.current->kind == TK_IDENT && !strcmp(token_ctx.current->val, "va_arg"))
@@ -253,6 +255,7 @@ static Node *primary_expr()
         Node *tn = type_name();           // type to fetch
         node->type = tn->type;
         expect(TK_RPAREN);
+        node->nu.vaarg.ap = node->children[0];
         return node;
     }
     else if (token_ctx.current->kind == TK_IDENT && !strcmp(token_ctx.current->val, "va_end"))
@@ -263,6 +266,7 @@ static Node *primary_expr()
         node->type = t_void;
         add_child(node, assign_expr());   // ap
         expect(TK_RPAREN);
+        node->nu.vaend.ap = node->children[0];
         return node;
     }
     else if (token_ctx.current->kind == TK_IDENT)
@@ -653,6 +657,8 @@ static Node *cast_expr()
         node->type = node->children[node->child_count - 1]->type;
         expect(TK_RPAREN);
         add_child(node, cast_expr());
+        // Set nu.cast.expr to point to the expression (children[1])
+        node->nu.cast.expr = node->children[1];
         return node;
     }
     else
@@ -690,7 +696,15 @@ void insert_scale(Node *n, int child, int size)
     lit->ival = size;
     add_child(sc, lit);
     add_child(sc, n->children[child]);
+    // Set nu.binop fields for the new scale node
+    sc->nu.binop.lhs = lit;
+    sc->nu.binop.rhs = sc->children[1];
     n->children[child] = sc;
+    // Update parent's nu.binop field to point to the new scale node
+    if (n->kind == ND_BINOP || n->kind == ND_ASSIGN) {
+        if (child == 0) n->nu.binop.lhs = sc;
+        else if (child == 1) n->nu.binop.rhs = sc;
+    }
 }
 static Node *add_expr()
 {
@@ -1691,6 +1705,8 @@ void insert_cast(Node *n, int child, Type *t)
     add_child(c, new_node(ND_DECLARATION, 0, false));
     add_child(c, n->children[child]);
     c->type = t;
+    // Set the CAST node's own nu.cast.expr to point to the expression (children[1])
+    c->nu.cast.expr = c->children[1];
     n->children[child] = c;
     // Update nu.* fields to match children[]
     if (n->kind == ND_BINOP || n->kind == ND_ASSIGN) {
@@ -1714,6 +1730,22 @@ void insert_cast(Node *n, int child, Type *t)
         n->nu.ifstmt.cond = c;
     } else if (n->kind == ND_EXPRSTMT && child == 0) {
         n->nu.exprstmt.decl = c;
+    } else if (n->kind == ND_CAST && child == 1) {
+        n->nu.cast.expr = c;
+    } else if (n->kind == ND_TERNARY) {
+        if (child == 0) n->nu.ternary.cond = c;
+        else if (child == 1) n->nu.ternary.then_ = c;
+        else if (child == 2) n->nu.ternary.else_ = c;
+    } else if (n->kind == ND_COMPOUND_ASSIGN) {
+        if (child == 0) n->nu.compound_assign.lhs = c;
+        else if (child == 1) n->nu.compound_assign.rhs = c;
+    } else if (n->kind == ND_VA_START) {
+        if (child == 0) n->nu.vastart.ap = c;
+        else if (child == 1) n->nu.vastart.last = c;
+    } else if (n->kind == ND_VA_ARG && child == 0) {
+        n->nu.vaarg.ap = c;
+    } else if (n->kind == ND_VA_END && child == 0) {
+        n->nu.vaend.ap = c;
     }
 }
 Type *check_operands(Node *n)
