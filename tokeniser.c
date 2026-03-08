@@ -151,7 +151,7 @@ void unget_token()
 }
 char *expect(Token_kind tk)
 {
-    fprintf(stderr, "%s %s\n", __func__, token_ctx.current->val);
+    DBG_PRINT("%s %s\n", __func__, token_ctx.current->val);
     if (token_ctx.current->kind == tk)
     {
         char *val   = token_ctx.current->val;

@@ -11,6 +11,8 @@ CodegenContext codegen_ctx;
 
 
 typedef struct { int offset; bool is_param; } LocalAddr;
+// Returns bp-relative byte offset for local variables and parameters.
+// Returns offset == -1 for globals (use symbolic label) and local-statics (use _ls{id} label).
 static LocalAddr find_local_addr(Node *node, const char *name)
 {
     // Get the offset from bp of the local variable in node.
@@ -290,28 +292,41 @@ void gen_pushi(int val)
     emit("%i", val);
     emit("push");
 }
-void gen_logor()
-{
-    int l1 = new_label();
-    int l2 = new_label();
-    gen_jnz(l1);
-    gen_pop();
-    gen_jnz(l1);
-    gen_j(l2);
-    gen_label(l1);
-    gen_imm(1);
-    gen_label(l2);
+// Forward declaration needed by gen_logor_expr / gen_logand_expr below.
+void gen_expr(Node *node);
 
-}
-void gen_logand()
+// Short-circuit logical OR: if lhs != 0 result is 1 without evaluating rhs.
+// Self-contained — does not push or pop; r0 holds the result on exit.
+static void gen_logor_expr(Node *lhs, Node *rhs)
 {
-    int l1 = new_label();
-    int l2 = new_label();
-    gen_jz(l1);
-    gen_pop();
-    gen_jz(l1);
+    int l_true = new_label();
+    int l_end  = new_label();
+    gen_expr(lhs);
+    gen_jnz(l_true);   // lhs != 0 → skip rhs
+    gen_expr(rhs);
+    gen_jnz(l_true);
+    gen_imm(0);
+    gen_j(l_end);
+    gen_label(l_true);
     gen_imm(1);
-    gen_label(l1);
+    gen_label(l_end);
+}
+
+// Short-circuit logical AND: if lhs == 0 result is 0 without evaluating rhs.
+// Self-contained — does not push or pop; r0 holds the result on exit.
+static void gen_logand_expr(Node *lhs, Node *rhs)
+{
+    int l_false = new_label();
+    int l_end   = new_label();
+    gen_expr(lhs);
+    gen_jz(l_false);   // lhs == 0 → skip rhs
+    gen_expr(rhs);
+    gen_jz(l_false);
+    gen_imm(1);
+    gen_j(l_end);
+    gen_label(l_false);
+    gen_imm(0);
+    gen_label(l_end);
 }
 void gen_st(int s)
 {
@@ -627,6 +642,7 @@ void gen_cast(Type *src, Type *dst)
 void gen_expr(Node *node)
 {
     printf(";%s %s %s\n", __func__, nodestr(node->kind), node_ident_str(node));
+    // ===== Binary operators =====
     if (node->kind == ND_BINOP)
     {
         Node *lhs = node->u.binop.lhs;
@@ -637,6 +653,10 @@ void gen_expr(Node *node)
             gen_expr(rhs);    // result is rhs
             return;
         }
+        // Short-circuit operators must be handled before the lhs push.
+        if (node->op_kind == TK_LOGOR)  { gen_logor_expr(lhs, rhs);  return; }
+        if (node->op_kind == TK_LOGAND) { gen_logand_expr(lhs, rhs); return; }
+
         gen_expr(lhs);
         gen_push();
         gen_expr(rhs);
@@ -669,8 +689,6 @@ void gen_expr(Node *node)
             case TK_NE:        gen_ne();     return;
             case TK_SHIFTR:    gen_shiftr(); return;
             case TK_SHIFTL:    gen_shiftl(); return;
-            case TK_LOGOR:     gen_logor();  return;
-            case TK_LOGAND:    gen_logand(); return;
             case TK_BITOR:     gen_bitor();  return;
             case TK_BITXOR:    gen_bitxor(); return;
             case TK_AMPERSAND: gen_bitand(); return;
@@ -678,6 +696,7 @@ void gen_expr(Node *node)
             default: error("BINOP op_kind %d not handled in codegen", node->op_kind);
         }
     }
+    // ===== Literals =====
     else if (node->kind == ND_LITERAL)
     {
         if (node->strval)
@@ -690,38 +709,33 @@ void gen_expr(Node *node)
         else
             gen_imm((int)node->ival);
     }
+    // ===== Identifiers and function calls =====
     else if (node->kind == ND_IDENT)
     {
         Symbol *sym = node->symbol;
-        if (istype_function(sym->type) && node->is_function)
+        if (sym->is_enum_const)
         {
-            // Direct named call: myfunc(args)
-            gen_callfunction(node);
+            // Enum constant: inline the integer value; no memory load.
+            gen_imm(sym->offset);
         }
-        else if (istype_function(sym->type) && !node->is_function)
+        else if (node->is_function)
         {
-            // Function name used as a value: fp = myfunc
-            gen_varaddr_from_ident(node, sym->name);
-        }
-        else if (istype_ptr(sym->type)
-                 && sym->type->u.ptr.pointee->base == TB_FUNCTION
-                 && node->is_function)
-        {
-            // Indirect call through function pointer variable: fp(args)
-            gen_callfunction_via_ptr(node);
-        }
-        else if (node->symbol->is_enum_const)
-        {
-            gen_imm(node->symbol->offset);
+            // Call context: the identifier appears as the callee of a call expression.
+            if (istype_function(sym->type))
+                gen_callfunction(node);          // direct call: myfunc(args)
+            else if (istype_ptr(sym->type))
+                gen_callfunction_via_ptr(node);  // indirect call via ptr: fp(args)
         }
         else
         {
+            // Value context: load or address of the variable.
             gen_varaddr(node);
-            // Don't fetch from address if array (array name IS the address)
-            if (!istype_array(node->symbol->type))
-                gen_ld(node->symbol->type->size);
+            // Don't fetch from address if array/function (name IS the address).
+            if (!istype_array(sym->type) && !istype_function(sym->type))
+                gen_ld(sym->type->size);
         }
     }
+    // ===== Unary operators =====
     else if (node->kind == ND_UNARYOP)
     {
         // Use u.unaryop.operand directly
@@ -815,6 +829,7 @@ void gen_expr(Node *node)
         default: error("unary op_kind %d not handled in codegen", node->op_kind);
         }
     }
+    // ===== Assignment =====
     else if (node->kind == ND_ASSIGN)
     {
         Node *lhs = node->u.binop.lhs;
@@ -824,6 +839,7 @@ void gen_expr(Node *node)
         gen_expr(rhs);
         gen_st(lhs->type->size);
     }
+    // ===== Compound assignment =====
     else if (node->kind == ND_COMPOUND_ASSIGN)
     {
         // Evaluate LHS address exactly once, then: load old value, compute rhs, apply op, store.
@@ -873,6 +889,7 @@ void gen_expr(Node *node)
         }
         gen_st(sz);
     }
+    // ===== Cast =====
     else if (node->kind == ND_CAST)
     {
         // The type conversion is defined by the type of the expression in child 1 and the
@@ -881,6 +898,7 @@ void gen_expr(Node *node)
         gen_expr(node->u.cast.expr);
         gen_cast(node->u.cast.expr->type, node->type);
     }
+    // ===== Member access =====
     else if (node->kind == ND_MEMBER && node->is_function)
     {
         // Call through a function-pointer struct member: s.fp(args) or s->fp(args)
@@ -895,6 +913,7 @@ void gen_expr(Node *node)
         gen_addr(node);         // handles both . and ->
         gen_ld(node->type->size);
     }
+    // ===== Ternary =====
     else if (node->kind == ND_TERNARY)
     {
         Node *cond  = node->u.ternary.cond;
@@ -910,6 +929,7 @@ void gen_expr(Node *node)
         gen_expr(else_);
         gen_label(l_end);
     }
+    // ===== VA_START / VA_ARG / VA_END =====
     else if (node->kind == ND_VA_START)
     {
         // va_start(ap, last_param)
@@ -1078,7 +1098,7 @@ void gen_continuestmt(Node *node)
 void gen_exprstmt(Node *node)
 {
     // printf(";%s\n", __func__);
-    gen_expr(node->u.exprstmt.decl);
+    gen_expr(node->u.exprstmt.expr);
 }
 bool is_constexpr(Node *n)
 {

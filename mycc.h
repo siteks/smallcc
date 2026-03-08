@@ -126,7 +126,7 @@ typedef enum
 // It is NOT the type representation — that is Type.
 typedef enum
 {
-    DS_DERIVED  = 0,
+    DS_NONE     = 0,     // initial value; no specifiers collected yet
     DS_VOID     = 0x1,
     DS_CHAR     = 0x2,
     DS_SHORT    = 0x4,
@@ -243,7 +243,12 @@ struct Symbol
 {
     const char *name;
     Type   *type;
-    int     offset;
+    int     offset;     // Meaning depends on symbol kind:
+                        //   global (depth==0):          byte position in global data area
+                        //   local (is_param==false):    accumulated local size (lea -(go+offset))
+                        //   parameter (is_param):       bytes above bp (lea +(go+offset))
+                        //   enum constant (is_enum_const): integer value (not an address)
+                        //   local static (is_local_static): local_static_counter ID (_ls{id})
     bool    is_param;
     bool    is_enum_const;
     bool    is_static;      // file-scope static → name-mangled label
@@ -286,7 +291,7 @@ struct Node
         struct { Node *selector; Node *body; } switchstmt;  // ND_SWITCHSTMT
         struct { Node *expr; } returnstmt;                  // ND_RETURNSTMT
         struct { char *name; Node *stmt; } labelstmt;       // ND_LABELSTMT
-        struct { Node *decl; } exprstmt;                    // ND_EXPRSTMT
+        struct { Node *expr; } exprstmt;                    // ND_EXPRSTMT
         struct { Node *type_decl; Node *expr; } cast;       // ND_CAST
         struct { Node *cond; Node *then_; Node *else_; } ternary; // ND_TERNARY
         struct { Node *lhs; Node *rhs; } compound_assign; // ND_COMPOUND_ASSIGN
@@ -318,6 +323,10 @@ struct Node
 
 Node *program();
 void print_tree(Node *node, int depth);
+// Walk a node's logical children. Cat A (expressions) and Cat B (statements) store
+// children in u.* union fields; Cat C (containers: ND_PROGRAM, ND_COMPSTMT,
+// ND_DECLARATION, ND_DECLARATOR, ND_INITLIST etc.) store them in children[].
+// fn is called for each child in declaration order.
 void for_each_child(Node *node, void (*fn)(Node *child, void *ctx), void *ctx);
 
 // ---------------------------------------------------------------

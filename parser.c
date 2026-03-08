@@ -423,7 +423,10 @@ static Node *unary_expr()
     // Keep pointer to array or func ident, so we can reference later during fixup
     Symbol *s = node->symbol;
     int array_depth = 0;
-    // Keep ref to primary expression node so we can mark as function call is necessary
+    // pex_node tracks the "most recent base node" in the postfix chain.
+    // When '(' is encountered, pex_node->is_function is set — marking that node as the
+    // call site. For simple calls: pex_node == node (the ident/literal). For member calls
+    // (s.fp() or s->fp()): pex_node is the ND_MEMBER node after processing '.' or '->'.
     Node *pex_node = node;
     while(is_postfix(token_ctx.current->kind))
     {
@@ -1298,7 +1301,7 @@ static Node *stmt()
         {
             unget_token();
             node->kind = ND_EXPRSTMT;
-            node->u.exprstmt.decl = expr();
+            node->u.exprstmt.expr = expr();
             expect(TK_SEMICOLON);
         }
     }
@@ -1313,7 +1316,7 @@ static Node *stmt()
     else if (token_ctx.current->kind != TK_SEMICOLON)
     {
         node->kind = ND_EXPRSTMT;
-        node->u.exprstmt.decl = expr();
+        node->u.exprstmt.expr = expr();
         expect(TK_SEMICOLON);
     }
     return node;
@@ -1511,7 +1514,7 @@ void for_each_child(Node *node, void (*fn)(Node *child, void *ctx), void *ctx)
         call_fn(node->u.returnstmt.expr, fn, ctx);
         return;
     case ND_EXPRSTMT:
-        call_fn(node->u.exprstmt.decl, fn, ctx);
+        call_fn(node->u.exprstmt.expr, fn, ctx);
         return;
     case ND_LABELSTMT:
         call_fn(node->u.labelstmt.stmt, fn, ctx);
@@ -1632,7 +1635,7 @@ static Node **get_u_child_slot(Node *n, int child)
         if (child == 1) return &n->u.dowhile.cond;
         break;
     case ND_EXPRSTMT:
-        if (child == 0) return &n->u.exprstmt.decl;
+        if (child == 0) return &n->u.exprstmt.expr;
         break;
     case ND_VA_START:
         if (child == 0) return &n->u.vastart.ap;
@@ -1671,6 +1674,9 @@ void insert_cast(Node *n, int child, Type *t)
     if (n->children && child < n->child_count)
         n->children[child] = c;
 }
+// Resolve operand types for a binary expression and insert ND_CAST nodes
+// for implicit arithmetic conversions (C89 §3.2.1.5 usual arithmetic conversions).
+// Returns the resulting type after conversion.
 Type *check_operands(Node *n)
 {
     // Perform the 'usual arithmetic conversions' (C89 §3.2.1.5).
@@ -1719,6 +1725,8 @@ Type *check_operands(Node *n)
     Node *result_lhs = n->u.binop.lhs;
     return result_lhs->type;
 }
+// Resolve the operand type for a unary expression, inserting ND_CAST nodes
+// for implicit integer promotions (C89 §3.2.1.1). Returns the result type.
 Type *check_unary_operand(Node *n)
 {
     // Integer promotions for unary operands (C89 §3.2.1.1).
@@ -1767,8 +1775,8 @@ static void propagate_types_visitor(Node *child, void *ctx)
 }
 void propagate_types(Node *p, Node *n)
 {
-    // Traverse expressions in tree, propagating types from literals and
-    // variables up to unary and binary operators
+    // Post-order walk: children are visited first so their types are resolved before
+    // this node examines them. Mirrors the semantics of bottom-up type inference.
     DBG_FUNC();
     for_each_child(n, propagate_types_visitor, n);
     if (!p)
