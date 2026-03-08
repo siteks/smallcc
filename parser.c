@@ -1706,10 +1706,14 @@ void insert_cast(Node *n, int child, Type *t)
         if (child == 0) n->nu.forstmt.init = c;
         else if (child == 1) n->nu.forstmt.cond = c;
         else if (child == 2) n->nu.forstmt.inc = c;
-    } else if (n->kind == ND_DOWHILESTMT && child == 1) {
-        n->nu.dowhile.cond = c;
+        else if (child == 3) n->nu.forstmt.body = c;
+    } else if (n->kind == ND_DOWHILESTMT) {
+        if (child == 0) n->nu.dowhile.body = c;
+        else if (child == 1) n->nu.dowhile.cond = c;
     } else if (n->kind == ND_IFSTMT && child == 0) {
         n->nu.ifstmt.cond = c;
+    } else if (n->kind == ND_EXPRSTMT && child == 0) {
+        n->nu.exprstmt.decl = c;
     }
 }
 Type *check_operands(Node *n)

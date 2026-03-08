@@ -1006,14 +1006,18 @@ void gen_decl(Node *node);  // forward declaration
 void gen_forstmt(Node *node)
 {
     printf(";%s\n", __func__);
-    // children: [init, cond, inc, body]
+    // Use nu.forstmt fields (kept in sync by insert_cast)
+    Node *init = node->nu.forstmt.init;
+    Node *cond = node->nu.forstmt.cond;
+    Node *inc  = node->nu.forstmt.inc;
+    Node *body = node->nu.forstmt.body;
     // If the init was a declaration, node->symtable holds the for-init scope.
     if (node->symtable)
         gen_adj(-node->symtable->size);
-    if (node->children[0]->kind == ND_DECLARATION)
-        gen_decl(node->children[0]);
-    else if (node->children[0]->kind != ND_EMPTY)
-        gen_expr(node->children[0]);
+    if (init->kind == ND_DECLARATION)
+        gen_decl(init);
+    else if (init->kind != ND_EMPTY)
+        gen_expr(init);
     int lloop  = new_label();
     int lcont  = new_label();
     int lbreak = new_label();
@@ -1021,14 +1025,14 @@ void gen_forstmt(Node *node)
     codegen_ctx.cont_labels[codegen_ctx.loop_depth]  = lcont;
     codegen_ctx.loop_depth++;
     gen_label(lloop);
-    if (node->children[1]->kind != ND_EMPTY) {
-        gen_expr(node->children[1]);
+    if (cond->kind != ND_EMPTY) {
+        gen_expr(cond);
         gen_jz(lbreak);
     }
-    gen_stmt(node->children[3]);
+    gen_stmt(body);
     gen_label(lcont);
-    if (node->children[2]->kind != ND_EMPTY)
-        gen_expr(node->children[2]);
+    if (inc->kind != ND_EMPTY)
+        gen_expr(inc);
     gen_j(lloop);
     gen_label(lbreak);
     codegen_ctx.loop_depth--;
@@ -1038,7 +1042,9 @@ void gen_forstmt(Node *node)
 void gen_dowhilestmt(Node *node)
 {
     printf(";%s\n", __func__);
-    // children: [body, cond]
+    // Use nu.dowhile fields (kept in sync by insert_cast)
+    Node *body = node->nu.dowhile.body;
+    Node *cond = node->nu.dowhile.cond;
     int lloop  = new_label();
     int lcont  = new_label();
     int lbreak = new_label();
@@ -1046,9 +1052,9 @@ void gen_dowhilestmt(Node *node)
     codegen_ctx.cont_labels[codegen_ctx.loop_depth]  = lcont;
     codegen_ctx.loop_depth++;
     gen_label(lloop);
-    gen_stmt(node->children[0]);
+    gen_stmt(body);
     gen_label(lcont);
-    gen_expr(node->children[1]);
+    gen_expr(cond);
     gen_jnz(lloop);
     gen_label(lbreak);
     codegen_ctx.loop_depth--;
@@ -1064,7 +1070,8 @@ void gen_continuestmt(Node *node)
 void gen_exprstmt(Node *node)
 {
     // printf(";%s\n", __func__);
-    gen_expr(node->children[0]);
+    // Use nu.exprstmt.decl (kept in sync by insert_cast)
+    gen_expr(node->nu.exprstmt.decl);
 }
 bool is_constexpr(Node *n)
 {
