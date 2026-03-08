@@ -483,8 +483,4 @@ extern ExternContext extern_ctx;
 // Legacy current_global_tu macro
 #define current_global_tu (type_ctx.current_tu)
 
-// Convenience macros for tokenizer globals
-#define token (token_ctx.current)
-#define user_input (token_ctx.user_input)
-
 #endif

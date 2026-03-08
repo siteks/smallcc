@@ -16,7 +16,7 @@ void error(const char *fmt, ...)
 static char *read_file(const char *path)
 {
     FILE *f = fopen(path, "r");
-    if (!f) { fprintf(stderr, "Cannot open %s\n", path); exit(1); }
+    if (!f) { error("Cannot open %s\n", path); }
     fseek(f, 0, SEEK_END);
     long sz = ftell(f);
     rewind(f);
@@ -101,17 +101,23 @@ int main(int argc, char **argv)
         make_basic_types();
         prepopulate_extern_syms();
 
-        user_input = source;
-        token = tokenise(source);
+        token_ctx.user_input = source;
+        token_ctx.current = tokenise(source);
+#ifdef DEBUG_ENABLED
         print_tokens();
+#endif
         Node *node = program();
+#ifdef DEBUG_ENABLED
         print_tree(node, 0);
         print_symbol_table(type_ctx.symbol_table, 0);
         print_type_table();
+#endif
         propagate_types(0, node);
+#ifdef DEBUG_ENABLED
         print_tree(node, 0);
         print_symbol_table(type_ctx.symbol_table, 0);
         print_type_table();
+#endif
 
         gen_code(node, tu);
         harvest_globals();

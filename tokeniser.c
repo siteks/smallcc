@@ -143,30 +143,30 @@ const char *token_str(Token_kind tk)
 // Note: token_ctx.last is part of TokenContext
 void unget_token()
 {
-    // Go back to the last token
+    // Go back to the last token_ctx.current
     if (token_ctx.last)
-        token = token_ctx.last;
+        token_ctx.current = token_ctx.last;
     else
-        error("No last token to go back to!\n");
+        error("No last token_ctx.current to go back to!\n");
 }
 char *expect(Token_kind tk)
 {
-    fprintf(stderr, "%s %s\n", __func__, token->val);
-    if (token->kind == tk)
+    fprintf(stderr, "%s %s\n", __func__, token_ctx.current->val);
+    if (token_ctx.current->kind == tk)
     {
-        char *val   = token->val;
-        token_ctx.last  = token;
-        token       = token->next;
+        char *val   = token_ctx.current->val;
+        token_ctx.last  = token_ctx.current;
+        token_ctx.current       = token_ctx.current->next;
         return val;
     }
     else
     {
         char space[1024];
         memset(space, 0x20, 1024);
-        space[token->loc] = 0;
-        fprintf(stderr, "%s\n", user_input);
+        space[token_ctx.current->loc] = 0;
+        fprintf(stderr, "%s\n", token_ctx.user_input);
         fprintf(stderr, "%s^\n", space);
-        error("Expecting '%s' got '%s'\n", token_str(tk), token_str(token->kind));
+        error("Expecting '%s' got '%s'\n", token_str(tk), token_str(token_ctx.current->kind));
     }
     return 0;
 }
@@ -174,32 +174,32 @@ char *expect(Token_kind tk)
 
 bool at_eof()
 {
-    return token->kind == TK_EOF;
+    return token_ctx.current->kind == TK_EOF;
 }
 
 int expect_number()
 {
-    if (token->kind == TK_CONSTINT)
+    if (token_ctx.current->kind == TK_CONSTINT)
     {
-        int val     = (int)token->ival;
-        token_ctx.last  = token;
-        token       = token->next;
+        int val     = (int)token_ctx.current->ival;
+        token_ctx.last  = token_ctx.current;
+        token_ctx.current       = token_ctx.current->next;
         return val;
     }
-    error("Expected integer constant, got '%s'\n", token->val);
+    error("Expected integer constant, got '%s'\n", token_ctx.current->val);
     return 0;
 }
 
 char *expect_ident()
 {
-    if (token->kind == TK_IDENT)
+    if (token_ctx.current->kind == TK_IDENT)
     {
-        char *val   = token->val;
-        token_ctx.last  = token;
-        token       = token->next;
+        char *val   = token_ctx.current->val;
+        token_ctx.last  = token_ctx.current;
+        token_ctx.current       = token_ctx.current->next;
         return val;
     }
-    error("Expected identifier, got '%s'\n", token->val);
+    error("Expected identifier, got '%s'\n", token_ctx.current->val);
     return 0;
 }
 
@@ -208,7 +208,7 @@ Token *new_token(Token_kind kind, Token *cur, char *str, int len)
     Token *tok  = calloc(1, sizeof(Token));
     tok->kind   = kind;
     tok->val    = calloc(1, len + 1);
-    tok->loc    = str - user_input;
+    tok->loc    = str - token_ctx.user_input;
     if (len)
         memcpy(tok->val, str, len);
     cur->next   = tok;
@@ -427,7 +427,7 @@ Token *tokenise(char *p)
             strtok->kind = TK_STRING;
             strtok->val  = buf;
             strtok->ival = len;
-            strtok->loc  = start - user_input;
+            strtok->loc  = start - token_ctx.user_input;
             cur->next = strtok;
             cur = strtok;
             continue;
@@ -441,7 +441,7 @@ Token *tokenise(char *p)
 
 void print_tokens()
 {
-    for(Token *p = token; p; p = p->next)
+    for(Token *p = token_ctx.current; p; p = p->next)
     {
         fprintf(stderr, "Kind:%s val:%s\n", token_str(p->kind), p->val);
     }

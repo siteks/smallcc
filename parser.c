@@ -229,9 +229,9 @@ static Node *add_child(Node *parent, Node *child)
 
 static Node *primary_expr()
 {
-    DBG_FUNC_TOKEN(token);
+    DBG_FUNC_TOKEN(token_ctx.current);
     Node *node;
-    if (token->kind == TK_IDENT && !strcmp(token->val, "va_start"))
+    if (token_ctx.current->kind == TK_IDENT && !strcmp(token_ctx.current->val, "va_start"))
     {
         expect(TK_IDENT);
         expect(TK_LPAREN);
@@ -243,7 +243,7 @@ static Node *primary_expr()
         expect(TK_RPAREN);
         return node;
     }
-    else if (token->kind == TK_IDENT && !strcmp(token->val, "va_arg"))
+    else if (token_ctx.current->kind == TK_IDENT && !strcmp(token_ctx.current->val, "va_arg"))
     {
         expect(TK_IDENT);
         expect(TK_LPAREN);
@@ -255,7 +255,7 @@ static Node *primary_expr()
         expect(TK_RPAREN);
         return node;
     }
-    else if (token->kind == TK_IDENT && !strcmp(token->val, "va_end"))
+    else if (token_ctx.current->kind == TK_IDENT && !strcmp(token_ctx.current->val, "va_end"))
     {
         expect(TK_IDENT);
         expect(TK_LPAREN);
@@ -265,14 +265,14 @@ static Node *primary_expr()
         expect(TK_RPAREN);
         return node;
     }
-    else if (token->kind == TK_IDENT)
+    else if (token_ctx.current->kind == TK_IDENT)
     {
         node = new_node(ND_IDENT, expect(TK_IDENT), true);
     }
-    else if (token->kind == TK_CONSTINT || token->kind == TK_CONSTFLT)
+    else if (token_ctx.current->kind == TK_CONSTINT || token_ctx.current->kind == TK_CONSTFLT)
     {
-        Token *tk = token;
-        node = new_node(ND_LITERAL, expect(token->kind), true);
+        Token *tk = token_ctx.current;
+        node = new_node(ND_LITERAL, expect(token_ctx.current->kind), true);
         int slen = strlen(tk->val);
         Const_suffix cs = CS_NONE;
         // Get the suffix
@@ -330,22 +330,22 @@ static Node *primary_expr()
         // node->type = insert_type(node, "");
 
     }
-    else if (token->kind == TK_CHARACTER)
+    else if (token_ctx.current->kind == TK_CHARACTER)
     {
-        int char_val = (int)token->val[0];
+        int char_val = (int)token_ctx.current->val[0];
         char c[64];
         sprintf(c, "%d", char_val);
         expect(TK_CHARACTER);
-        DBG_PRINT("%s %s\n", c, token->val);
+        DBG_PRINT("%s %s\n", c, token_ctx.current->val);
         node = new_node(ND_LITERAL, c, true);
         node->ival = char_val;
         node->type = t_char;
     }
-    else if (token->kind == TK_STRING)
+    else if (token_ctx.current->kind == TK_STRING)
     {
         node = new_node(ND_LITERAL, NULL, true);
-        node->strval     = token->val;
-        node->strval_len = (int)token->ival;
+        node->strval     = token_ctx.current->val;
+        node->strval_len = (int)token_ctx.current->ival;
         node->type       = get_pointer_type(t_char);
         expect(TK_STRING);
     }
@@ -368,14 +368,14 @@ bool is_postfix(Token_kind tk)
 }
 static Node *unary_expr()
 {
-    DBG_FUNC_TOKEN(token);
+    DBG_FUNC_TOKEN(token_ctx.current);
     Node *node = 0;
-    if (token->kind == TK_SIZEOF)
+    if (token_ctx.current->kind == TK_SIZEOF)
     {
-        token = token->next;
+        token_ctx.current = token_ctx.current->next;
         node = new_node(ND_LITERAL, NULL, true);
         node->type = t_int;
-        if (token->kind == TK_LPAREN && is_type_name_or_type(token->next))
+        if (token_ctx.current->kind == TK_LPAREN && is_type_name_or_type(token_ctx.current->next))
         {
             expect(TK_LPAREN);
             Node *tn = type_name();
@@ -385,7 +385,7 @@ static Node *unary_expr()
         else
         {
             Node *inner;
-            if (token->kind == TK_LPAREN)
+            if (token_ctx.current->kind == TK_LPAREN)
             {
                 expect(TK_LPAREN);
                 inner = unary_expr();
@@ -400,23 +400,23 @@ static Node *unary_expr()
         }
         return node;
     }
-    else if (token->kind == TK_INC || token->kind == TK_DEC
-            ||  token->kind == TK_AMPERSAND || token->kind == TK_STAR
-            ||  token->kind == TK_PLUS || token->kind == TK_MINUS
-            ||  token->kind == TK_BANG || token->kind == TK_TWIDDLE)
+    else if (token_ctx.current->kind == TK_INC || token_ctx.current->kind == TK_DEC
+            ||  token_ctx.current->kind == TK_AMPERSAND || token_ctx.current->kind == TK_STAR
+            ||  token_ctx.current->kind == TK_PLUS || token_ctx.current->kind == TK_MINUS
+            ||  token_ctx.current->kind == TK_BANG || token_ctx.current->kind == TK_TWIDDLE)
     {
-        Token_kind k = token->kind;
-        token = token->next;  // consume the operator token
+        Token_kind k = token_ctx.current->kind;
+        token_ctx.current = token_ctx.current->next;  // consume the operator token_ctx.current
         node = new_node(ND_UNARYOP, NULL, true);
         node->op_kind = k;
         add_child(node, unary_expr());
     }
-    else if (token->kind == TK_IDENT
-            || token->kind == TK_CONSTINT
-            || token->kind == TK_CONSTFLT
-            || token->kind == TK_CHARACTER
-            || token->kind == TK_STRING
-            || token->kind == TK_LPAREN)
+    else if (token_ctx.current->kind == TK_IDENT
+            || token_ctx.current->kind == TK_CONSTINT
+            || token_ctx.current->kind == TK_CONSTFLT
+            || token_ctx.current->kind == TK_CHARACTER
+            || token_ctx.current->kind == TK_STRING
+            || token_ctx.current->kind == TK_LPAREN)
     {
         node = primary_expr();
         if (node->kind == ND_IDENT)
@@ -431,9 +431,9 @@ static Node *unary_expr()
     int array_depth = 0;
     // Keep ref to primary expression node so we can mark as function call is necessary
     Node *pex_node = node;
-    while(is_postfix(token->kind))
+    while(is_postfix(token_ctx.current->kind))
     {
-        switch (token->kind)
+        switch (token_ctx.current->kind)
         {
             case(TK_LBRACKET):
                 // rewrite as per A.7.3.1: E1[E2] equiv *((E1) + (E2))
@@ -468,7 +468,7 @@ static Node *unary_expr()
                     }
                     if (!s)
                         error("No ident before left bracket\n");
-                    expect(token->kind);
+                    expect(token_ctx.current->kind);
                     Node *e1 = node;
                     Node *add;
                     // Walk type chain to current array depth
@@ -512,12 +512,12 @@ static Node *unary_expr()
                 // Function call
                 expect(TK_LPAREN);
                 pex_node->is_function = true;
-                if (token->kind != TK_RPAREN)
+                if (token_ctx.current->kind != TK_RPAREN)
                 {
                     add_child(node, assign_expr());
-                    while (token->kind == TK_COMMA)
+                    while (token_ctx.current->kind == TK_COMMA)
                     {
-                        token = token->next;
+                        token_ctx.current = token_ctx.current->next;
                         add_child(node, assign_expr());
                     }
                 }
@@ -525,7 +525,7 @@ static Node *unary_expr()
                 break;
             case(TK_DOT):
             {
-                expect(token->kind);
+                expect(token_ctx.current->kind);
                 Node *n = new_node(ND_MEMBER, NULL, true);
                 n->op_kind = TK_DOT;
                 add_child(n, node);
@@ -548,9 +548,9 @@ static Node *unary_expr()
             case(TK_INC):
             case(TK_DEC):
             {
-                Token_kind post_k = (token->kind == TK_INC) ? TK_POST_INC : TK_POST_DEC;
-                char *op = (token->kind == TK_INC) ? "post++" : "post--";
-                token = token->next;
+                Token_kind post_k = (token_ctx.current->kind == TK_INC) ? TK_POST_INC : TK_POST_DEC;
+                char *op = (token_ctx.current->kind == TK_INC) ? "post++" : "post--";
+                token_ctx.current = token_ctx.current->next;
                 Node *n = new_node(ND_UNARYOP, op, true);
                 n->op_kind = post_k;
                 add_child(n, node);
@@ -580,16 +580,16 @@ static Node *type_name()
     // At least one of (void, char..., typename, const, volatile), with optional abst-decl
     // This is a strict subset of declarator
     // We are going to ignore const, volatile
-    // if (is_type_name_or_type(token))
+    // if (is_type_name_or_type(token_ctx.current))
     // {
-    //     return new_node(ND_TYPE_NAME, expect(token->kind));
+    //     return new_node(ND_TYPE_NAME, expect(token_ctx.current->kind));
     // }
     Node *node = new_node(ND_DECLARATION, 0, true);
-    if (token->kind == TK_IDENT && is_typedef_name(token->val))
+    if (token_ctx.current->kind == TK_IDENT && is_typedef_name(token_ctx.current->val))
     {
-        node->type = find_typedef_type(token->val);
+        node->type = find_typedef_type(token_ctx.current->val);
         expect(TK_IDENT);
-        if (token->kind == TK_STAR)
+        if (token_ctx.current->kind == TK_STAR)
         {
             expect(TK_STAR);
             node->type = get_pointer_type(node->type);
@@ -601,7 +601,7 @@ static Node *type_name()
     {
         enum_decl(node);
     }
-    while(token->kind != TK_RPAREN)
+    while(token_ctx.current->kind != TK_RPAREN)
     {
         add_child(node, declarator());
     }
@@ -611,21 +611,21 @@ static Node *type_name()
 }
 static Node *cast_expr()
 {
-    DBG_FUNC_TOKEN(token);
-    if (token->kind != TK_LPAREN)
+    DBG_FUNC_TOKEN(token_ctx.current);
+    if (token_ctx.current->kind != TK_LPAREN)
     {
         return unary_expr();
     }
     // May be either a cast or a primary expr with parens eg "(" expr ")". 
-    // If the ident following the current token is a type name or 
+    // If the ident following the current token_ctx.current is a type name or 
     // const|volatile, this is a cast. A cast may be followed by a cast
     expect(TK_LPAREN);
-    if (is_type_name_or_type(token))
+    if (is_type_name_or_type(token_ctx.current))
     {
         // This is a cast, create the node and add the type elements as
         // children
         Node *node = new_node(ND_CAST, 0, true);
-        // while (token->kind != TK_RPAREN)
+        // while (token_ctx.current->kind != TK_RPAREN)
         // {
         //     add_child(node, type_name());
         // }
@@ -638,7 +638,7 @@ static Node *cast_expr()
     }
     else
     {
-        // We checked ident and it was not a type, so rewind one token
+        // We checked ident and it was not a type, so rewind one token_ctx.current
         // and proceed as unary_expr 
         unget_token();
         return unary_expr();
@@ -646,11 +646,11 @@ static Node *cast_expr()
 }
 static Node *mult_expr()
 {
-    DBG_FUNC_TOKEN(token);
+    DBG_FUNC_TOKEN(token_ctx.current);
     Node *node = cast_expr();
-    while (token->kind == TK_STAR || token->kind == TK_SLASH || token->kind == TK_PERCENT)
+    while (token_ctx.current->kind == TK_STAR || token_ctx.current->kind == TK_SLASH || token_ctx.current->kind == TK_PERCENT)
     {
-        Token_kind k = token->kind;
+        Token_kind k = token_ctx.current->kind;
         expect(k);
         Node *enode = new_node(ND_BINOP, NULL, true);
         enode->op_kind = k;
@@ -672,11 +672,11 @@ void insert_scale(Node *n, int child, int size)
 }
 static Node *add_expr()
 {
-    DBG_FUNC_TOKEN(token);
+    DBG_FUNC_TOKEN(token_ctx.current);
     Node *node = mult_expr();
-    while (token->kind == TK_PLUS || token->kind == TK_MINUS)
+    while (token_ctx.current->kind == TK_PLUS || token_ctx.current->kind == TK_MINUS)
     {
-        Token_kind k = token->kind;
+        Token_kind k = token_ctx.current->kind;
         expect(k);
         Node *enode = new_node(ND_BINOP, NULL, true);
         enode->op_kind = k;
@@ -688,11 +688,11 @@ static Node *add_expr()
 }
 static Node *shift_expr()
 {
-    DBG_FUNC_TOKEN(token);
+    DBG_FUNC_TOKEN(token_ctx.current);
     Node *node = add_expr();
-    while (token->kind == TK_SHIFTL || token->kind == TK_SHIFTR)
+    while (token_ctx.current->kind == TK_SHIFTL || token_ctx.current->kind == TK_SHIFTR)
     {
-        Token_kind k = token->kind;
+        Token_kind k = token_ctx.current->kind;
         expect(k);
         Node *enode = new_node(ND_BINOP, NULL, true);
         enode->op_kind = k;
@@ -704,11 +704,11 @@ static Node *shift_expr()
 }
 static Node *rel_expr()
 {
-    DBG_FUNC_TOKEN(token);
+    DBG_FUNC_TOKEN(token_ctx.current);
     Node *node = shift_expr();
-    while (token->kind == TK_LT || token->kind == TK_LE || token->kind == TK_GT || token->kind == TK_GE)
+    while (token_ctx.current->kind == TK_LT || token_ctx.current->kind == TK_LE || token_ctx.current->kind == TK_GT || token_ctx.current->kind == TK_GE)
     {
-        Token_kind k = token->kind;
+        Token_kind k = token_ctx.current->kind;
         expect(k);
         Node *enode = new_node(ND_BINOP, NULL, true);
         enode->op_kind = k;
@@ -720,11 +720,11 @@ static Node *rel_expr()
 }
 static Node *equal_expr()
 {
-    DBG_FUNC_TOKEN(token);
+    DBG_FUNC_TOKEN(token_ctx.current);
     Node *node = rel_expr();
-    while (token->kind == TK_EQ || token->kind == TK_NE)
+    while (token_ctx.current->kind == TK_EQ || token_ctx.current->kind == TK_NE)
     {
-        Token_kind k = token->kind;
+        Token_kind k = token_ctx.current->kind;
         expect(k);
         Node *enode = new_node(ND_BINOP, NULL, true);
         enode->op_kind = k;
@@ -736,11 +736,11 @@ static Node *equal_expr()
 }
 static Node *bitand_expr()
 {
-    DBG_FUNC_TOKEN(token);
+    DBG_FUNC_TOKEN(token_ctx.current);
     Node *node = equal_expr();
-    while (token->kind == TK_AMPERSAND)
+    while (token_ctx.current->kind == TK_AMPERSAND)
     {
-        Token_kind k = token->kind;
+        Token_kind k = token_ctx.current->kind;
         expect(k);
         Node *enode = new_node(ND_BINOP, NULL, true);
         enode->op_kind = k;
@@ -752,11 +752,11 @@ static Node *bitand_expr()
 }
 static Node *bitxor_expr()
 {
-    DBG_FUNC_TOKEN(token);
+    DBG_FUNC_TOKEN(token_ctx.current);
     Node *node = bitand_expr();
-    while (token->kind == TK_BITXOR)
+    while (token_ctx.current->kind == TK_BITXOR)
     {
-        Token_kind k = token->kind;
+        Token_kind k = token_ctx.current->kind;
         expect(k);
         Node *enode = new_node(ND_BINOP, NULL, true);
         enode->op_kind = k;
@@ -768,11 +768,11 @@ static Node *bitxor_expr()
 }
 static Node *bitor_expr()
 {
-    DBG_FUNC_TOKEN(token);
+    DBG_FUNC_TOKEN(token_ctx.current);
     Node *node = bitxor_expr();
-    while (token->kind == TK_BITOR)
+    while (token_ctx.current->kind == TK_BITOR)
     {
-        Token_kind k = token->kind;
+        Token_kind k = token_ctx.current->kind;
         expect(k);
         Node *enode = new_node(ND_BINOP, NULL, true);
         enode->op_kind = k;
@@ -784,11 +784,11 @@ static Node *bitor_expr()
 }
 static Node *logand_expr()
 {
-    DBG_FUNC_TOKEN(token);
+    DBG_FUNC_TOKEN(token_ctx.current);
     Node *node = bitor_expr();
-    while (token->kind == TK_LOGAND)
+    while (token_ctx.current->kind == TK_LOGAND)
     {
-        Token_kind k = token->kind;
+        Token_kind k = token_ctx.current->kind;
         expect(k);
         Node *enode = new_node(ND_BINOP, NULL, true);
         enode->op_kind = k;
@@ -800,11 +800,11 @@ static Node *logand_expr()
 }
 static Node *logor_expr()
 {
-    DBG_FUNC_TOKEN(token);
+    DBG_FUNC_TOKEN(token_ctx.current);
     Node *node = logand_expr();
-    while (token->kind == TK_LOGOR)
+    while (token_ctx.current->kind == TK_LOGOR)
     {
-        Token_kind k = token->kind;
+        Token_kind k = token_ctx.current->kind;
         expect(k);
         Node *enode = new_node(ND_BINOP, NULL, true);
         enode->op_kind = k;
@@ -817,11 +817,11 @@ static Node *logor_expr()
 static Node *assign_expr();
 static Node *cond_expr()
 {
-    DBG_FUNC_TOKEN(token);
+    DBG_FUNC_TOKEN(token_ctx.current);
     Node *node = logor_expr();
-    if (token->kind != TK_QUESTION)
+    if (token_ctx.current->kind != TK_QUESTION)
         return node;
-    token = token->next;    // consume '?'
+    token_ctx.current = token_ctx.current->next;    // consume '?'
     Node *tnode = new_node(ND_TERNARY, NULL, true);
     add_child(tnode, node);
     add_child(tnode, expr());
@@ -831,9 +831,9 @@ static Node *cond_expr()
 }
 static Node *assign_expr()
 {
-    DBG_FUNC_TOKEN(token);
+    DBG_FUNC_TOKEN(token_ctx.current);
     Node *node = cond_expr();
-    if (token->kind == TK_ASSIGN)
+    if (token_ctx.current->kind == TK_ASSIGN)
     {
         Node *anode = new_node(ND_ASSIGN, expect(TK_ASSIGN), true);
         add_child(anode, node);
@@ -850,10 +850,10 @@ static Node *assign_expr()
     };
     Token_kind op_tk = TK_EMPTY;
     for (int i = 0; i < (int)(sizeof(ca_map)/sizeof(ca_map[0])); i++)
-        if (token->kind == ca_map[i].compound) { op_tk = ca_map[i].base; break; }
+        if (token_ctx.current->kind == ca_map[i].compound) { op_tk = ca_map[i].base; break; }
     if (op_tk != TK_EMPTY)
     {
-        token = token->next;        // consume compound token
+        token_ctx.current = token_ctx.current->next;        // consume compound token_ctx.current
         Node *anode = new_node(ND_COMPOUND_ASSIGN, NULL, true);
         anode->op_kind = op_tk;
         add_child(anode, node);
@@ -864,11 +864,11 @@ static Node *assign_expr()
 }
 Node *expr()
 {
-    DBG_FUNC_TOKEN(token);
+    DBG_FUNC_TOKEN(token_ctx.current);
     Node *node = assign_expr();
-    while (token->kind == TK_COMMA)
+    while (token_ctx.current->kind == TK_COMMA)
     {
-        token = token->next;
+        token_ctx.current = token_ctx.current->next;
         Node *enode = new_node(ND_BINOP, NULL, true);
         enode->op_kind = TK_COMMA;
         add_child(enode, node);
@@ -908,11 +908,11 @@ bool is_typequal(Token_kind tk)
 
 static void parse_decl_specifiers(Node *node)
 {
-    while (is_sc_spec(token->kind) || is_typespec(token->kind) || is_typequal(token->kind))
+    while (is_sc_spec(token_ctx.current->kind) || is_typespec(token_ctx.current->kind) || is_typequal(token_ctx.current->kind))
     {
-        if (is_sc_spec(token->kind))  node->sclass   = token->kind;
-        if (is_typespec(token->kind)) node->typespec |= to_typespec(token->kind);
-        expect(token->kind);
+        if (is_sc_spec(token_ctx.current->kind))  node->sclass   = token_ctx.current->kind;
+        if (is_typespec(token_ctx.current->kind)) node->typespec |= to_typespec(token_ctx.current->kind);
+        expect(token_ctx.current->kind);
     }
 }
 
@@ -936,7 +936,7 @@ static Node *param_declaration()
     {
         enum_decl(node);
     }
-    if (token->kind == TK_STAR || token->kind == TK_IDENT || token->kind == TK_LPAREN)
+    if (token_ctx.current->kind == TK_STAR || token_ctx.current->kind == TK_IDENT || token_ctx.current->kind == TK_LPAREN)
     {
         Node *n = add_child(node, declarator());
     }
@@ -951,13 +951,13 @@ static Node *param_type_list()
     DBG_FUNC();
     Node *node = new_node(ND_PTYPE_LIST, 0, false);
     node->symtable = enter_new_scope(false);
-    while(token->kind != TK_RPAREN)
+    while(token_ctx.current->kind != TK_RPAREN)
     {
         add_child(node, param_declaration());
-        if (token->kind == TK_COMMA)
+        if (token_ctx.current->kind == TK_COMMA)
         {
             expect(TK_COMMA);
-            if (token->kind == TK_ELLIPSIS)
+            if (token_ctx.current->kind == TK_ELLIPSIS)
             {
                 expect(TK_ELLIPSIS);
                 node->is_variadic = true;
@@ -985,11 +985,11 @@ static Node *direct_decl()
     //                      | ( <parameter-type-list> )
     //                      | ( {<identifier>}* )
     Node *node = new_node(ND_DIRECT_DECL, 0, false);
-    if (token->kind == TK_IDENT)
+    if (token_ctx.current->kind == TK_IDENT)
     {
         add_child(node, new_node(ND_IDENT, expect(TK_IDENT), false));
     }
-    else if (token->kind == TK_LPAREN)
+    else if (token_ctx.current->kind == TK_LPAREN)
     {
         expect(TK_LPAREN);
         add_child(node, declarator());
@@ -997,17 +997,17 @@ static Node *direct_decl()
     }
     while(true)
     {
-        if (token->kind == TK_LBRACKET)
+        if (token_ctx.current->kind == TK_LBRACKET)
         {
             add_child(node, new_node(ND_ARRAY_DECL, expect(TK_LBRACKET), false));
             Node *n = node->children[node->child_count - 1];
-            if (token->kind != TK_RBRACKET)
+            if (token_ctx.current->kind != TK_RBRACKET)
             {
                 add_child(n, constant_expr());
             }
             expect(TK_RBRACKET);
         }
-        else if (token->kind == TK_LPAREN)
+        else if (token_ctx.current->kind == TK_LPAREN)
         {
             add_child(node, new_node(ND_FUNC_DECL, expect(TK_LPAREN), false));
             Node *n = node->children[node->child_count - 1];
@@ -1030,14 +1030,14 @@ static Node *declarator()
     //                    | volatile
     Node *node = new_node(ND_DECLARATOR, 0, false);
     node->pointer_level = 0;
-    while(token->kind == TK_STAR)
+    while(token_ctx.current->kind == TK_STAR)
     {
         expect(TK_STAR);
         node->pointer_level++;
-        if (is_typequal(token->kind))
+        if (is_typequal(token_ctx.current->kind))
         {
             // TODO record this somehow
-            expect(token->kind);
+            expect(token_ctx.current->kind);
         }
     }
     add_child(node, direct_decl());
@@ -1048,7 +1048,7 @@ static Node *initializer_list()
 {
     Node *node = new_node(ND_INITLIST, 0, false);
     add_child(node, initializer());
-    while (token->kind == TK_COMMA)
+    while (token_ctx.current->kind == TK_COMMA)
     {
         expect(TK_COMMA);
         add_child(node, initializer());
@@ -1062,12 +1062,12 @@ static Node *initializer()
     //                 | { <initializer-list> }
     //                 | { <initializer-list> , }  
     Node *node;
-    if (token->kind == TK_LBRACE)
+    if (token_ctx.current->kind == TK_LBRACE)
     {
-        expect(token->kind);
+        expect(token_ctx.current->kind);
         node = initializer_list();
-        if (token->kind == TK_COMMA)
-            expect(token->kind);
+        if (token_ctx.current->kind == TK_COMMA)
+            expect(token_ctx.current->kind);
         expect(TK_RBRACE);
     }
     else
@@ -1079,7 +1079,7 @@ static Node *init_declarator()
     DBG_FUNC();
     Node *node;
     node = declarator();
-    if (token->kind == TK_ASSIGN)
+    if (token_ctx.current->kind == TK_ASSIGN)
     {
         expect(TK_ASSIGN);
         add_child(node, initializer());
@@ -1094,7 +1094,7 @@ static void struct_decl(Node *node, int depth)
     //                             | struct-or-union "{" struct-declaration+ "}"
     //                             | struct-or-union identifier        
     Node *n = 0;
-    if (token->kind == TK_IDENT)
+    if (token_ctx.current->kind == TK_IDENT)
     {
         // struct or union definition with a tag, or an incomplete type, or a declaration.
         // Declarations using incomplete types are only valid if a pointer
@@ -1102,7 +1102,7 @@ static void struct_decl(Node *node, int depth)
         n->typespec |= (node->typespec & DS_UNION) ? DS_UNION : DS_STRUCT;
         add_child(n, new_node(ND_IDENT, expect(TK_IDENT), false));
     }
-    if (token->kind == TK_LBRACE)
+    if (token_ctx.current->kind == TK_LBRACE)
     {
         if (!n)
         {
@@ -1117,7 +1117,7 @@ static void struct_decl(Node *node, int depth)
         {
             add_child(n, declaration(depth + 1));
         }
-        while (token->kind != TK_RBRACE);
+        while (token_ctx.current->kind != TK_RBRACE);
         leave_scope();
         expect(TK_RBRACE);
     }
@@ -1127,15 +1127,15 @@ static void enum_decl(Node *node)
 {
     // Optional tag name
     char *tagname = NULL;
-    if (token->kind == TK_IDENT)
+    if (token_ctx.current->kind == TK_IDENT)
     {
-        tagname = strdup(token->val);
+        tagname = strdup(token_ctx.current->val);
         expect(TK_IDENT);
     }
     if (!tagname)
         tagname = strdup(new_anon_label());
 
-    if (token->kind == TK_LBRACE)
+    if (token_ctx.current->kind == TK_LBRACE)
     {
         // Full definition: insert tag, parse body
         Symbol *tag_sym = insert_tag(node, tagname);
@@ -1144,19 +1144,19 @@ static void enum_decl(Node *node)
         node->type      = ety;
         expect(TK_LBRACE);
         int next_val = 0;
-        while (token->kind != TK_RBRACE)
+        while (token_ctx.current->kind != TK_RBRACE)
         {
             char *ename = strdup(expect(TK_IDENT));
-            if (token->kind == TK_ASSIGN)
+            if (token_ctx.current->kind == TK_ASSIGN)
             {
                 expect(TK_ASSIGN);
                 int sign = 1;
-                if (token->kind == TK_MINUS) { sign = -1; expect(TK_MINUS); }
-                next_val = sign * (int)token->ival;
+                if (token_ctx.current->kind == TK_MINUS) { sign = -1; expect(TK_MINUS); }
+                next_val = sign * (int)token_ctx.current->ival;
                 expect(TK_CONSTINT);
             }
             insert_enum_const(node, ety, ename, next_val++);
-            if (token->kind == TK_COMMA)
+            if (token_ctx.current->kind == TK_COMMA)
                 expect(TK_COMMA);
         }
         expect(TK_RBRACE);
@@ -1176,17 +1176,17 @@ static Node *declaration(int depth)
     Node *node = new_node(ND_DECLARATION, 0, false);
     // At least one decl_spec
     // TODO storage class defaults A.8.1
-    while(is_sc_spec(token->kind) || is_typespec(token->kind) || is_typequal(token->kind)
-          || (token->kind == TK_IDENT && is_typedef_name(token->val) && node->typespec == 0))
+    while(is_sc_spec(token_ctx.current->kind) || is_typespec(token_ctx.current->kind) || is_typequal(token_ctx.current->kind)
+          || (token_ctx.current->kind == TK_IDENT && is_typedef_name(token_ctx.current->val) && node->typespec == 0))
     {
-        if (is_sc_spec(token->kind))    node->sclass = token->kind;
-        if (is_typespec(token->kind))   node->typespec |= to_typespec(token->kind);
-        if (token->kind == TK_IDENT && is_typedef_name(token->val))
+        if (is_sc_spec(token_ctx.current->kind))    node->sclass = token_ctx.current->kind;
+        if (is_typespec(token_ctx.current->kind))   node->typespec |= to_typespec(token_ctx.current->kind);
+        if (token_ctx.current->kind == TK_IDENT && is_typedef_name(token_ctx.current->val))
         {
             node->typespec |= DS_TYPEDEF;
-            node->type      = find_typedef_type(token->val);
+            node->type      = find_typedef_type(token_ctx.current->val);
         }
-        expect(token->kind);
+        expect(token_ctx.current->kind);
     }
     if (node->typespec & (DS_STRUCT | DS_UNION))
     {
@@ -1196,15 +1196,15 @@ static Node *declaration(int depth)
     {
         enum_decl(node);
     }
-    while(token->kind != TK_SEMICOLON)
+    while(token_ctx.current->kind != TK_SEMICOLON)
     {
         add_child(node, init_declarator());
-        if (token->kind != TK_SEMICOLON)
+        if (token_ctx.current->kind != TK_SEMICOLON)
         {
             // We could get this far to find out this is a function definition.
-            // If the next token is a '{' and we are not in a struct, union, enum, then
+            // If the next token_ctx.current is a '{' and we are not in a struct, union, enum, then
             // it is a func definition
-            if (token->kind == TK_LBRACE)
+            if (token_ctx.current->kind == TK_LBRACE)
             {
                 add_types_and_symbols(node, false, 0);
                 parser_ctx.current_function = node;
@@ -1233,15 +1233,15 @@ static Node *comp_stmt(bool use_last_scope)
     Node *node      = new_node(ND_COMPSTMT, 0, false);
     node->symtable  = enter_new_scope(use_last_scope);
     DBG_PRINT("%s\n", curr_scope_str());
-    if (token->kind == TK_LBRACE)
+    if (token_ctx.current->kind == TK_LBRACE)
     {
         // <compound-statement> ::= { {<declaration-or-statement>}* }
         // C99 extension: declarations may appear anywhere in a block.
         expect(TK_LBRACE);
-        while (token->kind != TK_RBRACE)
+        while (token_ctx.current->kind != TK_RBRACE)
         {
-            if (is_sc_spec(token->kind) || is_typespec(token->kind) || is_typequal(token->kind)
-                || (token->kind == TK_IDENT && is_typedef_name(token->val)))
+            if (is_sc_spec(token_ctx.current->kind) || is_typespec(token_ctx.current->kind) || is_typequal(token_ctx.current->kind)
+                || (token_ctx.current->kind == TK_IDENT && is_typedef_name(token_ctx.current->val)))
                 add_child(node, declaration(0));
             else
                 add_child(node, stmt());
@@ -1255,11 +1255,11 @@ static Node *stmt()
 {
     DBG_FUNC();
     Node *node = new_node(ND_STMT, 0, false);
-    if (token->kind == TK_LBRACE)
+    if (token_ctx.current->kind == TK_LBRACE)
     {
         add_child(node, comp_stmt(false));
     }
-    else if (token->kind == TK_IF)
+    else if (token_ctx.current->kind == TK_IF)
     {
         node->kind = ND_IFSTMT;
         expect(TK_IF);
@@ -1267,13 +1267,13 @@ static Node *stmt()
         add_child(node, expr());
         expect(TK_RPAREN);
         add_child(node, stmt());
-        if (token->kind == TK_ELSE)
+        if (token_ctx.current->kind == TK_ELSE)
         {
             expect(TK_ELSE);
             add_child(node, stmt());
         }
     }
-    else if (token->kind == TK_WHILE)
+    else if (token_ctx.current->kind == TK_WHILE)
     {
         node->kind = ND_WHILESTMT;
         expect(TK_WHILE);
@@ -1282,21 +1282,21 @@ static Node *stmt()
         expect(TK_RPAREN);
         add_child(node, stmt());
     }
-    else if (token->kind == TK_FOR)
+    else if (token_ctx.current->kind == TK_FOR)
     {
         node->kind = ND_FORSTMT;
         expect(TK_FOR);
         expect(TK_LPAREN);
         // init: optional declaration (C99) or expression
-        if (is_sc_spec(token->kind) || is_typespec(token->kind) || is_typequal(token->kind)
-            || (token->kind == TK_IDENT && is_typedef_name(token->val)))
+        if (is_sc_spec(token_ctx.current->kind) || is_typespec(token_ctx.current->kind) || is_typequal(token_ctx.current->kind)
+            || (token_ctx.current->kind == TK_IDENT && is_typedef_name(token_ctx.current->val)))
         {
             // C99 for-init declaration: for (int i = 0; ...).
             // Enter an implicit scope so the variable is confined to the loop.
             node->symtable = enter_new_scope(false);
             add_child(node, declaration(0));   // declaration() consumes the ';'
         }
-        else if (token->kind == TK_SEMICOLON)
+        else if (token_ctx.current->kind == TK_SEMICOLON)
         {
             add_child(node, new_node(ND_EMPTY, 0, false));
             expect(TK_SEMICOLON);
@@ -1307,13 +1307,13 @@ static Node *stmt()
             expect(TK_SEMICOLON);
         }
         // condition (optional; absent = infinite loop)
-        if (token->kind == TK_SEMICOLON)
+        if (token_ctx.current->kind == TK_SEMICOLON)
             add_child(node, new_node(ND_EMPTY, 0, false));
         else
             add_child(node, expr());
         expect(TK_SEMICOLON);
         // increment (optional)
-        if (token->kind == TK_RPAREN)
+        if (token_ctx.current->kind == TK_RPAREN)
             add_child(node, new_node(ND_EMPTY, 0, false));
         else
             add_child(node, expr());
@@ -1322,7 +1322,7 @@ static Node *stmt()
         if (node->symtable)
             leave_scope();
     }
-    else if (token->kind == TK_DO)
+    else if (token_ctx.current->kind == TK_DO)
     {
         node->kind = ND_DOWHILESTMT;
         expect(TK_DO);
@@ -1333,7 +1333,7 @@ static Node *stmt()
         expect(TK_RPAREN);
         expect(TK_SEMICOLON);
     }
-    else if (token->kind == TK_SWITCH)
+    else if (token_ctx.current->kind == TK_SWITCH)
     {
         node->kind = ND_SWITCHSTMT;
         expect(TK_SWITCH);
@@ -1342,13 +1342,13 @@ static Node *stmt()
         expect(TK_RPAREN);
         add_child(node, comp_stmt(false));// body (always a compound)
     }
-    else if (token->kind == TK_CASE)
+    else if (token_ctx.current->kind == TK_CASE)
     {
         node->kind = ND_CASESTMT;
         expect(TK_CASE);
-        if (token->kind == TK_IDENT)
+        if (token_ctx.current->kind == TK_IDENT)
         {
-            Symbol *s = find_symbol(node, token->val, NS_IDENT);
+            Symbol *s = find_symbol(node, token_ctx.current->val, NS_IDENT);
             if (!s || !istype_enum(s->type))
                 error("Expected integer constant in case\n");
             node->ival = (long long)s->offset;
@@ -1360,35 +1360,35 @@ static Node *stmt()
         }
         expect(TK_COLON);
     }
-    else if (token->kind == TK_DEFAULT)
+    else if (token_ctx.current->kind == TK_DEFAULT)
     {
         node->kind = ND_DEFAULTSTMT;
         expect(TK_DEFAULT);
         expect(TK_COLON);
     }
-    else if (token->kind == TK_BREAK)
+    else if (token_ctx.current->kind == TK_BREAK)
     {
         node->kind = ND_BREAKSTMT;
         expect(TK_BREAK);
         expect(TK_SEMICOLON);
     }
-    else if (token->kind == TK_CONTINUE)
+    else if (token_ctx.current->kind == TK_CONTINUE)
     {
         node->kind = ND_CONTINUESTMT;
         expect(TK_CONTINUE);
         expect(TK_SEMICOLON);
     }
-    else if (token->kind == TK_GOTO)
+    else if (token_ctx.current->kind == TK_GOTO)
     {
         node->kind = ND_GOTOSTMT;
         expect(TK_GOTO);
         node->u.label = strdup(expect_ident());
         expect(TK_SEMICOLON);
     }
-    else if (token->kind == TK_IDENT)
+    else if (token_ctx.current->kind == TK_IDENT)
     {
         char *name = expect(TK_IDENT);
-        if (token->kind == TK_COLON)
+        if (token_ctx.current->kind == TK_COLON)
         {
             node->kind = ND_LABELSTMT;
             node->u.label = strdup(name);
@@ -1403,18 +1403,18 @@ static Node *stmt()
             expect(TK_SEMICOLON);
         }
     }
-    else if (token->kind == TK_RETURN)
+    else if (token_ctx.current->kind == TK_RETURN)
     {
         node->kind = ND_RETURNSTMT;
         expect(TK_RETURN);
-        if (token->kind != TK_SEMICOLON)
+        if (token_ctx.current->kind != TK_SEMICOLON)
         {
             add_child(node, expr());
 
         }
         expect(TK_SEMICOLON);
     }
-    else if (token->kind != TK_SEMICOLON)
+    else if (token_ctx.current->kind != TK_SEMICOLON)
     {
         node->kind = ND_EXPRSTMT;
         add_child(node, expr());
