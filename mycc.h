@@ -270,37 +270,33 @@ struct Node
 {
     Node_kind       kind;
     union {
-        // OLD: identifier/label/operator strings and values
         char        *ident;      // ND_IDENT: variable/function name (heap)
-        char        *label;      // ND_LABELSTMT, ND_GOTOSTMT: goto label (heap)
-        Token_kind   op;         // ND_BINOP, ND_UNARYOP, ND_MEMBER: operator
-        // NEW: Tagged union fields for expression operands
-        struct { Node *lhs; Node *rhs; } binop;
-        struct { Node *operand; } unaryop;
-        struct { Node *base; char *field_name; } member;
-        struct { Node *base; Node *idx; } subscript;
-        struct { Node **items; int count; } initlist;
+        char        *label;      // ND_GOTOSTMT: goto label (heap)
+        struct { Node *lhs; Node *rhs; } binop;            // ND_BINOP, ND_ASSIGN
+        struct { Node *operand; } unaryop;                  // ND_UNARYOP
+        struct { Node *base; char *field_name; } member;    // ND_MEMBER
+        struct { Node **items; int count; } initlist;       // ND_INITLIST
         struct { Node *cond; Node *then_; Node *else_; } ifstmt;
         struct { Node *cond; Node *body; } whilestmt;
         struct { Node *init; Node *cond; Node *inc; Node *body; } forstmt;
-        struct { Node *body; Node *cond; } dowhile;
-        struct { Node *expr; } returnstmt;
-        struct { char *name; Node *target; } gotostmt;
-        struct { char *name; Node *stmt; } labelstmt;
-        struct { Node *decl; } exprstmt;
-        struct { Node *expr; } cast;
-        struct { Node *cond; Node *then_; Node *else_; } ternary;
-        struct { Node *lhs; Node *rhs; Token_kind op; } compound_assign;
-        struct { Node *ap; Node *last; } vastart;
-        struct { Node *ap; } vaarg;
-        struct { Node *ap; } vaend;
+        struct { Node *body; Node *cond; } dowhile;         // ND_DOWHILESTMT
+        struct { Node *selector; Node *body; } switchstmt;  // ND_SWITCHSTMT
+        struct { Node *expr; } returnstmt;                  // ND_RETURNSTMT
+        struct { char *name; Node *stmt; } labelstmt;       // ND_LABELSTMT
+        struct { Node *decl; } exprstmt;                    // ND_EXPRSTMT
+        struct { Node *type_decl; Node *expr; } cast;       // ND_CAST
+        struct { Node *cond; Node *then_; Node *else_; } ternary; // ND_TERNARY
+        struct { Node *lhs; Node *rhs; Token_kind op; } compound_assign; // ND_COMPOUND_ASSIGN
+        struct { Node *ap; Node *last; } vastart;           // ND_VA_START
+        struct { Node *ap; } vaarg;                         // ND_VA_ARG
+        struct { Node *ap; } vaend;                         // ND_VA_END
     } u;
     long long       ival;
     double          fval;
     char            *strval;
     int             strval_len;
-    Node            **children;     // OLD: keep during transition
-    int             child_count;    // OLD: keep during transition
+    Node            **children;     // Cat C nodes + function call args
+    int             child_count;
     int             offset;
     int             pointer_level;
     bool            is_expr;
@@ -319,6 +315,7 @@ struct Node
 
 Node *program();
 void print_tree(Node *node, int depth);
+void for_each_child(Node *node, void (*fn)(Node *child, void *ctx), void *ctx);
 
 // ---------------------------------------------------------------
 // Code gen

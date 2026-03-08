@@ -92,16 +92,21 @@ void reset_codegen(void)
     // 'codegen_ctx.label_counter' is NOT reset — monotonically increasing across TUs.
 }
 
+static void collect_labels(Node *node);
+static void collect_labels_visitor(Node *child, void *ctx)
+{
+    (void)ctx;
+    collect_labels(child);
+}
 static void collect_labels(Node *node)
 {
     if (node->kind == ND_LABELSTMT)
     {
         codegen_ctx.label_table[codegen_ctx.label_table_size].label_id = new_label();
-        strncpy(codegen_ctx.label_table[codegen_ctx.label_table_size].name, node->u.label, 63);
+        strncpy(codegen_ctx.label_table[codegen_ctx.label_table_size].name, node->u.labelstmt.name, 63);
         codegen_ctx.label_table_size++;
     }
-    for (int i = 0; i < node->child_count; i++)
-        collect_labels(node->children[i]);
+    for_each_child(node, collect_labels_visitor, NULL);
 }
 
 //--------------------------------------------------------------------------------
@@ -421,8 +426,8 @@ void gen_callfunction_via_ptr(Node *node)
 // Indirect call through dereferenced pointer: (*fp)(args)
 void gen_callfunction_via_deref(Node *node)
 {
-    int param_size = push_args(node, 1);
-    // Use u.unaryop.operand for the dereferenced pointer expression
+    // Args are in children[0+] (operand is in u.unaryop.operand, not children)
+    int param_size = push_args(node, 0);
     gen_expr(node->u.unaryop.operand);
     gen_jli();
     gen_adj(param_size);
@@ -628,7 +633,6 @@ void gen_expr(Node *node)
     printf(";%s %s %s\n", __func__, nodestr(node->kind), node_ident_str(node));
     if (node->kind == ND_BINOP)
     {
-        // Use nu.binop fields (kept in sync by insert_cast)
         Node *lhs = node->u.binop.lhs;
         Node *rhs = node->u.binop.rhs;
         if (node->op_kind == TK_COMMA)
@@ -817,7 +821,6 @@ void gen_expr(Node *node)
     }
     else if (node->kind == ND_ASSIGN)
     {
-        // Use nu.binop fields (kept in sync by insert_cast)
         Node *lhs = node->u.binop.lhs;
         Node *rhs = node->u.binop.rhs;
         gen_addr(lhs);
@@ -836,7 +839,6 @@ void gen_expr(Node *node)
         //   gen_expr(rhs)  → r0 = rhs
         //   op             → r0 = old_val op rhs; stack: [addr]
         //   store          → mem[addr] = r0; stack: []
-        // Use nu.compound_assign fields (kept in sync by insert_cast)
         Node *lhs = node->u.compound_assign.lhs;
         Node *rhs = node->u.compound_assign.rhs;
         int sz = lhs->type ? lhs->type->size : 2;
@@ -899,7 +901,6 @@ void gen_expr(Node *node)
     }
     else if (node->kind == ND_TERNARY)
     {
-        // Use nu.ternary fields (kept in sync by insert_cast)
         Node *cond  = node->u.ternary.cond;
         Node *then_ = node->u.ternary.then_;
         Node *else_ = node->u.ternary.else_;
@@ -917,7 +918,6 @@ void gen_expr(Node *node)
     {
         // va_start(ap, last_param)
         // ap = bp + last_param_offset + last_param_size
-        // Use nu.vastart fields (kept in sync by insert_cast)
         Node *ap_node  = node->u.vastart.ap;
         Node *lp_node  = node->u.vastart.last;
         int param_off  = lp_node->symbol->offset;
@@ -932,7 +932,6 @@ void gen_expr(Node *node)
         // va_arg(ap, T) where T has size s
         // Returns *old_ap, advances ap by s
         int s         = node->type->size;
-        // Use nu.vaarg.ap (kept in sync by insert_cast)
         Node *ap_node = node->u.vaarg.ap;
         // Save old ap value
         gen_addr(ap_node);    // r0 = &ap
@@ -964,7 +963,6 @@ void gen_return()
 void gen_returnstmt(Node *node)
 {
     printf(";%s\n", __func__);
-    // Use nu.returnstmt.expr (kept in sync with children[0] by insert_cast)
     Node *expr = node->u.returnstmt.expr;
     if (expr)
     {
@@ -1001,7 +999,6 @@ void gen_ifstmt(Node *node)
 void gen_whilestmt(Node *node)
 {
     printf(";%s\n", __func__);
-    // Use nu.whilestmt fields (kept in sync by insert_cast)
     Node *cond = node->u.whilestmt.cond;
     Node *body = node->u.whilestmt.body;
     int lloop   = new_label();
@@ -1021,7 +1018,6 @@ void gen_decl(Node *node);  // forward declaration
 void gen_forstmt(Node *node)
 {
     printf(";%s\n", __func__);
-    // Use nu.forstmt fields (kept in sync by insert_cast)
     Node *init = node->u.forstmt.init;
     Node *cond = node->u.forstmt.cond;
     Node *inc  = node->u.forstmt.inc;
@@ -1057,7 +1053,6 @@ void gen_forstmt(Node *node)
 void gen_dowhilestmt(Node *node)
 {
     printf(";%s\n", __func__);
-    // Use nu.dowhile fields (kept in sync by insert_cast)
     Node *body = node->u.dowhile.body;
     Node *cond = node->u.dowhile.cond;
     int lloop  = new_label();
@@ -1085,7 +1080,6 @@ void gen_continuestmt(Node *node)
 void gen_exprstmt(Node *node)
 {
     // printf(";%s\n", __func__);
-    // Use nu.exprstmt.decl (kept in sync by insert_cast)
     gen_expr(node->u.exprstmt.decl);
 }
 bool is_constexpr(Node *n)
@@ -1178,15 +1172,15 @@ void gen_mem_inits(char *data, Node *n, Symbol *s, int vaddr, int offset, int de
 
 int int_unaryop(Node *n)
 {
-    int i = int_constexpr(n->children[0]);
+    int i = int_constexpr(n->u.unaryop.operand);
     if (n->op_kind == TK_MINUS)
         return -i;
     return i;
 }
 int int_binop(Node *n)
 {
-    int i = int_constexpr(n->children[0]);
-    int j = int_constexpr(n->children[1]);
+    int i = int_constexpr(n->u.binop.lhs);
+    int j = int_constexpr(n->u.binop.rhs);
     switch (n->op_kind)
     {
         case TK_PLUS:  return i + j;
@@ -1471,9 +1465,9 @@ static int find_label_id(char *name)
 }
 void gen_labelstmt(Node *node)
 {
-    gen_label(find_label_id(node->u.label));
-    if (node->child_count)
-        gen_stmt(node->children[0]);
+    gen_label(find_label_id(node->u.labelstmt.name));
+    if (node->u.labelstmt.stmt)
+        gen_stmt(node->u.labelstmt.stmt);
 }
 void gen_gotostmt(Node *node)
 {
@@ -1482,8 +1476,8 @@ void gen_gotostmt(Node *node)
 void gen_switchstmt(Node *node)
 {
     printf(";%s\n", __func__);
-    Node *selector = node->children[0];
-    Node *body     = node->children[1]; // ND_COMPSTMT
+    Node *selector = node->u.switchstmt.selector;
+    Node *body     = node->u.switchstmt.body; // ND_COMPSTMT
     int lbreak     = new_label();
     int ldefault   = -1;
     // Phase 1: assign codegen_ctx.label_counter to cases and emit comparisons
