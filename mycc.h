@@ -11,6 +11,23 @@
 void error(const char *fmt, ...);
 
 // ===============================================================
+// Debug Output Control
+// ===============================================================
+
+// Uncomment to enable debug output
+// #define DEBUG_ENABLED 1
+
+#ifdef DEBUG_ENABLED
+    #define DBG_PRINT(...) fprintf(stderr, __VA_ARGS__)
+    #define DBG_FUNC() fprintf(stderr, "%s\n", __func__)
+    #define DBG_FUNC_TOKEN(tok) fprintf(stderr, "%s %s\n", __func__, (tok)->val)
+#else
+    #define DBG_PRINT(...) ((void)0)
+    #define DBG_FUNC() ((void)0)
+    #define DBG_FUNC_TOKEN(tok) ((void)0)
+#endif
+
+// ===============================================================
 // Module Context Structs - groups related global state
 // ===============================================================
 
@@ -39,9 +56,11 @@ typedef enum
     TK_VOID, TK_CHAR, TK_UCHAR, TK_SHORT, TK_USHORT, TK_INT, TK_UINT, TK_LONG,
     TK_ULONG, TK_FLOAT, TK_DOUBLE, TK_SIGNED, TK_UNSIGNED, TK_STRUCT, TK_UNION, TK_ENUM,
     TK_TYPEDEF, TK_INVALID, TK_ELLIPSIS,
-    // The following are not real tokens - used only for op_kind to distinguish postfix
-    TK_POST_INC, TK_POST_DEC,
 } Token_kind;
+
+// Pseudo-tokens for postfix ++/-- (used in Node.u.op)
+#define TK_POST_INC 0x1000
+#define TK_POST_DEC 0x1001
 
 
 struct Keyword
@@ -250,7 +269,11 @@ typedef struct Node Node;
 struct Node
 {
     Node_kind       kind;
-    char            val[64];
+    union {
+        char        *ident;      // ND_IDENT: variable/function name (heap)
+        char        *label;      // ND_LABELSTMT, ND_GOTOSTMT: goto label (heap)
+        Token_kind   op;         // ND_BINOP, ND_UNARYOP, ND_MEMBER: operator
+    } u;
     long long       ival;
     double          fval;
     char            *strval;
