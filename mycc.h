@@ -278,8 +278,8 @@ struct Node
     double          fval;
     char            *strval;
     int             strval_len;
-    Node            **children;
-    int             child_count;
+    Node            **children;     // OLD: keep during transition
+    int             child_count;    // OLD: keep during transition
     int             offset;
     int             pointer_level;
     bool            is_expr;
@@ -294,6 +294,29 @@ struct Node
     Symbol_table    *symtable;
     Symbol          *symbol;
     Type           *type;
+
+    // NEW: Tagged union fields (incrementally populated during migration)
+    union {
+        struct { Node *lhs; Node *rhs; } binop;
+        struct { Node *operand; } unaryop;
+        struct { Node *base; char *field_name; } member;
+        struct { Node *base; Node *idx; } subscript;
+        struct { Node **items; int count; } initlist;
+        struct { Node *cond; Node *then_; Node *else_; } ifstmt;
+        struct { Node *cond; Node *body; } whilestmt;
+        struct { Node *init; Node *cond; Node *inc; Node *body; } forstmt;
+        struct { Node *body; Node *cond; } dowhile;
+        struct { Node *expr; } returnstmt;
+        struct { char *name; Node *target; } gotostmt;
+        struct { char *name; Node *stmt; } labelstmt;
+        struct { Node *decl; } exprstmt;
+        struct { Node *expr; } cast;
+        struct { Node *cond; Node *then_; Node *else_; } ternary;
+        struct { Node *lhs; Node *rhs; Token_kind op; } compound_assign;
+        struct { Node *ap; Node *last; } vastart;
+        struct { Node *ap; } vaarg;
+        struct { Node *ap; } vaend;
+    } nu;
 };
 
 Node *program();
