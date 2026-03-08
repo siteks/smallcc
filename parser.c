@@ -1692,6 +1692,25 @@ void insert_cast(Node *n, int child, Type *t)
     add_child(c, n->children[child]);
     c->type = t;
     n->children[child] = c;
+    // Update nu.* fields to match children[]
+    if (n->kind == ND_BINOP || n->kind == ND_ASSIGN) {
+        if (child == 0) n->nu.binop.lhs = c;
+        else if (child == 1) n->nu.binop.rhs = c;
+    } else if (n->kind == ND_RETURNSTMT && child == 0) {
+        n->nu.returnstmt.expr = c;
+    } else if (n->kind == ND_UNARYOP && child == 0) {
+        n->nu.unaryop.operand = c;
+    } else if (n->kind == ND_WHILESTMT && child == 0) {
+        n->nu.whilestmt.cond = c;
+    } else if (n->kind == ND_FORSTMT) {
+        if (child == 0) n->nu.forstmt.init = c;
+        else if (child == 1) n->nu.forstmt.cond = c;
+        else if (child == 2) n->nu.forstmt.inc = c;
+    } else if (n->kind == ND_DOWHILESTMT && child == 1) {
+        n->nu.dowhile.cond = c;
+    } else if (n->kind == ND_IFSTMT && child == 0) {
+        n->nu.ifstmt.cond = c;
+    }
 }
 Type *check_operands(Node *n)
 {

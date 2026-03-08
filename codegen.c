@@ -949,10 +949,12 @@ void gen_return()
 void gen_returnstmt(Node *node)
 {
     printf(";%s\n", __func__);
-    if (node->child_count)
+    // Use nu.returnstmt.expr (kept in sync with children[0] by insert_cast)
+    Node *expr = node->nu.returnstmt.expr;
+    if (expr)
     {
         // Must have an expression
-        gen_expr(node->children[0]);
+        gen_expr(expr);
     }
     gen_return();
 
@@ -984,16 +986,18 @@ void gen_ifstmt(Node *node)
 void gen_whilestmt(Node *node)
 {
     printf(";%s\n", __func__);
-    // structure is expr, stmt
+    // Use nu.whilestmt fields (kept in sync by insert_cast)
+    Node *cond = node->nu.whilestmt.cond;
+    Node *body = node->nu.whilestmt.body;
     int lloop   = new_label();
     int lbreak  = new_label();
     codegen_ctx.break_labels[codegen_ctx.loop_depth] = lbreak;
     codegen_ctx.cont_labels[codegen_ctx.loop_depth]  = lloop;
     codegen_ctx.loop_depth++;
     gen_label(lloop);
-    gen_expr(node->children[0]);
+    gen_expr(cond);
     gen_jz(lbreak);
-    gen_stmt(node->children[1]);
+    gen_stmt(body);
     gen_j(lloop);
     gen_label(lbreak);
     codegen_ctx.loop_depth--;
