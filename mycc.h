@@ -221,7 +221,7 @@ struct Type
 typedef enum
 {
     ST_COMPSTMT,
-    ST_STRUCT,
+    ST_STRUCT,  // also used for union scopes
 } Scope_type;
 typedef enum
 {
@@ -316,7 +316,9 @@ struct Node
     Token_kind      sclass;
     Token_kind      op_kind;    // for ND_BINOP/UNARYOP/MEMBER: identifies the operator
     Symbol_table    *st;
-    Symbol_table    *symtable;
+    Symbol_table    *symtable;  // ND_COMPSTMT: its own scope.
+                                // ND_FORSTMT: hidden for-init scope (NULL if init is not a decl).
+                                // ND_STRUCT: the struct-member parsing scope.
     Symbol          *symbol;
     Type           *type;
 };
@@ -510,7 +512,7 @@ extern ExternContext extern_ctx;
 #define t_float  (type_ctx.t_float)
 #define t_double (type_ctx.t_double)
 
-// Legacy current_global_tu macro
+// Convenience alias used throughout codegen and types.
 #define current_global_tu (type_ctx.current_tu)
 
 #endif

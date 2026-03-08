@@ -208,8 +208,6 @@ void emit(const char *fmt, ...)
 
 void gen_label(int label)       { printf("_l%d:\n", label); }
 void gen_symlabel(const char *name) { printf("%s:\n", name); }
-void gen_text()                 { printf(".text\n"); }
-void gen_data()                 { /* printf(".data\n");*/ }
 void gen_align()                { emit("align"); }
 void gen_word(int d)            { printf("    word 0x%04x\n", d & 0xffff); }
 void gen_jz(int label)          { emit("jz %l", label); }
@@ -330,15 +328,17 @@ static void gen_logand_expr(Node *lhs, Node *rhs)
 }
 void gen_st(int s)
 {
-    if (s == 1) gen_sb();
-    if (s == 2) gen_sw();
-    if (s == 4) gen_sl();
+    if (s == 1)      gen_sb();
+    else if (s == 2) gen_sw();
+    else if (s == 4) gen_sl();
+    else             error("gen_st: unsupported size %d\n", s);
 }
 void gen_ld(int s)
 {
-    if (s == 1) gen_lb();
-    if (s == 2) gen_lw();
-    if (s == 4) gen_ll();
+    if (s == 1)      gen_lb();
+    else if (s == 2) gen_lw();
+    else if (s == 4) gen_ll();
+    else             error("gen_ld: unsupported size %d\n", s);
 }
 
 static void emit_float_bytes(double val)
@@ -1089,24 +1089,30 @@ void gen_dowhilestmt(Node *node)
 }
 void gen_breakstmt(Node *node)
 {
+    if (codegen_ctx.loop_depth == 0)
+        error("break outside loop or switch\n");
     gen_j(codegen_ctx.break_labels[codegen_ctx.loop_depth - 1]);
 }
 void gen_continuestmt(Node *node)
 {
+    if (codegen_ctx.loop_depth == 0)
+        error("continue outside loop\n");
     gen_j(codegen_ctx.cont_labels[codegen_ctx.loop_depth - 1]);
 }
 void gen_exprstmt(Node *node)
 {
-    // printf(";%s\n", __func__);
     gen_expr(node->u.exprstmt.expr);
 }
 bool is_constexpr(Node *n)
 {
     if (n->kind == ND_LITERAL) return true;
-    if (n->kind == ND_BINOP || n->kind == ND_UNARYOP) return true;
     // Enum constants are compile-time integers
     if (n->kind == ND_IDENT && n->symbol && n->symbol->is_enum_const) return true;
-    // Other idents (non-enum) are not compile-time constants
+    // Composite expressions are constexpr only if all operands are.
+    if (n->kind == ND_BINOP)
+        return is_constexpr(n->u.binop.lhs) && is_constexpr(n->u.binop.rhs);
+    if (n->kind == ND_UNARYOP)
+        return is_constexpr(n->u.unaryop.operand);
     return false;
 }
 int count_constexpr(Node *n)
@@ -1586,14 +1592,13 @@ void gen_code(Node *node, int tu_index)
 {
     printf(";%s\n", __func__);
 
-    // Do two passes, one to get the globals allocated space, then the functions
-    // gen_text();
+    // Pass 1: emit function definitions (text area)
     for(int i = 0; i < node->child_count; i++)
     {
         if (node->children[i]->kind == ND_DECLARATION && node->children[i]->is_func_defn)
             gen_function(node->children[i]);
     }
-    // gen_data();
+    // Pass 2: emit global variable declarations (data area)
     for(int i = 0; i < node->child_count; i++)
     {
         if (node->children[i]->kind == ND_DECLARATION && !node->children[i]->is_func_defn)

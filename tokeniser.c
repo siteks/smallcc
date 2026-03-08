@@ -334,7 +334,6 @@ Token *tokenise(char *p)
             case '!': cur = new_token(TK_BANG,      cur, p++, 1); continue;
             case ',': cur = new_token(TK_COMMA,     cur, p++, 1); continue;
             case '.': cur = new_token(TK_DOT,       cur, p++, 1); continue;
-            // case '&': cur = new_token(TK_BITAND,    cur, p++, 1); continue;
             case '|': cur = new_token(TK_BITOR,     cur, p++, 1); continue;
             case '^': cur = new_token(TK_BITXOR,    cur, p++, 1); continue;
             case '%': cur = new_token(TK_PERCENT,   cur, p++, 1); continue;

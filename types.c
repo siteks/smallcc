@@ -11,7 +11,7 @@ Symbol *insert_tag(Node *node, char *ident);
 static Symbol *insert_typedef(Node *node, Type *type, const char *ident);
 static Symbol *new_symbol(Type *type, const char *ident, int offset);
 static Symbol *insert_ident(Node *node, Type *type, const char *ident, bool is_param);
-static Type  *generate_struct_type2(Node *decl_node, int depth);
+static Type  *generate_struct_type(Node *decl_node, int depth);
 static Type  *type_from_declarator(Node *decl, Type *base);
 static Type  *type_from_direct_decl(Node *dd, Type *base);
 static Type  *typespec_to_base(Decl_spec typespec);
@@ -21,8 +21,10 @@ static Type  *typespec_to_base(Decl_spec typespec);
 // ---------------------------------------------------------------
 static int do_align(int val, int size)
 {
+    if (size == 1) return val;  // 1-byte alignment: no padding needed
     if (size == 2) return (val & 1) ? (val & ~1) + 2 : val;
     if (size == 4) return (val & 3) ? (val & ~3) + 4 : val;
+    error("do_align: unexpected alignment %d\n", size);
     return val;
 }
 
@@ -47,8 +49,9 @@ static void append_type(Type *t)
 // ---------------------------------------------------------------
 Type *get_basic_type(Type_base base)
 {
+    // Basic scalar types have no derived fields; check base alone.
     for (Type *p = type_ctx.type_list; p; p = p->next)
-        if (p->base == base && !p->u.ptr.pointee)
+        if (p->base == base && base <= TB_DOUBLE)
             return p;
 
     Type *t = calloc(1, sizeof(Type));
@@ -408,9 +411,9 @@ static void calc_struct_layout(Type *st)
 }
 
 // ---------------------------------------------------------------
-// generate_struct_type2
+// generate_struct_type
 // ---------------------------------------------------------------
-static Type *generate_struct_type2(Node *decl_node, int depth)
+static Type *generate_struct_type(Node *decl_node, int depth)
 {
     DBG_FUNC();
     if (!(decl_node->kind == ND_DECLARATION && decl_node->child_count >= 1
@@ -450,7 +453,7 @@ static Type *generate_struct_type2(Node *decl_node, int depth)
                 Type *base;
                 if (d->typespec & (DS_STRUCT | DS_UNION)) {
                     if (has_nested_struct) {
-                        base = generate_struct_type2(d, depth + 1);
+                        base = generate_struct_type(d, depth + 1);
                     } else {
                         Node *sn   = d->children[0];
                         char *stag = sn->children[0]->u.ident;
@@ -510,7 +513,7 @@ void add_types_and_symbols(Node *node, bool is_param, int depth)
                 if (node->child_count == 1) {
                     // Standalone incomplete struct (e.g. "struct foo;")
                     DBG_PRINT("%s incomplete struct\n", __func__);
-                    Type *t    = generate_struct_type2(node, 0);
+                    Type *t    = generate_struct_type(node, 0);
                     if (n->symbol) n->symbol->type = t;
                     node->type  = t;
                 } else {
@@ -523,7 +526,7 @@ void add_types_and_symbols(Node *node, bool is_param, int depth)
                 n->symbol = insert_tag(node, n->children[0]->u.ident);
                 if (!depth) {
                     DBG_PRINT("%s creating struct type\n", __func__);
-                    Type *t    = generate_struct_type2(node, 0);
+                    Type *t    = generate_struct_type(node, 0);
                     n->symbol->type = t;
                     node->type  = t;
                 }
@@ -547,6 +550,8 @@ void add_types_and_symbols(Node *node, bool is_param, int depth)
     bool first_decl = true;
     for (int i = 0; i < node->child_count; i++) {
         Node *n = node->children[i];
+        // Skip declarators when depth > 0: struct/union member symbols are built
+        // by generate_struct_type() directly, not by this pass.
         if (n->kind != ND_DECLARATOR || depth)
             continue;
 

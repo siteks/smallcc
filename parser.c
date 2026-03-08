@@ -155,7 +155,6 @@
 //                  | "return" expression? ";"
 // Parser context instance
 ParserContext parser_ctx;
-extern int scope_indices[];
 
 static Node *primary_expr();
 static Node *unary_expr();
@@ -282,8 +281,6 @@ static Node *primary_expr()
         if (tk->val[0] == '0') // leading zero is octal or hex
             cs |= CS_OX;
 
-        // node->typespec = TK_INT;
-
         if (tk->kind == TK_CONSTINT)
         {
             //  dec     int,            l int,  ul int
@@ -321,8 +318,6 @@ static Node *primary_expr()
             if (f >= -3.402823466e38 && f <= 3.402823466e38)        node->type = t_float;
             else error("Float constant out of range");
         }
-        // node->type = insert_type(node, "");
-
     }
     else if (token_ctx.current->kind == TK_CHARACTER)
     {
@@ -849,7 +844,7 @@ static Node *param_declaration()
     }
     if (token_ctx.current->kind == TK_STAR || token_ctx.current->kind == TK_IDENT || token_ctx.current->kind == TK_LPAREN)
     {
-        Node *n = add_child(node, declarator());
+        add_child(node, declarator());
     }
     // else: abstract declarator (no name) — valid in C89
 
@@ -884,8 +879,9 @@ static Node *param_type_list()
 }
 static Node *constant_expr()
 {
+    // C89 §3.4: constant-expression ::= conditional-expression
     DBG_FUNC();
-    return equal_expr();
+    return cond_expr();
 }
 static Node *direct_decl()
 {
@@ -1251,7 +1247,7 @@ static Node *stmt()
         if (token_ctx.current->kind == TK_IDENT)
         {
             Symbol *s = find_symbol(node, token_ctx.current->val, NS_IDENT);
-            if (!s || !istype_enum(s->type))
+            if (!s || !s->is_enum_const)
                 error("Expected integer constant in case\n");
             node->ival = (long long)s->offset;
             expect(TK_IDENT);
@@ -1397,7 +1393,7 @@ static const char *node_val_str(Node *node)
     }
 }
 
-char buf[1024];
+static char buf[1024];
 char *node_str(Node *node)
 {
     buf[0] = 0;
