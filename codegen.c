@@ -961,17 +961,21 @@ void gen_ifstmt(Node *node)
 {
     printf(";%s\n", __func__);
     // Structure is expr, stmt, [stmt]
+    // Migrated to use nu.ifstmt fields
+    Node *cond = node->nu.ifstmt.cond;
+    Node *then_ = node->nu.ifstmt.then_;
+    Node *else_ = node->nu.ifstmt.else_;
     int l_else = new_label();
-    gen_expr(node->children[0]);
+    gen_expr(cond);
     gen_jz(l_else);
-    gen_stmt(node->children[1]);
-    if (node->child_count == 3)
+    gen_stmt(then_);
+    if (else_)
     {
         int l_end = new_label();
         gen_j(l_end);
         gen_label(l_else);
         printf(";else clause\n");
-        gen_stmt(node->children[2]);
+        gen_stmt(else_);
         gen_label(l_end);
     }
     else
