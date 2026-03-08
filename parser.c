@@ -241,8 +241,8 @@ static Node *primary_expr()
         expect(TK_COMMA);
         add_child(node, assign_expr());   // last named param
         expect(TK_RPAREN);
-        node->nu.vastart.ap = node->children[0];
-        node->nu.vastart.last = node->children[1];
+        node->u.vastart.ap = node->children[0];
+        node->u.vastart.last = node->children[1];
         return node;
     }
     else if (token_ctx.current->kind == TK_IDENT && !strcmp(token_ctx.current->val, "va_arg"))
@@ -255,7 +255,7 @@ static Node *primary_expr()
         Node *tn = type_name();           // type to fetch
         node->type = tn->type;
         expect(TK_RPAREN);
-        node->nu.vaarg.ap = node->children[0];
+        node->u.vaarg.ap = node->children[0];
         return node;
     }
     else if (token_ctx.current->kind == TK_IDENT && !strcmp(token_ctx.current->val, "va_end"))
@@ -266,7 +266,7 @@ static Node *primary_expr()
         node->type = t_void;
         add_child(node, assign_expr());   // ap
         expect(TK_RPAREN);
-        node->nu.vaend.ap = node->children[0];
+        node->u.vaend.ap = node->children[0];
         return node;
     }
     else if (token_ctx.current->kind == TK_IDENT)
@@ -415,7 +415,7 @@ static Node *unary_expr()
         node->op_kind = k;
         add_child(node, unary_expr());
         // NEW: also populate tagged union field
-        node->nu.unaryop.operand = node->children[0];
+        node->u.unaryop.operand = node->children[0];
     }
     else if (token_ctx.current->kind == TK_IDENT
             || token_ctx.current->kind == TK_CONSTINT
@@ -467,14 +467,14 @@ static Node *unary_expr()
                         add_child(add_node, e1);
                         add_child(add_node, idx);
                         // NEW: also populate tagged union fields for BINOP
-                        add_node->nu.binop.lhs = e1;
-                        add_node->nu.binop.rhs = idx;
+                        add_node->u.binop.lhs = e1;
+                        add_node->u.binop.rhs = idx;
                         node = new_node(ND_UNARYOP, NULL, true);
                         node->op_kind = TK_STAR;
                         node->type = elem;
                         add_child(node, add_node);
                         // NEW: also populate tagged union field for UNARYOP
-                        node->nu.unaryop.operand = add_node;
+                        node->u.unaryop.operand = add_node;
                         break;
                     }
                     if (!s)
@@ -517,11 +517,11 @@ static Node *unary_expr()
                     add_child(mul, expr());
                     add_child(add, mul);
                     // NEW: also populate tagged union fields
-                    add->nu.binop.lhs = e1;
-                    add->nu.binop.rhs = mul;
-                    mul->nu.binop.lhs = stride_lit;
-                    mul->nu.binop.rhs = mul->children[1];
-                    outer_unary->nu.unaryop.operand = add;
+                    add->u.binop.lhs = e1;
+                    add->u.binop.rhs = mul;
+                    mul->u.binop.lhs = stride_lit;
+                    mul->u.binop.rhs = mul->children[1];
+                    outer_unary->u.unaryop.operand = add;
                     expect(TK_RBRACKET);
                     break;
                 }
@@ -548,8 +548,8 @@ static Node *unary_expr()
                 add_child(n, node);
                 add_child(n, new_node(ND_IDENT, expect(TK_IDENT), true));
                 // NEW: also populate tagged union fields
-                n->nu.member.base = node;
-                n->nu.member.field_name = n->children[1]->u.ident;
+                n->u.member.base = node;
+                n->u.member.field_name = n->children[1]->u.ident;
                 node = n;
                 pex_node = n;
                 break;
@@ -562,8 +562,8 @@ static Node *unary_expr()
                 add_child(n, node);
                 add_child(n, new_node(ND_IDENT, expect(TK_IDENT), true));
                 // NEW: also populate tagged union fields
-                n->nu.member.base = node;
-                n->nu.member.field_name = n->children[1]->u.ident;
+                n->u.member.base = node;
+                n->u.member.field_name = n->children[1]->u.ident;
                 node = n;
                 pex_node = n;
                 break;
@@ -658,7 +658,7 @@ static Node *cast_expr()
         expect(TK_RPAREN);
         add_child(node, cast_expr());
         // Set nu.cast.expr to point to the expression (children[1])
-        node->nu.cast.expr = node->children[1];
+        node->u.cast.expr = node->children[1];
         return node;
     }
     else
@@ -682,8 +682,8 @@ static Node *mult_expr()
         add_child(enode, node);
         add_child(enode, cast_expr());
         // NEW: also populate tagged union fields
-        enode->nu.binop.lhs = node;
-        enode->nu.binop.rhs = enode->children[1];
+        enode->u.binop.lhs = node;
+        enode->u.binop.rhs = enode->children[1];
         node = enode;
     }
     return node;
@@ -697,13 +697,13 @@ void insert_scale(Node *n, int child, int size)
     add_child(sc, lit);
     add_child(sc, n->children[child]);
     // Set nu.binop fields for the new scale node
-    sc->nu.binop.lhs = lit;
-    sc->nu.binop.rhs = sc->children[1];
+    sc->u.binop.lhs = lit;
+    sc->u.binop.rhs = sc->children[1];
     n->children[child] = sc;
     // Update parent's nu.binop field to point to the new scale node
     if (n->kind == ND_BINOP || n->kind == ND_ASSIGN) {
-        if (child == 0) n->nu.binop.lhs = sc;
-        else if (child == 1) n->nu.binop.rhs = sc;
+        if (child == 0) n->u.binop.lhs = sc;
+        else if (child == 1) n->u.binop.rhs = sc;
     }
 }
 static Node *add_expr()
@@ -719,8 +719,8 @@ static Node *add_expr()
         add_child(enode, node);
         add_child(enode, mult_expr());
         // NEW: also populate tagged union fields
-        enode->nu.binop.lhs = node;
-        enode->nu.binop.rhs = enode->children[1];
+        enode->u.binop.lhs = node;
+        enode->u.binop.rhs = enode->children[1];
         node = enode;
     }
     return node;
@@ -738,8 +738,8 @@ static Node *shift_expr()
         add_child(enode, node);
         add_child(enode, add_expr());
         // NEW: also populate tagged union fields
-        enode->nu.binop.lhs = node;
-        enode->nu.binop.rhs = enode->children[1];
+        enode->u.binop.lhs = node;
+        enode->u.binop.rhs = enode->children[1];
         node = enode;
     }
     return node;
@@ -757,8 +757,8 @@ static Node *rel_expr()
         add_child(enode, node);
         add_child(enode, shift_expr());
         // NEW: also populate tagged union fields
-        enode->nu.binop.lhs = node;
-        enode->nu.binop.rhs = enode->children[1];
+        enode->u.binop.lhs = node;
+        enode->u.binop.rhs = enode->children[1];
         node = enode;
     }
     return node;
@@ -776,8 +776,8 @@ static Node *equal_expr()
         add_child(enode, node);
         add_child(enode, rel_expr());
         // NEW: also populate tagged union fields
-        enode->nu.binop.lhs = node;
-        enode->nu.binop.rhs = enode->children[1];
+        enode->u.binop.lhs = node;
+        enode->u.binop.rhs = enode->children[1];
         node = enode;
     }
     return node;
@@ -795,8 +795,8 @@ static Node *bitand_expr()
         add_child(enode, node);
         add_child(enode, equal_expr());
         // NEW: also populate tagged union fields
-        enode->nu.binop.lhs = node;
-        enode->nu.binop.rhs = enode->children[1];
+        enode->u.binop.lhs = node;
+        enode->u.binop.rhs = enode->children[1];
         node = enode;
     }
     return node;
@@ -814,8 +814,8 @@ static Node *bitxor_expr()
         add_child(enode, node);
         add_child(enode, bitand_expr());
         // NEW: also populate tagged union fields
-        enode->nu.binop.lhs = node;
-        enode->nu.binop.rhs = enode->children[1];
+        enode->u.binop.lhs = node;
+        enode->u.binop.rhs = enode->children[1];
         node = enode;
     }
     return node;
@@ -833,8 +833,8 @@ static Node *bitor_expr()
         add_child(enode, node);
         add_child(enode, bitxor_expr());
         // NEW: also populate tagged union fields
-        enode->nu.binop.lhs = node;
-        enode->nu.binop.rhs = enode->children[1];
+        enode->u.binop.lhs = node;
+        enode->u.binop.rhs = enode->children[1];
         node = enode;
     }
     return node;
@@ -852,8 +852,8 @@ static Node *logand_expr()
         add_child(enode, node);
         add_child(enode, bitor_expr());
         // NEW: also populate tagged union fields
-        enode->nu.binop.lhs = node;
-        enode->nu.binop.rhs = enode->children[1];
+        enode->u.binop.lhs = node;
+        enode->u.binop.rhs = enode->children[1];
         node = enode;
     }
     return node;
@@ -871,8 +871,8 @@ static Node *logor_expr()
         add_child(enode, node);
         add_child(enode, logand_expr());
         // NEW: also populate tagged union fields
-        enode->nu.binop.lhs = node;
-        enode->nu.binop.rhs = enode->children[1];
+        enode->u.binop.lhs = node;
+        enode->u.binop.rhs = enode->children[1];
         node = enode;
     }
     return node;
@@ -891,9 +891,9 @@ static Node *cond_expr()
     expect(TK_COLON);
     add_child(tnode, cond_expr());
     // NEW: also populate tagged union fields
-    tnode->nu.ternary.cond = node;
-    tnode->nu.ternary.then_ = tnode->children[1];
-    tnode->nu.ternary.else_ = tnode->children[2];
+    tnode->u.ternary.cond = node;
+    tnode->u.ternary.then_ = tnode->children[1];
+    tnode->u.ternary.else_ = tnode->children[2];
     return tnode;
 }
 static Node *assign_expr()
@@ -906,8 +906,8 @@ static Node *assign_expr()
         add_child(anode, node);
         add_child(anode, assign_expr());
         // NEW: populate tagged union fields
-        anode->nu.binop.lhs = node;
-        anode->nu.binop.rhs = anode->children[1];
+        anode->u.binop.lhs = node;
+        anode->u.binop.rhs = anode->children[1];
         return anode;
     }
     // Compound assignment: a op= b
@@ -929,9 +929,9 @@ static Node *assign_expr()
         add_child(anode, node);
         add_child(anode, assign_expr());
         // NEW: also populate tagged union fields
-        anode->nu.compound_assign.lhs = node;
-        anode->nu.compound_assign.rhs = anode->children[1];
-        anode->nu.compound_assign.op = op_tk;
+        anode->u.compound_assign.lhs = node;
+        anode->u.compound_assign.rhs = anode->children[1];
+        anode->u.compound_assign.op = op_tk;
         return anode;
     }
     return node;
@@ -948,8 +948,8 @@ Node *expr()
         add_child(enode, node);
         add_child(enode, assign_expr());
         // NEW: also populate tagged union fields
-        enode->nu.binop.lhs = node;
-        enode->nu.binop.rhs = enode->children[1];
+        enode->u.binop.lhs = node;
+        enode->u.binop.rhs = enode->children[1];
         node = enode;
     }
     return node;
@@ -1131,8 +1131,8 @@ static Node *initializer_list()
         add_child(node, initializer());
     }
     // NEW: populate tagged union fields
-    node->nu.initlist.count = node->child_count;
-    node->nu.initlist.items = node->children;  // share the array (both old and new point to same)
+    node->u.initlist.count = node->child_count;
+    node->u.initlist.items = node->children;  // share the array (both old and new point to same)
     return node;
 }
 static Node *initializer()
@@ -1350,15 +1350,15 @@ static Node *stmt()
         Node *then_ = stmt();
         add_child(node, then_);
         // NEW: populate tagged union fields
-        node->nu.ifstmt.cond = cond;
-        node->nu.ifstmt.then_ = then_;
-        node->nu.ifstmt.else_ = NULL;
+        node->u.ifstmt.cond = cond;
+        node->u.ifstmt.then_ = then_;
+        node->u.ifstmt.else_ = NULL;
         if (token_ctx.current->kind == TK_ELSE)
         {
             expect(TK_ELSE);
             Node *else_ = stmt();
             add_child(node, else_);
-            node->nu.ifstmt.else_ = else_;
+            node->u.ifstmt.else_ = else_;
         }
     }
     else if (token_ctx.current->kind == TK_WHILE)
@@ -1372,8 +1372,8 @@ static Node *stmt()
         Node *body = stmt();
         add_child(node, body);
         // NEW: populate tagged union fields
-        node->nu.whilestmt.cond = cond;
-        node->nu.whilestmt.body = body;
+        node->u.whilestmt.cond = cond;
+        node->u.whilestmt.body = body;
     }
     else if (token_ctx.current->kind == TK_FOR)
     {
@@ -1432,10 +1432,10 @@ static Node *stmt()
         Node *body = stmt();          // body
         add_child(node, body);
         // NEW: populate tagged union fields
-        node->nu.forstmt.init = init;
-        node->nu.forstmt.cond = cond;
-        node->nu.forstmt.inc = inc;
-        node->nu.forstmt.body = body;
+        node->u.forstmt.init = init;
+        node->u.forstmt.cond = cond;
+        node->u.forstmt.inc = inc;
+        node->u.forstmt.body = body;
         if (node->symtable)
             leave_scope();
     }
@@ -1452,8 +1452,8 @@ static Node *stmt()
         expect(TK_RPAREN);
         expect(TK_SEMICOLON);
         // NEW: populate tagged union fields
-        node->nu.dowhile.body = body;
-        node->nu.dowhile.cond = cond;
+        node->u.dowhile.body = body;
+        node->u.dowhile.cond = cond;
     }
     else if (token_ctx.current->kind == TK_SWITCH)
     {
@@ -1518,8 +1518,8 @@ static Node *stmt()
             Node *target = stmt();
             add_child(node, target);
             // NEW: populate tagged union fields
-            node->nu.labelstmt.name = strdup(name);
-            node->nu.labelstmt.stmt = target;
+            node->u.labelstmt.name = strdup(name);
+            node->u.labelstmt.stmt = target;
         }
         else
         {
@@ -1528,7 +1528,7 @@ static Node *stmt()
             Node *e = expr();
             add_child(node, e);
             // NEW: populate tagged union field
-            node->nu.exprstmt.decl = e;
+            node->u.exprstmt.decl = e;
             expect(TK_SEMICOLON);
         }
     }
@@ -1544,7 +1544,7 @@ static Node *stmt()
         }
         expect(TK_SEMICOLON);
         // NEW: populate tagged union field
-        node->nu.returnstmt.expr = ret_expr;
+        node->u.returnstmt.expr = ret_expr;
     }
     else if (token_ctx.current->kind != TK_SEMICOLON)
     {
@@ -1552,7 +1552,7 @@ static Node *stmt()
         Node *e = expr();
         add_child(node, e);
         // NEW: populate tagged union field
-        node->nu.exprstmt.decl = e;
+        node->u.exprstmt.decl = e;
         expect(TK_SEMICOLON);
     }
     return node;
@@ -1706,56 +1706,56 @@ void insert_cast(Node *n, int child, Type *t)
     add_child(c, n->children[child]);
     c->type = t;
     // Set the CAST node's own nu.cast.expr to point to the expression (children[1])
-    c->nu.cast.expr = c->children[1];
+    c->u.cast.expr = c->children[1];
     n->children[child] = c;
     // Update nu.* fields to match children[]
     if (n->kind == ND_BINOP || n->kind == ND_ASSIGN) {
-        if (child == 0) n->nu.binop.lhs = c;
-        else if (child == 1) n->nu.binop.rhs = c;
+        if (child == 0) n->u.binop.lhs = c;
+        else if (child == 1) n->u.binop.rhs = c;
     } else if (n->kind == ND_RETURNSTMT && child == 0) {
-        n->nu.returnstmt.expr = c;
+        n->u.returnstmt.expr = c;
     } else if (n->kind == ND_UNARYOP && child == 0) {
-        n->nu.unaryop.operand = c;
+        n->u.unaryop.operand = c;
     } else if (n->kind == ND_WHILESTMT && child == 0) {
-        n->nu.whilestmt.cond = c;
+        n->u.whilestmt.cond = c;
     } else if (n->kind == ND_FORSTMT) {
-        if (child == 0) n->nu.forstmt.init = c;
-        else if (child == 1) n->nu.forstmt.cond = c;
-        else if (child == 2) n->nu.forstmt.inc = c;
-        else if (child == 3) n->nu.forstmt.body = c;
+        if (child == 0) n->u.forstmt.init = c;
+        else if (child == 1) n->u.forstmt.cond = c;
+        else if (child == 2) n->u.forstmt.inc = c;
+        else if (child == 3) n->u.forstmt.body = c;
     } else if (n->kind == ND_DOWHILESTMT) {
-        if (child == 0) n->nu.dowhile.body = c;
-        else if (child == 1) n->nu.dowhile.cond = c;
+        if (child == 0) n->u.dowhile.body = c;
+        else if (child == 1) n->u.dowhile.cond = c;
     } else if (n->kind == ND_IFSTMT && child == 0) {
-        n->nu.ifstmt.cond = c;
+        n->u.ifstmt.cond = c;
     } else if (n->kind == ND_EXPRSTMT && child == 0) {
-        n->nu.exprstmt.decl = c;
+        n->u.exprstmt.decl = c;
     } else if (n->kind == ND_CAST && child == 1) {
-        n->nu.cast.expr = c;
+        n->u.cast.expr = c;
     } else if (n->kind == ND_TERNARY) {
-        if (child == 0) n->nu.ternary.cond = c;
-        else if (child == 1) n->nu.ternary.then_ = c;
-        else if (child == 2) n->nu.ternary.else_ = c;
+        if (child == 0) n->u.ternary.cond = c;
+        else if (child == 1) n->u.ternary.then_ = c;
+        else if (child == 2) n->u.ternary.else_ = c;
     } else if (n->kind == ND_COMPOUND_ASSIGN) {
-        if (child == 0) n->nu.compound_assign.lhs = c;
-        else if (child == 1) n->nu.compound_assign.rhs = c;
+        if (child == 0) n->u.compound_assign.lhs = c;
+        else if (child == 1) n->u.compound_assign.rhs = c;
     } else if (n->kind == ND_VA_START) {
-        if (child == 0) n->nu.vastart.ap = c;
-        else if (child == 1) n->nu.vastart.last = c;
+        if (child == 0) n->u.vastart.ap = c;
+        else if (child == 1) n->u.vastart.last = c;
     } else if (n->kind == ND_VA_ARG && child == 0) {
-        n->nu.vaarg.ap = c;
+        n->u.vaarg.ap = c;
     } else if (n->kind == ND_VA_END && child == 0) {
-        n->nu.vaend.ap = c;
+        n->u.vaend.ap = c;
     }
 }
 Type *check_operands(Node *n)
 {
     // Perform the 'usual arithmetic conversions' (C89 §3.2.1.5).
     // Promotions use the *original* lhs/rhs types for checks; insert_cast
-    // replaces n->children[], so we return n->nu.binop.lhs->type at the end
+    // replaces n->children[], so we return n->u.binop.lhs->type at the end
     // to get the post-cast result type (not lhs->type which stays pre-cast).
-    Node *lhs = n->nu.binop.lhs ? n->nu.binop.lhs : n->children[0];
-    Node *rhs = n->nu.binop.rhs ? n->nu.binop.rhs : n->children[1];
+    Node *lhs = n->u.binop.lhs ? n->u.binop.lhs : n->children[0];
+    Node *rhs = n->u.binop.rhs ? n->u.binop.rhs : n->children[1];
     DBG_PRINT("%s %016llx %016llx\n", __func__, (unsigned long long)lhs->type, (unsigned long long)rhs->type);
 
     // Float/double: one side pulls the other up
@@ -1793,7 +1793,7 @@ Type *check_operands(Node *n)
     // Return the post-cast type of the left child (both children now have the
     // same type after conversions, so either would give the same answer).
     // After insert_cast, nu.binop.lhs may have been updated, so prefer it.
-    Node *result_lhs = n->nu.binop.lhs ? n->nu.binop.lhs : n->children[0];
+    Node *result_lhs = n->u.binop.lhs ? n->u.binop.lhs : n->children[0];
     return result_lhs->type;
 }
 Type *check_unary_operand(Node *n)
@@ -1804,7 +1804,7 @@ Type *check_unary_operand(Node *n)
     // NOTE: function argument promotion is not applied here; harmless on this
     // 16-bit target (all narrow integers ≤ 2 bytes share the calling convention
     // slot size), but would need revisiting for a 32-bit target.
-    Node *lhs = n->nu.unaryop.operand ? n->nu.unaryop.operand : n->children[0];
+    Node *lhs = n->u.unaryop.operand ? n->u.unaryop.operand : n->children[0];
     DBG_PRINT("%s %016llx\n", __func__, (unsigned long long)lhs->type);
 
     // For dereference, the result type is the element type; no promotion of the pointer.
@@ -1830,7 +1830,7 @@ Type *check_unary_operand(Node *n)
         return t_int;
 
     // Result type is the (possibly promoted) operand type.
-    Node *result_operand = n->nu.unaryop.operand ? n->nu.unaryop.operand : n->children[0];
+    Node *result_operand = n->u.unaryop.operand ? n->u.unaryop.operand : n->children[0];
     return result_operand->type;
 }
 bool is_unscaled_ptr(Node *n)
@@ -1866,9 +1866,9 @@ void propagate_types(Node *p, Node *n)
         if (n->child_count < 2)
             error("Malformed struct reference\n");
         // Use nu.member.base if available, fall back to children[0]
-        Node *lhs = n->nu.member.base ? n->nu.member.base : n->children[0];
+        Node *lhs = n->u.member.base ? n->u.member.base : n->children[0];
         // Field name is now in nu.member.field_name (string), not a node
-        char *field_name = n->nu.member.field_name ? n->nu.member.field_name : n->children[1]->u.ident;
+        char *field_name = n->u.member.field_name ? n->u.member.field_name : n->children[1]->u.ident;
         if (lhs->kind == ND_IDENT)
         {
             // If the lhs is an ident (rather than a member operator), it must be
@@ -1902,7 +1902,7 @@ void propagate_types(Node *p, Node *n)
         if (n->kind == ND_TERNARY)
         {
             // Result type is the common type of then/else branches
-            Node *then_ = n->nu.ternary.then_ ? n->nu.ternary.then_ : n->children[1];
+            Node *then_ = n->u.ternary.then_ ? n->u.ternary.then_ : n->children[1];
             n->type = then_->type;
         }
         if (n->kind == ND_BINOP)
@@ -1910,7 +1910,7 @@ void propagate_types(Node *p, Node *n)
             if (n->op_kind == TK_COMMA)
             {
                 // Comma: result type is the right operand's type
-                Node *rhs = n->nu.binop.rhs ? n->nu.binop.rhs : n->children[1];
+                Node *rhs = n->u.binop.rhs ? n->u.binop.rhs : n->children[1];
                 n->type = rhs->type;
             }
             else
@@ -1925,8 +1925,8 @@ void propagate_types(Node *p, Node *n)
 
             // See if either node is a pointer and the other an int of some sort. If so, we need to
             // scale the int by the size of the pointed to type
-            Node *lhs = n->nu.binop.lhs ? n->nu.binop.lhs : n->children[0];
-            Node *rhs = n->nu.binop.rhs ? n->nu.binop.rhs : n->children[1];
+            Node *lhs = n->u.binop.lhs ? n->u.binop.lhs : n->children[0];
+            Node *rhs = n->u.binop.rhs ? n->u.binop.rhs : n->children[1];
             if (is_unscaled_ptr(lhs) && istype_intlike(rhs->type))
                 insert_scale(n, 1, elem_type(lhs->type)->size);
             else if (is_unscaled_ptr(rhs) && istype_intlike(lhs->type))
@@ -1944,8 +1944,8 @@ void propagate_types(Node *p, Node *n)
     {
         // Result type is the LHS type (same as plain assignment).
         // If RHS type differs from LHS type, cast RHS so codegen uses consistent ops.
-        Node *lhs = n->nu.compound_assign.lhs ? n->nu.compound_assign.lhs : n->children[0];
-        Node *rhs = n->nu.compound_assign.rhs ? n->nu.compound_assign.rhs : n->children[1];
+        Node *lhs = n->u.compound_assign.lhs ? n->u.compound_assign.lhs : n->children[0];
+        Node *rhs = n->u.compound_assign.rhs ? n->u.compound_assign.rhs : n->children[1];
         Type *lhs_type = lhs->type;
         n->type = lhs_type;
         if (rhs->type != lhs_type)
@@ -1955,7 +1955,7 @@ void propagate_types(Node *p, Node *n)
     {
         n->type = parser_ctx.current_function->type->u.fn.ret;
         DBG_PRINT("%s found return stmt with expr, type of func:%s:\n", __func__, fulltype_str(n->type));
-        Node *expr = n->nu.returnstmt.expr ? n->nu.returnstmt.expr : n->children[0];
+        Node *expr = n->u.returnstmt.expr ? n->u.returnstmt.expr : n->children[0];
         if (n->type != expr->type)
             insert_cast(n, 0, n->type);
     }

@@ -423,7 +423,7 @@ void gen_callfunction_via_deref(Node *node)
 {
     int param_size = push_args(node, 1);
     // Use nu.unaryop.operand for the dereferenced pointer expression
-    Node *operand = node->nu.unaryop.operand ? node->nu.unaryop.operand : node->children[0];
+    Node *operand = node->u.unaryop.operand ? node->u.unaryop.operand : node->children[0];
     gen_expr(operand);
     gen_jli();
     gen_adj(param_size);
@@ -506,12 +506,12 @@ void gen_addr(Node *node)
     }
     else if (node->kind == ND_UNARYOP && node->op_kind == TK_STAR)
     {
-        Node *operand = node->nu.unaryop.operand ? node->nu.unaryop.operand : node->children[0];
+        Node *operand = node->u.unaryop.operand ? node->u.unaryop.operand : node->children[0];
         gen_expr(operand);
     }
     else if (node->kind == ND_MEMBER)
     {
-        Node *base = node->nu.member.base ? node->nu.member.base : node->children[0];
+        Node *base = node->u.member.base ? node->u.member.base : node->children[0];
         if (node->op_kind == TK_ARROW)
             gen_expr(base);    // load pointer value
         else
@@ -632,8 +632,8 @@ void gen_expr(Node *node)
     if (node->kind == ND_BINOP)
     {
         // Use nu.binop fields (kept in sync by insert_cast)
-        Node *lhs = node->nu.binop.lhs;
-        Node *rhs = node->nu.binop.rhs;
+        Node *lhs = node->u.binop.lhs;
+        Node *rhs = node->u.binop.rhs;
         if (node->op_kind == TK_COMMA)
         {
             gen_expr(lhs);    // evaluate for side effects
@@ -728,7 +728,7 @@ void gen_expr(Node *node)
     else if (node->kind == ND_UNARYOP)
     {
         // Use nu.unaryop.operand with fallback to children[0]
-        Node *operand = node->nu.unaryop.operand ? node->nu.unaryop.operand : node->children[0];
+        Node *operand = node->u.unaryop.operand ? node->u.unaryop.operand : node->children[0];
         switch (node->op_kind)
         {
         case TK_PLUS:
@@ -821,8 +821,8 @@ void gen_expr(Node *node)
     else if (node->kind == ND_ASSIGN)
     {
         // Use nu.binop fields (kept in sync by insert_cast)
-        Node *lhs = node->nu.binop.lhs;
-        Node *rhs = node->nu.binop.rhs;
+        Node *lhs = node->u.binop.lhs;
+        Node *rhs = node->u.binop.rhs;
         gen_addr(lhs);
         gen_push();
         gen_expr(rhs);
@@ -840,8 +840,8 @@ void gen_expr(Node *node)
         //   op             → r0 = old_val op rhs; stack: [addr]
         //   store          → mem[addr] = r0; stack: []
         // Use nu.compound_assign fields (kept in sync by insert_cast)
-        Node *lhs = node->nu.compound_assign.lhs;
-        Node *rhs = node->nu.compound_assign.rhs;
+        Node *lhs = node->u.compound_assign.lhs;
+        Node *rhs = node->u.compound_assign.rhs;
         int sz = lhs->type ? lhs->type->size : 2;
         gen_addr(lhs);
         gen_push();
@@ -883,7 +883,7 @@ void gen_expr(Node *node)
         // The type conversion is defined by the type of the expression in child 1 and the
         // type of the cast
         // Use nu.cast.expr (kept in sync by insert_cast)
-        Node *expr = node->nu.cast.expr ? node->nu.cast.expr : node->children[1];
+        Node *expr = node->u.cast.expr ? node->u.cast.expr : node->children[1];
         gen_expr(expr);
         gen_cast(expr->type, node->type);
     }
@@ -904,9 +904,9 @@ void gen_expr(Node *node)
     else if (node->kind == ND_TERNARY)
     {
         // Use nu.ternary fields (kept in sync by insert_cast)
-        Node *cond  = node->nu.ternary.cond;
-        Node *then_ = node->nu.ternary.then_;
-        Node *else_ = node->nu.ternary.else_;
+        Node *cond  = node->u.ternary.cond;
+        Node *then_ = node->u.ternary.then_;
+        Node *else_ = node->u.ternary.else_;
         int l_else = new_label();
         int l_end  = new_label();
         gen_expr(cond);
@@ -922,8 +922,8 @@ void gen_expr(Node *node)
         // va_start(ap, last_param)
         // ap = bp + last_param_offset + last_param_size
         // Use nu.vastart fields (kept in sync by insert_cast)
-        Node *ap_node  = node->nu.vastart.ap;
-        Node *lp_node  = node->nu.vastart.last;
+        Node *ap_node  = node->u.vastart.ap;
+        Node *lp_node  = node->u.vastart.last;
         int param_off  = lp_node->symbol->offset;
         int param_size = lp_node->symbol->type->size;
         gen_addr(ap_node);                       // r0 = &ap
@@ -937,7 +937,7 @@ void gen_expr(Node *node)
         // Returns *old_ap, advances ap by s
         int s         = node->type->size;
         // Use nu.vaarg.ap (kept in sync by insert_cast)
-        Node *ap_node = node->nu.vaarg.ap;
+        Node *ap_node = node->u.vaarg.ap;
         // Save old ap value
         gen_addr(ap_node);    // r0 = &ap
         gen_ld(2);            // r0 = ap (current vararg pointer)
@@ -969,7 +969,7 @@ void gen_returnstmt(Node *node)
 {
     printf(";%s\n", __func__);
     // Use nu.returnstmt.expr (kept in sync with children[0] by insert_cast)
-    Node *expr = node->nu.returnstmt.expr;
+    Node *expr = node->u.returnstmt.expr;
     if (expr)
     {
         // Must have an expression
@@ -983,9 +983,9 @@ void gen_ifstmt(Node *node)
     printf(";%s\n", __func__);
     // Structure is expr, stmt, [stmt]
     // Migrated to use nu.ifstmt fields
-    Node *cond = node->nu.ifstmt.cond;
-    Node *then_ = node->nu.ifstmt.then_;
-    Node *else_ = node->nu.ifstmt.else_;
+    Node *cond = node->u.ifstmt.cond;
+    Node *then_ = node->u.ifstmt.then_;
+    Node *else_ = node->u.ifstmt.else_;
     int l_else = new_label();
     gen_expr(cond);
     gen_jz(l_else);
@@ -1006,8 +1006,8 @@ void gen_whilestmt(Node *node)
 {
     printf(";%s\n", __func__);
     // Use nu.whilestmt fields (kept in sync by insert_cast)
-    Node *cond = node->nu.whilestmt.cond;
-    Node *body = node->nu.whilestmt.body;
+    Node *cond = node->u.whilestmt.cond;
+    Node *body = node->u.whilestmt.body;
     int lloop   = new_label();
     int lbreak  = new_label();
     codegen_ctx.break_labels[codegen_ctx.loop_depth] = lbreak;
@@ -1026,10 +1026,10 @@ void gen_forstmt(Node *node)
 {
     printf(";%s\n", __func__);
     // Use nu.forstmt fields (kept in sync by insert_cast)
-    Node *init = node->nu.forstmt.init;
-    Node *cond = node->nu.forstmt.cond;
-    Node *inc  = node->nu.forstmt.inc;
-    Node *body = node->nu.forstmt.body;
+    Node *init = node->u.forstmt.init;
+    Node *cond = node->u.forstmt.cond;
+    Node *inc  = node->u.forstmt.inc;
+    Node *body = node->u.forstmt.body;
     // If the init was a declaration, node->symtable holds the for-init scope.
     if (node->symtable)
         gen_adj(-node->symtable->size);
@@ -1062,8 +1062,8 @@ void gen_dowhilestmt(Node *node)
 {
     printf(";%s\n", __func__);
     // Use nu.dowhile fields (kept in sync by insert_cast)
-    Node *body = node->nu.dowhile.body;
-    Node *cond = node->nu.dowhile.cond;
+    Node *body = node->u.dowhile.body;
+    Node *cond = node->u.dowhile.cond;
     int lloop  = new_label();
     int lcont  = new_label();
     int lbreak = new_label();
@@ -1090,7 +1090,7 @@ void gen_exprstmt(Node *node)
 {
     // printf(";%s\n", __func__);
     // Use nu.exprstmt.decl (kept in sync by insert_cast)
-    gen_expr(node->nu.exprstmt.decl);
+    gen_expr(node->u.exprstmt.decl);
 }
 bool is_constexpr(Node *n)
 {

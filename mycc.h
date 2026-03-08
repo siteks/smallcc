@@ -270,9 +270,30 @@ struct Node
 {
     Node_kind       kind;
     union {
+        // OLD: identifier/label/operator strings and values
         char        *ident;      // ND_IDENT: variable/function name (heap)
         char        *label;      // ND_LABELSTMT, ND_GOTOSTMT: goto label (heap)
         Token_kind   op;         // ND_BINOP, ND_UNARYOP, ND_MEMBER: operator
+        // NEW: Tagged union fields for expression operands
+        struct { Node *lhs; Node *rhs; } binop;
+        struct { Node *operand; } unaryop;
+        struct { Node *base; char *field_name; } member;
+        struct { Node *base; Node *idx; } subscript;
+        struct { Node **items; int count; } initlist;
+        struct { Node *cond; Node *then_; Node *else_; } ifstmt;
+        struct { Node *cond; Node *body; } whilestmt;
+        struct { Node *init; Node *cond; Node *inc; Node *body; } forstmt;
+        struct { Node *body; Node *cond; } dowhile;
+        struct { Node *expr; } returnstmt;
+        struct { char *name; Node *target; } gotostmt;
+        struct { char *name; Node *stmt; } labelstmt;
+        struct { Node *decl; } exprstmt;
+        struct { Node *expr; } cast;
+        struct { Node *cond; Node *then_; Node *else_; } ternary;
+        struct { Node *lhs; Node *rhs; Token_kind op; } compound_assign;
+        struct { Node *ap; Node *last; } vastart;
+        struct { Node *ap; } vaarg;
+        struct { Node *ap; } vaend;
     } u;
     long long       ival;
     double          fval;
@@ -294,29 +315,6 @@ struct Node
     Symbol_table    *symtable;
     Symbol          *symbol;
     Type           *type;
-
-    // NEW: Tagged union fields (incrementally populated during migration)
-    union {
-        struct { Node *lhs; Node *rhs; } binop;
-        struct { Node *operand; } unaryop;
-        struct { Node *base; char *field_name; } member;
-        struct { Node *base; Node *idx; } subscript;
-        struct { Node **items; int count; } initlist;
-        struct { Node *cond; Node *then_; Node *else_; } ifstmt;
-        struct { Node *cond; Node *body; } whilestmt;
-        struct { Node *init; Node *cond; Node *inc; Node *body; } forstmt;
-        struct { Node *body; Node *cond; } dowhile;
-        struct { Node *expr; } returnstmt;
-        struct { char *name; Node *target; } gotostmt;
-        struct { char *name; Node *stmt; } labelstmt;
-        struct { Node *decl; } exprstmt;
-        struct { Node *expr; } cast;
-        struct { Node *cond; Node *then_; Node *else_; } ternary;
-        struct { Node *lhs; Node *rhs; Token_kind op; } compound_assign;
-        struct { Node *ap; Node *last; } vastart;
-        struct { Node *ap; } vaarg;
-        struct { Node *ap; } vaend;
-    } nu;
 };
 
 Node *program();
