@@ -422,7 +422,9 @@ void gen_callfunction_via_ptr(Node *node)
 void gen_callfunction_via_deref(Node *node)
 {
     int param_size = push_args(node, 1);
-    gen_expr(node->children[0]);
+    // Use nu.unaryop.operand for the dereferenced pointer expression
+    Node *operand = node->nu.unaryop.operand ? node->nu.unaryop.operand : node->children[0];
+    gen_expr(operand);
     gen_jli();
     gen_adj(param_size);
 }
@@ -504,14 +506,16 @@ void gen_addr(Node *node)
     }
     else if (node->kind == ND_UNARYOP && node->op_kind == TK_STAR)
     {
-        gen_expr(node->children[0]);
+        Node *operand = node->nu.unaryop.operand ? node->nu.unaryop.operand : node->children[0];
+        gen_expr(operand);
     }
     else if (node->kind == ND_MEMBER)
     {
+        Node *base = node->nu.member.base ? node->nu.member.base : node->children[0];
         if (node->op_kind == TK_ARROW)
-            gen_expr(node->children[0]);    // load pointer value
+            gen_expr(base);    // load pointer value
         else
-            gen_addr(node->children[0]);    // struct base address
+            gen_addr(base);    // struct base address
         gen_push();
         gen_offset(node);
         gen_add();
@@ -723,24 +727,26 @@ void gen_expr(Node *node)
     }
     else if (node->kind == ND_UNARYOP)
     {
+        // Use nu.unaryop.operand with fallback to children[0]
+        Node *operand = node->nu.unaryop.operand ? node->nu.unaryop.operand : node->children[0];
         switch (node->op_kind)
         {
         case TK_PLUS:
-            gen_expr(node->children[0]);
+            gen_expr(operand);
             break;
         case TK_MINUS:
-            if (istype_fp(node->children[0]->type))
+            if (istype_fp(operand->type))
             {
                 gen_imm_float(0.0);
                 gen_push();
-                gen_expr(node->children[0]);
+                gen_expr(operand);
                 gen_fsub();
             }
             else
             {
                 gen_imm(0);
                 gen_push();
-                gen_expr(node->children[0]);
+                gen_expr(operand);
                 gen_sub();
             }
             break;
@@ -752,21 +758,21 @@ void gen_expr(Node *node)
             }
             else
             {
-                gen_expr(node->children[0]);
+                gen_expr(operand);
                 gen_ld(elem_type(node->type)->size);
             }
             break;
         case TK_AMPERSAND:
-            gen_addr(node->children[0]);
+            gen_addr(operand);
             break;
         case TK_BANG:
-            gen_expr(node->children[0]);
+            gen_expr(operand);
             gen_push();
             gen_imm(0);
             gen_eq();
             break;
         case TK_TWIDDLE:
-            gen_expr(node->children[0]);
+            gen_expr(operand);
             gen_push();
             gen_imm(0xffffffff);
             gen_bitxor();
@@ -776,11 +782,10 @@ void gen_expr(Node *node)
         case TK_INC: case TK_DEC:
         {
             int is_inc = (node->op_kind == TK_INC);
-            Node *child = node->children[0];
-            int sz = child->type ? child->type->size : 2;
-            gen_addr(child);
+            int sz = operand->type ? operand->type->size : 2;
+            gen_addr(operand);
             gen_push();         // stack: [&x]
-            gen_expr(child);
+            gen_expr(operand);
             gen_push();         // stack: [&x, x]
             gen_imm(1);
             if (is_inc) gen_add(); else gen_sub();  // r0 = x±1, stack: [&x]
@@ -795,13 +800,12 @@ void gen_expr(Node *node)
         case TK_POST_INC: case TK_POST_DEC:
         {
             int is_inc = (node->op_kind == TK_POST_INC);
-            Node *child = node->children[0];
-            int sz = child->type ? child->type->size : 2;
-            gen_expr(child);    // r0 = old_x
+            int sz = operand->type ? operand->type->size : 2;
+            gen_expr(operand);    // r0 = old_x
             gen_push();         // stack: [old_x]
-            gen_addr(child);    // r0 = &x
+            gen_addr(operand);    // r0 = &x
             gen_push();         // stack: [old_x, &x]
-            gen_expr(child);    // r0 = x (reload)
+            gen_expr(operand);    // r0 = x (reload)
             gen_push();         // stack: [old_x, &x, x]
             gen_imm(1);
             if (is_inc) gen_add(); else gen_sub();  // r0 = x±1, stack: [old_x, &x]
