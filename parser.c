@@ -160,8 +160,6 @@ extern int scope_indices[];
 static Node *primary_expr();
 static Node *unary_expr();
 static Node *type_name();
-static Node *mult_expr();
-static Node *add_expr();
 static Node *assign_expr();
 static Node *expr();
 static Node *stmt();
@@ -178,8 +176,6 @@ static void parse_decl_specifiers(Node *node);
 
 
 
-
-// Note: parser_ctx.current_function and parser_ctx.anon_index are now in ParserContext
 
 void reset_parser(void)
 {
@@ -643,22 +639,62 @@ static Node *cast_expr()
         return unary_expr();
     }
 }
-static Node *mult_expr()
+// Generic binary-expression parser.
+// sub_parser: function to parse the next-lower-precedence operand
+// ops: NULL-terminated array of Token_kinds that trigger this level
+static Node *parse_binop(Node *(*sub_parser)(void), const Token_kind *ops)
 {
-    DBG_FUNC_TOKEN(token_ctx.current);
-    Node *node = cast_expr();
-    while (token_ctx.current->kind == TK_STAR || token_ctx.current->kind == TK_SLASH || token_ctx.current->kind == TK_PERCENT)
+    Node *node = sub_parser();
+    for (;;)
     {
         Token_kind k = token_ctx.current->kind;
+        bool matched = false;
+        for (int i = 0; ops[i] != TK_INVALID; i++)
+            if (k == ops[i]) { matched = true; break; }
+        if (!matched) break;
         expect(k);
         Node *enode = new_node(ND_BINOP, NULL, true);
         enode->op_kind = k;
         enode->u.binop.lhs = node;
-        enode->u.binop.rhs = cast_expr();
+        enode->u.binop.rhs = sub_parser();
         node = enode;
     }
     return node;
 }
+
+static const Token_kind ops_mult[]   = { TK_STAR, TK_SLASH, TK_PERCENT, TK_INVALID };
+static const Token_kind ops_add[]    = { TK_PLUS, TK_MINUS, TK_INVALID };
+static const Token_kind ops_shift[]  = { TK_SHIFTL, TK_SHIFTR, TK_INVALID };
+static const Token_kind ops_rel[]    = { TK_LT, TK_LE, TK_GT, TK_GE, TK_INVALID };
+static const Token_kind ops_equal[]  = { TK_EQ, TK_NE, TK_INVALID };
+static const Token_kind ops_bitand[] = { TK_AMPERSAND, TK_INVALID };
+static const Token_kind ops_bitxor[] = { TK_BITXOR, TK_INVALID };
+static const Token_kind ops_bitor[]  = { TK_BITOR, TK_INVALID };
+static const Token_kind ops_logand[] = { TK_LOGAND, TK_INVALID };
+static const Token_kind ops_logor[]  = { TK_LOGOR, TK_INVALID };
+
+// Forward declarations needed for parse_binop sub_parser references
+static Node *cast_expr();
+static Node *add_expr();
+static Node *shift_expr();
+static Node *rel_expr();
+static Node *equal_expr();
+static Node *bitand_expr();
+static Node *bitxor_expr();
+static Node *bitor_expr();
+static Node *logand_expr();
+
+static Node *mult_expr()   { return parse_binop(cast_expr,    ops_mult);   }
+static Node *add_expr()    { return parse_binop(mult_expr,    ops_add);    }
+static Node *shift_expr()  { return parse_binop(add_expr,     ops_shift);  }
+static Node *rel_expr()    { return parse_binop(shift_expr,   ops_rel);    }
+static Node *equal_expr()  { return parse_binop(rel_expr,     ops_equal);  }
+static Node *bitand_expr() { return parse_binop(equal_expr,   ops_bitand); }
+static Node *bitxor_expr() { return parse_binop(bitand_expr,  ops_bitxor); }
+static Node *bitor_expr()  { return parse_binop(bitxor_expr,  ops_bitor);  }
+static Node *logand_expr() { return parse_binop(bitor_expr,   ops_logand); }
+static Node *logor_expr()  { return parse_binop(logand_expr,  ops_logor);  }
+
 static Node **get_u_child_slot(Node *n, int child);
 void insert_scale(Node *n, int child, int size)
 {
@@ -667,164 +703,18 @@ void insert_scale(Node *n, int child, int size)
     Node *lit = new_node(ND_LITERAL, NULL, true);
     lit->ival = size;
 
-    // Read the original child from u.* slot
     Node **slot = get_u_child_slot(n, child);
     Node *original = slot ? *slot : n->children[child];
 
     sc->u.binop.lhs = lit;
     sc->u.binop.rhs = original;
-    // Also maintain children[] during transition
+    // Also populate children[] for Cat C nodes that use it
     add_child(sc, lit);
     add_child(sc, original);
 
-    // Write scale node back to u.* slot and children[]
     if (slot) *slot = sc;
     if (n->children && child < n->child_count)
         n->children[child] = sc;
-}
-static Node *add_expr()
-{
-    DBG_FUNC_TOKEN(token_ctx.current);
-    Node *node = mult_expr();
-    while (token_ctx.current->kind == TK_PLUS || token_ctx.current->kind == TK_MINUS)
-    {
-        Token_kind k = token_ctx.current->kind;
-        expect(k);
-        Node *enode = new_node(ND_BINOP, NULL, true);
-        enode->op_kind = k;
-        enode->u.binop.lhs = node;
-        enode->u.binop.rhs = mult_expr();
-        node = enode;
-    }
-    return node;
-}
-static Node *shift_expr()
-{
-    DBG_FUNC_TOKEN(token_ctx.current);
-    Node *node = add_expr();
-    while (token_ctx.current->kind == TK_SHIFTL || token_ctx.current->kind == TK_SHIFTR)
-    {
-        Token_kind k = token_ctx.current->kind;
-        expect(k);
-        Node *enode = new_node(ND_BINOP, NULL, true);
-        enode->op_kind = k;
-        enode->u.binop.lhs = node;
-        enode->u.binop.rhs = add_expr();
-        node = enode;
-    }
-    return node;
-}
-static Node *rel_expr()
-{
-    DBG_FUNC_TOKEN(token_ctx.current);
-    Node *node = shift_expr();
-    while (token_ctx.current->kind == TK_LT || token_ctx.current->kind == TK_LE || token_ctx.current->kind == TK_GT || token_ctx.current->kind == TK_GE)
-    {
-        Token_kind k = token_ctx.current->kind;
-        expect(k);
-        Node *enode = new_node(ND_BINOP, NULL, true);
-        enode->op_kind = k;
-        enode->u.binop.lhs = node;
-        enode->u.binop.rhs = shift_expr();
-        node = enode;
-    }
-    return node;
-}
-static Node *equal_expr()
-{
-    DBG_FUNC_TOKEN(token_ctx.current);
-    Node *node = rel_expr();
-    while (token_ctx.current->kind == TK_EQ || token_ctx.current->kind == TK_NE)
-    {
-        Token_kind k = token_ctx.current->kind;
-        expect(k);
-        Node *enode = new_node(ND_BINOP, NULL, true);
-        enode->op_kind = k;
-        enode->u.binop.lhs = node;
-        enode->u.binop.rhs = rel_expr();
-        node = enode;
-    }
-    return node;
-}
-static Node *bitand_expr()
-{
-    DBG_FUNC_TOKEN(token_ctx.current);
-    Node *node = equal_expr();
-    while (token_ctx.current->kind == TK_AMPERSAND)
-    {
-        Token_kind k = token_ctx.current->kind;
-        expect(k);
-        Node *enode = new_node(ND_BINOP, NULL, true);
-        enode->op_kind = k;
-        enode->u.binop.lhs = node;
-        enode->u.binop.rhs = equal_expr();
-        node = enode;
-    }
-    return node;
-}
-static Node *bitxor_expr()
-{
-    DBG_FUNC_TOKEN(token_ctx.current);
-    Node *node = bitand_expr();
-    while (token_ctx.current->kind == TK_BITXOR)
-    {
-        Token_kind k = token_ctx.current->kind;
-        expect(k);
-        Node *enode = new_node(ND_BINOP, NULL, true);
-        enode->op_kind = k;
-        enode->u.binop.lhs = node;
-        enode->u.binop.rhs = bitand_expr();
-        node = enode;
-    }
-    return node;
-}
-static Node *bitor_expr()
-{
-    DBG_FUNC_TOKEN(token_ctx.current);
-    Node *node = bitxor_expr();
-    while (token_ctx.current->kind == TK_BITOR)
-    {
-        Token_kind k = token_ctx.current->kind;
-        expect(k);
-        Node *enode = new_node(ND_BINOP, NULL, true);
-        enode->op_kind = k;
-        enode->u.binop.lhs = node;
-        enode->u.binop.rhs = bitxor_expr();
-        node = enode;
-    }
-    return node;
-}
-static Node *logand_expr()
-{
-    DBG_FUNC_TOKEN(token_ctx.current);
-    Node *node = bitor_expr();
-    while (token_ctx.current->kind == TK_LOGAND)
-    {
-        Token_kind k = token_ctx.current->kind;
-        expect(k);
-        Node *enode = new_node(ND_BINOP, NULL, true);
-        enode->op_kind = k;
-        enode->u.binop.lhs = node;
-        enode->u.binop.rhs = bitor_expr();
-        node = enode;
-    }
-    return node;
-}
-static Node *logor_expr()
-{
-    DBG_FUNC_TOKEN(token_ctx.current);
-    Node *node = logand_expr();
-    while (token_ctx.current->kind == TK_LOGOR)
-    {
-        Token_kind k = token_ctx.current->kind;
-        expect(k);
-        Node *enode = new_node(ND_BINOP, NULL, true);
-        enode->op_kind = k;
-        enode->u.binop.lhs = node;
-        enode->u.binop.rhs = logand_expr();
-        node = enode;
-    }
-    return node;
 }
 static Node *assign_expr();
 static Node *cond_expr()
@@ -870,7 +760,6 @@ static Node *assign_expr()
         anode->op_kind = op_tk;
         anode->u.compound_assign.lhs = node;
         anode->u.compound_assign.rhs = assign_expr();
-        anode->u.compound_assign.op = op_tk;
         return anode;
     }
     return node;
@@ -921,10 +810,16 @@ bool is_typequal(Token_kind tk)
 
 static void parse_decl_specifiers(Node *node)
 {
-    while (is_sc_spec(token_ctx.current->kind) || is_typespec(token_ctx.current->kind) || is_typequal(token_ctx.current->kind))
+    while (is_sc_spec(token_ctx.current->kind) || is_typespec(token_ctx.current->kind) || is_typequal(token_ctx.current->kind)
+           || (token_ctx.current->kind == TK_IDENT && is_typedef_name(token_ctx.current->val) && node->typespec == 0))
     {
         if (is_sc_spec(token_ctx.current->kind))  node->sclass   = token_ctx.current->kind;
         if (is_typespec(token_ctx.current->kind)) node->typespec |= to_typespec(token_ctx.current->kind);
+        if (token_ctx.current->kind == TK_IDENT && is_typedef_name(token_ctx.current->val))
+        {
+            node->typespec |= DS_TYPEDEF;
+            node->type      = find_typedef_type(token_ctx.current->val);
+        }
         expect(token_ctx.current->kind);
     }
 }
@@ -1066,9 +961,6 @@ static Node *initializer_list()
         expect(TK_COMMA);
         add_child(node, initializer());
     }
-    // NEW: populate tagged union fields
-    node->u.initlist.count = node->child_count;
-    node->u.initlist.items = node->children;  // share the array (both old and new point to same)
     return node;
 }
 static Node *initializer()
@@ -1190,20 +1082,8 @@ static Node *declaration(int depth)
     DBG_FUNC();
     // <declaration> ::=  {<declaration-specifier>}+ {<init-declarator>}* ;
     Node *node = new_node(ND_DECLARATION, 0, false);
-    // At least one decl_spec
-    // TODO storage class defaults A.8.1
-    while(is_sc_spec(token_ctx.current->kind) || is_typespec(token_ctx.current->kind) || is_typequal(token_ctx.current->kind)
-          || (token_ctx.current->kind == TK_IDENT && is_typedef_name(token_ctx.current->val) && node->typespec == 0))
-    {
-        if (is_sc_spec(token_ctx.current->kind))    node->sclass = token_ctx.current->kind;
-        if (is_typespec(token_ctx.current->kind))   node->typespec |= to_typespec(token_ctx.current->kind);
-        if (token_ctx.current->kind == TK_IDENT && is_typedef_name(token_ctx.current->val))
-        {
-            node->typespec |= DS_TYPEDEF;
-            node->type      = find_typedef_type(token_ctx.current->val);
-        }
-        expect(token_ctx.current->kind);
-    }
+    // At least one decl_spec (including optional typedef-name)
+    parse_decl_specifiers(node);
     if (node->typespec & (DS_STRUCT | DS_UNION))
     {
         struct_decl(node, depth);
@@ -1764,7 +1644,9 @@ static Node **get_u_child_slot(Node *n, int child)
     case ND_VA_END:
         if (child == 0) return &n->u.vaend.ap;
         break;
-    default: break;
+    default:
+        error("get_u_child_slot: unhandled node kind %d (%s)", n->kind, nodestr(n->kind));
+        return NULL;
     }
     return NULL;
 }
@@ -1775,18 +1657,16 @@ void insert_cast(Node *n, int child, Type *t)
     Node *c = new_node(ND_CAST, 0, true);
     Node *placeholder = new_node(ND_DECLARATION, 0, false);
 
-    // Read the original child from u.* slot
     Node **slot = get_u_child_slot(n, child);
     Node *original = slot ? *slot : n->children[child];
 
     c->u.cast.type_decl = placeholder;
     c->u.cast.expr = original;
     c->type = t;
-    // Also maintain children[] during transition
+    // Also populate children[] for Cat C nodes that use it
     add_child(c, placeholder);
     add_child(c, original);
 
-    // Write cast node back to u.* slot and children[]
     if (slot) *slot = c;
     if (n->children && child < n->child_count)
         n->children[child] = c;

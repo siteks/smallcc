@@ -10,6 +10,10 @@
 
 void error(const char *fmt, ...);
 
+// Target architecture constants
+#define WORD_SIZE      2   // size of int and pointer (16-bit target)
+#define FRAME_OVERHEAD 8   // enter saves lr+bp (4 bytes each); params start at bp+8
+
 // ===============================================================
 // Debug Output Control
 // ===============================================================
@@ -275,7 +279,6 @@ struct Node
         struct { Node *lhs; Node *rhs; } binop;            // ND_BINOP, ND_ASSIGN
         struct { Node *operand; } unaryop;                  // ND_UNARYOP
         struct { Node *base; char *field_name; } member;    // ND_MEMBER
-        struct { Node **items; int count; } initlist;       // ND_INITLIST
         struct { Node *cond; Node *then_; Node *else_; } ifstmt;
         struct { Node *cond; Node *body; } whilestmt;
         struct { Node *init; Node *cond; Node *inc; Node *body; } forstmt;
@@ -286,7 +289,7 @@ struct Node
         struct { Node *decl; } exprstmt;                    // ND_EXPRSTMT
         struct { Node *type_decl; Node *expr; } cast;       // ND_CAST
         struct { Node *cond; Node *then_; Node *else_; } ternary; // ND_TERNARY
-        struct { Node *lhs; Node *rhs; Token_kind op; } compound_assign; // ND_COMPOUND_ASSIGN
+        struct { Node *lhs; Node *rhs; } compound_assign; // ND_COMPOUND_ASSIGN
         struct { Node *ap; Node *last; } vastart;           // ND_VA_START
         struct { Node *ap; } vaarg;                         // ND_VA_ARG
         struct { Node *ap; } vaend;                         // ND_VA_END

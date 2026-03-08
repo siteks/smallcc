@@ -102,10 +102,22 @@ Type *get_array_type(Type *elem, int count)
     return t;
 }
 
+static bool params_match(Param *a, Param *b)
+{
+    while (a && b)
+    {
+        if (a->type != b->type) return false;
+        a = a->next;
+        b = b->next;
+    }
+    return a == NULL && b == NULL;
+}
+
 Type *get_function_type(Type *ret, Param *params, bool is_variadic)
 {
     for (Type *p = type_ctx.type_list; p; p = p->next)
-        if (p->base == TB_FUNCTION && p->u.fn.ret == ret && p->u.fn.is_variadic == is_variadic)
+        if (p->base == TB_FUNCTION && p->u.fn.ret == ret && p->u.fn.is_variadic == is_variadic
+            && params_match(p->u.fn.params, params))
             return p;
 
     Type *t = calloc(1, sizeof(Type));
@@ -796,7 +808,7 @@ static Symbol *insert_ident(Node *node, Type *type, const char *ident, bool is_p
     st->global_offset = go;
 
     int offset       = 0;
-    int param_offset = 8;
+    int param_offset = FRAME_OVERHEAD;  // params start above saved lr+bp
     int last_size    = 0;
     for (Symbol *s = st->idents; s; s = s->next) {
         if (s->is_param) {

@@ -261,6 +261,7 @@ static int decode_string_char(const char *src, char *out)
                 *out = (char)strtol(src, &q, 8);
                 return 1 + (int)(q - src);
             }
+            fprintf(stderr, "warning: unrecognized escape sequence '\\%c'\n", *src);
             *out = *src;
             return 2;
     }

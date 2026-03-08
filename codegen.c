@@ -65,10 +65,6 @@ static LocalAddr find_local_addr(Node *node, const char *name)
 }
 
 
-// Note: codegen_ctx.label_counter, break_labels, cont_labels, loop_depth are now in CodegenContext
-
-// Note: codegen_ctx.strlits, codegen_ctx.strlit_count, codegen_ctx.local_statics, codegen_ctx.local_static_count now in CodegenContext
-
 static int new_strlit(char *data, int len)
 {
     int id = codegen_ctx.label_counter++;
@@ -406,7 +402,7 @@ static int push_args(Node *node, int start_idx)
     {
         gen_expr(node->children[i]);
         int s = node->children[i]->type->size;
-        if (s == 0) s = 2;  // function designator decay
+        if (s == 0) s = WORD_SIZE;  // function designator decay to pointer size
         if (s == 2) gen_pushw(); else gen_push();
         param_size += s;
     }
@@ -890,7 +886,7 @@ void gen_expr(Node *node)
         // Call through a function-pointer struct member: s.fp(args) or s->fp(args)
         int param_size = push_args(node, 2);
         gen_addr(node);
-        gen_ld(2);
+        gen_ld(WORD_SIZE);  // load function pointer (pointer-sized)
         gen_jli();
         gen_adj(param_size);
     }
@@ -935,13 +931,13 @@ void gen_expr(Node *node)
         Node *ap_node = node->u.vaarg.ap;
         // Save old ap value
         gen_addr(ap_node);    // r0 = &ap
-        gen_ld(2);            // r0 = ap (current vararg pointer)
+        gen_ld(WORD_SIZE);    // r0 = ap (current vararg pointer)
         gen_push();           // stack: [old_ap]
         // Advance ap: ap = ap + s
         gen_addr(ap_node);    // r0 = &ap
         gen_push();           // stack: [old_ap, &ap]
         gen_addr(ap_node);    // r0 = &ap
-        gen_ld(2);            // r0 = ap
+        gen_ld(WORD_SIZE);    // r0 = ap
         gen_push();           // stack: [old_ap, &ap, ap]
         gen_imm(s);           // r0 = s
         gen_add();            // r0 = ap + s; stack: [old_ap, &ap]
@@ -976,7 +972,6 @@ void gen_ifstmt(Node *node)
 {
     printf(";%s\n", __func__);
     // Structure is expr, stmt, [stmt]
-    // Migrated to use nu.ifstmt fields
     Node *cond = node->u.ifstmt.cond;
     Node *then_ = node->u.ifstmt.then_;
     Node *else_ = node->u.ifstmt.else_;
@@ -999,6 +994,7 @@ void gen_ifstmt(Node *node)
 void gen_whilestmt(Node *node)
 {
     printf(";%s\n", __func__);
+    if (codegen_ctx.loop_depth >= 64) error("too deeply nested");
     Node *cond = node->u.whilestmt.cond;
     Node *body = node->u.whilestmt.body;
     int lloop   = new_label();
@@ -1018,6 +1014,7 @@ void gen_decl(Node *node);  // forward declaration
 void gen_forstmt(Node *node)
 {
     printf(";%s\n", __func__);
+    if (codegen_ctx.loop_depth >= 64) error("too deeply nested");
     Node *init = node->u.forstmt.init;
     Node *cond = node->u.forstmt.cond;
     Node *inc  = node->u.forstmt.inc;
@@ -1053,6 +1050,7 @@ void gen_forstmt(Node *node)
 void gen_dowhilestmt(Node *node)
 {
     printf(";%s\n", __func__);
+    if (codegen_ctx.loop_depth >= 64) error("too deeply nested");
     Node *body = node->u.dowhile.body;
     Node *cond = node->u.dowhile.cond;
     int lloop  = new_label();
@@ -1084,8 +1082,12 @@ void gen_exprstmt(Node *node)
 }
 bool is_constexpr(Node *n)
 {
-    // TODO this isnt rigorous
-    return n->kind == ND_LITERAL || n->kind == ND_BINOP || n->kind == ND_IDENT || n->kind == ND_UNARYOP;
+    if (n->kind == ND_LITERAL) return true;
+    if (n->kind == ND_BINOP || n->kind == ND_UNARYOP) return true;
+    // Enum constants are compile-time integers
+    if (n->kind == ND_IDENT && n->symbol && n->symbol->is_enum_const) return true;
+    // Other idents (non-enum) are not compile-time constants
+    return false;
 }
 int count_constexpr(Node *n)
 {
@@ -1476,6 +1478,7 @@ void gen_gotostmt(Node *node)
 void gen_switchstmt(Node *node)
 {
     printf(";%s\n", __func__);
+    if (codegen_ctx.loop_depth >= 64) error("too deeply nested");
     Node *selector = node->u.switchstmt.selector;
     Node *body     = node->u.switchstmt.body; // ND_COMPSTMT
     int lbreak     = new_label();

@@ -1,4 +1,5 @@
 
+#include <sys/stat.h>
 #include "mycc.h"
 
 
@@ -42,6 +43,11 @@ static void harvest_globals(void)
             if (!strcmp(extern_ctx.syms[i].name, s->name)) { already = true; break; }
         if (!already)
         {
+            if (extern_ctx.count >= 1024)
+            {
+                fprintf(stderr, "too many extern symbols\n");
+                exit(1);
+            }
             extern_ctx.syms[extern_ctx.count].name = s->name;
             extern_ctx.syms[extern_ctx.count].type = s->type;
             extern_ctx.count++;
@@ -81,9 +87,8 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    FILE *probe = fopen(argv[1], "r");
-    bool file_mode = (probe != NULL);
-    if (probe) fclose(probe);
+    struct stat st;
+    bool file_mode = (stat(argv[1], &st) == 0 && S_ISREG(st.st_mode));
 
     int tu_count = file_mode ? (argc - 1) : 1;
 
