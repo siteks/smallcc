@@ -577,6 +577,8 @@ static Node *unary_expr()
                 Node *n = new_node(ND_UNARYOP, op, true);
                 n->op_kind = post_k;
                 add_child(n, node);
+                // NEW: also populate tagged union field
+                n->u.unaryop.operand = node;
                 node = n;
                 break;
             }
@@ -1754,8 +1756,8 @@ Type *check_operands(Node *n)
     // Promotions use the *original* lhs/rhs types for checks; insert_cast
     // replaces n->children[], so we return n->u.binop.lhs->type at the end
     // to get the post-cast result type (not lhs->type which stays pre-cast).
-    Node *lhs = n->u.binop.lhs ? n->u.binop.lhs : n->children[0];
-    Node *rhs = n->u.binop.rhs ? n->u.binop.rhs : n->children[1];
+    Node *lhs = n->u.binop.lhs;
+    Node *rhs = n->u.binop.rhs;
     DBG_PRINT("%s %016llx %016llx\n", __func__, (unsigned long long)lhs->type, (unsigned long long)rhs->type);
 
     // Float/double: one side pulls the other up
@@ -1793,7 +1795,7 @@ Type *check_operands(Node *n)
     // Return the post-cast type of the left child (both children now have the
     // same type after conversions, so either would give the same answer).
     // After insert_cast, nu.binop.lhs may have been updated, so prefer it.
-    Node *result_lhs = n->u.binop.lhs ? n->u.binop.lhs : n->children[0];
+    Node *result_lhs = n->u.binop.lhs;
     return result_lhs->type;
 }
 Type *check_unary_operand(Node *n)
@@ -1804,7 +1806,7 @@ Type *check_unary_operand(Node *n)
     // NOTE: function argument promotion is not applied here; harmless on this
     // 16-bit target (all narrow integers ≤ 2 bytes share the calling convention
     // slot size), but would need revisiting for a 32-bit target.
-    Node *lhs = n->u.unaryop.operand ? n->u.unaryop.operand : n->children[0];
+    Node *lhs = n->u.unaryop.operand;
     DBG_PRINT("%s %016llx\n", __func__, (unsigned long long)lhs->type);
 
     // For dereference, the result type is the element type; no promotion of the pointer.
@@ -1830,7 +1832,7 @@ Type *check_unary_operand(Node *n)
         return t_int;
 
     // Result type is the (possibly promoted) operand type.
-    Node *result_operand = n->u.unaryop.operand ? n->u.unaryop.operand : n->children[0];
+    Node *result_operand = n->u.unaryop.operand;
     return result_operand->type;
 }
 bool is_unscaled_ptr(Node *n)
@@ -1866,9 +1868,9 @@ void propagate_types(Node *p, Node *n)
         if (n->child_count < 2)
             error("Malformed struct reference\n");
         // Use nu.member.base if available, fall back to children[0]
-        Node *lhs = n->u.member.base ? n->u.member.base : n->children[0];
+        Node *lhs = n->u.member.base;
         // Field name is now in nu.member.field_name (string), not a node
-        char *field_name = n->u.member.field_name ? n->u.member.field_name : n->children[1]->u.ident;
+        char *field_name = n->u.member.field_name;
         if (lhs->kind == ND_IDENT)
         {
             // If the lhs is an ident (rather than a member operator), it must be
@@ -1902,7 +1904,7 @@ void propagate_types(Node *p, Node *n)
         if (n->kind == ND_TERNARY)
         {
             // Result type is the common type of then/else branches
-            Node *then_ = n->u.ternary.then_ ? n->u.ternary.then_ : n->children[1];
+            Node *then_ = n->u.ternary.then_;
             n->type = then_->type;
         }
         if (n->kind == ND_BINOP)
@@ -1910,7 +1912,7 @@ void propagate_types(Node *p, Node *n)
             if (n->op_kind == TK_COMMA)
             {
                 // Comma: result type is the right operand's type
-                Node *rhs = n->u.binop.rhs ? n->u.binop.rhs : n->children[1];
+                Node *rhs = n->u.binop.rhs;
                 n->type = rhs->type;
             }
             else
@@ -1925,8 +1927,8 @@ void propagate_types(Node *p, Node *n)
 
             // See if either node is a pointer and the other an int of some sort. If so, we need to
             // scale the int by the size of the pointed to type
-            Node *lhs = n->u.binop.lhs ? n->u.binop.lhs : n->children[0];
-            Node *rhs = n->u.binop.rhs ? n->u.binop.rhs : n->children[1];
+            Node *lhs = n->u.binop.lhs;
+            Node *rhs = n->u.binop.rhs;
             if (is_unscaled_ptr(lhs) && istype_intlike(rhs->type))
                 insert_scale(n, 1, elem_type(lhs->type)->size);
             else if (is_unscaled_ptr(rhs) && istype_intlike(lhs->type))
@@ -1944,8 +1946,8 @@ void propagate_types(Node *p, Node *n)
     {
         // Result type is the LHS type (same as plain assignment).
         // If RHS type differs from LHS type, cast RHS so codegen uses consistent ops.
-        Node *lhs = n->u.compound_assign.lhs ? n->u.compound_assign.lhs : n->children[0];
-        Node *rhs = n->u.compound_assign.rhs ? n->u.compound_assign.rhs : n->children[1];
+        Node *lhs = n->u.compound_assign.lhs;
+        Node *rhs = n->u.compound_assign.rhs;
         Type *lhs_type = lhs->type;
         n->type = lhs_type;
         if (rhs->type != lhs_type)
@@ -1955,7 +1957,7 @@ void propagate_types(Node *p, Node *n)
     {
         n->type = parser_ctx.current_function->type->u.fn.ret;
         DBG_PRINT("%s found return stmt with expr, type of func:%s:\n", __func__, fulltype_str(n->type));
-        Node *expr = n->u.returnstmt.expr ? n->u.returnstmt.expr : n->children[0];
+        Node *expr = n->u.returnstmt.expr;
         if (n->type != expr->type)
             insert_cast(n, 0, n->type);
     }

@@ -422,9 +422,8 @@ void gen_callfunction_via_ptr(Node *node)
 void gen_callfunction_via_deref(Node *node)
 {
     int param_size = push_args(node, 1);
-    // Use nu.unaryop.operand for the dereferenced pointer expression
-    Node *operand = node->u.unaryop.operand ? node->u.unaryop.operand : node->children[0];
-    gen_expr(operand);
+    // Use u.unaryop.operand for the dereferenced pointer expression
+    gen_expr(node->u.unaryop.operand);
     gen_jli();
     gen_adj(param_size);
 }
@@ -506,16 +505,14 @@ void gen_addr(Node *node)
     }
     else if (node->kind == ND_UNARYOP && node->op_kind == TK_STAR)
     {
-        Node *operand = node->u.unaryop.operand ? node->u.unaryop.operand : node->children[0];
-        gen_expr(operand);
+        gen_expr(node->u.unaryop.operand);
     }
     else if (node->kind == ND_MEMBER)
     {
-        Node *base = node->u.member.base ? node->u.member.base : node->children[0];
         if (node->op_kind == TK_ARROW)
-            gen_expr(base);    // load pointer value
+            gen_expr(node->u.member.base);    // load pointer value
         else
-            gen_addr(base);    // struct base address
+            gen_addr(node->u.member.base);    // struct base address
         gen_push();
         gen_offset(node);
         gen_add();
@@ -727,8 +724,8 @@ void gen_expr(Node *node)
     }
     else if (node->kind == ND_UNARYOP)
     {
-        // Use nu.unaryop.operand with fallback to children[0]
-        Node *operand = node->u.unaryop.operand ? node->u.unaryop.operand : node->children[0];
+        // Use u.unaryop.operand directly
+        Node *operand = node->u.unaryop.operand;
         switch (node->op_kind)
         {
         case TK_PLUS:
@@ -882,10 +879,9 @@ void gen_expr(Node *node)
     {
         // The type conversion is defined by the type of the expression in child 1 and the
         // type of the cast
-        // Use nu.cast.expr (kept in sync by insert_cast)
-        Node *expr = node->u.cast.expr ? node->u.cast.expr : node->children[1];
-        gen_expr(expr);
-        gen_cast(expr->type, node->type);
+        // Use u.cast.expr directly
+        gen_expr(node->u.cast.expr);
+        gen_cast(node->u.cast.expr->type, node->type);
     }
     else if (node->kind == ND_MEMBER && node->is_function)
     {
