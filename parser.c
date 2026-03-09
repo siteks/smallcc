@@ -213,12 +213,13 @@ Node *new_node(Node_kind kind, char *val, bool is_expr)
 
 
 
-static void list_append(Node **head, Node *item)
+typedef struct { Node *head; Node *tail; } NodeList;
+#define NL_INIT { NULL, NULL }
+static void nl_append(NodeList *l, Node *item)
 {
-    if (!*head) { *head = item; return; }
-    Node *p = *head;
-    while (p->next) p = p->next;
-    p->next = item;
+    if (!l->tail) l->head = item;
+    else          l->tail->next = item;
+    l->tail = item;
 }
 
 static Node *primary_expr()
@@ -513,12 +514,14 @@ static Node *unary_expr()
                 {
                     // ND_IDENT args → ch[0]; ND_UNARYOP args → ch[1]; ND_MEMBER args → ch[1]
                     int args_slot = (node->kind == ND_IDENT) ? 0 : 1;
-                    list_append(&node->ch[args_slot], assign_expr());
+                    NodeList args = NL_INIT;
+                    nl_append(&args, assign_expr());
                     while (token_ctx.current->kind == TK_COMMA)
                     {
                         token_ctx.current = token_ctx.current->next;
-                        list_append(&node->ch[args_slot], assign_expr());
+                        nl_append(&args, assign_expr());
                     }
+                    node->ch[args_slot] = args.head;
                 }
                 expect(TK_RPAREN);
                 break;
@@ -601,12 +604,12 @@ static Node *type_name()
     {
         enum_decl(&ds);
     }
-    Node *decls = NULL;
+    NodeList decls = NL_INIT;
     while(token_ctx.current->kind != TK_RPAREN)
     {
-        list_append(&decls, declarator());
+        nl_append(&decls, declarator());
     }
-    Node *node = make_decl_node(&ds, NULL, decls);
+    Node *node = make_decl_node(&ds, NULL, decls.head);
     node->type = type2_from_decl_node(node, ds);
     DBG_PRINT("%s type:%s\n", __func__, fulltype_str(node->type));
     return node;
@@ -866,14 +869,14 @@ static Node *param_declaration()
     {
         enum_decl(&ds);
     }
-    Node *decls = NULL;
+    NodeList decls = NL_INIT;
     if (token_ctx.current->kind == TK_STAR || token_ctx.current->kind == TK_IDENT || token_ctx.current->kind == TK_LPAREN)
     {
-        list_append(&decls, declarator());
+        nl_append(&decls, declarator());
     }
     // else: abstract declarator (no name) — valid in C89
 
-    Node *node = make_decl_node(&ds, spec, decls);
+    Node *node = make_decl_node(&ds, spec, decls.head);
     // At this point, we can add the symbols and types to the tables
     add_types_and_symbols(node, ds, true, false);
     return node;
@@ -883,9 +886,10 @@ static Node *param_type_list()
     DBG_FUNC();
     Node *node = new_node(ND_PTYPE_LIST, 0, false);
     node->symtable = enter_new_scope();
+    NodeList params = NL_INIT;
     while(token_ctx.current->kind != TK_RPAREN)
     {
-        list_append(&node->ch[0], param_declaration());   // params list
+        nl_append(&params, param_declaration());   // params list
         if (token_ctx.current->kind == TK_COMMA)
         {
             expect(TK_COMMA);
@@ -897,6 +901,7 @@ static Node *param_type_list()
             }
         }
     }
+    node->ch[0] = params.head;
     leave_scope();
     // Restore type_ctx.last_symbol_table to this scope so that nested param_type_list
     // calls (inside function-pointer declarators) do not overwrite it.
@@ -922,12 +927,13 @@ static Node *direct_decl()
         node->ch[0] = declarator();   // name (grouped declarator like (*fp))
         expect(TK_RPAREN);
     }
+    NodeList suffixes = NL_INIT;
     while(true)
     {
         if (token_ctx.current->kind == TK_LBRACKET)
         {
             Node *arr = new_node(ND_ARRAY_DECL, expect(TK_LBRACKET), false);
-            list_append(&node->ch[1], arr);   // suffixes list
+            nl_append(&suffixes, arr);   // suffixes list
             if (token_ctx.current->kind != TK_RBRACKET)
             {
                 arr->ch[0] = cond_expr();  // size
@@ -937,15 +943,15 @@ static Node *direct_decl()
         else if (token_ctx.current->kind == TK_LPAREN)
         {
             Node *fn = new_node(ND_FUNC_DECL, expect(TK_LPAREN), false);
-            list_append(&node->ch[1], fn);   // suffixes list
+            nl_append(&suffixes, fn);   // suffixes list
             // ND_FUNC_DECL kind itself signals "function suffix"; no is_function field needed
-            // TODO can also be identifier
             fn->ch[0] = param_type_list();   // params
             expect(TK_RPAREN);
         }
         else
             break;
     }
+    node->ch[1] = suffixes.head;
     return node;
 }
 static Node *declarator()
@@ -975,12 +981,14 @@ static Node *initializer();
 static Node *initializer_list()
 {
     Node *node = new_node(ND_INITLIST, 0, false);
-    list_append(&node->ch[0], initializer());   // items list
+    NodeList items = NL_INIT;
+    nl_append(&items, initializer());   // items list
     while (token_ctx.current->kind == TK_COMMA)
     {
         expect(TK_COMMA);
-        list_append(&node->ch[0], initializer());
+        nl_append(&items, initializer());
     }
+    node->ch[0] = items.head;
     return node;
 }
 static Node *initializer()
@@ -1042,11 +1050,13 @@ static Node *struct_decl(DeclParseState *ds, int depth)
         expect(TK_LBRACE);
         n->symtable = enter_new_scope();
         n->symtable->scope_type = ST_STRUCT;
+        NodeList members = NL_INIT;
         do
         {
-            list_append(&n->ch[1], declaration(depth + 1));   // members list
+            nl_append(&members, declaration(depth + 1));   // members list
         }
         while (token_ctx.current->kind != TK_RBRACE);
+        n->ch[1] = members.head;
         leave_scope();
         expect(TK_RBRACE);
     }
@@ -1115,10 +1125,10 @@ static Node *declaration(int depth)
     {
         enum_decl(&ds);
     }
-    Node *decls = NULL;
+    NodeList decls = NL_INIT;
     while(token_ctx.current->kind != TK_SEMICOLON)
     {
-        list_append(&decls, init_declarator());
+        nl_append(&decls, init_declarator());
         if (token_ctx.current->kind != TK_SEMICOLON)
         {
             // We could get this far to find out this is a function definition.
@@ -1126,7 +1136,7 @@ static Node *declaration(int depth)
             // it is a func definition
             if (token_ctx.current->kind == TK_LBRACE)
             {
-                Node *node = make_decl_node(&ds, spec, decls);
+                Node *node = make_decl_node(&ds, spec, decls.head);
                 add_types_and_symbols(node, ds, false, false);
                 parser_ctx.current_function = node;
                 // This is the first compound statement of a
@@ -1143,7 +1153,7 @@ static Node *declaration(int depth)
     expect(TK_SEMICOLON);
     // At this point, we can add the symbols and types to the tables
     // We don't add struct members but we do add tags
-    Node *node = make_decl_node(&ds, spec, decls);
+    Node *node = make_decl_node(&ds, spec, decls.head);
     add_types_and_symbols(node, ds, false, depth != 0);
     return node;
 }
@@ -1158,14 +1168,16 @@ static Node *comp_stmt(bool use_last_scope)
         // <compound-statement> ::= { {<declaration-or-statement>}* }
         // C99 extension: declarations may appear anywhere in a block.
         expect(TK_LBRACE);
+        NodeList stmts = NL_INIT;
         while (token_ctx.current->kind != TK_RBRACE)
         {
             if (is_sc_spec(token_ctx.current->kind) || is_typespec(token_ctx.current->kind) || is_typequal(token_ctx.current->kind)
                 || (token_ctx.current->kind == TK_IDENT && is_typedef_name(token_ctx.current->val)))
-                list_append(&node->ch[0], declaration(0));   // stmts list
+                nl_append(&stmts, declaration(0));   // stmts list
             else
-                list_append(&node->ch[0], stmt());
+                nl_append(&stmts, stmt());
         }
+        node->ch[0] = stmts.head;
         expect(TK_RBRACE);
     }
     leave_scope();
@@ -1341,10 +1353,12 @@ Node *program()
 {
     DBG_FUNC();
     Node *node = new_node(ND_PROGRAM, 0, false);
+    NodeList top = NL_INIT;
     while(!at_eof())
     {
-        list_append(&node->ch[0], declaration(0));   // decls list
+        nl_append(&top, declaration(0));   // decls list
     }
+    node->ch[0] = top.head;
     return node;
 }
 const char *nodestr(Node_kind k)
