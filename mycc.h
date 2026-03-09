@@ -377,21 +377,34 @@ void insert_coercions(Node *root);
 Node *new_node(Node_kind kind, char *val, bool is_expr);
 
 
-bool istype_float(Type *t);
-bool istype_fp(Type *t);      // float or double
-bool istype_char(Type *t);
-bool istype_uchar(Type *t);
-bool istype_short(Type *t);
-bool istype_ushort(Type *t);
-bool istype_enum(Type *t);
-bool istype_int(Type *t);
-bool istype_uint(Type *t);
-bool istype_long(Type *t);
-bool istype_ulong(Type *t);
-bool istype_ptr(Type *t);
-bool istype_array(Type *t);
-bool istype_function(Type *t);
-bool istype_intlike(Type *t);
+static inline bool istype(Type *t, Type_base b) { return t && t->base == b; }
+
+#define istype_float(t)    istype(t, TB_FLOAT)
+#define istype_char(t)     istype(t, TB_CHAR)
+#define istype_uchar(t)    istype(t, TB_UCHAR)
+#define istype_short(t)    istype(t, TB_SHORT)
+#define istype_ushort(t)   istype(t, TB_USHORT)
+#define istype_enum(t)     istype(t, TB_ENUM)
+#define istype_int(t)      istype(t, TB_INT)
+#define istype_uint(t)     istype(t, TB_UINT)
+#define istype_long(t)     istype(t, TB_LONG)
+#define istype_ulong(t)    istype(t, TB_ULONG)
+#define istype_ptr(t)      istype(t, TB_POINTER)
+#define istype_array(t)    istype(t, TB_ARRAY)
+#define istype_function(t) istype(t, TB_FUNCTION)
+
+static inline bool istype_fp(Type *t)
+{
+    return t && (t->base == TB_FLOAT || t->base == TB_DOUBLE);
+}
+static inline bool istype_intlike(Type *t)
+{
+    return t && (t->base == TB_CHAR  || t->base == TB_UCHAR  ||
+                 t->base == TB_SHORT || t->base == TB_USHORT ||
+                 t->base == TB_INT   || t->base == TB_UINT   ||
+                 t->base == TB_LONG  || t->base == TB_ULONG  ||
+                 t->base == TB_ENUM);
+}
 
 const char *get_decl_ident(Node *node);
 
