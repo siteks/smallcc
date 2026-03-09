@@ -1468,138 +1468,71 @@ char *node_str(Node *node)
     return buf;
 }
 
+// Data-driven child traversal.
+// For each Node_kind, record how each of ch[0..3] should be visited:
+//   SL_UNUSED  — slot is not used by this node kind
+//   SL_DIRECT  — slot holds a single child pointer (visit once, if non-NULL)
+//   SL_LIST    — slot holds the head of a linked-list (iterate via ->next)
+typedef enum { SL_UNUSED = 0, SL_DIRECT, SL_LIST } SlotKind;
+typedef struct { SlotKind s[4]; } NodeShape;
+
+#define U SL_UNUSED
+#define D SL_DIRECT
+#define L SL_LIST
+static const NodeShape node_shapes[ND_UNDEFINED] = {
+    [ND_PROGRAM]         = {{L, U, U, U}},  // ch[0]=decls list
+    [ND_EXPRSTMT]        = {{D, U, U, U}},  // ch[0]=expr
+    [ND_COMPSTMT]        = {{L, U, U, U}},  // ch[0]=stmts list
+    [ND_IFSTMT]          = {{D, D, D, U}},  // ch[0]=cond, ch[1]=then, ch[2]=else
+    [ND_WHILESTMT]       = {{D, D, U, U}},  // ch[0]=cond, ch[1]=body
+    [ND_RETURNSTMT]      = {{D, U, U, U}},  // ch[0]=expr
+    [ND_STMT]            = {{D, U, U, U}},
+    [ND_BINOP]           = {{D, D, U, U}},  // ch[0]=lhs, ch[1]=rhs
+    [ND_UNARYOP]         = {{D, L, U, U}},  // ch[0]=operand, ch[1]=args (deref calls)
+    [ND_CAST]            = {{D, D, U, U}},  // ch[0]=type_decl, ch[1]=expr
+    [ND_ASSIGN]          = {{D, D, U, U}},  // ch[0]=lhs, ch[1]=rhs
+    [ND_COMPOUND_ASSIGN] = {{D, D, U, U}},  // ch[0]=lhs, ch[1]=rhs
+    [ND_IDENT]           = {{L, U, U, U}},  // ch[0]=args list (direct calls)
+    [ND_LITERAL]         = {{U, U, U, U}},  // leaf
+    [ND_INITLIST]        = {{L, U, U, U}},  // ch[0]=items list
+    [ND_DECLARATION]     = {{D, L, D, U}},  // ch[0]=spec, ch[1]=decls, ch[2]=func_body
+    [ND_DECLARATOR]      = {{D, D, U, U}},
+    [ND_DIRECT_DECL]     = {{D, L, U, U}},  // ch[0]=name, ch[1]=suffixes list
+    [ND_PTYPE_LIST]      = {{L, U, U, U}},  // ch[0]=params list
+    [ND_TYPE_NAME]       = {{D, U, U, U}},  // ch[0]=decl
+    [ND_ARRAY_DECL]      = {{D, U, U, U}},  // ch[0]=size
+    [ND_FUNC_DECL]       = {{D, U, U, U}},  // ch[0]=params
+    [ND_STRUCT]          = {{D, L, U, U}},  // ch[0]=tag, ch[1]=members list
+    [ND_MEMBER]          = {{D, L, U, U}},  // ch[0]=base, ch[1]=args list
+    [ND_FORSTMT]         = {{D, D, D, D}},  // ch[0]=init, ch[1]=cond, ch[2]=inc, ch[3]=body
+    [ND_DOWHILESTMT]     = {{D, D, U, U}},  // ch[0]=body, ch[1]=cond
+    [ND_SWITCHSTMT]      = {{D, D, U, U}},  // ch[0]=selector, ch[1]=body
+    [ND_CASESTMT]        = {{U, U, U, U}},  // leaf
+    [ND_DEFAULTSTMT]     = {{U, U, U, U}},  // leaf
+    [ND_BREAKSTMT]       = {{U, U, U, U}},  // leaf
+    [ND_CONTINUESTMT]    = {{U, U, U, U}},  // leaf
+    [ND_EMPTY]           = {{U, U, U, U}},  // leaf
+    [ND_LABELSTMT]       = {{D, U, U, U}},  // ch[0]=stmt
+    [ND_GOTOSTMT]        = {{U, U, U, U}},  // leaf
+    [ND_TERNARY]         = {{D, D, D, U}},  // ch[0]=cond, ch[1]=then, ch[2]=else
+    [ND_VA_START]        = {{D, D, U, U}},  // ch[0]=ap, ch[1]=last_param
+    [ND_VA_ARG]          = {{D, U, U, U}},  // ch[0]=ap
+    [ND_VA_END]          = {{D, U, U, U}},  // ch[0]=ap
+};
+#undef U
+#undef D
+#undef L
+
 void for_each_child(Node *node, void (*fn)(Node *child, void *ctx), void *ctx)
 {
     if (!node) return;
-    switch (node->kind)
-    {
-    // Single-child nodes (ch[0] only, no linked-list children)
-    case ND_RETURNSTMT:
-    case ND_EXPRSTMT:
-    case ND_VA_ARG:
-    case ND_VA_END:
-    case ND_ARRAY_DECL:
-    case ND_FUNC_DECL:
-    case ND_STMT:
-    case ND_LABELSTMT:
-        if (node->ch[0]) fn(node->ch[0], ctx);
-        return;
-
-    // Two-child nodes (ch[0], ch[1], no linked-list children)
-    case ND_BINOP:
-    case ND_ASSIGN:
-    case ND_CAST:
-    case ND_COMPOUND_ASSIGN:
-    case ND_WHILESTMT:
-    case ND_DOWHILESTMT:
-    case ND_SWITCHSTMT:
-    case ND_VA_START:
-    case ND_DECLARATOR:
-        if (node->ch[0]) fn(node->ch[0], ctx);
-        if (node->ch[1]) fn(node->ch[1], ctx);
-        return;
-
-    // Three-child nodes
-    case ND_TERNARY:
-    case ND_IFSTMT:
-        if (node->ch[0]) fn(node->ch[0], ctx);
-        if (node->ch[1]) fn(node->ch[1], ctx);
-        if (node->ch[2]) fn(node->ch[2], ctx);
-        return;
-
-    // Four-child nodes
-    case ND_FORSTMT:
-        if (node->ch[0]) fn(node->ch[0], ctx);
-        if (node->ch[1]) fn(node->ch[1], ctx);
-        if (node->ch[2]) fn(node->ch[2], ctx);
-        if (node->ch[3]) fn(node->ch[3], ctx);
-        return;
-
-    // UNARYOP: ch[0]=operand, ch[1]=args list (for deref calls)
-    case ND_UNARYOP:
-        if (node->ch[0]) fn(node->ch[0], ctx);
-        for (Node *a = node->ch[1]; a; a = a->next)
-            fn(a, ctx);
-        return;
-
-    // MEMBER: ch[0]=base, ch[1]=args list
-    case ND_MEMBER:
-        if (node->ch[0]) fn(node->ch[0], ctx);
-        for (Node *a = node->ch[1]; a; a = a->next)
-            fn(a, ctx);
-        return;
-
-    // IDENT: ch[0]=args list (for direct calls)
-    case ND_IDENT:
-        for (Node *a = node->ch[0]; a; a = a->next)
-            fn(a, ctx);
-        return;
-
-    // Leaf nodes — no children to visit
-    case ND_LITERAL:
-    case ND_GOTOSTMT:
-    case ND_BREAKSTMT:
-    case ND_CONTINUESTMT:
-    case ND_CASESTMT:
-    case ND_DEFAULTSTMT:
-    case ND_EMPTY:
-        return;
-
-    // ND_PROGRAM: ch[0] = decls list head
-    case ND_PROGRAM:
-    {
-        for (Node *c = node->ch[0]; c; c = c->next)
-            fn(c, ctx);
-        return;
-    }
-    // ND_COMPSTMT: ch[0] = stmts list head
-    case ND_COMPSTMT:
-    {
-        for (Node *c = node->ch[0]; c; c = c->next)
-            fn(c, ctx);
-        return;
-    }
-    // ND_PTYPE_LIST: ch[0] = params list head
-    case ND_PTYPE_LIST:
-    {
-        for (Node *c = node->ch[0]; c; c = c->next)
-            fn(c, ctx);
-        return;
-    }
-    // ND_INITLIST: ch[0] = items list head
-    case ND_INITLIST:
-    {
-        for (Node *c = node->ch[0]; c; c = c->next)
-            fn(c, ctx);
-        return;
-    }
-    // ND_DECLARATION: ch[0]=spec, ch[1]=decls list, ch[2]=func_body
-    case ND_DECLARATION:
-        if (node->ch[0]) fn(node->ch[0], ctx);
-        for (Node *c = node->ch[1]; c; c = c->next)
-            fn(c, ctx);
-        if (node->ch[2]) fn(node->ch[2], ctx);
-        return;
-    // ND_DIRECT_DECL: ch[0]=name, ch[1]=suffixes list
-    case ND_DIRECT_DECL:
-        if (node->ch[0]) fn(node->ch[0], ctx);
-        for (Node *c = node->ch[1]; c; c = c->next)
-            fn(c, ctx);
-        return;
-    // ND_STRUCT: ch[0]=tag, ch[1]=members list
-    case ND_STRUCT:
-        if (node->ch[0]) fn(node->ch[0], ctx);
-        for (Node *c = node->ch[1]; c; c = c->next)
-            fn(c, ctx);
-        return;
-
-    // ND_TYPE_NAME: ch[0]=decl
-    case ND_TYPE_NAME:
-        if (node->ch[0]) fn(node->ch[0], ctx);
-        return;
-
-    default:
+    if (node->kind >= ND_UNDEFINED)
         error("for_each_child: unhandled node kind %d (%s)\n", node->kind, nodestr(node->kind));
+    const NodeShape *sh = &node_shapes[node->kind];
+    for (int i = 0; i < 4; i++)
+    {
+        if      (sh->s[i] == SL_DIRECT) { if (node->ch[i]) fn(node->ch[i], ctx); }
+        else if (sh->s[i] == SL_LIST)   { for (Node *c = node->ch[i]; c; c = c->next) fn(c, ctx); }
     }
 }
 
