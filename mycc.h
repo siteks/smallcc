@@ -462,6 +462,48 @@ Symbol *insert_enum_const(Symbol_table *st, Type *ety, char *ident, int value);
 Symbol *find_symbol_st(Symbol_table *st, const char *name, Namespace nspace);
 
 // ===============================================================
+// IR (Intermediate Representation)
+// ===============================================================
+// A flat linked list of IRInst nodes is built during AST traversal.
+// ir_emit_asm() walks the list and prints assembly text to stdout.
+
+typedef enum {
+    IR_IMM,
+    IR_PUSH, IR_PUSHW,
+    IR_POP,  IR_POPW,
+    IR_ADD, IR_SUB, IR_MUL, IR_DIV, IR_MOD,
+    IR_LB, IR_LW, IR_LL,
+    IR_SB, IR_SW, IR_SL,
+    IR_LEA,
+    IR_JZ, IR_JNZ, IR_J,
+    IR_JL,
+    IR_JLI,
+    IR_RET,
+    IR_ENTER,
+    IR_ADJ,
+    IR_LABEL,
+    IR_SYMLABEL,
+    IR_SXB, IR_SXW,
+    IR_FADD, IR_FSUB, IR_FMUL, IR_FDIV,
+    IR_ITOF, IR_FTOI,
+    IR_EQ, IR_NE, IR_LT, IR_LE, IR_GT, IR_GE,
+    IR_FLT, IR_FLE, IR_FGT, IR_FGE,
+    IR_SHL, IR_SHR, IR_AND, IR_OR, IR_XOR,
+    IR_ALIGN,
+    IR_WORD,
+    IR_BYTE,
+    IR_PUTCHAR,
+    IR_COMMENT,
+} IROp;
+
+typedef struct IRInst {
+    IROp          op;
+    int           operand;
+    const char   *sym;
+    struct IRInst *next;
+} IRInst;
+
+// ===============================================================
 // Context Struct Definitions (must come after type definitions)
 // ===============================================================
 
@@ -525,6 +567,9 @@ typedef struct CodegenContext {
     // Goto labels
     LabelEntry label_table[64];
     int label_table_size;
+    // IR instruction list (built during gen_*, flushed by ir_emit_asm at end of gen_code)
+    IRInst *ir_head;
+    IRInst *ir_tail;
 } CodegenContext;
 
 // Global context instances (defined in respective .c files)

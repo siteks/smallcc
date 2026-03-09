@@ -1,5 +1,4 @@
 
-#include <stdarg.h>
 #include "mycc.h"
 
 
@@ -34,6 +33,7 @@ static int new_strlit(char *data, int len)
 }
 
 int new_label();
+static void ir_emit_asm(IRInst *ir);
 
 void reset_codegen(void)
 {
@@ -41,9 +41,26 @@ void reset_codegen(void)
     codegen_ctx.local_static_count = 0;
     codegen_ctx.loop_depth        = 0;
     codegen_ctx.label_table_size  = 0;
+    codegen_ctx.ir_head           = NULL;
+    codegen_ctx.ir_tail           = NULL;
     memset(codegen_ctx.break_labels, 0, sizeof(codegen_ctx.break_labels));
     memset(codegen_ctx.cont_labels,  0, sizeof(codegen_ctx.cont_labels));
     // 'codegen_ctx.label_counter' is NOT reset — monotonically increasing across TUs.
+}
+
+static IRInst *ir_append(IROp op, int operand, const char *sym)
+{
+    IRInst *inst = arena_alloc(sizeof(IRInst));
+    inst->op      = op;
+    inst->operand = operand;
+    inst->sym     = sym;
+    inst->next    = NULL;
+    if (codegen_ctx.ir_tail)
+        codegen_ctx.ir_tail->next = inst;
+    else
+        codegen_ctx.ir_head = inst;
+    codegen_ctx.ir_tail = inst;
+    return inst;
 }
 
 static void collect_labels(Node *node);
@@ -98,153 +115,16 @@ static void collect_labels(Node *node)
 //--------------------------------------------------------------------------------
 int new_label() { return codegen_ctx.label_counter++; }
 
-// Format specifiers:
-//   %s  - string operand (instruction name or label name)
-//   %d  - decimal integer
-//   %x  - hex integer (4-digit for word values)
-//   %l  - label number (auto-prefixed with _l)
-//   %i  - immediate value (outputs immw/immwh pair if > 16 bits)
-//   %%  - literal %
-void emit(const char *fmt, ...)
-{
-    va_list args;
-    va_start(args, fmt);
-
-    const char *p = fmt;
-    int needs_indent = 1;
-    while (*p)
-    {
-        if (*p != '%')
-        {
-            if (needs_indent)
-            {
-                printf("    ");
-                needs_indent = 0;
-            }
-            putchar(*p);
-            p++;
-            continue;
-        }
-        p++;
-        switch (*p)
-        {
-            case 's':
-                printf("%s", va_arg(args, char*));
-                break;
-            case 'd':
-                printf("%d", va_arg(args, int));
-                break;
-            case 'x':
-                printf("0x%04x", va_arg(args, int) & 0xffff);
-                break;
-            case 'l':
-                printf("_l%d", va_arg(args, int));
-                break;
-            case 'i':
-            {
-                int val = va_arg(args, int);
-                printf("immw    0x%04x", val & 0xffff);
-                if (val & 0xffff0000)
-                    printf("\n    immwh   0x%04x", ((unsigned)val >> 16) & 0xffff);
-                break;
-            }
-            case '%':
-                putchar('%');
-                break;
-            default:
-                putchar(*p);
-                break;
-        }
-        p++;
-    }
-    printf("\n");
-
-    va_end(args);
-}
-
-void gen_label(int label)       { printf("_l%d:\n", label); }
-void gen_symlabel(const char *name) { printf("%s:\n", name); }
-void gen_align()                { emit("align"); }
-void gen_word(int d)            { printf("    word 0x%04x\n", d & 0xffff); }
-void gen_jz(int label)          { emit("jz %l", label); }
-void gen_jnz(int label)         { emit("jnz %l", label); }
-void gen_j(int label)           { emit("j %l", label); }
-void gen_push()                 { emit("push"); }
-void gen_pop()                  { emit("pop"); }
-void gen_pushw()                { emit("pushw"); }
-void gen_popw()                 { emit("popw"); }
-void gen_jl(const char *label)  { emit("jl %s", label); }
-void gen_jli()                  { emit("jli"); }
-void gen_adj(int offset)        { emit("adj %d", offset); }
-void gen_add()                  { emit("add"); }
-void gen_sub()                  { emit("sub"); }
-void gen_mul()                  { emit("mul"); }
-void gen_div()                  { emit("div"); }
-void gen_mod()                  { emit("mod"); }
-void gen_eq()                   { emit("eq"); }
-void gen_ne()                   { emit("ne"); }
-void gen_lt()                   { emit("lt"); }
-void gen_le()                   { emit("le"); }
-void gen_gt()                   { emit("gt"); }
-void gen_ge()                   { emit("ge"); }
-void gen_shiftl()               { emit("shl"); }
-void gen_shiftr()               { emit("shr"); }
-void gen_bitor()                { emit("or"); }
-void gen_bitand()               { emit("and"); }
-void gen_bitxor()               { emit("xor"); }
-void gen_lb()                   { emit("lb"); }
-void gen_lw()                   { emit("lw"); }
-void gen_ll()                   { emit("ll"); }
-void gen_sb()                   { emit("sb"); }
-void gen_sw()                   { emit("sw"); }
-void gen_sl()                   { emit("sl"); }
-void gen_sxb()                  { emit("sxb"); }
-void gen_sxw()                  { emit("sxw"); }
-void gen_fadd()                 { emit("fadd"); }
-void gen_fsub()                 { emit("fsub"); }
-void gen_fmul()                 { emit("fmul"); }
-void gen_fdiv()                 { emit("fdiv"); }
-void gen_flt()                  { emit("flt"); }
-void gen_fle()                  { emit("fle"); }
-void gen_fgt()                  { emit("fgt"); }
-void gen_fge()                  { emit("fge"); }
-void gen_itof()                 { emit("itof"); }
-void gen_ftoi()                 { emit("ftoi"); }
-void gen_lea(int o)             { emit("lea %d", o); }
 
 void gen_zeros(int bytes)
 {
-    for(int i = bytes; i >= 8; i-= 8)
-        printf("    byte    0 0 0 0 0 0 0 0\n");
-    if (bytes % 8)
-    {
-        printf("    byte    ");
-        for(int i = 0; i < bytes % 8; i++)
-            printf("0 ");
-        printf("\n");
-    }
+    for (int i = 0; i < bytes; i++)
+        ir_append(IR_BYTE, 0, NULL);
 }
 void gen_bytes(char *data, int size)
 {
-    for(int i = 0; i < size; i++)
-    {
-        if (i % 8 == 0)
-            printf("    byte    ");
-        printf("0x%02x ", data[i]);
-        if (i % 8 == 7)
-            printf("\n");
-    }
-    if (size % 8)
-        printf("\n");
-}
-void gen_imm(int val)
-{
-    emit("%i", val);
-}
-void gen_pushi(int val)
-{
-    emit("%i", val);
-    emit("push");
+    for (int i = 0; i < size; i++)
+        ir_append(IR_BYTE, (unsigned char)data[i], NULL);
 }
 // Forward declaration needed by gen_logor_expr / gen_logand_expr below.
 void gen_expr(Node *node);
@@ -256,14 +136,14 @@ static void gen_logor_expr(Node *lhs, Node *rhs)
     int l_true = new_label();
     int l_end  = new_label();
     gen_expr(lhs);
-    gen_jnz(l_true);   // lhs != 0 → skip rhs
+    ir_append(IR_JNZ, l_true, NULL);   // lhs != 0 → skip rhs
     gen_expr(rhs);
-    gen_jnz(l_true);
-    gen_imm(0);
-    gen_j(l_end);
-    gen_label(l_true);
-    gen_imm(1);
-    gen_label(l_end);
+    ir_append(IR_JNZ, l_true, NULL);
+    ir_append(IR_IMM, 0, NULL);
+    ir_append(IR_J, l_end, NULL);
+    ir_append(IR_LABEL, l_true, NULL);
+    ir_append(IR_IMM, 1, NULL);
+    ir_append(IR_LABEL, l_end, NULL);
 }
 
 // Short-circuit logical AND: if lhs == 0 result is 0 without evaluating rhs.
@@ -273,27 +153,27 @@ static void gen_logand_expr(Node *lhs, Node *rhs)
     int l_false = new_label();
     int l_end   = new_label();
     gen_expr(lhs);
-    gen_jz(l_false);   // lhs == 0 → skip rhs
+    ir_append(IR_JZ, l_false, NULL);   // lhs == 0 → skip rhs
     gen_expr(rhs);
-    gen_jz(l_false);
-    gen_imm(1);
-    gen_j(l_end);
-    gen_label(l_false);
-    gen_imm(0);
-    gen_label(l_end);
+    ir_append(IR_JZ, l_false, NULL);
+    ir_append(IR_IMM, 1, NULL);
+    ir_append(IR_J, l_end, NULL);
+    ir_append(IR_LABEL, l_false, NULL);
+    ir_append(IR_IMM, 0, NULL);
+    ir_append(IR_LABEL, l_end, NULL);
 }
 void gen_st(int s)
 {
-    if (s == 1)      gen_sb();
-    else if (s == 2) gen_sw();
-    else if (s == 4) gen_sl();
+    if (s == 1)      ir_append(IR_SB,    0, NULL);
+    else if (s == 2) ir_append(IR_SW,    0, NULL);
+    else if (s == 4) ir_append(IR_SL,    0, NULL);
     else             error("gen_st: unsupported size %d\n", s);
 }
 void gen_ld(int s)
 {
-    if (s == 1)      gen_lb();
-    else if (s == 2) gen_lw();
-    else if (s == 4) gen_ll();
+    if (s == 1)      ir_append(IR_LB,    0, NULL);
+    else if (s == 2) ir_append(IR_LW,    0, NULL);
+    else if (s == 4) ir_append(IR_LL,    0, NULL);
     else             error("gen_ld: unsupported size %d\n", s);
 }
 
@@ -309,8 +189,7 @@ void gen_imm_float(double val)
     float f = (float)val;
     unsigned int bits;
     memcpy(&bits, &f, sizeof(bits));
-    printf("    immw    0x%04x\n", bits & 0xffff);
-    printf("    immwh   0x%04x\n", (bits >> 16) & 0xffff);
+    ir_append(IR_IMM, (int)bits, NULL);
 }
 void gen_varaddr_from_ident(Node *node, const char *name)
 {
@@ -319,28 +198,30 @@ void gen_varaddr_from_ident(Node *node, const char *name)
     {
         Symbol *sym = node->symbol;
         if (sym && sym->kind == SYM_STATIC_LOCAL)
-            printf("    immw    _ls%d\n", sym->offset);
+        {
+            char buf[32];
+            snprintf(buf, sizeof(buf), "_ls%d", sym->offset);
+            ir_append(IR_IMM, 0, arena_strdup(buf));
+        }
         else if (sym && sym->kind == SYM_STATIC_GLOBAL)
-            printf("    immw    _s%d_%s\n", sym->tu_index, sym->name);
+        {
+            char buf[80];
+            snprintf(buf, sizeof(buf), "_s%d_%s", sym->tu_index, sym->name);
+            ir_append(IR_IMM, 0, arena_strdup(buf));
+        }
         else
-            printf("    immw    %s\n", name);
+            ir_append(IR_IMM, 0, name);
     }
     else if (la.is_param)
-        // Function parameter: above bp
-        printf("    lea     %d\n", la.offset);
+        ir_append(IR_LEA, la.offset, NULL);
     else
-        // Local variable: below bp
-        printf("    lea     %d\n", -la.offset);
+        ir_append(IR_LEA, -la.offset, NULL);
 }
 void gen_varaddr(Node *node)
 {
     if (node->kind != ND_IDENT)
         error("Expecting local var got %s", nodestr(node->kind));
     gen_varaddr_from_ident(node, node->u.ident.name);
-}
-void gen_preamble(void)
-{
-    printf("    enter   0\n");
 }
 void gen_fill(int offset, int size)
 {
@@ -349,9 +230,9 @@ void gen_fill(int offset, int size)
         step = 2;
     for(int i = 0; i < size; i+=step)
     {
-        gen_lea(offset + i);
-        gen_push();
-        gen_imm(0);
+        ir_append(IR_LEA, offset + i, NULL);
+        ir_append(IR_PUSH,  0, NULL);
+        ir_append(IR_IMM, 0, NULL);
         gen_st(step);
     }
 }
@@ -378,7 +259,7 @@ static int push_args_list(Node *first_arg)
         gen_expr(args[i]);
         int s = args[i]->type->size;
         if (s == 0) s = WORD_SIZE;  // function designator decays to pointer size
-        if (s == 2) gen_pushw(); else gen_push();
+        if (s == 2) ir_append(IR_PUSHW, 0, NULL); else ir_append(IR_PUSH,  0, NULL);
         param_size += s;
     }
     return param_size;
@@ -391,8 +272,8 @@ void gen_callfunction_via_ptr(Node *node)
     int param_size = push_args_list(node->ch[0]);   // args list
     gen_varaddr(node);
     gen_ld(node->symbol->type->size);
-    gen_jli();
-    gen_adj(param_size);
+    ir_append(IR_JLI,   0, NULL);
+    ir_append(IR_ADJ, param_size, NULL);
 }
 
 // Indirect call through dereferenced pointer: (*fp)(args)
@@ -400,8 +281,8 @@ void gen_callfunction_via_deref(Node *node)
 {
     int param_size = push_args_list(node->ch[1]);   // args list
     gen_expr(node->ch[0]);                           // operand (function pointer expr)
-    gen_jli();
-    gen_adj(param_size);
+    ir_append(IR_JLI,   0, NULL);
+    ir_append(IR_ADJ, param_size, NULL);
 }
 
 void gen_callfunction(Node *node)
@@ -412,7 +293,7 @@ void gen_callfunction(Node *node)
         if (!node->ch[0] || node->ch[0]->next)
             error("putchar requires exactly 1 argument\n");
         gen_expr(node->ch[0]);
-        printf("    putchar\n");
+        ir_append(IR_PUTCHAR, 0, NULL);
         return;
     }
     // We have to call the function. This means setting up the
@@ -448,13 +329,13 @@ void gen_callfunction(Node *node)
         char mangled[80];
         snprintf(mangled, sizeof(mangled), "_s%d_%s",
                  node->symbol->tu_index, node->symbol->name);
-        gen_jl(mangled);
+        ir_append(IR_JL, 0, mangled);
     }
     else
-        gen_jl(node->symbol->name);
+        ir_append(IR_JL, 0, node->symbol->name);
     // For the function postamble, we need to adjust the stack by the size of the
     // push parameters
-    gen_adj(param_size);
+    ir_append(IR_ADJ, param_size, NULL);
 
 }
 static const char *node_ident_str(Node *node)
@@ -471,13 +352,11 @@ static const char *node_ident_str(Node *node)
 
 void gen_offset(Node *node)
 {
-    printf(";%s %s %s offset:%d\n", __func__, nodestr(node->kind), node_ident_str(node), node->u.member.offset);
     // lhs is structure, rhs is member within
-    gen_imm(node->u.member.offset);
+    ir_append(IR_IMM, node->u.member.offset, NULL);
 }
 void gen_addr(Node *node)
 {
-    printf(";%s %s %s\n", __func__, nodestr(node->kind), node_ident_str(node));
     if (node->kind == ND_IDENT)
     {
         gen_varaddr(node);
@@ -492,9 +371,9 @@ void gen_addr(Node *node)
             gen_expr(node->ch[0]);    // base: load pointer value
         else
             gen_addr(node->ch[0]);    // base: struct base address
-        gen_push();
+        ir_append(IR_PUSH,  0, NULL);
         gen_offset(node);
-        gen_add();
+        ir_append(IR_ADD,   0, NULL);
     }
     else
         error("Expecting lvalue\n");
@@ -525,19 +404,19 @@ void gen_cast(Type *src, Type *dst)
         return;
     if (istype_intlike(src) && istype_fp(dst))
     {
-        if (src->size == 1) gen_sxb();
-        else if (src->size == 2) gen_sxw();
-        gen_itof();
+        if (src->size == 1) ir_append(IR_SXB,   0, NULL);
+        else if (src->size == 2) ir_append(IR_SXW,   0, NULL);
+        ir_append(IR_ITOF,  0, NULL);
         return;
     }
     if (istype_fp(src) && istype_intlike(dst))
     {
-        gen_ftoi();
+        ir_append(IR_FTOI,  0, NULL);
         if (dst->size < 4)
         {
-            gen_push();
-            gen_imm(dst->size == 1 ? 0xff : 0xffff);
-            gen_bitand();
+            ir_append(IR_PUSH,  0, NULL);
+            ir_append(IR_IMM, dst->size == 1 ? 0xff : 0xffff, NULL);
+            ir_append(IR_AND,   0, NULL);
         }
         return;
     }
@@ -554,51 +433,51 @@ void gen_cast(Type *src, Type *dst)
     if ((istype_long(src) || istype_ulong(src)) && dst->size == 2)
     {
         // Truncate
-        gen_push();
-        gen_imm(0xffff);
-        gen_bitand();
+        ir_append(IR_PUSH,  0, NULL);
+        ir_append(IR_IMM, 0xffff, NULL);
+        ir_append(IR_AND,   0, NULL);
         return;
     }
     if ((istype_long(src) || istype_ulong(src)) && dst->size == 1)
     {
         // Truncate
-        gen_push();
-        gen_imm(0xff);
-        gen_bitand();
+        ir_append(IR_PUSH,  0, NULL);
+        ir_append(IR_IMM, 0xff, NULL);
+        ir_append(IR_AND,   0, NULL);
         return;
     }
     if (src->size == 2 && dst->size == 1)
     {
         // Mask top 8 bits. 
         // The high word is first on the stack, highest address (little endian)
-        gen_push();
-        gen_imm(0xff);
-        gen_bitand();
+        ir_append(IR_PUSH,  0, NULL);
+        ir_append(IR_IMM, 0xff, NULL);
+        ir_append(IR_AND,   0, NULL);
         return;
     }
     if (istype_char(src) && dst->size == 2)
     {
         // Sign extend
-        gen_sxb();
+        ir_append(IR_SXB,   0, NULL);
         return;
     }
     if (istype_char(src) && (istype_long(dst) || istype_ulong(dst)))
     {
-        gen_sxb();
+        ir_append(IR_SXB,   0, NULL);
         return;
     }
     if ((istype_short(src) || istype_int(src)) && (istype_long(dst) || istype_ulong(dst)))
     {
-        gen_sxw();
+        ir_append(IR_SXW,   0, NULL);
         return;
     }
     if ((istype_uchar(src) || istype_uint(src) || istype_enum(src) || istype_ptr(src)) 
         && (istype_long(dst) || istype_ulong(dst)))
     {
         // Zero extend
-        gen_push();
-        gen_imm(0xffff);
-        gen_bitand();
+        ir_append(IR_PUSH,  0, NULL);
+        ir_append(IR_IMM, 0xffff, NULL);
+        ir_append(IR_AND,   0, NULL);
         return;
     }
 }
@@ -610,42 +489,41 @@ static void gen_arith_op(Token_kind op, bool is_float)
     {
         switch (op)
         {
-            case TK_PLUS:  gen_fadd(); return;
-            case TK_MINUS: gen_fsub(); return;
-            case TK_STAR:  gen_fmul(); return;
-            case TK_SLASH: gen_fdiv(); return;
-            case TK_LT:    gen_flt();  return;
-            case TK_LE:    gen_fle();  return;
-            case TK_GT:    gen_fgt();  return;
-            case TK_GE:    gen_fge();  return;
+            case TK_PLUS:  ir_append(IR_FADD,  0, NULL); return;
+            case TK_MINUS: ir_append(IR_FSUB,  0, NULL); return;
+            case TK_STAR:  ir_append(IR_FMUL,  0, NULL); return;
+            case TK_SLASH: ir_append(IR_FDIV,  0, NULL); return;
+            case TK_LT:    ir_append(IR_FLT,   0, NULL);  return;
+            case TK_LE:    ir_append(IR_FLE,   0, NULL);  return;
+            case TK_GT:    ir_append(IR_FGT,   0, NULL);  return;
+            case TK_GE:    ir_append(IR_FGE,   0, NULL);  return;
             default: error("fp op_kind %d not handled in codegen", op);
         }
     }
     switch (op)
     {
-        case TK_PLUS:      gen_add();    return;
-        case TK_MINUS:     gen_sub();    return;
-        case TK_STAR:      gen_mul();    return;
-        case TK_SLASH:     gen_div();    return;
-        case TK_LT:        gen_lt();     return;
-        case TK_LE:        gen_le();     return;
-        case TK_GT:        gen_gt();     return;
-        case TK_GE:        gen_ge();     return;
-        case TK_EQ:        gen_eq();     return;
-        case TK_NE:        gen_ne();     return;
-        case TK_SHIFTR:    gen_shiftr(); return;
-        case TK_SHIFTL:    gen_shiftl(); return;
-        case TK_BITOR:     gen_bitor();  return;
-        case TK_BITXOR:    gen_bitxor(); return;
-        case TK_AMPERSAND: gen_bitand(); return;
-        case TK_PERCENT:   gen_mod();    return;
+        case TK_PLUS:      ir_append(IR_ADD,   0, NULL);    return;
+        case TK_MINUS:     ir_append(IR_SUB,   0, NULL);    return;
+        case TK_STAR:      ir_append(IR_MUL,   0, NULL);    return;
+        case TK_SLASH:     ir_append(IR_DIV,   0, NULL);    return;
+        case TK_LT:        ir_append(IR_LT,    0, NULL);     return;
+        case TK_LE:        ir_append(IR_LE,    0, NULL);     return;
+        case TK_GT:        ir_append(IR_GT,    0, NULL);     return;
+        case TK_GE:        ir_append(IR_GE,    0, NULL);     return;
+        case TK_EQ:        ir_append(IR_EQ,    0, NULL);     return;
+        case TK_NE:        ir_append(IR_NE,    0, NULL);     return;
+        case TK_SHIFTR:    ir_append(IR_SHR,   0, NULL); return;
+        case TK_SHIFTL:    ir_append(IR_SHL,   0, NULL); return;
+        case TK_BITOR:     ir_append(IR_OR,    0, NULL);  return;
+        case TK_BITXOR:    ir_append(IR_XOR,   0, NULL); return;
+        case TK_AMPERSAND: ir_append(IR_AND,   0, NULL); return;
+        case TK_PERCENT:   ir_append(IR_MOD,   0, NULL);    return;
         default: error("op_kind %d not handled in codegen", op);
     }
 }
 
 void gen_expr(Node *node)
 {
-    printf(";%s %s %s\n", __func__, nodestr(node->kind), node_ident_str(node));
     // ===== Binary operators =====
     if (node->kind == ND_BINOP)
     {
@@ -662,7 +540,7 @@ void gen_expr(Node *node)
         if (node->op_kind == TK_LOGAND) { gen_logand_expr(lhs, rhs); return; }
 
         gen_expr(lhs);
-        gen_push();
+        ir_append(IR_PUSH,  0, NULL);
         gen_expr(rhs);
         gen_arith_op(node->op_kind, istype_fp(lhs->type));
         return;
@@ -673,12 +551,14 @@ void gen_expr(Node *node)
         if (node->u.literal.strval)
         {
             int sid = new_strlit(node->u.literal.strval, node->u.literal.strval_len);
-            printf("    immw    _l%d\n", sid);
+            char buf[32];
+            snprintf(buf, sizeof(buf), "_l%d", sid);
+            ir_append(IR_IMM, 0, arena_strdup(buf));
         }
         else if (istype_fp(node->type))
             gen_imm_float(node->u.literal.fval);
         else
-            gen_imm((int)node->u.literal.ival);
+            ir_append(IR_IMM, (int)node->u.literal.ival, NULL);
     }
     // ===== Identifiers and function calls =====
     else if (node->kind == ND_IDENT)
@@ -687,7 +567,7 @@ void gen_expr(Node *node)
         if (sym->kind == SYM_ENUM_CONST)
         {
             // Enum constant: inline the integer value; no memory load.
-            gen_imm(sym->offset);
+            ir_append(IR_IMM, sym->offset, NULL);
         }
         else if (node->u.ident.is_function)
         {
@@ -719,16 +599,16 @@ void gen_expr(Node *node)
             if (istype_fp(operand->type))
             {
                 gen_imm_float(0.0);
-                gen_push();
+                ir_append(IR_PUSH,  0, NULL);
                 gen_expr(operand);
-                gen_fsub();
+                ir_append(IR_FSUB,  0, NULL);
             }
             else
             {
-                gen_imm(0);
-                gen_push();
+                ir_append(IR_IMM, 0, NULL);
+                ir_append(IR_PUSH,  0, NULL);
                 gen_expr(operand);
-                gen_sub();
+                ir_append(IR_SUB,   0, NULL);
             }
             break;
         case TK_STAR:
@@ -748,15 +628,15 @@ void gen_expr(Node *node)
             break;
         case TK_BANG:
             gen_expr(operand);
-            gen_push();
-            gen_imm(0);
-            gen_eq();
+            ir_append(IR_PUSH,  0, NULL);
+            ir_append(IR_IMM, 0, NULL);
+            ir_append(IR_EQ,    0, NULL);
             break;
         case TK_TILDE:
             gen_expr(operand);
-            gen_push();
-            gen_imm(0xffffffff);
-            gen_bitxor();
+            ir_append(IR_PUSH,  0, NULL);
+            ir_append(IR_IMM, 0xffffffff, NULL);
+            ir_append(IR_XOR,   0, NULL);
             break;
         // Prefix increment/decrement: ++x / --x
         // Result: new value of x
@@ -765,11 +645,11 @@ void gen_expr(Node *node)
             int is_inc = (node->op_kind == TK_INC);
             int sz = operand->type ? operand->type->size : 2;
             gen_addr(operand);
-            gen_push();         // stack: [&x]
+            ir_append(IR_PUSH,  0, NULL);         // stack: [&x]
             gen_expr(operand);
-            gen_push();         // stack: [&x, x]
-            gen_imm(1);
-            if (is_inc) gen_add(); else gen_sub();  // r0 = x±1, stack: [&x]
+            ir_append(IR_PUSH,  0, NULL);         // stack: [&x, x]
+            ir_append(IR_IMM, 1, NULL);
+            if (is_inc) ir_append(IR_ADD,   0, NULL); else ir_append(IR_SUB,   0, NULL);  // r0 = x±1, stack: [&x]
             gen_st(sz);
             // r0 still holds x±1 (sw/sb/sl don't modify r0)
             break;
@@ -783,16 +663,16 @@ void gen_expr(Node *node)
             int is_inc = (node->op_kind == TK_POST_INC);
             int sz = operand->type ? operand->type->size : 2;
             gen_expr(operand);    // r0 = old_x
-            gen_push();         // stack: [old_x]
+            ir_append(IR_PUSH,  0, NULL);         // stack: [old_x]
             gen_addr(operand);    // r0 = &x
-            gen_push();         // stack: [old_x, &x]
+            ir_append(IR_PUSH,  0, NULL);         // stack: [old_x, &x]
             gen_expr(operand);    // r0 = x (reload)
-            gen_push();         // stack: [old_x, &x, x]
-            gen_imm(1);
-            if (is_inc) gen_add(); else gen_sub();  // r0 = x±1, stack: [old_x, &x]
+            ir_append(IR_PUSH,  0, NULL);         // stack: [old_x, &x, x]
+            ir_append(IR_IMM, 1, NULL);
+            if (is_inc) ir_append(IR_ADD,   0, NULL); else ir_append(IR_SUB,   0, NULL);  // r0 = x±1, stack: [old_x, &x]
             gen_st(sz);
             // stack: [old_x], r0 = x±1
-            gen_pop();          // r0 = old_x, stack: []
+            ir_append(IR_POP,   0, NULL);          // r0 = old_x, stack: []
             break;
         }
         #pragma clang diagnostic pop
@@ -805,7 +685,7 @@ void gen_expr(Node *node)
         Node *lhs = node->ch[0];
         Node *rhs = node->ch[1];
         gen_addr(lhs);
-        gen_push();
+        ir_append(IR_PUSH,  0, NULL);
         gen_expr(rhs);
         gen_st(lhs->type->size);
     }
@@ -825,9 +705,9 @@ void gen_expr(Node *node)
         Node *rhs = node->ch[1];
         int sz = lhs->type ? lhs->type->size : 2;
         gen_addr(lhs);
-        gen_push();
+        ir_append(IR_PUSH,  0, NULL);
         gen_ld(sz);
-        gen_push();
+        ir_append(IR_PUSH,  0, NULL);
         gen_expr(rhs);
         gen_arith_op(node->op_kind, istype_fp(lhs->type));
         gen_st(sz);
@@ -846,8 +726,8 @@ void gen_expr(Node *node)
         int param_size = push_args_list(node->ch[1]);   // args list
         gen_addr(node);
         gen_ld(WORD_SIZE);  // load function pointer (pointer-sized)
-        gen_jli();
-        gen_adj(param_size);
+        ir_append(IR_JLI,   0, NULL);
+        ir_append(IR_ADJ, param_size, NULL);
     }
     else if (node->kind == ND_MEMBER)
     {
@@ -863,12 +743,12 @@ void gen_expr(Node *node)
         int l_else = new_label();
         int l_end  = new_label();
         gen_expr(cond);
-        gen_jz(l_else);
+        ir_append(IR_JZ, l_else, NULL);
         gen_expr(then_);
-        gen_j(l_end);
-        gen_label(l_else);
+        ir_append(IR_J, l_end, NULL);
+        ir_append(IR_LABEL, l_else, NULL);
         gen_expr(else_);
-        gen_label(l_end);
+        ir_append(IR_LABEL, l_end, NULL);
     }
     // ===== VA_START / VA_ARG / VA_END =====
     else if (node->kind == ND_VA_START)
@@ -880,9 +760,9 @@ void gen_expr(Node *node)
         int param_off  = lp_node->symbol->offset;
         int param_size = lp_node->symbol->type->size;
         gen_addr(ap_node);                       // r0 = &ap
-        gen_push();                              // stack: [&ap]
-        gen_lea(param_off + param_size);         // r0 = bp + first_vararg_offset
-        gen_sw();                                // mem[&ap] = first_vararg_addr
+        ir_append(IR_PUSH,  0, NULL);                              // stack: [&ap]
+        ir_append(IR_LEA, param_off + param_size, NULL);         // r0 = bp + first_vararg_offset
+        ir_append(IR_SW,    0, NULL);                                // mem[&ap] = first_vararg_addr
     }
     else if (node->kind == ND_VA_ARG)
     {
@@ -893,18 +773,18 @@ void gen_expr(Node *node)
         // Save old ap value
         gen_addr(ap_node);    // r0 = &ap
         gen_ld(WORD_SIZE);    // r0 = ap (current vararg pointer)
-        gen_push();           // stack: [old_ap]
+        ir_append(IR_PUSH,  0, NULL);           // stack: [old_ap]
         // Advance ap: ap = ap + s
         gen_addr(ap_node);    // r0 = &ap
-        gen_push();           // stack: [old_ap, &ap]
+        ir_append(IR_PUSH,  0, NULL);           // stack: [old_ap, &ap]
         gen_addr(ap_node);    // r0 = &ap
         gen_ld(WORD_SIZE);    // r0 = ap
-        gen_push();           // stack: [old_ap, &ap, ap]
-        gen_imm(s);           // r0 = s
-        gen_add();            // r0 = ap + s; stack: [old_ap, &ap]
-        gen_sw();             // mem[&ap] = ap + s; stack: [old_ap]
+        ir_append(IR_PUSH,  0, NULL);           // stack: [old_ap, &ap, ap]
+        ir_append(IR_IMM, s, NULL);           // r0 = s
+        ir_append(IR_ADD,   0, NULL);            // r0 = ap + s; stack: [old_ap, &ap]
+        ir_append(IR_SW,    0, NULL);             // mem[&ap] = ap + s; stack: [old_ap]
         // Load vararg from old_ap
-        gen_pop();            // r0 = old_ap; stack: []
+        ir_append(IR_POP,   0, NULL);            // r0 = old_ap; stack: []
         gen_ld(s);            // r0 = *(old_ap) = vararg value
     }
     else if (node->kind == ND_VA_END)
@@ -913,48 +793,40 @@ void gen_expr(Node *node)
         (void)node;
     }
 }
-void gen_return()
-{
-    printf("    ret\n");
-}
 void gen_returnstmt(Node *node)
 {
-    printf(";%s\n", __func__);
     Node *expr = node->ch[0];   // return expr (NULL if bare return)
     if (expr)
     {
         // Must have an expression
         gen_expr(expr);
     }
-    gen_return();
+    ir_append(IR_RET,   0, NULL);
 
 }
 void gen_ifstmt(Node *node)
 {
-    printf(";%s\n", __func__);
     // Structure is expr, stmt, [stmt]
     Node *cond = node->ch[0];
     Node *then_ = node->ch[1];
     Node *else_ = node->ch[2];
     int l_else = new_label();
     gen_expr(cond);
-    gen_jz(l_else);
+    ir_append(IR_JZ, l_else, NULL);
     gen_stmt(then_);
     if (else_)
     {
         int l_end = new_label();
-        gen_j(l_end);
-        gen_label(l_else);
-        printf(";else clause\n");
+        ir_append(IR_J, l_end, NULL);
+        ir_append(IR_LABEL, l_else, NULL);
         gen_stmt(else_);
-        gen_label(l_end);
+        ir_append(IR_LABEL, l_end, NULL);
     }
     else
-        gen_label(l_else);
+        ir_append(IR_LABEL, l_else, NULL);
 }
 void gen_whilestmt(Node *node)
 {
-    printf(";%s\n", __func__);
     if (codegen_ctx.loop_depth >= 64) error("too deeply nested");
     Node *cond = node->ch[0];
     Node *body = node->ch[1];
@@ -963,18 +835,17 @@ void gen_whilestmt(Node *node)
     codegen_ctx.break_labels[codegen_ctx.loop_depth] = lbreak;
     codegen_ctx.cont_labels[codegen_ctx.loop_depth]  = lloop;
     codegen_ctx.loop_depth++;
-    gen_label(lloop);
+    ir_append(IR_LABEL, lloop, NULL);
     gen_expr(cond);
-    gen_jz(lbreak);
+    ir_append(IR_JZ, lbreak, NULL);
     gen_stmt(body);
-    gen_j(lloop);
-    gen_label(lbreak);
+    ir_append(IR_J, lloop, NULL);
+    ir_append(IR_LABEL, lbreak, NULL);
     codegen_ctx.loop_depth--;
 }
 void gen_decl(Node *node);  // forward declaration
 void gen_forstmt(Node *node)
 {
-    printf(";%s\n", __func__);
     if (codegen_ctx.loop_depth >= 64) error("too deeply nested");
     Node *init = node->ch[0];
     Node *cond = node->ch[1];
@@ -982,7 +853,7 @@ void gen_forstmt(Node *node)
     Node *body = node->ch[3];
     // If the init was a declaration, node->symtable holds the for-init scope.
     if (node->symtable)
-        gen_adj(-node->symtable->size);
+        ir_append(IR_ADJ, -node->symtable->size, NULL);
     if (init->kind == ND_DECLARATION)
         gen_decl(init);
     else if (init->kind != ND_EMPTY)
@@ -993,24 +864,23 @@ void gen_forstmt(Node *node)
     codegen_ctx.break_labels[codegen_ctx.loop_depth] = lbreak;
     codegen_ctx.cont_labels[codegen_ctx.loop_depth]  = lcont;
     codegen_ctx.loop_depth++;
-    gen_label(lloop);
+    ir_append(IR_LABEL, lloop, NULL);
     if (cond->kind != ND_EMPTY) {
         gen_expr(cond);
-        gen_jz(lbreak);
+        ir_append(IR_JZ, lbreak, NULL);
     }
     gen_stmt(body);
-    gen_label(lcont);
+    ir_append(IR_LABEL, lcont, NULL);
     if (inc->kind != ND_EMPTY)
         gen_expr(inc);
-    gen_j(lloop);
-    gen_label(lbreak);
+    ir_append(IR_J, lloop, NULL);
+    ir_append(IR_LABEL, lbreak, NULL);
     codegen_ctx.loop_depth--;
     if (node->symtable)
-        gen_adj(node->symtable->size);
+        ir_append(IR_ADJ, node->symtable->size, NULL);
 }
 void gen_dowhilestmt(Node *node)
 {
-    printf(";%s\n", __func__);
     if (codegen_ctx.loop_depth >= 64) error("too deeply nested");
     Node *body = node->ch[0];
     Node *cond = node->ch[1];
@@ -1020,25 +890,25 @@ void gen_dowhilestmt(Node *node)
     codegen_ctx.break_labels[codegen_ctx.loop_depth] = lbreak;
     codegen_ctx.cont_labels[codegen_ctx.loop_depth]  = lcont;
     codegen_ctx.loop_depth++;
-    gen_label(lloop);
+    ir_append(IR_LABEL, lloop, NULL);
     gen_stmt(body);
-    gen_label(lcont);
+    ir_append(IR_LABEL, lcont, NULL);
     gen_expr(cond);
-    gen_jnz(lloop);
-    gen_label(lbreak);
+    ir_append(IR_JNZ, lloop, NULL);
+    ir_append(IR_LABEL, lbreak, NULL);
     codegen_ctx.loop_depth--;
 }
 void gen_breakstmt(Node *node)
 {
     if (codegen_ctx.loop_depth == 0)
         error("break outside loop or switch\n");
-    gen_j(codegen_ctx.break_labels[codegen_ctx.loop_depth - 1]);
+    ir_append(IR_J, codegen_ctx.break_labels[codegen_ctx.loop_depth - 1], NULL);
 }
 void gen_continuestmt(Node *node)
 {
     if (codegen_ctx.loop_depth == 0)
         error("continue outside loop\n");
-    gen_j(codegen_ctx.cont_labels[codegen_ctx.loop_depth - 1]);
+    ir_append(IR_J, codegen_ctx.cont_labels[codegen_ctx.loop_depth - 1], NULL);
 }
 void gen_exprstmt(Node *node)
 {
@@ -1070,7 +940,6 @@ int count_constexpr(Node *n)
 }
 void gen_inits(Node *n, Symbol *s, int vaddr, int offset, int depth)
 {
-    printf(";%s %s vaddr:%d os:%d depth:%d\n", __func__, nodestr(n->kind),vaddr,offset, depth);
     // Compute the element size (innermost) and row stride at current depth
     int elem_sz = array_elem_type(s->type)->size;
     // stride at this depth = size of elem at depth levels down
@@ -1084,8 +953,8 @@ void gen_inits(Node *n, Symbol *s, int vaddr, int offset, int depth)
     for (Node *item = n->ch[0]; item; item = item->next)   // items list
         if (is_constexpr(item))
         {
-            gen_lea(vaddr + ptr);
-            gen_push();
+            ir_append(IR_LEA, vaddr + ptr, NULL);
+            ir_append(IR_PUSH,  0, NULL);
             gen_expr(item);
             gen_st(elem_sz);
             ptr += elem_sz;
@@ -1108,7 +977,6 @@ void gen_inits(Node *n, Symbol *s, int vaddr, int offset, int depth)
 int int_constexpr(Node *n);
 void gen_mem_inits(char *data, Node *n, Symbol *s, int vaddr, int offset, int depth)
 {
-    printf(";%s %s os:%d depth:%d\n", __func__, nodestr(n->kind),offset, depth);
     // Compute element size and row stride at current depth
     int elem_sz = array_elem_type(s->type)->size;
     Type *arr_at = s->type;
@@ -1189,8 +1057,8 @@ static void gen_struct_inits(Node *n, int vaddr, Type *st)
         }
         else if (is_constexpr(child))
         {
-            gen_lea(vaddr + f->offset);
-            gen_push();
+            ir_append(IR_LEA, vaddr + f->offset, NULL);
+            ir_append(IR_PUSH,  0, NULL);
             gen_expr(child);
             gen_st(f->type->size);
         }
@@ -1248,9 +1116,9 @@ void gen_initlist(Node *n, Symbol *s)
             Node *l;
             for(l = n; !is_constexpr(l); l = l->ch[0]);   // items list head
             gen_varaddr_from_ident(n, s->name);
-            gen_push();
+            ir_append(IR_PUSH,  0, NULL);
             gen_expr(l);
-            gen_sw();
+            ir_append(IR_SW,    0, NULL);
         }
         else if (constexpr)
         {
@@ -1282,7 +1150,7 @@ void gen_initlist(Node *n, Symbol *s)
             if (istype_fp(t))
                 emit_float_bytes(l->u.literal.fval);
             else
-                gen_word(int_constexpr(l));
+                ir_append(IR_WORD, int_constexpr(l), NULL);
         }
         else if (constexpr)
         {
@@ -1296,7 +1164,6 @@ void gen_initlist(Node *n, Symbol *s)
 
 void gen_decl(Node *node)
 {
-    printf(";%s declaration\n", __func__);
     if (node->u.declaration.sclass == SC_TYPEDEF) return;
     if (node->u.declaration.sclass == SC_EXTERN)  return;  // extern decl → no data emission
     // The symbol table has all the details needed for declarations.
@@ -1334,16 +1201,16 @@ void gen_decl(Node *node)
                     int   len = init->u.literal.strval_len + 1;
                     for (int i = 0; i < len; i++)
                     {
-                        gen_lea(vaddr + i);
-                        gen_push();
-                        gen_imm((unsigned char)str[i]);
-                        gen_sb();
+                        ir_append(IR_LEA, vaddr + i, NULL);
+                        ir_append(IR_PUSH,  0, NULL);
+                        ir_append(IR_IMM, (unsigned char)str[i], NULL);
+                        ir_append(IR_SB,    0, NULL);
                     }
                 }
                 else
                 {
                     gen_varaddr_from_ident(n, n->symbol->name);
-                    gen_push();
+                    ir_append(IR_PUSH,  0, NULL);
                     gen_expr(init);
                     gen_st(n->symbol->type->size);
                 }
@@ -1360,16 +1227,16 @@ void gen_decl(Node *node)
                     error("Missing symbol!\n");
                 // Skip bare function prototypes — no data to emit
                 if (istype_function(n->symbol->type)) continue;
-                gen_align();
+                ir_append(IR_ALIGN, 0, NULL);
                 if (n->symbol->kind == SYM_STATIC_GLOBAL)
                 {
                     char mangled[80];
                     snprintf(mangled, sizeof(mangled), "_s%d_%s",
                              n->symbol->tu_index, n->symbol->name);
-                    gen_symlabel(mangled);
+                    ir_append(IR_SYMLABEL, 0, mangled);
                 }
                 else
-                    gen_symlabel(n->symbol->name);
+                    ir_append(IR_SYMLABEL, 0, n->symbol->name);
                 // If there is no init, we make space
 
                 if (n->ch[1] != NULL)   // init
@@ -1389,7 +1256,9 @@ void gen_decl(Node *node)
                     {
                         // char *p = "hello" — emit pointer to deferred string data
                         int sid = new_strlit(init->u.literal.strval, init->u.literal.strval_len);
-                        printf("    word    _l%d\n", sid);
+                        char buf[32];
+                        snprintf(buf, sizeof(buf), "_l%d", sid);
+                        ir_append(IR_WORD, 0, arena_strdup(buf));
                     }
                     else
                     {
@@ -1398,7 +1267,7 @@ void gen_decl(Node *node)
                         else
                         {
                             int val = int_constexpr(init);
-                            gen_word(val);
+                            ir_append(IR_WORD, val, NULL);
                         }
                     }
                 }
@@ -1412,9 +1281,8 @@ void gen_decl(Node *node)
 }
 void gen_compstmt(Node *node)
 {
-    printf(";%s\n", __func__);
     // Make space on stack for this scope's locals
-    gen_adj(-node->symtable->size);
+    ir_append(IR_ADJ, -node->symtable->size, NULL);
     for (Node *n = node->ch[0]; n; n = n->next)   // stmts list
     {
         if (n->kind == ND_DECLARATION)
@@ -1423,7 +1291,7 @@ void gen_compstmt(Node *node)
             gen_stmt(n);
     }
     // Release the space back
-    gen_adj(node->symtable->size);
+    ir_append(IR_ADJ, node->symtable->size, NULL);
 }
 static int find_label_id(char *name)
 {
@@ -1435,17 +1303,16 @@ static int find_label_id(char *name)
 }
 void gen_labelstmt(Node *node)
 {
-    gen_label(find_label_id(node->u.labelstmt.name));
+    ir_append(IR_LABEL, find_label_id(node->u.labelstmt.name), NULL);
     if (node->ch[0])   // stmt
         gen_stmt(node->ch[0]);
 }
 void gen_gotostmt(Node *node)
 {
-    gen_j(find_label_id(node->u.label));
+    ir_append(IR_J, find_label_id(node->u.label), NULL);
 }
 void gen_switchstmt(Node *node)
 {
-    printf(";%s\n", __func__);
     if (codegen_ctx.loop_depth >= 64) error("too deeply nested");
     Node *selector = node->ch[0];
     Node *body     = node->ch[1]; // ND_COMPSTMT
@@ -1458,41 +1325,40 @@ void gen_switchstmt(Node *node)
             int lcase              = new_label();
             ch->u.casestmt.label_id = lcase;
             gen_expr(selector);
-            gen_push();
-            gen_imm((int)ch->u.casestmt.value);
-            gen_eq();
-            gen_jnz(lcase);
+            ir_append(IR_PUSH,  0, NULL);
+            ir_append(IR_IMM, (int)ch->u.casestmt.value, NULL);
+            ir_append(IR_EQ,    0, NULL);
+            ir_append(IR_JNZ, lcase, NULL);
         } else if (ch->kind == ND_DEFAULTSTMT) {
             int ldef                   = new_label();
             ch->u.defaultstmt.label_id = ldef;
             ldefault                   = ldef;
         }
     }
-    if (ldefault >= 0) gen_j(ldefault);
-    else               gen_j(lbreak);
+    if (ldefault >= 0) ir_append(IR_J, ldefault, NULL);
+    else               ir_append(IR_J, lbreak, NULL);
     // Phase 2: emit body with case codegen_ctx.label_counter
     codegen_ctx.break_labels[codegen_ctx.loop_depth] = lbreak;
     codegen_ctx.cont_labels[codegen_ctx.loop_depth]  = -1;
     codegen_ctx.loop_depth++;
-    gen_adj(-body->symtable->size);
+    ir_append(IR_ADJ, -body->symtable->size, NULL);
     for (Node *ch = body->ch[0]; ch; ch = ch->next)   // stmts list
     {
         if (ch->kind == ND_CASESTMT)
-            gen_label(ch->u.casestmt.label_id);
+            ir_append(IR_LABEL, ch->u.casestmt.label_id, NULL);
         else if (ch->kind == ND_DEFAULTSTMT)
-            gen_label(ch->u.defaultstmt.label_id);
+            ir_append(IR_LABEL, ch->u.defaultstmt.label_id, NULL);
         else if (ch->kind == ND_DECLARATION)
             gen_decl(ch);
         else
             gen_stmt(ch);
     }
-    gen_adj(body->symtable->size);
+    ir_append(IR_ADJ, body->symtable->size, NULL);
     codegen_ctx.loop_depth--;
-    gen_label(lbreak);
+    ir_append(IR_LABEL, lbreak, NULL);
 }
 void gen_stmt(Node *node)
 {
-    printf(";%s\n", __func__);
     switch(node->kind)
     {
     case ND_EXPRSTMT:    gen_exprstmt(node);    return;
@@ -1514,29 +1380,27 @@ void gen_stmt(Node *node)
     default:;
     }
 }
-void gen_param_list(Node *node)
-{
-    gen_preamble();
-}
 void gen_function(Node *node)
 {
-    printf(";%s\n", __func__);
     Node *first_decl = node->ch[1];   // decls list head
     Node *func_body  = node->ch[2];   // func_body
     Symbol *fsym = first_decl->symbol;
     if (fsym->kind == SYM_STATIC_GLOBAL)
-        printf("_s%d_%s:\n", fsym->tu_index, fsym->name);
+    {
+        char buf[80];
+        snprintf(buf, sizeof(buf), "_s%d_%s", fsym->tu_index, fsym->name);
+        ir_append(IR_SYMLABEL, 0, arena_strdup(buf));
+    }
     else
-        printf("%s:\n", fsym->name);
+        ir_append(IR_SYMLABEL, 0, fsym->name);
     codegen_ctx.label_table_size = 0;
     collect_labels(func_body);
-    gen_param_list(first_decl);
+    ir_append(IR_ENTER, 0, NULL);
     gen_stmt(func_body);
-    gen_return();
+    ir_append(IR_RET,   0, NULL);
 }
 void gen_code(Node *node, int tu_index)
 {
-    printf(";%s\n", __func__);
 
     // Pass 1: emit function definitions (text area)
     for (Node *c = node->ch[0]; c; c = c->next)   // decls list
@@ -1555,8 +1419,12 @@ void gen_code(Node *node, int tu_index)
     {
         LocalStaticEntry *e = &codegen_ctx.local_statics[i];
         Node *n = e->decl_node;
-        gen_align();
-        printf("_ls%d:\n", e->id);
+        ir_append(IR_ALIGN, 0, NULL);
+        {
+            char buf[32];
+            snprintf(buf, sizeof(buf), "_ls%d", e->id);
+            ir_append(IR_SYMLABEL, 0, arena_strdup(buf));
+        }
         Node *init = n->ch[1];   // init
         if (init != NULL)
         {
@@ -1567,14 +1435,16 @@ void gen_code(Node *node, int tu_index)
             else if (init->u.literal.strval)
             {
                 int sid = new_strlit(init->u.literal.strval, init->u.literal.strval_len);
-                printf("    word    _l%d\n", sid);
+                char sbuf[32];
+                snprintf(sbuf, sizeof(sbuf), "_l%d", sid);
+                ir_append(IR_WORD, 0, arena_strdup(sbuf));
             }
             else if (istype_fp(e->sym->type))
                 emit_float_bytes(init->u.literal.fval);
             else
             {
                 int val = int_constexpr(init);
-                gen_word(val);
+                ir_append(IR_WORD, val, NULL);
             }
         }
         else
@@ -1583,9 +1453,125 @@ void gen_code(Node *node, int tu_index)
     // Pass 3: emit deferred string literal data
     for (int i = 0; i < codegen_ctx.strlit_count; i++)
     {
-        gen_align();
-        gen_label(codegen_ctx.strlits[i].id);
+        ir_append(IR_ALIGN, 0, NULL);
+        ir_append(IR_LABEL, codegen_ctx.strlits[i].id, NULL);
         gen_bytes(codegen_ctx.strlits[i].data, codegen_ctx.strlits[i].len + 1);
+    }
+    ir_emit_asm(codegen_ctx.ir_head);
+}
+
+// -----------------------------------------------------------------------
+// IR backend: walk the IR list and emit assembly text to stdout.
+// -----------------------------------------------------------------------
+
+static const char *ir_opname[] = {
+    [IR_ADD]     = "add",
+    [IR_SUB]     = "sub",
+    [IR_MUL]     = "mul",
+    [IR_DIV]     = "div",
+    [IR_MOD]     = "mod",
+    [IR_LB]      = "lb",
+    [IR_LW]      = "lw",
+    [IR_LL]      = "ll",
+    [IR_SB]      = "sb",
+    [IR_SW]      = "sw",
+    [IR_SL]      = "sl",
+    [IR_RET]     = "ret",
+    [IR_PUSH]    = "push",
+    [IR_PUSHW]   = "pushw",
+    [IR_POP]     = "pop",
+    [IR_POPW]    = "popw",
+    [IR_SXB]     = "sxb",
+    [IR_SXW]     = "sxw",
+    [IR_FADD]    = "fadd",
+    [IR_FSUB]    = "fsub",
+    [IR_FMUL]    = "fmul",
+    [IR_FDIV]    = "fdiv",
+    [IR_ITOF]    = "itof",
+    [IR_FTOI]    = "ftoi",
+    [IR_EQ]      = "eq",
+    [IR_NE]      = "ne",
+    [IR_LT]      = "lt",
+    [IR_LE]      = "le",
+    [IR_GT]      = "gt",
+    [IR_GE]      = "ge",
+    [IR_FLT]     = "flt",
+    [IR_FLE]     = "fle",
+    [IR_FGT]     = "fgt",
+    [IR_FGE]     = "fge",
+    [IR_SHL]     = "shl",
+    [IR_SHR]     = "shr",
+    [IR_AND]     = "and",
+    [IR_OR]      = "or",
+    [IR_XOR]     = "xor",
+    [IR_JLI]     = "jli",
+    [IR_PUTCHAR] = "putchar",
+    [IR_ALIGN]   = "align",
+};
+
+static void ir_emit_asm(IRInst *ir)
+{
+    for (IRInst *p = ir; p; p = p->next)
+    {
+        switch (p->op)
+        {
+        case IR_LABEL:
+            printf("_l%d:\n", p->operand);
+            break;
+        case IR_SYMLABEL:
+            printf("%s:\n", p->sym);
+            break;
+        case IR_COMMENT:
+            printf(";%s\n", p->sym);
+            break;
+        case IR_IMM:
+            if (p->sym)
+            {
+                printf("    immw    %s\n", p->sym);
+            }
+            else
+            {
+                unsigned u = (unsigned)p->operand;
+                printf("    immw    0x%04x\n", u & 0xffff);
+                if (u > 0xffff)
+                    printf("    immwh   0x%04x\n", (u >> 16) & 0xffff);
+            }
+            break;
+        case IR_LEA:
+            printf("    lea     %d\n", p->operand);
+            break;
+        case IR_J:
+            printf("    j       _l%d\n", p->operand);
+            break;
+        case IR_JZ:
+            printf("    jz      _l%d\n", p->operand);
+            break;
+        case IR_JNZ:
+            printf("    jnz     _l%d\n", p->operand);
+            break;
+        case IR_JL:
+            printf("    jl      %s\n", p->sym);
+            break;
+        case IR_ENTER:
+            printf("    enter   %d\n", p->operand);
+            break;
+        case IR_ADJ:
+            printf("    adj     %d\n", p->operand);
+            break;
+        case IR_WORD:
+            if (p->sym)
+                printf("    word    %s\n", p->sym);
+            else
+                printf("    word    0x%04x\n", p->operand & 0xffff);
+            break;
+        case IR_BYTE:
+            printf("    byte    0x%02x\n", p->operand & 0xff);
+            break;
+        default:
+            if (p->op < (int)(sizeof(ir_opname) / sizeof(ir_opname[0])) && ir_opname[p->op])
+                printf("    %s\n", ir_opname[p->op]);
+            break;
+        }
     }
 }
 
