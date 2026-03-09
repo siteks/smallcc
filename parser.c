@@ -612,18 +612,10 @@ static Node *type_name()
 static Node *cast_expr()
 {
     DBG_FUNC_TOKEN(token_ctx.current);
-    if (token_ctx.current->kind != TK_LPAREN)
+    // Peek ahead: only enter cast path if "(" is followed by a type name.
+    if (token_ctx.current->kind == TK_LPAREN && is_type_name_or_type(token_ctx.current->next))
     {
-        return unary_expr();
-    }
-    // May be either a cast or a primary expr with parens eg "(" expr ")". 
-    // If the ident following the current token_ctx.current is a type name or 
-    // const|volatile, this is a cast. A cast may be followed by a cast
-    expect(TK_LPAREN);
-    if (is_type_name_or_type(token_ctx.current))
-    {
-        // This is a cast, create the node and add the type elements as
-        // children
+        expect(TK_LPAREN);
         Node *node = new_node(ND_CAST, 0, true);
         Node *tn = type_name();
         node->type = tn->type;
@@ -633,13 +625,7 @@ static Node *cast_expr()
         node->ch[1] = cexpr;  // expr
         return node;
     }
-    else
-    {
-        // We checked ident and it was not a type, so rewind one token_ctx.current
-        // and proceed as unary_expr 
-        unget_token();
-        return unary_expr();
-    }
+    return unary_expr();
 }
 // Generic binary-expression parser.
 // sub_parser: function to parse the next-lower-precedence operand
@@ -1326,23 +1312,18 @@ static Node *stmt()
         node->u.label = arena_strdup(expect_ident());
         expect(TK_SEMICOLON);
     }
+    else if (token_ctx.current->kind == TK_IDENT && token_ctx.current->next->kind == TK_COLON)
+    {
+        node->kind = ND_LABELSTMT;
+        node->u.labelstmt.name = arena_strdup(expect(TK_IDENT));
+        expect(TK_COLON);
+        node->ch[0] = stmt();   // labeled statement
+    }
     else if (token_ctx.current->kind == TK_IDENT)
     {
-        char *name = expect(TK_IDENT);
-        if (token_ctx.current->kind == TK_COLON)
-        {
-            node->kind = ND_LABELSTMT;
-            expect(TK_COLON);
-            node->u.labelstmt.name = arena_strdup(name);
-            node->ch[0] = stmt();   // labeled statement
-        }
-        else
-        {
-            unget_token();
-            node->kind = ND_EXPRSTMT;
-            node->ch[0] = expr();   // expr
-            expect(TK_SEMICOLON);
-        }
+        node->kind = ND_EXPRSTMT;
+        node->ch[0] = expr();
+        expect(TK_SEMICOLON);
     }
     else if (token_ctx.current->kind == TK_RETURN)
     {

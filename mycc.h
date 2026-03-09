@@ -73,8 +73,8 @@ typedef enum
     TK_DEFAULT, TK_DO, TK_ELSE, TK_EXTERN, TK_FOR, TK_GOTO, TK_IF, TK_REGISTER,
     TK_RETURN, TK_SIZEOF, TK_STATIC, TK_SWITCH, TK_VOLATILE, TK_WHILE,
 // Basic types
-    TK_VOID, TK_CHAR, TK_UCHAR, TK_SHORT, TK_USHORT, TK_INT, TK_UINT, TK_LONG,
-    TK_ULONG, TK_FLOAT, TK_DOUBLE, TK_SIGNED, TK_UNSIGNED, TK_STRUCT, TK_UNION, TK_ENUM,
+    TK_VOID, TK_CHAR, TK_SHORT, TK_INT, TK_LONG,
+    TK_FLOAT, TK_DOUBLE, TK_SIGNED, TK_UNSIGNED, TK_STRUCT, TK_UNION, TK_ENUM,
     TK_TYPEDEF, TK_INVALID, TK_ELLIPSIS,
 // Pseudo-tokens used in Node.op_kind only; never emitted by the tokeniser
     TK_POST_INC, TK_POST_DEC,
@@ -391,7 +391,6 @@ bool istype_array(Type *t);
 bool istype_function(Type *t);
 bool istype_intlike(Type *t);
 
-void unget_token();
 const char *get_decl_ident(Node *node);
 
 
@@ -482,7 +481,6 @@ typedef struct TypeContext {
 
 typedef struct TokenContext {
     Token *current;             // current token
-    Token *last;                // for unget_token
     char *user_input;           // input source string
 } TokenContext;
 

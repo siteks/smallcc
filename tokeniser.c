@@ -148,13 +148,9 @@ static const char *const token_names[] = {
     [TK_WHILE]          = "while",
     [TK_VOID]           = "void",
     [TK_CHAR]           = "char",
-    [TK_UCHAR]          = "uchar",
     [TK_SHORT]          = "short",
-    [TK_USHORT]         = "ushort",
     [TK_INT]            = "int",
-    [TK_UINT]           = "uint",
     [TK_LONG]           = "long",
-    [TK_ULONG]          = "ulong",
     [TK_FLOAT]          = "float",
     [TK_DOUBLE]         = "double",
     [TK_SIGNED]         = "signed",
@@ -190,23 +186,13 @@ bool is_type_name(Token_kind tk)
     return (unsigned)tk < sizeof(is_type_tok)/sizeof(is_type_tok[0]) && is_type_tok[tk];
 }
 
-// Note: token_ctx.last is part of TokenContext
-void unget_token()
-{
-    // Go back to the last token_ctx.current
-    if (token_ctx.last)
-        token_ctx.current = token_ctx.last;
-    else
-        error("No last token_ctx.current to go back to!\n");
-}
 char *expect(Token_kind tk)
 {
     DBG_PRINT("%s %s\n", __func__, token_ctx.current->val);
     if (token_ctx.current->kind == tk)
     {
-        char *val   = token_ctx.current->val;
-        token_ctx.last  = token_ctx.current;
-        token_ctx.current       = token_ctx.current->next;
+        char *val           = token_ctx.current->val;
+        token_ctx.current   = token_ctx.current->next;
         return val;
     }
     else
@@ -231,9 +217,8 @@ int expect_number()
 {
     if (token_ctx.current->kind == TK_CONSTINT)
     {
-        int val     = (int)token_ctx.current->ival;
-        token_ctx.last  = token_ctx.current;
-        token_ctx.current       = token_ctx.current->next;
+        int val           = (int)token_ctx.current->ival;
+        token_ctx.current = token_ctx.current->next;
         return val;
     }
     error("Expected integer constant, got '%s'\n", token_ctx.current->val);
@@ -244,9 +229,8 @@ char *expect_ident()
 {
     if (token_ctx.current->kind == TK_IDENT)
     {
-        char *val   = token_ctx.current->val;
-        token_ctx.last  = token_ctx.current;
-        token_ctx.current       = token_ctx.current->next;
+        char *val         = token_ctx.current->val;
+        token_ctx.current = token_ctx.current->next;
         return val;
     }
     error("Expected identifier, got '%s'\n", token_ctx.current->val);
@@ -273,11 +257,6 @@ Token_kind find_token(char *str, int l)
             return keywords[i].kind;
     }
     return TK_IDENT;
-}
-
-bool ishex(char a)
-{
-    return isdigit(a) || (a >= 'a' && a <= 'f') || (a >= 'A' && a <= 'F');
 }
 
 // Decode one character (possibly an escape sequence) at *src.
