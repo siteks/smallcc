@@ -605,6 +605,47 @@ void gen_cast(Type *src, Type *dst)
         return;
     }
 }
+// Emit the arithmetic/comparison instruction for binary op `op`.
+// Assumes lhs is already on the stack and rhs is in r0.
+static void gen_arith_op(Token_kind op, bool is_float)
+{
+    if (is_float)
+    {
+        switch (op)
+        {
+            case TK_PLUS:  gen_fadd(); return;
+            case TK_MINUS: gen_fsub(); return;
+            case TK_STAR:  gen_fmul(); return;
+            case TK_SLASH: gen_fdiv(); return;
+            case TK_LT:    gen_flt();  return;
+            case TK_LE:    gen_fle();  return;
+            case TK_GT:    gen_fgt();  return;
+            case TK_GE:    gen_fge();  return;
+            default: error("fp op_kind %d not handled in codegen", op);
+        }
+    }
+    switch (op)
+    {
+        case TK_PLUS:      gen_add();    return;
+        case TK_MINUS:     gen_sub();    return;
+        case TK_STAR:      gen_mul();    return;
+        case TK_SLASH:     gen_div();    return;
+        case TK_LT:        gen_lt();     return;
+        case TK_LE:        gen_le();     return;
+        case TK_GT:        gen_gt();     return;
+        case TK_GE:        gen_ge();     return;
+        case TK_EQ:        gen_eq();     return;
+        case TK_NE:        gen_ne();     return;
+        case TK_SHIFTR:    gen_shiftr(); return;
+        case TK_SHIFTL:    gen_shiftl(); return;
+        case TK_BITOR:     gen_bitor();  return;
+        case TK_BITXOR:    gen_bitxor(); return;
+        case TK_AMPERSAND: gen_bitand(); return;
+        case TK_PERCENT:   gen_mod();    return;
+        default: error("op_kind %d not handled in codegen", op);
+    }
+}
+
 void gen_expr(Node *node)
 {
     printf(";%s %s %s\n", __func__, nodestr(node->kind), node_ident_str(node));
@@ -626,41 +667,8 @@ void gen_expr(Node *node)
         gen_expr(lhs);
         gen_push();
         gen_expr(rhs);
-        if (istype_fp(lhs->type))
-        {
-            switch (node->op_kind)
-            {
-                case TK_PLUS:  gen_fadd(); return;
-                case TK_MINUS: gen_fsub(); return;
-                case TK_STAR:  gen_fmul(); return;
-                case TK_SLASH: gen_fdiv(); return;
-                case TK_LT:    gen_flt();  return;
-                case TK_LE:    gen_fle();  return;
-                case TK_GT:    gen_fgt();  return;
-                case TK_GE:    gen_fge();  return;
-                default: break;
-            }
-        }
-        switch (node->op_kind)
-        {
-            case TK_PLUS:      gen_add();    return;
-            case TK_MINUS:     gen_sub();    return;
-            case TK_STAR:      gen_mul();    return;
-            case TK_SLASH:     gen_div();    return;
-            case TK_LT:        gen_lt();     return;
-            case TK_LE:        gen_le();     return;
-            case TK_GT:        gen_gt();     return;
-            case TK_GE:        gen_ge();     return;
-            case TK_EQ:        gen_eq();     return;
-            case TK_NE:        gen_ne();     return;
-            case TK_SHIFTR:    gen_shiftr(); return;
-            case TK_SHIFTL:    gen_shiftl(); return;
-            case TK_BITOR:     gen_bitor();  return;
-            case TK_BITXOR:    gen_bitxor(); return;
-            case TK_AMPERSAND: gen_bitand(); return;
-            case TK_PERCENT:   gen_mod();    return;
-            default: error("BINOP op_kind %d not handled in codegen", node->op_kind);
-        }
+        gen_arith_op(node->op_kind, istype_fp(lhs->type));
+        return;
     }
     // ===== Literals =====
     else if (node->kind == ND_LITERAL)
@@ -824,34 +832,7 @@ void gen_expr(Node *node)
         gen_ld(sz);
         gen_push();
         gen_expr(rhs);
-        if (istype_fp(lhs->type))
-        {
-            switch (node->op_kind)
-            {
-                case TK_PLUS:  gen_fadd(); break;
-                case TK_MINUS: gen_fsub(); break;
-                case TK_STAR:  gen_fmul(); break;
-                case TK_SLASH: gen_fdiv(); break;
-                default: error("fp compound op_kind %d not handled", node->op_kind);
-            }
-        }
-        else
-        {
-            switch (node->op_kind)
-            {
-                case TK_PLUS:      gen_add();    break;
-                case TK_MINUS:     gen_sub();    break;
-                case TK_STAR:      gen_mul();    break;
-                case TK_SLASH:     gen_div();    break;
-                case TK_PERCENT:   gen_mod();    break;
-                case TK_AMPERSAND: gen_bitand(); break;
-                case TK_BITOR:     gen_bitor();  break;
-                case TK_BITXOR:    gen_bitxor(); break;
-                case TK_SHIFTL:    gen_shiftl(); break;
-                case TK_SHIFTR:    gen_shiftr(); break;
-                default: error("compound op_kind %d not handled", node->op_kind);
-            }
-        }
+        gen_arith_op(node->op_kind, istype_fp(lhs->type));
         gen_st(sz);
     }
     // ===== Cast =====
