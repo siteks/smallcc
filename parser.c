@@ -1645,54 +1645,54 @@ void insert_cast(Node *n, int child, Type *t)
     c->type = t;
     n->ch[child] = c;
 }
+// C89 §3.2.1.1 integer promotions: narrow integer types widen to int (or uint).
+// NOTE: on a 32-bit target sizeof(int)==4, so ushort would promote to int instead of uint,
+// and short→int would emit sxw rather than being a no-op.
+static Type *promote(Type *t)
+{
+    if (istype_char(t) || istype_uchar(t) || istype_short(t) || istype_enum(t)) return t_int;
+    if (istype_ushort(t)) return t_uint;
+    return t;
+}
+
+// C89 §3.2.1.5 usual arithmetic conversions: given two already-promoted types,
+// return the common type both operands must be converted to.
+static Type *usual_arith_type(Type *l, Type *r)
+{
+    if (istype_fp(l) || istype_fp(r))                                   return t_float;
+    if (istype_ulong(l) || istype_ulong(r))                             return t_ulong;
+    if ((istype_long(l) && istype_uint(r)) || (istype_uint(l) && istype_long(r))) return t_long;
+    if (istype_long(l) || istype_long(r))                               return t_long;
+    if (istype_uint(l) || istype_uint(r))                               return t_uint;
+    return t_int;
+}
+
 // Insert ND_CAST nodes for implicit arithmetic conversions (C89 §3.2.1.5 usual arithmetic conversions).
 static void insert_binop_coercions(Node *n)
 {
-    // Promotions use the *original* lhs/rhs types for checks; insert_cast
-    // replaces n->ch[0]/ch[1] in place.
-    Node *lhs = n->ch[0];
-    Node *rhs = n->ch[1];
+    Node *lhs = n->ch[0], *rhs = n->ch[1];
     DBG_PRINT("%s %016llx %016llx\n", __func__, (unsigned long long)lhs->type, (unsigned long long)rhs->type);
 
-    // Float/double: one side pulls the other up
-    if (istype_float(lhs->type) && !istype_float(rhs->type))            insert_cast(n, 1, t_float);
-    else if (!istype_float(lhs->type) && istype_float(rhs->type))       insert_cast(n, 0, t_float);
+    // Pointer/array arithmetic is handled separately; no arithmetic coercions here.
+    if (istype_ptr(lhs->type) || istype_array(lhs->type) ||
+        istype_ptr(rhs->type) || istype_array(rhs->type))
+        return;
 
-    // Integer promotions (C89 §3.2.1.1):
-    //   char/uchar/short → int;  ushort → uint (int can't represent all ushort
-    //   values on a 16-bit target where sizeof(int)==sizeof(short)==2);
-    //   enum → int.
-    // NOTE: on a 32-bit target, sizeof(int)==4 so int CAN represent all ushort
-    // values; ushort would then promote to int rather than uint.  Also,
-    // short→int would generate sxw (a real widening), not a no-op.
-    if (istype_char(lhs->type))                                         insert_cast(n, 0, t_int);
-    if (istype_char(rhs->type))                                         insert_cast(n, 1, t_int);
-    if (istype_uchar(lhs->type))                                        insert_cast(n, 0, t_int);
-    if (istype_uchar(rhs->type))                                        insert_cast(n, 1, t_int);
-    if (istype_short(lhs->type))                                        insert_cast(n, 0, t_int);
-    if (istype_short(rhs->type))                                        insert_cast(n, 1, t_int);
-    if (istype_ushort(lhs->type))                                       insert_cast(n, 0, t_uint);
-    if (istype_ushort(rhs->type))                                       insert_cast(n, 1, t_uint);
-    if (istype_enum(lhs->type))                                         insert_cast(n, 0, t_int);
-    if (istype_enum(rhs->type))                                         insert_cast(n, 1, t_int);
+    // Step 1: integer promotions — widen each narrow type independently.
+    Type *pl = promote(lhs->type);
+    Type *pr = promote(rhs->type);
+    if (pl != lhs->type) insert_cast(n, 0, pl);
+    if (pr != rhs->type) insert_cast(n, 1, pr);
 
-    // Usual arithmetic conversions — rank hierarchy (C89 §3.2.1.5)
-    if (istype_ulong(lhs->type) && !istype_ulong(rhs->type))            insert_cast(n, 1, t_ulong);
-    else if (!istype_ulong(lhs->type) && istype_ulong(rhs->type))       insert_cast(n, 0, t_ulong);
-    else if (istype_long(lhs->type) && istype_uint(rhs->type))          insert_cast(n, 1, t_long);
-    else if (istype_uint(lhs->type) && istype_long(rhs->type))          insert_cast(n, 0, t_long);
-    else if (istype_long(lhs->type) && !istype_long(rhs->type))         insert_cast(n, 1, t_long);
-    else if (!istype_long(lhs->type) && istype_long(rhs->type))         insert_cast(n, 0, t_long);
-    else if (istype_uint(lhs->type) && !istype_uint(rhs->type))         insert_cast(n, 1, t_uint);
-    else if (!istype_uint(lhs->type) && istype_uint(rhs->type))         insert_cast(n, 0, t_uint);
+    // Step 2: usual arithmetic conversions — bring both to the common type.
+    Type *common = usual_arith_type(pl, pr);
+    if (n->ch[0]->type != common) insert_cast(n, 0, common);
+    if (n->ch[1]->type != common) insert_cast(n, 1, common);
 }
 
 // Insert ND_CAST nodes for implicit integer promotions in a unary expression (C89 §3.2.1.1).
 static void insert_unary_coercions(Node *n)
 {
-    Node *lhs = n->ch[0];   // operand
-    DBG_PRINT("%s %016llx\n", __func__, (unsigned long long)lhs->type);
-
     // Dereference, address-of, and increment/decrement: no promotion needed.
     if (n->op_kind == TK_STAR || n->op_kind == TK_AMPERSAND ||
         n->op_kind == TK_INC  || n->op_kind == TK_DEC ||
@@ -1700,11 +1700,10 @@ static void insert_unary_coercions(Node *n)
         return;
 
     // For +, -, ~, !: promote narrow integer types.
-    if (istype_char(lhs->type))    insert_cast(n, 0, t_int);
-    if (istype_uchar(lhs->type))   insert_cast(n, 0, t_int);
-    if (istype_short(lhs->type))   insert_cast(n, 0, t_int);
-    if (istype_ushort(lhs->type))  insert_cast(n, 0, t_uint);
-    if (istype_enum(lhs->type))    insert_cast(n, 0, t_int);
+    Node *operand = n->ch[0];
+    DBG_PRINT("%s %016llx\n", __func__, (unsigned long long)operand->type);
+    Type *pt = promote(operand->type);
+    if (pt != operand->type) insert_cast(n, 0, pt);
 }
 
 bool is_unscaled_ptr(Node *n)
@@ -1755,23 +1754,9 @@ static Type *binop_result_type(Node *n)
     // Internal stride literals (created by the parser, not typed) have t_void.
     if (l == t_void || r == t_void) return t_void;
     // Pointer/array arithmetic: pointer + int → pointer; preserve the pointer type.
-    // This matches check_operands returning lhs->type when lhs is a pointer/array.
     if (l->base == TB_POINTER || l->base == TB_ARRAY) return l;
     if (r->base == TB_POINTER || r->base == TB_ARRAY) return r;
-    if (istype_float(l) || istype_float(r))
-        return t_float;
-    // Apply integer promotions conceptually
-    if (istype_char(l) || istype_uchar(l) || istype_short(l) || istype_enum(l))  l = t_int;
-    if (istype_char(r) || istype_uchar(r) || istype_short(r) || istype_enum(r))  r = t_int;
-    if (istype_ushort(l)) l = t_uint;
-    if (istype_ushort(r)) r = t_uint;
-    // Usual arithmetic conversions
-    if (istype_ulong(l) || istype_ulong(r))                       return t_ulong;
-    if ((istype_long(l) && istype_uint(r)) ||
-        (istype_uint(l) && istype_long(r)))                       return t_long;
-    if (istype_long(l) || istype_long(r))                         return t_long;
-    if (istype_uint(l) || istype_uint(r))                         return t_uint;
-    return t_int;
+    return usual_arith_type(promote(l), promote(r));
 }
 
 // Pure helper: compute the result type for a unary expression after promotions,
@@ -1785,8 +1770,7 @@ static Type *unary_result_type(Node *n)
         n->op_kind == TK_POST_INC || n->op_kind == TK_POST_DEC)
         return t;
     // Promotions for +, -, ~, !
-    if (istype_char(t) || istype_uchar(t) || istype_short(t) || istype_enum(t)) t = t_int;
-    else if (istype_ushort(t)) t = t_uint;
+    t = promote(t);
     if (n->op_kind == TK_BANG) return t_int;
     return t;
 }
