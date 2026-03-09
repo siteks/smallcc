@@ -57,8 +57,9 @@ static char *read_file(const char *path)
 
 static void harvest_globals(void)
 {
-    for (Symbol *s = type_ctx.symbol_table->idents; s; s = s->next)
+    for (Symbol *s = type_ctx.symbol_table->symbols; s; s = s->next)
     {
+        if (s->ns != NS_IDENT) continue;
         if (s->kind == SYM_STATIC_GLOBAL || s->kind == SYM_STATIC_LOCAL || s->kind == SYM_EXTERN) continue;
         if (!strcmp(s->name, "putchar")) continue;
         insert_extern_sym(s->name, s->type);

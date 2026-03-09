@@ -282,6 +282,7 @@ struct Symbol
                         //   SYM_ENUM_CONST:    integer value (not an address)
                         //   SYM_STATIC_LOCAL:  local_static_counter ID (_ls{id})
     SymbolKind kind;
+    Namespace  ns;          // NS_IDENT | NS_TAG | NS_TYPEDEF
     int     tu_index;       // TU that defined a static (SYM_STATIC_GLOBAL / SYM_STATIC_LOCAL)
     Symbol  *next;
 };
@@ -292,10 +293,7 @@ struct Symbol_table
     int             depth;       // scope nesting depth (0 = global)
     Scope_type      scope_type;  // ST_COMPSTMT or ST_STRUCT
     int             scope_id;    // monotonic ID assigned at creation (for debug)
-    Symbol          *idents;
-    Symbol          *tags;
-    Symbol          *labels;
-    Symbol          *typedefs;
+    Symbol          *symbols;    // unified list: idents + tags + typedefs
     int             size;
     Symbol_table    *parent;
 };

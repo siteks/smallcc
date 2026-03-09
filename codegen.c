@@ -21,7 +21,7 @@ static LocalAddr find_local_addr(Node *node, const char *name)
     while (!found)
     {
         DBG_PRINT("Searching in scope id:%d depth:%d\n", st->scope_id, st->depth);
-        for (s = st->idents; s; s = s->next)
+        for (s = st->symbols; s; s = s->next)
         {
             DBG_PRINT("Ident:%s\n", s->name);
             if (!strcmp(name, s->name)) { found = true; break; }

@@ -329,17 +329,17 @@ void reset_types_state(void)
     // These are the cross-TU globals marked by harvest_globals.
     // Statics, putchar, and unresolved externs are excluded and not preserved.
     Symbol *carry = NULL, **tail = &carry;
-    Symbol *prev = type_ctx.symbol_table ? type_ctx.symbol_table->idents : NULL;
+    Symbol *prev = type_ctx.symbol_table ? type_ctx.symbol_table->symbols : NULL;
     for (Symbol *s = prev; s; s = s->next)
     {
-        if (s->kind != SYM_EXTERN) continue;
+        if (s->ns != NS_IDENT || s->kind != SYM_EXTERN) continue;
         *tail = s;
         tail  = &s->next;
     }
     if (carry) *tail = NULL;
 
-    type_ctx.symbol_table      = arena_alloc(sizeof(Symbol_table));
-    type_ctx.symbol_table->idents = carry;
+    type_ctx.symbol_table          = arena_alloc(sizeof(Symbol_table));
+    type_ctx.symbol_table->symbols = carry;
     type_ctx.curr_scope_st     = type_ctx.symbol_table;
     type_ctx.last_symbol_table = type_ctx.symbol_table;
     type_ctx.scope_depth       = 0;
@@ -350,9 +350,9 @@ void reset_types_state(void)
 void insert_extern_sym(const char *name, Type *type)
 {
     // If already present, mark it as an extern reference for subsequent TUs.
-    for (Symbol *s = type_ctx.symbol_table->idents; s; s = s->next)
+    for (Symbol *s = type_ctx.symbol_table->symbols; s; s = s->next)
     {
-        if (!strcmp(s->name, name))
+        if (s->ns == NS_IDENT && !strcmp(s->name, name))
         {
             s->kind = SYM_EXTERN;
             return;
@@ -363,7 +363,8 @@ void insert_extern_sym(const char *name, Type *type)
     sym->name    = name;
     sym->type    = type;
     sym->kind    = SYM_EXTERN;
-    append_symbol(&type_ctx.symbol_table->idents, sym);
+    sym->ns      = NS_IDENT;
+    append_symbol(&type_ctx.symbol_table->symbols, sym);
 }
 
 // ---------------------------------------------------------------
@@ -371,13 +372,14 @@ void insert_extern_sym(const char *name, Type *type)
 // ---------------------------------------------------------------
 static void insert_builtin(char *name, Type *type)
 {
-    for (Symbol *s = type_ctx.symbol_table->idents; s; s = s->next)
-        if (!strcmp(s->name, name)) return;
+    for (Symbol *s = type_ctx.symbol_table->symbols; s; s = s->next)
+        if (s->ns == NS_IDENT && !strcmp(s->name, name)) return;
     Symbol *sym = arena_alloc(sizeof(Symbol));
-    sym->name = name;
-    sym->type = type;
+    sym->name   = name;
+    sym->type   = type;
     sym->offset = 0;
-    append_symbol(&type_ctx.symbol_table->idents, sym);
+    sym->ns     = NS_IDENT;
+    append_symbol(&type_ctx.symbol_table->symbols, sym);
 }
 
 void make_basic_types()
@@ -629,11 +631,8 @@ Symbol *find_symbol_st(Symbol_table *st, const char *name, Namespace nspace)
 {
     for (; st; st = st->parent) {
         DBG_PRINT("Searching in scope id:%d depth:%d\n", st->scope_id, st->depth);
-        Symbol *s = nspace == NS_IDENT   ? st->idents
-                  : nspace == NS_TAG     ? st->tags
-                  : nspace == NS_TYPEDEF ? st->typedefs
-                  :                        st->labels;
-        for (; s; s = s->next) {
+        for (Symbol *s = st->symbols; s; s = s->next) {
+            if (s->ns != nspace) continue;
             DBG_PRINT("Name:%s\n", s->name);
             if (!strcmp(name, s->name)) return s;
         }
@@ -692,14 +691,15 @@ void leave_scope()
 Symbol *insert_tag(Symbol_table *st, char *ident)
 {
     DBG_PRINT("%s %s\n", __func__, ident);
-    for (Symbol *s = st->tags; s; s = s->next)
-        if (!strcmp(s->name, ident))
+    for (Symbol *s = st->symbols; s; s = s->next)
+        if (s->ns == NS_TAG && !strcmp(s->name, ident))
         {
             DBG_PRINT("%s tag already exists\n", __func__);
             return s;
         }
     Symbol *sym = new_symbol(t_void, ident, 0);
-    append_symbol(&st->tags, sym);
+    sym->ns = NS_TAG;
+    append_symbol(&st->symbols, sym);
     return sym;
 }
 
@@ -708,7 +708,8 @@ Symbol *insert_enum_const(Symbol_table *st, Type *ety, char *ident, int value)
     DBG_PRINT("%s %s = %d\n", __func__, ident, value);
     Symbol *sym = new_symbol(ety, ident, value);
     sym->kind = SYM_ENUM_CONST;
-    append_symbol(&st->idents, sym);
+    // ns already NS_IDENT from new_symbol
+    append_symbol(&st->symbols, sym);
     return sym;
 }
 
@@ -716,10 +717,11 @@ static Symbol *insert_typedef(Node *node, Type *type, const char *ident)
 {
     DBG_PRINT("%s %s\n", __func__, ident);
     Symbol_table *st = find_scope(node);
-    for (Symbol *s = st->typedefs; s; s = s->next)
-        if (!strcmp(s->name, ident)) return s;
+    for (Symbol *s = st->symbols; s; s = s->next)
+        if (s->ns == NS_TYPEDEF && !strcmp(s->name, ident)) return s;
     Symbol *sym = new_symbol(type, ident, 0);
-    append_symbol(&st->typedefs, sym);
+    sym->ns = NS_TYPEDEF;
+    append_symbol(&st->symbols, sym);
     return sym;
 }
 
@@ -744,6 +746,7 @@ static Symbol *new_symbol(Type *type, const char *ident, int offset)
     n->name     = ident;
     n->type     = type;
     n->offset   = offset;
+    n->ns       = NS_IDENT;   // default; callers override for NS_TAG/NS_TYPEDEF
     return n;
 }
 
@@ -760,13 +763,14 @@ static Symbol *insert_ident(Node *node, Type *type, const char *ident, bool is_p
             n->kind    = SYM_STATIC_LOCAL;
             n->tu_index = current_global_tu;
             // Do NOT increment st->size — not on the stack.
-            append_symbol(&st->idents, n);
+            append_symbol(&st->symbols, n);
             return n;
         }
     } else {
         // Global scope — check for existing entry first (dedup for pre-populated externs)
-        for (Symbol *s = st->idents; s; s = s->next)
+        for (Symbol *s = st->symbols; s; s = s->next)
         {
+            if (s->ns != NS_IDENT) continue;
             if (!strcmp(s->name, ident))
             {
                 if (sclass != SC_EXTERN)
@@ -810,14 +814,15 @@ static Symbol *insert_ident(Node *node, Type *type, const char *ident, bool is_p
         {
             n->kind = SYM_GLOBAL;
         }
-        append_symbol(&st->idents, n);
+        append_symbol(&st->symbols, n);
         return n;
     }
     // Local / parameter
     int offset       = 0;
     int param_offset = FRAME_OVERHEAD;  // params start above saved lr+bp
     int last_size    = 0;
-    for (Symbol *s = st->idents; s; s = s->next) {
+    for (Symbol *s = st->symbols; s; s = s->next) {
+        if (s->ns != NS_IDENT) continue;
         if (s->kind == SYM_PARAM) {
             param_offset = s->offset;
             last_size    = s->type->size;
@@ -830,7 +835,7 @@ static Symbol *insert_ident(Node *node, Type *type, const char *ident, bool is_p
     if (!is_param) st->size += type->size;
     Symbol *n  = new_symbol(type, ident, is_param ? param_offset : offset);
     n->kind    = is_param ? SYM_PARAM : SYM_LOCAL;
-    append_symbol(&st->idents, n);
+    append_symbol(&st->symbols, n);
     return n;
 }
 
@@ -851,8 +856,8 @@ void finalize_local_offsets(void)
         for (Symbol_table *p = st->parent; p && p->depth > 0; p = p->parent)
             go += p->size;
         // Adjust local symbol offsets
-        for (Symbol *s = st->idents; s; s = s->next)
-            if (s->kind == SYM_LOCAL)
+        for (Symbol *s = st->symbols; s; s = s->next)
+            if (s->ns == NS_IDENT && s->kind == SYM_LOCAL)
                 s->offset += go;
     }
 }
@@ -926,16 +931,16 @@ void print_symbol_table(Symbol_table *s, int depth)
 {
     if (depth == 0) {
         DBG_PRINT("------ Symbol table ------\n");
-        // Print global scope
         DBG_PRINT("Scope: id:%-4d depth:%-4d   0x%04x\n", s->scope_id, s->depth, s->size);
-        Symbol *sm;
-        for (sm = s->idents; sm; sm = sm->next)
-            DBG_PRINT("%016llx %-10s global 0x%02x %s\n",
-                (unsigned long long)sm->type, sm->name,
-                sm->offset, fulltype_str(sm->type));
-        for (sm = s->tags; sm; sm = sm->next)
-            DBG_PRINT("%016llx %-10s tag %s\n",
-                (unsigned long long)sm->type, sm->name, fulltype_str(sm->type));
+        for (Symbol *sm = s->symbols; sm; sm = sm->next) {
+            if (sm->ns == NS_TAG)
+                DBG_PRINT("%016llx %-10s tag %s\n",
+                    (unsigned long long)sm->type, sm->name, fulltype_str(sm->type));
+            else
+                DBG_PRINT("%016llx %-10s global 0x%02x %s\n",
+                    (unsigned long long)sm->type, sm->name,
+                    sm->offset, fulltype_str(sm->type));
+        }
         // Print all scopes from flat list
         for (int i = 0; i < type_ctx.scope_count; i++)
             print_symbol_table(type_ctx.scope_list[i], type_ctx.scope_list[i]->depth);
@@ -943,18 +948,16 @@ void print_symbol_table(Symbol_table *s, int depth)
     }
     for (int i = 0; i < depth; i++) DBG_PRINT("  ");
     DBG_PRINT("Scope: id:%-4d depth:%-4d   0x%04x\n", s->scope_id, s->depth, s->size);
-    Symbol *sm;
-    for (sm = s->idents; sm; sm = sm->next) {
+    for (Symbol *sm = s->symbols; sm; sm = sm->next) {
         for (int i = 0; i < depth; i++) DBG_PRINT("  ");
-        DBG_PRINT("%016llx %-10s %s 0x%02x %s\n",
-            (unsigned long long)sm->type, sm->name,
-            sm->kind == SYM_PARAM ? "param" : "local",
-            sm->offset, fulltype_str(sm->type));
-    }
-    for (sm = s->tags; sm; sm = sm->next) {
-        for (int i = 0; i < depth; i++) DBG_PRINT("  ");
-        DBG_PRINT("%016llx %-10s tag %s\n",
-            (unsigned long long)sm->type, sm->name, fulltype_str(sm->type));
+        if (sm->ns == NS_TAG)
+            DBG_PRINT("%016llx %-10s tag %s\n",
+                (unsigned long long)sm->type, sm->name, fulltype_str(sm->type));
+        else
+            DBG_PRINT("%016llx %-10s %s 0x%02x %s\n",
+                (unsigned long long)sm->type, sm->name,
+                sm->kind == SYM_PARAM ? "param" : "local",
+                sm->offset, fulltype_str(sm->type));
     }
 }
 #else
