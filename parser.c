@@ -168,9 +168,10 @@ static Node *init_declarator();
 static Node *declaration(int depth);
 // Additional forwards needed by unary_expr (sizeof, cast)
 static bool is_type_name_or_type(Token *tok);
-static void struct_decl(Node *node, int depth);
-static void enum_decl(Node *node);
-static void parse_decl_specifiers(Node *node);
+static Node *struct_decl(DeclParseState *ds, int depth);
+static void enum_decl(DeclParseState *ds);
+static void parse_decl_specifiers(DeclParseState *ds);
+static Node *make_decl_node(DeclParseState *ds, Node *spec, Node *decls);
 
 
 
@@ -204,7 +205,7 @@ Node *new_node(Node_kind kind, char *val, bool is_expr)
     // Store identifier/label strings in union; operators use op_kind instead
     if (val) {
         if (kind == ND_IDENT)
-            node->u.ident = strdup(val);
+            node->u.ident.name = strdup(val);
         else if (kind == ND_GOTOSTMT)
             node->u.label = strdup(val);
     }
@@ -212,12 +213,13 @@ Node *new_node(Node_kind kind, char *val, bool is_expr)
 }
 
 
-static Node *add_child(Node *parent, Node *child)
+
+static void list_append(Node **head, Node *item)
 {
-    parent->child_count++;
-    parent->children = (Node **)realloc(parent->children, parent->child_count * sizeof(Node *));
-    parent->children[parent->child_count - 1] = child;
-    return child;
+    if (!*head) { *head = item; return; }
+    Node *p = *head;
+    while (p->next) p = p->next;
+    p->next = item;
 }
 
 static Node *primary_expr()
@@ -392,7 +394,7 @@ static Node *unary_expr()
     else if (token_ctx.current->kind == TK_INC || token_ctx.current->kind == TK_DEC
             ||  token_ctx.current->kind == TK_AMPERSAND || token_ctx.current->kind == TK_STAR
             ||  token_ctx.current->kind == TK_PLUS || token_ctx.current->kind == TK_MINUS
-            ||  token_ctx.current->kind == TK_BANG || token_ctx.current->kind == TK_TWIDDLE)
+            ||  token_ctx.current->kind == TK_BANG || token_ctx.current->kind == TK_TILDE)
     {
         Token_kind k = token_ctx.current->kind;
         token_ctx.current = token_ctx.current->next;  // consume the operator token_ctx.current
@@ -411,7 +413,7 @@ static Node *unary_expr()
         if (node->kind == ND_IDENT)
         {
             // set the symbol
-            node->symbol = find_symbol(node, node->u.ident, NS_IDENT);
+            node->symbol = find_symbol(node, node->u.ident.name, NS_IDENT);
         }
     }
     // postfix-expr
@@ -478,7 +480,7 @@ static Node *unary_expr()
                         outer_unary->type = arr_at_depth->u.arr.elem;
                     } else {
                         outer_unary->op_kind = TK_PLUS;
-                        outer_unary->is_array_deref = true;
+                        outer_unary->u.unaryop.is_array_deref = true;
                     }
                     node = outer_unary;
                     Node *add = new_node(ND_BINOP, NULL, true);
@@ -499,16 +501,43 @@ static Node *unary_expr()
                     break;
                 }
             case(TK_LPAREN):
-                // Function call
+                // Function call: route args into the appropriate u.*.args linked list
                 expect(TK_LPAREN);
-                pex_node->is_function = true;
+                if (pex_node->kind == ND_IDENT)         pex_node->u.ident.is_function = true;
+                else if (pex_node->kind == ND_UNARYOP)  pex_node->u.unaryop.is_function = true;
+                else if (pex_node->kind == ND_MEMBER)   pex_node->u.member.is_function = true;
                 if (token_ctx.current->kind != TK_RPAREN)
                 {
-                    add_child(node, assign_expr());
-                    while (token_ctx.current->kind == TK_COMMA)
+                    if (node->kind == ND_IDENT)
                     {
-                        token_ctx.current = token_ctx.current->next;
-                        add_child(node, assign_expr());
+                        list_append(&node->u.ident.args, assign_expr());
+                        while (token_ctx.current->kind == TK_COMMA)
+                        {
+                            token_ctx.current = token_ctx.current->next;
+                            list_append(&node->u.ident.args, assign_expr());
+                        }
+                    }
+                    else if (node->kind == ND_UNARYOP)
+                    {
+                        list_append(&node->u.unaryop.args, assign_expr());
+                        while (token_ctx.current->kind == TK_COMMA)
+                        {
+                            token_ctx.current = token_ctx.current->next;
+                            list_append(&node->u.unaryop.args, assign_expr());
+                        }
+                    }
+                    else if (node->kind == ND_MEMBER)
+                    {
+                        list_append(&node->u.member.args, assign_expr());
+                        while (token_ctx.current->kind == TK_COMMA)
+                        {
+                            token_ctx.current = token_ctx.current->next;
+                            list_append(&node->u.member.args, assign_expr());
+                        }
+                    }
+                    else
+                    {
+                        error("Unexpected node kind %s at function call\n", nodestr(node->kind));
                     }
                 }
                 expect(TK_RPAREN);
@@ -520,9 +549,6 @@ static Node *unary_expr()
                 n->op_kind = TK_DOT;
                 n->u.member.base = node;
                 n->u.member.field_name = strdup(expect(TK_IDENT));
-                // Keep add_child for base so push_args(node, 2) works for s.fp(args)
-                add_child(n, node);
-                add_child(n, new_node(ND_IDENT, n->u.member.field_name, true));
                 node = n;
                 pex_node = n;
                 break;
@@ -534,9 +560,6 @@ static Node *unary_expr()
                 n->op_kind = TK_ARROW;
                 n->u.member.base = node;
                 n->u.member.field_name = strdup(expect(TK_IDENT));
-                // Keep add_child for base so push_args(node, 2) works for s->fp(args)
-                add_child(n, node);
-                add_child(n, new_node(ND_IDENT, n->u.member.field_name, true));
                 node = n;
                 pex_node = n;
                 break;
@@ -576,32 +599,33 @@ static Node *type_name()
     // At least one of (void, char..., typename, const, volatile), with optional abst-decl
     // This is a strict subset of declarator
     // We are going to ignore const, volatile
-    // if (is_type_name_or_type(token_ctx.current))
-    // {
-    //     return new_node(ND_TYPE_NAME, expect(token_ctx.current->kind));
-    // }
-    Node *node = new_node(ND_DECLARATION, 0, true);
+    DeclParseState ds = {0};
     if (token_ctx.current->kind == TK_IDENT && is_typedef_name(token_ctx.current->val))
     {
-        node->type = find_typedef_type(token_ctx.current->val);
+        ds.typedef_type = find_typedef_type(token_ctx.current->val);
+        ds.typespec = DS_TYPEDEF;
         expect(TK_IDENT);
         if (token_ctx.current->kind == TK_STAR)
         {
             expect(TK_STAR);
-            node->type = get_pointer_type(node->type);
+            ds.typedef_type = get_pointer_type(ds.typedef_type);
         }
+        Node *node = make_decl_node(&ds, NULL, NULL);
+        node->type = ds.typedef_type;
         return node;
     }
-    parse_decl_specifiers(node);
-    if (node->typespec & DS_ENUM)
+    parse_decl_specifiers(&ds);
+    if (ds.typespec & DS_ENUM)
     {
-        enum_decl(node);
+        enum_decl(&ds);
     }
+    Node *decls = NULL;
     while(token_ctx.current->kind != TK_RPAREN)
     {
-        add_child(node, declarator());
+        list_append(&decls, declarator());
     }
-    node->type = type2_from_decl_node(node);
+    Node *node = make_decl_node(&ds, NULL, decls);
+    node->type = type2_from_decl_node(node, ds);
     DBG_PRINT("%s type:%s\n", __func__, fulltype_str(node->type));
     return node;
 }
@@ -702,17 +726,11 @@ void insert_scale(Node *n, int child, int size)
     lit->ival = size;
 
     Node **slot = get_u_child_slot(n, child);
-    Node *original = slot ? *slot : n->children[child];
+    Node *original = *slot;
 
     sc->u.binop.lhs = lit;
     sc->u.binop.rhs = original;
-    // Also populate children[] for Cat C nodes that use it
-    add_child(sc, lit);
-    add_child(sc, original);
-
-    if (slot) *slot = sc;
-    if (n->children && child < n->child_count)
-        n->children[child] = sc;
+    *slot = sc;
 }
 static Node *assign_expr();
 static Node *cond_expr()
@@ -806,20 +824,33 @@ bool is_typequal(Token_kind tk)
         || (tk == TK_VOLATILE);
 }
 
-static void parse_decl_specifiers(Node *node)
+static void parse_decl_specifiers(DeclParseState *ds)
 {
     while (is_sc_spec(token_ctx.current->kind) || is_typespec(token_ctx.current->kind) || is_typequal(token_ctx.current->kind)
-           || (token_ctx.current->kind == TK_IDENT && is_typedef_name(token_ctx.current->val) && node->typespec == 0))
+           || (token_ctx.current->kind == TK_IDENT && is_typedef_name(token_ctx.current->val) && ds->typespec == 0))
     {
-        if (is_sc_spec(token_ctx.current->kind))  node->sclass   = token_ctx.current->kind;
-        if (is_typespec(token_ctx.current->kind)) node->typespec |= to_typespec(token_ctx.current->kind);
+        if (is_sc_spec(token_ctx.current->kind))  ds->sclass   = token_ctx.current->kind;
+        if (is_typespec(token_ctx.current->kind)) ds->typespec |= to_typespec(token_ctx.current->kind);
         if (token_ctx.current->kind == TK_IDENT && is_typedef_name(token_ctx.current->val))
         {
-            node->typespec |= DS_TYPEDEF;
-            node->type      = find_typedef_type(token_ctx.current->val);
+            ds->typespec    |= DS_TYPEDEF;
+            ds->typedef_type = find_typedef_type(token_ctx.current->val);
         }
         expect(token_ctx.current->kind);
     }
+}
+
+static Node *make_decl_node(DeclParseState *ds, Node *spec, Node *decls)
+{
+    Node *node = new_node(ND_DECLARATION, NULL, false);
+    node->u.declaration.spec    = spec;
+    node->u.declaration.decls   = decls;
+    node->u.declaration.typespec = ds->typespec;
+    node->u.declaration.sclass   = ds->sclass;
+    // Propagate typedef_type into node->type for use by type2_from_decl_node
+    if (ds->typedef_type)
+        node->type = ds->typedef_type;
+    return node;
 }
 
 static Node *param_declaration()
@@ -830,26 +861,29 @@ static Node *param_declaration()
     // <parameter-declaration> ::= {<declaration-specifier>}+ <declarator>
     //                           | {<declaration-specifier>}+ <abstract-declarator>
     //                           | {<declaration-specifier>}+
-    Node *node = new_node(ND_DECLARATION, 0, false);
+    DeclParseState ds = {0};
     // At least one decl_spec
     // TODO storage class defaults A.8.1
-    parse_decl_specifiers(node);
-    if (node->typespec & (DS_STRUCT | DS_UNION))
+    parse_decl_specifiers(&ds);
+    Node *spec = NULL;
+    if (ds.typespec & (DS_STRUCT | DS_UNION))
     {
-        struct_decl(node, 0);
+        spec = struct_decl(&ds, 0);
     }
-    else if (node->typespec & DS_ENUM)
+    else if (ds.typespec & DS_ENUM)
     {
-        enum_decl(node);
+        enum_decl(&ds);
     }
+    Node *decls = NULL;
     if (token_ctx.current->kind == TK_STAR || token_ctx.current->kind == TK_IDENT || token_ctx.current->kind == TK_LPAREN)
     {
-        add_child(node, declarator());
+        list_append(&decls, declarator());
     }
     // else: abstract declarator (no name) — valid in C89
 
+    Node *node = make_decl_node(&ds, spec, decls);
     // At this point, we can add the symbols and types to the tables
-    add_types_and_symbols(node, true, 0);
+    add_types_and_symbols(node, ds, true, 0);
     return node;
 }
 static Node *param_type_list()
@@ -859,14 +893,14 @@ static Node *param_type_list()
     node->symtable = enter_new_scope(false);
     while(token_ctx.current->kind != TK_RPAREN)
     {
-        add_child(node, param_declaration());
+        list_append(&node->u.ptype_list.params, param_declaration());
         if (token_ctx.current->kind == TK_COMMA)
         {
             expect(TK_COMMA);
             if (token_ctx.current->kind == TK_ELLIPSIS)
             {
                 expect(TK_ELLIPSIS);
-                node->is_variadic = true;
+                node->u.ptype_list.is_variadic = true;
                 break;
             }
         }
@@ -894,33 +928,33 @@ static Node *direct_decl()
     Node *node = new_node(ND_DIRECT_DECL, 0, false);
     if (token_ctx.current->kind == TK_IDENT)
     {
-        add_child(node, new_node(ND_IDENT, expect(TK_IDENT), false));
+        node->u.direct_decl.name = new_node(ND_IDENT, expect(TK_IDENT), false);
     }
     else if (token_ctx.current->kind == TK_LPAREN)
     {
         expect(TK_LPAREN);
-        add_child(node, declarator());
+        node->u.direct_decl.name = declarator();
         expect(TK_RPAREN);
     }
     while(true)
     {
         if (token_ctx.current->kind == TK_LBRACKET)
         {
-            add_child(node, new_node(ND_ARRAY_DECL, expect(TK_LBRACKET), false));
-            Node *n = node->children[node->child_count - 1];
+            Node *arr = new_node(ND_ARRAY_DECL, expect(TK_LBRACKET), false);
+            list_append(&node->u.direct_decl.suffixes, arr);
             if (token_ctx.current->kind != TK_RBRACKET)
             {
-                add_child(n, constant_expr());
+                arr->u.array_decl.size = constant_expr();
             }
             expect(TK_RBRACKET);
         }
         else if (token_ctx.current->kind == TK_LPAREN)
         {
-            add_child(node, new_node(ND_FUNC_DECL, expect(TK_LPAREN), false));
-            Node *n = node->children[node->child_count - 1];
-            n->is_function = true;
+            Node *fn = new_node(ND_FUNC_DECL, expect(TK_LPAREN), false);
+            list_append(&node->u.direct_decl.suffixes, fn);
+            // ND_FUNC_DECL kind itself signals "function suffix"; no is_function field needed
             // TODO can also be identifier
-            add_child(n, param_type_list());
+            fn->u.func_decl.params = param_type_list();
             expect(TK_RPAREN);
         }
         else
@@ -947,18 +981,18 @@ static Node *declarator()
             expect(token_ctx.current->kind);
         }
     }
-    add_child(node, direct_decl());
+    node->u.declarator.direct_decl = direct_decl();
     return node;
 }
 static Node *initializer();
 static Node *initializer_list()
 {
     Node *node = new_node(ND_INITLIST, 0, false);
-    add_child(node, initializer());
+    list_append(&node->u.initlist.items, initializer());
     while (token_ctx.current->kind == TK_COMMA)
     {
         expect(TK_COMMA);
-        add_child(node, initializer());
+        list_append(&node->u.initlist.items, initializer());
     }
     return node;
 }
@@ -989,48 +1023,50 @@ static Node *init_declarator()
     if (token_ctx.current->kind == TK_ASSIGN)
     {
         expect(TK_ASSIGN);
-        add_child(node, initializer());
+        node->u.declarator.init = initializer();
     }
     return node;
 }
 static Node *comp_stmt(bool use_last_scope);
 
-static void struct_decl(Node *node, int depth)
+static Node *struct_decl(DeclParseState *ds, int depth)
 {
     // struct-or-union-specifier ::= struct-or-union identifier "{" struct-declaration+ "}"
     //                             | struct-or-union "{" struct-declaration+ "}"
-    //                             | struct-or-union identifier        
-    Node *n = 0;
+    //                             | struct-or-union identifier
+    Node *n = NULL;
     if (token_ctx.current->kind == TK_IDENT)
     {
         // struct or union definition with a tag, or an incomplete type, or a declaration.
         // Declarations using incomplete types are only valid if a pointer
-        n = add_child(node, new_node(ND_STRUCT, 0, false));
-        n->typespec |= (node->typespec & DS_UNION) ? DS_UNION : DS_STRUCT;
-        add_child(n, new_node(ND_IDENT, expect(TK_IDENT), false));
+        n = new_node(ND_STRUCT, 0, false);
+        n->u.struct_spec.is_union = (ds->typespec & DS_UNION) != 0;
+        n->u.struct_spec.tag = new_node(ND_IDENT, expect(TK_IDENT), false);
     }
     if (token_ctx.current->kind == TK_LBRACE)
     {
         if (!n)
         {
             // Anonymous struct or union definition
-            n = add_child(node, new_node(ND_STRUCT, 0, false));
-            add_child(n, new_node(ND_IDENT, new_anon_label(), false));
+            n = new_node(ND_STRUCT, 0, false);
+            n->u.struct_spec.is_union = (ds->typespec & DS_UNION) != 0;
+            n->u.struct_spec.tag = new_node(ND_IDENT, new_anon_label(), false);
         }
         expect(TK_LBRACE);
         n->symtable = enter_new_scope(false);
         n->symtable->scope.scope_type = ST_STRUCT;
         do
         {
-            add_child(n, declaration(depth + 1));
+            list_append(&n->u.struct_spec.members, declaration(depth + 1));
         }
         while (token_ctx.current->kind != TK_RBRACE);
         leave_scope();
         expect(TK_RBRACE);
     }
+    return n;
 }
 
-static void enum_decl(Node *node)
+static void enum_decl(DeclParseState *ds)
 {
     // Optional tag name
     char *tagname = NULL;
@@ -1045,10 +1081,10 @@ static void enum_decl(Node *node)
     if (token_ctx.current->kind == TK_LBRACE)
     {
         // Full definition: insert tag, parse body
-        Symbol *tag_sym = insert_tag(node, tagname);
+        Symbol *tag_sym = insert_tag(type_ctx.curr_scope_st, tagname);
         Type  *ety     = get_enum_type(tag_sym);
         tag_sym->type   = ety;
-        node->type      = ety;
+        ds->typedef_type = ety;
         expect(TK_LBRACE);
         int next_val = 0;
         while (token_ctx.current->kind != TK_RBRACE)
@@ -1062,7 +1098,7 @@ static void enum_decl(Node *node)
                 next_val = sign * (int)token_ctx.current->ival;
                 expect(TK_CONSTINT);
             }
-            insert_enum_const(node, ety, ename, next_val++);
+            insert_enum_const(type_ctx.curr_scope_st, ety, ename, next_val++);
             if (token_ctx.current->kind == TK_COMMA)
                 expect(TK_COMMA);
         }
@@ -1071,8 +1107,8 @@ static void enum_decl(Node *node)
     else
     {
         // Tag-only reference
-        Symbol *tag_sym = find_symbol(node, tagname, NS_TAG);
-        node->type = tag_sym ? tag_sym->type : t_int;
+        Symbol *tag_sym = find_symbol_st(type_ctx.curr_scope_st, tagname, NS_TAG);
+        ds->typedef_type = tag_sym ? tag_sym->type : t_int;
     }
 }
 
@@ -1080,20 +1116,22 @@ static Node *declaration(int depth)
 {
     DBG_FUNC();
     // <declaration> ::=  {<declaration-specifier>}+ {<init-declarator>}* ;
-    Node *node = new_node(ND_DECLARATION, 0, false);
+    DeclParseState ds = {0};
     // At least one decl_spec (including optional typedef-name)
-    parse_decl_specifiers(node);
-    if (node->typespec & (DS_STRUCT | DS_UNION))
+    parse_decl_specifiers(&ds);
+    Node *spec = NULL;
+    if (ds.typespec & (DS_STRUCT | DS_UNION))
     {
-        struct_decl(node, depth);
+        spec = struct_decl(&ds, depth);
     }
-    else if (node->typespec & DS_ENUM)
+    else if (ds.typespec & DS_ENUM)
     {
-        enum_decl(node);
+        enum_decl(&ds);
     }
+    Node *decls = NULL;
     while(token_ctx.current->kind != TK_SEMICOLON)
     {
-        add_child(node, init_declarator());
+        list_append(&decls, init_declarator());
         if (token_ctx.current->kind != TK_SEMICOLON)
         {
             // We could get this far to find out this is a function definition.
@@ -1101,13 +1139,14 @@ static Node *declaration(int depth)
             // it is a func definition
             if (token_ctx.current->kind == TK_LBRACE)
             {
-                add_types_and_symbols(node, false, 0);
+                Node *node = make_decl_node(&ds, spec, decls);
+                add_types_and_symbols(node, ds, false, 0);
                 parser_ctx.current_function = node;
-                // This is the first compound statement of a 
+                // This is the first compound statement of a
                 // function, so we need to use the scope
-                /// created in the parameter list
-                add_child(node, comp_stmt(true));
-                node->is_func_defn = true;
+                // created in the parameter list
+                node->u.declaration.func_body = comp_stmt(true);
+                node->u.declaration.is_func_defn = true;
                 return node;
             }
             expect(TK_COMMA);
@@ -1117,9 +1156,8 @@ static Node *declaration(int depth)
     expect(TK_SEMICOLON);
     // At this point, we can add the symbols and types to the tables
     // We don't add struct members but we do add tags
-    // print_tree(node, 0);
-
-    add_types_and_symbols(node, false, depth);
+    Node *node = make_decl_node(&ds, spec, decls);
+    add_types_and_symbols(node, ds, false, depth);
     return node;
 }
 static Node *comp_stmt(bool use_last_scope)
@@ -1137,9 +1175,9 @@ static Node *comp_stmt(bool use_last_scope)
         {
             if (is_sc_spec(token_ctx.current->kind) || is_typespec(token_ctx.current->kind) || is_typequal(token_ctx.current->kind)
                 || (token_ctx.current->kind == TK_IDENT && is_typedef_name(token_ctx.current->val)))
-                add_child(node, declaration(0));
+                list_append(&node->u.compstmt.stmts, declaration(0));
             else
-                add_child(node, stmt());
+                list_append(&node->u.compstmt.stmts, stmt());
         }
         expect(TK_RBRACE);
     }
@@ -1152,7 +1190,7 @@ static Node *stmt()
     Node *node = new_node(ND_STMT, 0, false);
     if (token_ctx.current->kind == TK_LBRACE)
     {
-        add_child(node, comp_stmt(false));
+        node->u.stmt_wrap.body = comp_stmt(false);
     }
     else if (token_ctx.current->kind == TK_IF)
     {
@@ -1246,7 +1284,7 @@ static Node *stmt()
         expect(TK_CASE);
         if (token_ctx.current->kind == TK_IDENT)
         {
-            Symbol *s = find_symbol(node, token_ctx.current->val, NS_IDENT);
+            Symbol *s = find_symbol_st(node->st, token_ctx.current->val, NS_IDENT);
             if (!s || !s->is_enum_const)
                 error("Expected integer constant in case\n");
             node->ival = (long long)s->offset;
@@ -1323,7 +1361,7 @@ Node *program()
     Node *node = new_node(ND_PROGRAM, 0, false);
     while(!at_eof())
     {
-        add_child(node, declaration(0));
+        list_append(&node->u.program.decls, declaration(0));
     }
     return node;
 }
@@ -1380,14 +1418,18 @@ static const char *node_val_str(Node *node)
     if (!node) return "";
     switch (node->kind) {
         case ND_IDENT:
-            return node->u.ident ? node->u.ident : "";
+            return node->u.ident.name ? node->u.ident.name : "";
         case ND_LABELSTMT:
             return node->u.labelstmt.name ? node->u.labelstmt.name : "";
         case ND_GOTOSTMT:
             return node->u.label ? node->u.label : "";
         case ND_DECLARATOR:
+            return "";  // name is in u.declarator.direct_decl
         case ND_DIRECT_DECL:
-            return node->u.ident ? node->u.ident : "";
+        {
+            Node *nm = node->u.direct_decl.name;
+            return (nm && nm->kind == ND_IDENT && nm->u.ident.name) ? nm->u.ident.name : "";
+        }
         default:
             return "";
     }
@@ -1400,31 +1442,31 @@ char *node_str(Node *node)
     char *p = buf;
     if (!node)
         return buf;
-    p += sprintf(p, "%s: %5s %s ch:%d sc:%s fts:%s: t:%016llx ",
+    p += sprintf(p, "%s: %5s %s sc:%s fts:%s: t:%016llx ",
         nodestr(node->kind),
         node->kind == ND_ARRAY_DECL ? "array" :
-        node->is_func_defn ? "fdef " :
-        node->is_function ? "func " : "     ",
+        (node->kind == ND_DECLARATION && node->u.declaration.is_func_defn) ? "fdef " :
+        (node->kind == ND_IDENT ? node->u.ident.is_function :
+         node->kind == ND_UNARYOP ? node->u.unaryop.is_function :
+         node->kind == ND_MEMBER ? node->u.member.is_function : false) ? "func " : "     ",
         node_val_str(node),
-        node->child_count,
         node->st ? scope_str(node->st->scope) : "(nil)",
         node->type ? fulltype_str(node->type) : "",
         (unsigned long long)node->type);
     if (node->kind == ND_DECLARATION)
     {
         p += sprintf(p, "sclass:%s ",
-            token_str(node->sclass));
-        for(int j = 0; j < node->child_count; j++)
-            if (node->children[j]->kind == ND_DECLARATOR && node->children[j]->symbol)
+            token_str(node->u.declaration.sclass));
+        for (Node *d = node->u.declaration.decls; d; d = d->next)
+            if (d->kind == ND_DECLARATOR && d->symbol)
                 p += sprintf(p, "%s | ",
-                    fulltype_str(node->children[j]->symbol->type));
+                    fulltype_str(d->symbol->type));
     }
     if (node->kind == ND_DECLARATOR || node->kind == ND_DIRECT_DECL)
     {
         p += sprintf(p, "%s %d* %s ",
             node_val_str(node),
             node->pointer_level,
-            node->is_function ? "func" :
             node->kind == ND_ARRAY_DECL ? "array" : "");
     }
     return buf;
@@ -1448,9 +1490,8 @@ void for_each_child(Node *node, void (*fn)(Node *child, void *ctx), void *ctx)
         return;
     case ND_UNARYOP:
         call_fn(node->u.unaryop.operand, fn, ctx);
-        // Function call args in children[1+]
-        for (int i = 1; i < node->child_count; i++)
-            call_fn(node->children[i], fn, ctx);
+        for (Node *a = node->u.unaryop.args; a; a = a->next)
+            fn(a, ctx);
         return;
     case ND_CAST:
         call_fn(node->u.cast.type_decl, fn, ctx);
@@ -1467,9 +1508,8 @@ void for_each_child(Node *node, void (*fn)(Node *child, void *ctx), void *ctx)
         return;
     case ND_MEMBER:
         call_fn(node->u.member.base, fn, ctx);
-        // Function call args in children[2+]
-        for (int i = 2; i < node->child_count; i++)
-            call_fn(node->children[i], fn, ctx);
+        for (Node *a = node->u.member.args; a; a = a->next)
+            fn(a, ctx);
         return;
     case ND_VA_START:
         call_fn(node->u.vastart.ap, fn, ctx);
@@ -1518,9 +1558,8 @@ void for_each_child(Node *node, void (*fn)(Node *child, void *ctx), void *ctx)
 
     // Leaf nodes — no children to visit
     case ND_IDENT:
-        // ND_IDENT with is_function uses children[] for args
-        for (int i = 0; i < node->child_count; i++)
-            call_fn(node->children[i], fn, ctx);
+        for (Node *a = node->u.ident.args; a; a = a->next)
+            fn(a, ctx);
         return;
     case ND_LITERAL:
     case ND_GOTOSTMT:
@@ -1531,21 +1570,75 @@ void for_each_child(Node *node, void (*fn)(Node *child, void *ctx), void *ctx)
     case ND_EMPTY:
         return;
 
-    // Cat C: container/structural nodes — use children[]
-    case ND_PROGRAM:
-    case ND_COMPSTMT:
-    case ND_DECLARATION:
+    // ND_DECLARATOR: migrated to u.declarator
     case ND_DECLARATOR:
-    case ND_DIRECT_DECL:
+        call_fn(node->u.declarator.direct_decl, fn, ctx);
+        call_fn(node->u.declarator.init, fn, ctx);
+        return;
+    // ND_ARRAY_DECL: migrated to u.array_decl
     case ND_ARRAY_DECL:
+        call_fn(node->u.array_decl.size, fn, ctx);
+        return;
+    // ND_FUNC_DECL: migrated to u.func_decl
     case ND_FUNC_DECL:
-    case ND_PTYPE_LIST:
-    case ND_STRUCT:
-    case ND_INITLIST:
+        call_fn(node->u.func_decl.params, fn, ctx);
+        return;
+
+    // ND_TYPE_NAME: migrated to u.type_name (ND_TYPE_NAME is never created currently)
     case ND_TYPE_NAME:
+        call_fn(node->u.type_name.decl, fn, ctx);
+        return;
+    // ND_STMT: migrated to u.stmt_wrap
     case ND_STMT:
-        for (int i = 0; i < node->child_count; i++)
-            call_fn(node->children[i], fn, ctx);
+        call_fn(node->u.stmt_wrap.body, fn, ctx);
+        return;
+
+    // ND_PROGRAM: migrated to u.program
+    case ND_PROGRAM:
+    {
+        for (Node *c = node->u.program.decls; c; c = c->next)
+            fn(c, ctx);
+        return;
+    }
+    // ND_COMPSTMT: migrated to u.compstmt
+    case ND_COMPSTMT:
+    {
+        for (Node *c = node->u.compstmt.stmts; c; c = c->next)
+            fn(c, ctx);
+        return;
+    }
+    // ND_PTYPE_LIST: migrated to u.ptype_list
+    case ND_PTYPE_LIST:
+    {
+        for (Node *c = node->u.ptype_list.params; c; c = c->next)
+            fn(c, ctx);
+        return;
+    }
+    // ND_INITLIST: migrated to u.initlist
+    case ND_INITLIST:
+    {
+        for (Node *c = node->u.initlist.items; c; c = c->next)
+            fn(c, ctx);
+        return;
+    }
+    // ND_DECLARATION: migrated to u.declaration
+    case ND_DECLARATION:
+        call_fn(node->u.declaration.spec, fn, ctx);
+        for (Node *c = node->u.declaration.decls; c; c = c->next)
+            fn(c, ctx);
+        call_fn(node->u.declaration.func_body, fn, ctx);
+        return;
+    // ND_DIRECT_DECL: migrated to u.direct_decl
+    case ND_DIRECT_DECL:
+        call_fn(node->u.direct_decl.name, fn, ctx);
+        for (Node *c = node->u.direct_decl.suffixes; c; c = c->next)
+            fn(c, ctx);
+        return;
+    // ND_STRUCT: migrated to u.struct_spec
+    case ND_STRUCT:
+        call_fn(node->u.struct_spec.tag, fn, ctx);
+        for (Node *c = node->u.struct_spec.members; c; c = c->next)
+            fn(c, ctx);
         return;
 
     default:
@@ -1574,11 +1667,21 @@ void print_tree(Node *node, int depth)
 
 const char *get_decl_ident(Node *node)
 {
-    if (node->child_count)
+    // ND_DECLARATOR: name is in u.declarator.direct_decl
+    if (node->kind == ND_DECLARATOR)
     {
-        if (node->children[0]->kind == ND_IDENT)
-            return node->children[0]->u.ident;
-        return get_decl_ident(node->children[0]);
+        if (node->u.declarator.direct_decl)
+            return get_decl_ident(node->u.declarator.direct_decl);
+        return 0;
+    }
+    // ND_DIRECT_DECL: name is in u.direct_decl.name
+    if (node->kind == ND_DIRECT_DECL)
+    {
+        Node *name = node->u.direct_decl.name;
+        if (!name) return 0;
+        if (name->kind == ND_IDENT)
+            return name->u.ident.name;
+        return get_decl_ident(name);
     }
     return 0;
 }
@@ -1643,6 +1746,22 @@ static Node **get_u_child_slot(Node *n, int child)
     case ND_VA_END:
         if (child == 0) return &n->u.vaend.ap;
         break;
+    case ND_DECLARATOR:
+        if (child == 0) return &n->u.declarator.direct_decl;
+        if (child == 1) return &n->u.declarator.init;
+        break;
+    case ND_ARRAY_DECL:
+        if (child == 0) return &n->u.array_decl.size;
+        break;
+    case ND_FUNC_DECL:
+        if (child == 0) return &n->u.func_decl.params;
+        break;
+    case ND_TYPE_NAME:
+        if (child == 0) return &n->u.type_name.decl;
+        break;
+    case ND_STMT:
+        if (child == 0) return &n->u.stmt_wrap.body;
+        break;
     default:
         error("get_u_child_slot: unhandled node kind %d (%s)", n->kind, nodestr(n->kind));
         return NULL;
@@ -1657,28 +1776,18 @@ void insert_cast(Node *n, int child, Type *t)
     Node *placeholder = new_node(ND_DECLARATION, 0, false);
 
     Node **slot = get_u_child_slot(n, child);
-    Node *original = slot ? *slot : n->children[child];
+    Node *original = *slot;
 
     c->u.cast.type_decl = placeholder;
     c->u.cast.expr = original;
     c->type = t;
-    // Also populate children[] for Cat C nodes that use it
-    add_child(c, placeholder);
-    add_child(c, original);
-
-    if (slot) *slot = c;
-    if (n->children && child < n->child_count)
-        n->children[child] = c;
+    *slot = c;
 }
-// Resolve operand types for a binary expression and insert ND_CAST nodes
-// for implicit arithmetic conversions (C89 §3.2.1.5 usual arithmetic conversions).
-// Returns the resulting type after conversion.
-Type *check_operands(Node *n)
+// Insert ND_CAST nodes for implicit arithmetic conversions (C89 §3.2.1.5 usual arithmetic conversions).
+static void insert_binop_coercions(Node *n)
 {
-    // Perform the 'usual arithmetic conversions' (C89 §3.2.1.5).
     // Promotions use the *original* lhs/rhs types for checks; insert_cast
-    // replaces n->children[], so we return n->u.binop.lhs->type at the end
-    // to get the post-cast result type (not lhs->type which stays pre-cast).
+    // replaces n->u.binop.lhs/rhs in place.
     Node *lhs = n->u.binop.lhs;
     Node *rhs = n->u.binop.rhs;
     DBG_PRINT("%s %016llx %016llx\n", __func__, (unsigned long long)lhs->type, (unsigned long long)rhs->type);
@@ -1705,7 +1814,7 @@ Type *check_operands(Node *n)
     if (istype_enum(lhs->type))                                         insert_cast(n, 0, t_int);
     if (istype_enum(rhs->type))                                         insert_cast(n, 1, t_int);
 
-    // Usual arithmetic conversions — rank hierarchy (C89 §3.2.1.5):
+    // Usual arithmetic conversions — rank hierarchy (C89 §3.2.1.5)
     if (istype_ulong(lhs->type) && !istype_ulong(rhs->type))            insert_cast(n, 1, t_ulong);
     else if (!istype_ulong(lhs->type) && istype_ulong(rhs->type))       insert_cast(n, 0, t_ulong);
     else if (istype_long(lhs->type) && istype_uint(rhs->type))          insert_cast(n, 1, t_long);
@@ -1714,95 +1823,121 @@ Type *check_operands(Node *n)
     else if (!istype_long(lhs->type) && istype_long(rhs->type))         insert_cast(n, 0, t_long);
     else if (istype_uint(lhs->type) && !istype_uint(rhs->type))         insert_cast(n, 1, t_uint);
     else if (!istype_uint(lhs->type) && istype_uint(rhs->type))         insert_cast(n, 0, t_uint);
-
-    // Return the post-cast type of the left child (both children now have the
-    // same type after conversions, so either would give the same answer).
-    // After insert_cast, nu.binop.lhs may have been updated, so prefer it.
-    Node *result_lhs = n->u.binop.lhs;
-    return result_lhs->type;
 }
-// Resolve the operand type for a unary expression, inserting ND_CAST nodes
-// for implicit integer promotions (C89 §3.2.1.1). Returns the result type.
-Type *check_unary_operand(Node *n)
+
+// Insert ND_CAST nodes for implicit integer promotions in a unary expression (C89 §3.2.1.1).
+static void insert_unary_coercions(Node *n)
 {
-    // Integer promotions for unary operands (C89 §3.2.1.1).
-    // & and * do not evaluate/promote their operand in the usual sense:
-    //   & takes an address (no value conversion), * dereferences a pointer.
-    // NOTE: function argument promotion is not applied here; harmless on this
-    // 16-bit target (all narrow integers ≤ 2 bytes share the calling convention
-    // slot size), but would need revisiting for a 32-bit target.
     Node *lhs = n->u.unaryop.operand;
     DBG_PRINT("%s %016llx\n", __func__, (unsigned long long)lhs->type);
 
-    // For dereference, the result type is the element type; no promotion of the pointer.
-    if (n->op_kind == TK_STAR)
-        return elem_type(lhs->type);
-    // Address-of: take address of the original object; no promotion.
-    if (n->op_kind == TK_AMPERSAND)
-        return get_pointer_type(lhs->type);
-    // Increment/decrement: result type is the operand type, no promotion.
-    if (n->op_kind == TK_INC || n->op_kind == TK_DEC ||
+    // Dereference, address-of, and increment/decrement: no promotion needed.
+    if (n->op_kind == TK_STAR || n->op_kind == TK_AMPERSAND ||
+        n->op_kind == TK_INC  || n->op_kind == TK_DEC ||
         n->op_kind == TK_POST_INC || n->op_kind == TK_POST_DEC)
-        return lhs->type;
+        return;
 
-    // For all other unary ops (+, -, ~, !): promote narrow integer types.
+    // For +, -, ~, !: promote narrow integer types.
     if (istype_char(lhs->type))    insert_cast(n, 0, t_int);
     if (istype_uchar(lhs->type))   insert_cast(n, 0, t_int);
     if (istype_short(lhs->type))   insert_cast(n, 0, t_int);
     if (istype_ushort(lhs->type))  insert_cast(n, 0, t_uint);
     if (istype_enum(lhs->type))    insert_cast(n, 0, t_int);
-
-    // Logical not always yields int regardless of operand type.
-    if (n->op_kind == TK_BANG)
-        return t_int;
-
-    // Result type is the (possibly promoted) operand type.
-    Node *result_operand = n->u.unaryop.operand;
-    return result_operand->type;
 }
+
 bool is_unscaled_ptr(Node *n)
 {
-    return n->type && (n->type->base == TB_POINTER || n->type->base == TB_ARRAY) && !n->is_array_deref;
+    return n->type && (n->type->base == TB_POINTER || n->type->base == TB_ARRAY)
+        && !(n->kind == ND_UNARYOP && n->u.unaryop.is_array_deref);
 }
-static void propagate_types_visitor(Node *child, void *ctx)
+
+// --- Shared post-order traversal helper ---
+
+typedef void (*NodeVisitor)(Node *);
+
+static void post_order_walk(Node *n, NodeVisitor fn);
+static void post_order_step(Node *child, void *ctx)
 {
-    Node *parent = (Node *)ctx;
-    propagate_types(parent, child);
+    post_order_walk(child, (NodeVisitor)ctx);
 }
-void propagate_types(Node *p, Node *n)
+static void post_order_walk(Node *n, NodeVisitor fn)
 {
-    // Post-order walk: children are visited first so their types are resolved before
-    // this node examines them. Mirrors the semantics of bottom-up type inference.
-    DBG_FUNC();
-    for_each_child(n, propagate_types_visitor, n);
-    if (!p)
-    {
-        // We are at the top of the tree, nothing further to do
-        DBG_PRINT("%s finished\n", __func__);
-        return;
-    }
-    DBG_PRINT("Before: %s\n", node_str(n));
+    if (!n) return;
+    for_each_child(n, post_order_step, fn);
+    fn(n);
+}
+
+// --- Pass 1: resolve_symbols ---
+// Sets n->type for every ND_IDENT with is_expr == true.
+
+static void resolve_symbols_step(Node *n)
+{
     if (n->kind == ND_IDENT && n->is_expr)
-    {
-        if (p->kind != ND_MEMBER)
-            n->type = find_symbol(n, n->u.ident, NS_IDENT)->type;
-    }
+        n->type = find_symbol(n, n->u.ident.name, NS_IDENT)->type;
+}
+
+void resolve_symbols(Node *root)
+{
+    post_order_walk(root, resolve_symbols_step);
+}
+
+// --- Pass 2: derive_types ---
+// Sets n->type from children's already-set types. No AST mutations.
+
+// Pure helper: compute the result type for a binary expression after arithmetic
+// promotions and conversions, without inserting any cast nodes.
+static Type *binop_result_type(Node *n)
+{
+    Type *l = n->u.binop.lhs->type, *r = n->u.binop.rhs->type;
+    // If either operand type is unknown (t_void), defer — can't determine result type.
+    // Internal stride literals (created by the parser, not typed) have t_void.
+    if (l == t_void || r == t_void) return t_void;
+    // Pointer/array arithmetic: pointer + int → pointer; preserve the pointer type.
+    // This matches check_operands returning lhs->type when lhs is a pointer/array.
+    if (l->base == TB_POINTER || l->base == TB_ARRAY) return l;
+    if (r->base == TB_POINTER || r->base == TB_ARRAY) return r;
+    if (istype_float(l) || istype_float(r))
+        return t_float;
+    // Apply integer promotions conceptually
+    if (istype_char(l) || istype_uchar(l) || istype_short(l) || istype_enum(l))  l = t_int;
+    if (istype_char(r) || istype_uchar(r) || istype_short(r) || istype_enum(r))  r = t_int;
+    if (istype_ushort(l)) l = t_uint;
+    if (istype_ushort(r)) r = t_uint;
+    // Usual arithmetic conversions
+    if (istype_ulong(l) || istype_ulong(r))                       return t_ulong;
+    if ((istype_long(l) && istype_uint(r)) ||
+        (istype_uint(l) && istype_long(r)))                       return t_long;
+    if (istype_long(l) || istype_long(r))                         return t_long;
+    if (istype_uint(l) || istype_uint(r))                         return t_uint;
+    return t_int;
+}
+
+// Pure helper: compute the result type for a unary expression after promotions,
+// without inserting any cast nodes.
+static Type *unary_result_type(Node *n)
+{
+    Type *t = n->u.unaryop.operand->type;
+    if (n->op_kind == TK_STAR)       return elem_type(t);
+    if (n->op_kind == TK_AMPERSAND)  return get_pointer_type(t);
+    if (n->op_kind == TK_INC  || n->op_kind == TK_DEC ||
+        n->op_kind == TK_POST_INC || n->op_kind == TK_POST_DEC)
+        return t;
+    // Promotions for +, -, ~, !
+    if (istype_char(t) || istype_uchar(t) || istype_short(t) || istype_enum(t)) t = t_int;
+    else if (istype_ushort(t)) t = t_uint;
+    if (n->op_kind == TK_BANG) return t_int;
+    return t;
+}
+
+static void derive_types_step(Node *n)
+{
+    DBG_PRINT("derive_types: %s\n", node_str(n));
     if (n->kind == ND_MEMBER)
     {
-        // This is a child of a member operator
-        // lhs of member op is the structure, rhs is field
-        // child_count may be > 2 when is_function=true (args in children[2..])
         if (!n->u.member.base || !n->u.member.field_name)
             error("Malformed struct reference\n");
         Node *lhs = n->u.member.base;
-        // Field name is now in nu.member.field_name (string), not a node
         char *field_name = n->u.member.field_name;
-        if (lhs->kind == ND_IDENT)
-        {
-            // If the lhs is an ident (rather than a member operator), it must be
-            // in the ident namespace
-            lhs->type = find_symbol(lhs, lhs->u.ident, NS_IDENT)->type;
-        }
         // For ->, dereference the pointer to get the struct type
         Type *struct_type = lhs->type;
         if (n->op_kind == TK_ARROW)
@@ -1818,75 +1953,91 @@ void propagate_types(Node *p, Node *n)
             error("Can't find member %s in struct\n", field_name);
         DBG_PRINT("%s found member %s with offset %d basetype %016llx\n", __func__,
             field_name, n->offset, (unsigned long long)base);
-        // Member now has type pointing to inner type
         n->type = base;
         // If this is a call through a function-pointer member, resolve to return type
-        if (n->is_function && istype_ptr(n->type)
+        if (n->u.member.is_function && istype_ptr(n->type)
             && istype_function(n->type->u.ptr.pointee))
             n->type = n->type->u.ptr.pointee->u.fn.ret;
     }
     if (n->is_expr)
     {
         if (n->kind == ND_TERNARY)
-        {
-            // Result type is the common type of then/else branches
-            Node *then_ = n->u.ternary.then_;
-            n->type = then_->type;
-        }
+            n->type = n->u.ternary.then_->type;
         if (n->kind == ND_BINOP)
         {
             if (n->op_kind == TK_COMMA)
-            {
-                // Comma: result type is the right operand's type
-                Node *rhs = n->u.binop.rhs;
-                n->type = rhs->type;
-            }
+                n->type = n->u.binop.rhs->type;
             else
             {
-            n->type = check_operands(n);
-            // Comparison and logical operators always yield int, regardless of operand types
-            if (n->op_kind == TK_LT  || n->op_kind == TK_LE ||
-                n->op_kind == TK_GT  || n->op_kind == TK_GE ||
-                n->op_kind == TK_EQ  || n->op_kind == TK_NE ||
-                n->op_kind == TK_LOGAND || n->op_kind == TK_LOGOR)
-                n->type = t_int;
-
-            // See if either node is a pointer and the other an int of some sort. If so, we need to
-            // scale the int by the size of the pointed to type
-            Node *lhs = n->u.binop.lhs;
-            Node *rhs = n->u.binop.rhs;
-            if (is_unscaled_ptr(lhs) && istype_intlike(rhs->type))
-                insert_scale(n, 1, elem_type(lhs->type)->size);
-            else if (is_unscaled_ptr(rhs) && istype_intlike(lhs->type))
-                insert_scale(n, 0, elem_type(rhs->type)->size);
-            }   // end else (non-comma binop)
+                n->type = binop_result_type(n);
+                // Comparison and logical operators always yield int, regardless of operand types
+                if (n->op_kind == TK_LT   || n->op_kind == TK_LE ||
+                    n->op_kind == TK_GT   || n->op_kind == TK_GE ||
+                    n->op_kind == TK_EQ   || n->op_kind == TK_NE ||
+                    n->op_kind == TK_LOGAND || n->op_kind == TK_LOGOR)
+                    n->type = t_int;
+            }
         }
         if (n->kind == ND_UNARYOP)
         {
-            Type *t = check_unary_operand(n);
+            Type *t = unary_result_type(n);
             if (n->type == t_void)  // preserve non-void types already set by parser (e.g. array subscripts)
                 n->type = t;
         }
     }
     if (n->kind == ND_COMPOUND_ASSIGN)
+        n->type = n->u.compound_assign.lhs->type;
+    if (n->kind == ND_RETURNSTMT && n->u.returnstmt.expr)
     {
-        // Result type is the LHS type (same as plain assignment).
+        n->type = parser_ctx.current_function->type->u.fn.ret;
+        DBG_PRINT("%s found return stmt with expr, type of func:%s:\n", __func__, fulltype_str(n->type));
+    }
+    DBG_PRINT("derive_types after: %s\n", node_str(n));
+}
+
+void derive_types(Node *root)
+{
+    post_order_walk(root, derive_types_step);
+}
+
+// --- Pass 3: insert_coercions ---
+// Mutates the AST with insert_cast / insert_scale. No type derivation.
+
+static void insert_coercions_step(Node *n)
+{
+    if (n->is_expr && n->kind == ND_BINOP && n->op_kind != TK_COMMA)
+    {
+        insert_binop_coercions(n);
+        // Scale pointer arithmetic: if one side is a pointer and the other an integer,
+        // scale the integer by the size of the pointed-to element.
+        Node *lhs = n->u.binop.lhs;
+        Node *rhs = n->u.binop.rhs;
+        if (is_unscaled_ptr(lhs) && istype_intlike(rhs->type))
+            insert_scale(n, 1, elem_type(lhs->type)->size);
+        else if (is_unscaled_ptr(rhs) && istype_intlike(lhs->type))
+            insert_scale(n, 0, elem_type(rhs->type)->size);
+    }
+    if (n->is_expr && n->kind == ND_UNARYOP)
+        insert_unary_coercions(n);
+    if (n->kind == ND_COMPOUND_ASSIGN)
+    {
         // If RHS type differs from LHS type, cast RHS so codegen uses consistent ops.
         Node *lhs = n->u.compound_assign.lhs;
         Node *rhs = n->u.compound_assign.rhs;
         Type *lhs_type = lhs->type;
-        n->type = lhs_type;
         if (rhs->type != lhs_type)
             insert_cast(n, 1, lhs_type);
     }
     if (n->kind == ND_RETURNSTMT && n->u.returnstmt.expr)
     {
-        n->type = parser_ctx.current_function->type->u.fn.ret;
-        DBG_PRINT("%s found return stmt with expr, type of func:%s:\n", __func__, fulltype_str(n->type));
         Node *expr = n->u.returnstmt.expr;
         if (n->type != expr->type)
             insert_cast(n, 0, n->type);
     }
-    DBG_PRINT("After : %s\n", node_str(n));
+}
+
+void insert_coercions(Node *root)
+{
+    post_order_walk(root, insert_coercions_step);
 }
 

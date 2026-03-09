@@ -22,11 +22,7 @@ static Type  *typespec_to_base(Decl_spec typespec);
 // ---------------------------------------------------------------
 static int do_align(int val, int size)
 {
-    if (size == 1) return val;  // 1-byte alignment: no padding needed
-    if (size == 2) return (val & 1) ? (val & ~1) + 2 : val;
-    if (size == 4) return (val & 3) ? (val & ~3) + 4 : val;
-    error("do_align: unexpected alignment %d\n", size);
-    return val;
+    return (val + (size-1)) & ~(size-1);
 }
 
 static void append_symbol(Symbol **head, Symbol *sym)
@@ -453,7 +449,7 @@ static Type *generate_struct_type(Node *decl_node, DeclParseState ds, int depth)
         error("Should be struct declaration!\n");
 
     char *tagname = struct_node->u.struct_spec.tag->u.ident.name;
-    Symbol *tag = find_symbol(decl_node, tagname, NS_TAG);
+    Symbol *tag = find_symbol_st(decl_node->st, tagname, NS_TAG);
     if (!tag) {
 #ifdef DEBUG_ENABLED
         print_type_table();
@@ -488,7 +484,7 @@ static Type *generate_struct_type(Node *decl_node, DeclParseState ds, int depth)
                     } else {
                         Node *sn   = d->u.declaration.spec;
                         char *stag = sn->u.struct_spec.tag->u.ident.name;
-                        Symbol *stag_sym = find_symbol(d, stag, NS_TAG);
+                        Symbol *stag_sym = find_symbol_st(d->st, stag, NS_TAG);
                         base = (stag_sym && stag_sym->type) ? stag_sym->type : t_void;
                     }
                 } else {
@@ -626,26 +622,29 @@ Symbol_table *find_scope(Node *node)
     return node->st;
 }
 
+// Probe lookup: walk scope chain from st, return NULL if not found.
 Symbol *find_symbol_st(Symbol_table *st, const char *name, Namespace nspace)
 {
-    Symbol *s;
-    bool found = false;
-    while (!found) {
+    for (; st; st = st->parent) {
         DBG_PRINT("Searching in scope:%s\n", scope_str(st->scope));
-        s =     nspace == NS_IDENT   ? st->idents
-            :   nspace == NS_TAG     ? st->tags
-            :   nspace == NS_TYPEDEF ? st->typedefs
-            :                          st->labels;
+        Symbol *s = nspace == NS_IDENT   ? st->idents
+                  : nspace == NS_TAG     ? st->tags
+                  : nspace == NS_TYPEDEF ? st->typedefs
+                  :                        st->labels;
         for (; s; s = s->next) {
             DBG_PRINT("Name:%s\n", s->name);
-            if (!strcmp(name, s->name)) { found = true; break; }
+            if (!strcmp(name, s->name)) return s;
         }
-        if (found) break;
         DBG_PRINT("Not found, going to enclosing scope\n");
-        if (st->parent) st = st->parent;
-        else break;
     }
-    if (!found) {
+    return NULL;
+}
+
+// Fatal lookup: error if the symbol is not found.
+Symbol *find_symbol(Node *n, const char *name, Namespace nspace)
+{
+    Symbol *s = find_symbol_st(find_scope(n), name, nspace);
+    if (!s) {
 #ifdef DEBUG_ENABLED
         print_type_table();
         print_symbol_table(type_ctx.symbol_table, 0);
@@ -654,11 +653,6 @@ Symbol *find_symbol_st(Symbol_table *st, const char *name, Namespace nspace)
               nspace == NS_IDENT ? "ident" : nspace == NS_TAG ? "tag" : "label", name);
     }
     return s;
-}
-
-Symbol *find_symbol(Node *n, const char *name, Namespace nspace)
-{
-    return find_symbol_st(find_scope(n), name, nspace);
 }
 
 static Symbol_table *new_st_scope()
@@ -749,24 +743,16 @@ static Symbol *insert_typedef(Node *node, Type *type, const char *ident)
     return sym;
 }
 
-static Symbol *find_typedef_symbol(char *name)
-{
-    for (Symbol_table *st = type_ctx.curr_scope_st; st; st = st->parent)
-        for (Symbol *s = st->typedefs; s; s = s->next)
-            if (!strcmp(s->name, name)) return s;
-    return NULL;
-}
-
 bool is_typedef_name(char *name)
 {
     if (!strcmp(name, "va_list")) return true;
-    return find_typedef_symbol(name) != NULL;
+    return find_symbol_st(type_ctx.curr_scope_st, name, NS_TYPEDEF) != NULL;
 }
 
 Type *find_typedef_type(char *name)
 {
     if (!strcmp(name, "va_list")) return t_int;
-    Symbol *s = find_typedef_symbol(name);
+    Symbol *s = find_symbol_st(type_ctx.curr_scope_st, name, NS_TYPEDEF);
     if (s) return s->type;
     error("typedef '%s' not found\n", name);
     return NULL;
