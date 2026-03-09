@@ -183,7 +183,7 @@ void reset_parser(void)
 }
 static char *new_anon_label()
 {
-    static char a[16];
+    char *a = arena_alloc(16);
     sprintf(a, "_l%06d", parser_ctx.anon_index++);
     return a;
 }
@@ -1431,10 +1431,9 @@ static const char *node_val_str(Node *node)
     }
 }
 
-static char buf[1024];
 char *node_str(Node *node)
 {
-    buf[0] = 0;
+    char *buf = arena_alloc(1024);
     char *p = buf;
     if (!node)
         return buf;

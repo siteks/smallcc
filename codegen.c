@@ -360,9 +360,6 @@ void gen_fill(int offset, int size)
 // Everything below here uses pseudoinstructions
 //--------------------------------------------------------------------------------
 
-void gen_expr(Node *node);
-void gen_varaddr(Node *node);
-
 // Push function call args from a linked list (right-to-left onto stack).
 // Returns total bytes pushed.
 static int push_args_list(Node *first_arg)
