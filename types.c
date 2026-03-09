@@ -327,7 +327,22 @@ bool istype_intlike(Type *t)
 // ---------------------------------------------------------------
 void reset_types_state(void)
 {
+    // Carry over is_extern_decl symbols from the previous TU's global scope.
+    // These are the cross-TU globals marked by harvest_globals.
+    // Statics, putchar, and unresolved externs are excluded (they stay is_extern_decl=false
+    // or is_static=true) and are not preserved.
+    Symbol *carry = NULL, **tail = &carry;
+    Symbol *prev = type_ctx.symbol_table ? type_ctx.symbol_table->idents : NULL;
+    for (Symbol *s = prev; s; s = s->next)
+    {
+        if (!s->is_extern_decl) continue;
+        *tail = s;
+        tail  = &s->next;
+    }
+    if (carry) *tail = NULL;
+
     type_ctx.symbol_table      = calloc(1, sizeof(Symbol_table));
+    type_ctx.symbol_table->idents = carry;
     type_ctx.curr_scope_st     = type_ctx.symbol_table;
     type_ctx.last_symbol_table = type_ctx.symbol_table;
     type_ctx.scope_depth       = 0;
@@ -336,10 +351,16 @@ void reset_types_state(void)
 
 void insert_extern_sym(const char *name, Type *type)
 {
-    // Skip if already present (e.g. putchar from make_basic_types)
+    // If already present, mark it as an extern reference for subsequent TUs.
     for (Symbol *s = type_ctx.symbol_table->idents; s; s = s->next)
-        if (!strcmp(s->name, name)) return;
-
+    {
+        if (!strcmp(s->name, name))
+        {
+            s->is_extern_decl = true;
+            return;
+        }
+    }
+    // Not present — add a new extern entry (e.g. injected from outside).
     Symbol *sym         = calloc(1, sizeof(Symbol));
     sym->name           = name;
     sym->type           = type;
@@ -352,6 +373,8 @@ void insert_extern_sym(const char *name, Type *type)
 // ---------------------------------------------------------------
 static void insert_builtin(char *name, Type *type)
 {
+    for (Symbol *s = type_ctx.symbol_table->idents; s; s = s->next)
+        if (!strcmp(s->name, name)) return;
     Symbol *sym = calloc(1, sizeof(Symbol));
     sym->name = name;
     sym->type = type;

@@ -29,29 +29,13 @@ static char *read_file(const char *path)
 }
 
 
-// Cross-TU context instance
-ExternContext extern_ctx;
-
 static void harvest_globals(void)
 {
     for (Symbol *s = type_ctx.symbol_table->idents; s; s = s->next)
     {
         if (s->is_static || s->is_extern_decl) continue;
         if (!strcmp(s->name, "putchar")) continue;
-        bool already = false;
-        for (int i = 0; i < extern_ctx.count; i++)
-            if (!strcmp(extern_ctx.syms[i].name, s->name)) { already = true; break; }
-        if (!already)
-        {
-            if (extern_ctx.count >= 1024)
-            {
-                fprintf(stderr, "too many extern symbols\n");
-                exit(1);
-            }
-            extern_ctx.syms[extern_ctx.count].name = s->name;
-            extern_ctx.syms[extern_ctx.count].type = s->type;
-            extern_ctx.count++;
-        }
+        insert_extern_sym(s->name, s->type);
     }
 }
 
@@ -63,11 +47,6 @@ static void reset_tu(int tu)
     reset_types_state();
 }
 
-static void prepopulate_extern_syms(void)
-{
-    for (int i = 0; i < extern_ctx.count; i++)
-        insert_extern_sym(extern_ctx.syms[i].name, extern_ctx.syms[i].type);
-}
 
 int main(int argc, char **argv)
 {
@@ -94,7 +73,6 @@ int main(int argc, char **argv)
 
         reset_tu(tu);
         make_basic_types();
-        prepopulate_extern_syms();
 
         token_ctx.user_input = source;
         token_ctx.current = tokenise(source);

@@ -40,7 +40,6 @@ struct TypeContext;
 struct TokenContext;
 struct ParserContext;
 struct CodegenContext;
-struct ExternContext;
 
 // ---------------------------------------------------------------
 // Tokeniser
@@ -499,17 +498,11 @@ typedef struct CodegenContext {
     int label_table_size;
 } CodegenContext;
 
-typedef struct ExternContext {
-    struct ExternSym { const char *name; Type *type; } syms[1024];
-    int count;
-} ExternContext;
-
 // Global context instances (defined in respective .c files)
 extern TypeContext type_ctx;
 extern TokenContext token_ctx;
 extern ParserContext parser_ctx;
 extern CodegenContext codegen_ctx;
-extern ExternContext extern_ctx;
 
 // Convenience macros for basic types (for backward compatibility)
 #define t_void   (type_ctx.t_void)
