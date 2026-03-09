@@ -11,7 +11,7 @@
 // Tokenizer context instance
 TokenContext token_ctx;
 
-struct Keyword keywords[] = 
+struct Keyword keywords[] =
 {
     "auto",     TK_AUTO,
     "break",    TK_BREAK,
@@ -48,96 +48,146 @@ struct Keyword keywords[] =
     "",         TK_INVALID,
 };
 
-bool is_type_name(Token_kind tk)
-{
-    return  tk == TK_CONST
-        ||  tk == TK_VOLATILE
-        ||  tk == TK_STRUCT
-        ||  tk == TK_UNION
-        ||  tk == TK_ENUM
-        ||  tk == TK_VOID
-        ||  tk == TK_CHAR
-        ||  tk == TK_SHORT
-        ||  tk == TK_INT
-        ||  tk == TK_LONG
-        ||  tk == TK_FLOAT
-        ||  tk == TK_DOUBLE
-        ||  tk == TK_UNSIGNED
-        ||  tk == TK_SIGNED;
-}
+// All punctuator/operator tokens ordered longest-first for greedy matching.
+// A single loop over this table replaces the strncmp cascade and the switch.
+typedef struct { const char *str; int len; Token_kind kind; } PunctEntry;
+#define PE(s, k) { s, sizeof(s)-1, k }
+static const PunctEntry punct_table[] = {
+    // 3-character
+    PE("<<=", TK_SHIFTL_ASSIGN), PE(">>=", TK_SHIFTR_ASSIGN), PE("...", TK_ELLIPSIS),
+    // 2-character
+    PE("==", TK_EQ),   PE("!=", TK_NE),   PE(">=", TK_GE),   PE("<=", TK_LE),
+    PE("++", TK_INC),  PE("--", TK_DEC),  PE("&&", TK_LOGAND), PE("||", TK_LOGOR),
+    PE(">>", TK_SHIFTR), PE("<<", TK_SHIFTL), PE("->", TK_ARROW),
+    PE("+=", TK_PLUS_ASSIGN),   PE("-=", TK_MINUS_ASSIGN), PE("*=", TK_STAR_ASSIGN),
+    PE("/=", TK_SLASH_ASSIGN),  PE("&=", TK_AMP_ASSIGN),   PE("|=", TK_BITOR_ASSIGN),
+    PE("^=", TK_BITXOR_ASSIGN), PE("%=", TK_PERCENT_ASSIGN),
+    // 1-character
+    PE("+", TK_PLUS),    PE("-", TK_MINUS),   PE("*", TK_STAR),    PE("/", TK_SLASH),
+    PE("(", TK_LPAREN),  PE(")", TK_RPAREN),  PE("[", TK_LBRACKET), PE("]", TK_RBRACKET),
+    PE(">", TK_GT),      PE("<", TK_LT),      PE("=", TK_ASSIGN),  PE(";", TK_SEMICOLON),
+    PE(":", TK_COLON),   PE("{", TK_LBRACE),  PE("}", TK_RBRACE),  PE("&", TK_AMPERSAND),
+    PE("~", TK_TILDE),   PE("!", TK_BANG),    PE(",", TK_COMMA),   PE(".", TK_DOT),
+    PE("|", TK_BITOR),   PE("^", TK_BITXOR),  PE("%", TK_PERCENT), PE("?", TK_QUESTION),
+    { NULL, 0, TK_INVALID },
+};
+#undef PE
+
+// Direct-indexed names for every Token_kind value.
+static const char *const token_names[] = {
+    [TK_EMPTY]          = "EMPTY",
+    [TK_IDENT]          = "IDENT",
+    [TK_CONSTFLT]       = "CONSTFLT",
+    [TK_CONSTINT]       = "CONSTINT",
+    [TK_CHARACTER]      = "CHARACTER",
+    [TK_STRING]         = "STRING",
+    [TK_LPAREN]         = "LPAREN",
+    [TK_RPAREN]         = "RPAREN",
+    [TK_LBRACE]         = "LBRACE",
+    [TK_RBRACE]         = "RBRACE",
+    [TK_LBRACKET]       = "LBRACKET",
+    [TK_RBRACKET]       = "RBRACKET",
+    [TK_COMMA]          = "COMMA",
+    [TK_SEMICOLON]      = "SEMICOLON",
+    [TK_COLON]          = "COLON",
+    [TK_EQ]             = "==",
+    [TK_NE]             = "!=",
+    [TK_GE]             = ">=",
+    [TK_GT]             = ">",
+    [TK_LE]             = "<=",
+    [TK_LT]             = "<",
+    [TK_SHIFTR]         = ">>",
+    [TK_SHIFTL]         = "<<",
+    [TK_ASSIGN]         = "=",
+    [TK_PLUS]           = "+",
+    [TK_MINUS]          = "-",
+    [TK_STAR]           = "*",
+    [TK_SLASH]          = "/",
+    [TK_AMPERSAND]      = "&",
+    [TK_TILDE]          = "~",
+    [TK_BANG]           = "!",
+    [TK_EOF]            = "EOF",
+    [TK_INC]            = "++",
+    [TK_DEC]            = "--",
+    [TK_DOT]            = ".",
+    [TK_ARROW]          = "->",
+    [TK_LOGAND]         = "&&",
+    [TK_LOGOR]          = "||",
+    [TK_BITOR]          = "|",
+    [TK_BITXOR]         = "^",
+    [TK_PLUS_ASSIGN]    = "+=",
+    [TK_MINUS_ASSIGN]   = "-=",
+    [TK_STAR_ASSIGN]    = "*=",
+    [TK_SLASH_ASSIGN]   = "/=",
+    [TK_AMP_ASSIGN]     = "&=",
+    [TK_BITOR_ASSIGN]   = "|=",
+    [TK_BITXOR_ASSIGN]  = "^=",
+    [TK_SHIFTL_ASSIGN]  = "<<=",
+    [TK_SHIFTR_ASSIGN]  = ">>=",
+    [TK_PERCENT]        = "%",
+    [TK_QUESTION]       = "?",
+    [TK_PERCENT_ASSIGN] = "%=",
+    [TK_AUTO]           = "auto",
+    [TK_BREAK]          = "break",
+    [TK_CASE]           = "case",
+    [TK_CONST]          = "const",
+    [TK_CONTINUE]       = "continue",
+    [TK_DEFAULT]        = "default",
+    [TK_DO]             = "do",
+    [TK_ELSE]           = "else",
+    [TK_EXTERN]         = "extern",
+    [TK_FOR]            = "for",
+    [TK_GOTO]           = "goto",
+    [TK_IF]             = "if",
+    [TK_REGISTER]       = "register",
+    [TK_RETURN]         = "return",
+    [TK_SIZEOF]         = "sizeof",
+    [TK_STATIC]         = "static",
+    [TK_SWITCH]         = "switch",
+    [TK_VOLATILE]       = "volatile",
+    [TK_WHILE]          = "while",
+    [TK_VOID]           = "void",
+    [TK_CHAR]           = "char",
+    [TK_UCHAR]          = "uchar",
+    [TK_SHORT]          = "short",
+    [TK_USHORT]         = "ushort",
+    [TK_INT]            = "int",
+    [TK_UINT]           = "uint",
+    [TK_LONG]           = "long",
+    [TK_ULONG]          = "ulong",
+    [TK_FLOAT]          = "float",
+    [TK_DOUBLE]         = "double",
+    [TK_SIGNED]         = "signed",
+    [TK_UNSIGNED]       = "unsigned",
+    [TK_STRUCT]         = "struct",
+    [TK_UNION]          = "union",
+    [TK_ENUM]           = "enum",
+    [TK_TYPEDEF]        = "typedef",
+    [TK_INVALID]        = "INVALID",
+    [TK_ELLIPSIS]       = "...",
+    [TK_POST_INC]       = "post++",
+    [TK_POST_DEC]       = "post--",
+};
 
 const char *token_str(Token_kind tk)
 {
-    return 
-        tk == TK_EMPTY      ? "EMPTY    " :
-        tk == TK_IDENT      ? "IDENT    " :
-        tk == TK_CONSTFLT   ? "CONSTFLT " :
-        tk == TK_CONSTINT   ? "CONSTINT " :
-        tk == TK_CHARACTER  ? "CHARACTER" :
-        tk == TK_STRING     ? "STRING   " :
-        tk == TK_LPAREN     ? "LPAREN   " :
-        tk == TK_RPAREN     ? "RPAREN   " :
-        tk == TK_LBRACE     ? "LBRACE   " :
-        tk == TK_RBRACE     ? "RBRACE   " :
-        tk == TK_LBRACKET   ? "LBRACKET " :
-        tk == TK_RBRACKET   ? "RBRACKET " :
-        tk == TK_COMMA      ? "COMMA    " :
-        tk == TK_SEMICOLON  ? "SEMICOLON" :
-        tk == TK_COLON      ? "COLON    " :
-        tk == TK_EQ         ? "EQ       " :
-        tk == TK_NE         ? "NE       " :
-        tk == TK_GE         ? "GE       " :
-        tk == TK_GT         ? "GT       " :
-        tk == TK_LE         ? "LE       " :
-        tk == TK_LT         ? "LT       " :
-        tk == TK_INC        ? "INC      " :
-        tk == TK_DEC        ? "DEC      " :
-        tk == TK_DOT        ? "DOT      " :
-        tk == TK_ARROW      ? "ARROW    " :
-        tk == TK_ASSIGN     ? "ASSIGN   " :
-        tk == TK_PLUS       ? "PLUS     " :
-        tk == TK_MINUS      ? "MINUS    " :
-        tk == TK_STAR       ? "STAR     " :
-        tk == TK_SLASH      ? "SLASH    " :
-        tk == TK_AMPERSAND  ? "AMPERSAND" :
-        tk == TK_TWIDDLE    ? "TWIDDLE  " :
-        tk == TK_BANG       ? "BANG     " :
-        tk == TK_EOF        ? "EOF      " :
-        tk == TK_AUTO       ? "auto     " :
-        tk == TK_BREAK      ? "break    " :
-        tk == TK_CASE       ? "case     " :
-        tk == TK_CHAR       ? "char     " :
-        tk == TK_CONST      ? "const    " :
-        tk == TK_CONTINUE   ? "continue " :
-        tk == TK_DEFAULT    ? "default  " :
-        tk == TK_DO         ? "do       " :
-        tk == TK_DOUBLE     ? "double   " :
-        tk == TK_ELSE       ? "else     " :
-        tk == TK_ENUM       ? "enum     " :
-        tk == TK_EXTERN     ? "extern   " :
-        tk == TK_FLOAT      ? "float    " :
-        tk == TK_FOR        ? "for      " :
-        tk == TK_GOTO       ? "goto     " :
-        tk == TK_IF         ? "if       " :
-        tk == TK_INT        ? "int      " :
-        tk == TK_LONG       ? "long     " :
-        tk == TK_REGISTER   ? "register " :
-        tk == TK_RETURN     ? "return   " :
-        tk == TK_SHORT      ? "short    " :
-        tk == TK_SIGNED     ? "signed   " :
-        tk == TK_SIZEOF     ? "sizeof   " :
-        tk == TK_STATIC     ? "static   " :
-        tk == TK_STRUCT     ? "struct   " :
-        tk == TK_SWITCH     ? "switch   " :
-        tk == TK_TYPEDEF    ? "typedef  " :
-        tk == TK_UNION      ? "union    " :
-        tk == TK_UNSIGNED   ? "unsigned " :
-        tk == TK_VOID       ? "void     " :
-        tk == TK_VOLATILE   ? "volatile " :
-        tk == TK_WHILE      ? "while    " :
-        tk == TK_INVALID    ? "INVALID  " :
-        tk == TK_ELLIPSIS   ? "ELLIPSIS " :
-                              "UNKNOWN  ";
+    if ((unsigned)tk < sizeof(token_names)/sizeof(token_names[0]) && token_names[tk])
+        return token_names[tk];
+    return "UNKNOWN";
+}
+
+// Bool table: true for tokens that name a type specifier or qualifier.
+static const bool is_type_tok[TK_ENUM + 1] = {
+    [TK_CONST]    = true, [TK_VOLATILE] = true,
+    [TK_STRUCT]   = true, [TK_UNION]    = true, [TK_ENUM]   = true,
+    [TK_VOID]     = true, [TK_CHAR]     = true, [TK_SHORT]  = true,
+    [TK_INT]      = true, [TK_LONG]     = true, [TK_FLOAT]  = true,
+    [TK_DOUBLE]   = true, [TK_UNSIGNED] = true, [TK_SIGNED] = true,
+};
+
+bool is_type_name(Token_kind tk)
+{
+    return (unsigned)tk < sizeof(is_type_tok)/sizeof(is_type_tok[0]) && is_type_tok[tk];
 }
 
 // Note: token_ctx.last is part of TokenContext
@@ -205,25 +255,26 @@ char *expect_ident()
 
 Token *new_token(Token_kind kind, Token *cur, char *str, int len)
 {
-    Token *tok  = calloc(1, sizeof(Token));
+    Token *tok  = arena_alloc(sizeof(Token));
     tok->kind   = kind;
-    tok->val    = calloc(1, len + 1);
+    tok->val    = arena_alloc(len + 1);
     tok->loc    = str - token_ctx.user_input;
     if (len)
         memcpy(tok->val, str, len);
     cur->next   = tok;
     return tok;
 }
+
 Token_kind find_token(char *str, int l)
 {
-    // fprintf(stderr, "%s %s %d\n", __func__, str, l);
-    for(int i = 0; keywords[i].kind != TK_INVALID; i++)
+    for (int i = 0; keywords[i].kind != TK_INVALID; i++)
     {
-        if (strlen(keywords[i].keyword) == l && !strncmp(str, keywords[i].keyword, l))
+        if ((int)strlen(keywords[i].keyword) == l && !strncmp(str, keywords[i].keyword, l))
             return keywords[i].kind;
     }
     return TK_IDENT;
 }
+
 bool ishex(char a)
 {
     return isdigit(a) || (a >= 'a' && a <= 'f') || (a >= 'A' && a <= 'F');
@@ -266,6 +317,7 @@ static int decode_string_char(const char *src, char *out)
             return 2;
     }
 }
+
 Token *tokenise(char *p)
 {
     Token head;
@@ -274,91 +326,42 @@ Token *tokenise(char *p)
 
     while (*p)
     {
-        // fprintf(stderr, "%s\n", p);
-        if (isspace(*p))
+        if (isspace(*p)) { p++; continue; }
+
+        // Punctuators and operators: greedy longest-match via table
         {
-            // Skip white space
-            p++;
-            continue;
+            bool matched = false;
+            for (const PunctEntry *pt = punct_table; pt->str; pt++)
+            {
+                if (!strncmp(p, pt->str, pt->len))
+                {
+                    cur = new_token(pt->kind, cur, p, pt->len);
+                    p += pt->len;
+                    matched = true;
+                    break;
+                }
+            }
+            if (matched) continue;
         }
-        if (strlen(p) >= 3)
-        {
-            // Three character tokens (must come before two-character checks)
-            if (!strncmp(p, "<<=", 3)) {cur = new_token(TK_SHIFTL_ASSIGN, cur, p, 3); p += 3; continue;}
-            if (!strncmp(p, ">>=", 3)) {cur = new_token(TK_SHIFTR_ASSIGN, cur, p, 3); p += 3; continue;}
-            if (!strncmp(p, "...", 3)) {cur = new_token(TK_ELLIPSIS,      cur, p, 3); p += 3; continue;}
-        }
-        if (strlen(p) >= 2)
-        {
-            // Two character tokens
-            if (!strncmp(p, "==", 2)) {cur = new_token(TK_EQ, cur, p, 2); p += 2; continue;}
-            if (!strncmp(p, "!=", 2)) {cur = new_token(TK_NE, cur, p, 2); p += 2; continue;}
-            if (!strncmp(p, ">=", 2)) {cur = new_token(TK_GE, cur, p, 2); p += 2; continue;}
-            if (!strncmp(p, "<=", 2)) {cur = new_token(TK_LE, cur, p, 2); p += 2; continue;}
-            if (!strncmp(p, "++", 2)) {cur = new_token(TK_INC, cur, p, 2); p += 2; continue;}
-            if (!strncmp(p, "--", 2)) {cur = new_token(TK_DEC, cur, p, 2); p += 2; continue;}
-            if (!strncmp(p, "&&", 2)) {cur = new_token(TK_LOGAND, cur, p, 2); p += 2; continue;}
-            if (!strncmp(p, "||", 2)) {cur = new_token(TK_LOGOR, cur, p, 2); p += 2; continue;}
-            if (!strncmp(p, ">>", 2)) {cur = new_token(TK_SHIFTR, cur, p, 2); p += 2; continue;}
-            if (!strncmp(p, "<<", 2)) {cur = new_token(TK_SHIFTL, cur, p, 2); p += 2; continue;}
-            if (!strncmp(p, "->", 2)) {cur = new_token(TK_ARROW, cur, p, 2); p += 2; continue;}
-            if (!strncmp(p, "+=", 2)) {cur = new_token(TK_PLUS_ASSIGN,   cur, p, 2); p += 2; continue;}
-            if (!strncmp(p, "-=", 2)) {cur = new_token(TK_MINUS_ASSIGN,  cur, p, 2); p += 2; continue;}
-            if (!strncmp(p, "*=", 2)) {cur = new_token(TK_STAR_ASSIGN,   cur, p, 2); p += 2; continue;}
-            if (!strncmp(p, "/=", 2)) {cur = new_token(TK_SLASH_ASSIGN,  cur, p, 2); p += 2; continue;}
-            if (!strncmp(p, "&=", 2)) {cur = new_token(TK_AMP_ASSIGN,    cur, p, 2); p += 2; continue;}
-            if (!strncmp(p, "|=", 2)) {cur = new_token(TK_BITOR_ASSIGN,  cur, p, 2); p += 2; continue;}
-            if (!strncmp(p, "^=", 2)) {cur = new_token(TK_BITXOR_ASSIGN, cur, p, 2); p += 2; continue;}
-            if (!strncmp(p, "%=", 2)) {cur = new_token(TK_PERCENT_ASSIGN, cur, p, 2); p += 2; continue;}
-        }
-        // Single character tokens
-        switch (*p) 
-        {
-            case '+': cur = new_token(TK_PLUS,      cur, p++, 1); continue;
-            case '-': cur = new_token(TK_MINUS,     cur, p++, 1); continue;
-            case '*': cur = new_token(TK_STAR,      cur, p++, 1); continue;
-            case '/': cur = new_token(TK_SLASH,     cur, p++, 1); continue;
-            case '(': cur = new_token(TK_LPAREN,    cur, p++, 1); continue;
-            case ')': cur = new_token(TK_RPAREN,    cur, p++, 1); continue;
-            case '[': cur = new_token(TK_LBRACKET,  cur, p++, 1); continue;
-            case ']': cur = new_token(TK_RBRACKET,  cur, p++, 1); continue;
-            case '>': cur = new_token(TK_GT,        cur, p++, 1); continue;
-            case '<': cur = new_token(TK_LT,        cur, p++, 1); continue;
-            case '=': cur = new_token(TK_ASSIGN,    cur, p++, 1); continue;
-            case ';': cur = new_token(TK_SEMICOLON, cur, p++, 1); continue;
-            case ':': cur = new_token(TK_COLON,     cur, p++, 1); continue;
-            case '{': cur = new_token(TK_LBRACE,    cur, p++, 1); continue;
-            case '}': cur = new_token(TK_RBRACE,    cur, p++, 1); continue;
-            case '&': cur = new_token(TK_AMPERSAND, cur, p++, 1); continue;
-            case '~': cur = new_token(TK_TWIDDLE,   cur, p++, 1); continue;
-            case '!': cur = new_token(TK_BANG,      cur, p++, 1); continue;
-            case ',': cur = new_token(TK_COMMA,     cur, p++, 1); continue;
-            case '.': cur = new_token(TK_DOT,       cur, p++, 1); continue;
-            case '|': cur = new_token(TK_BITOR,     cur, p++, 1); continue;
-            case '^': cur = new_token(TK_BITXOR,    cur, p++, 1); continue;
-            case '%': cur = new_token(TK_PERCENT,   cur, p++, 1); continue;
-            case '?': cur = new_token(TK_QUESTION,  cur, p++, 1); continue;
-        }
+
         // Keywords and identifiers
         if (isalpha(*p) || *p == '_')
         {
-            // Scan forwards until non ident char
             char *q = p;
-            int i   = 0;
-            while(*q && (isalnum(*q) || *q == '_')) q++;
+            while (*q && (isalnum(*q) || *q == '_')) q++;
             int l   = q - p;
-            // Keywords and identifiers
             Token_kind tk = find_token(p, l);
             cur = new_token(tk, cur, p, l);
             p = q;
             continue;
         }
+
         if (isdigit(*p))
         {
             // integers may be followed by u, l, or ul (any case)
             // floats may be followed by f, l
             //
-            // Try both and use whichever decodes most
+            // Try both and use whichever decodes more characters
             char *q;
             int ilen, flen;
             long long ival = strtol(p, &q, 0);
@@ -388,6 +391,7 @@ Token *tokenise(char *p)
             p = q;
             continue;
         }
+
         if (*p == '\'')
         {
             char ch;
@@ -423,9 +427,10 @@ Token *tokenise(char *p)
                 if (*q == '"') { p = q + 1; } else break;
             } while (1);
             buf[len] = 0;
-            Token *strtok = calloc(1, sizeof(Token));
+            Token *strtok = arena_alloc(sizeof(Token));
             strtok->kind = TK_STRING;
-            strtok->val  = buf;
+            strtok->val  = arena_strdup(buf);
+            free(buf);
             strtok->ival = len;
             strtok->loc  = start - token_ctx.user_input;
             cur->next = strtok;
@@ -441,7 +446,7 @@ Token *tokenise(char *p)
 
 void print_tokens()
 {
-    for(Token *p = token_ctx.current; p; p = p->next)
+    for (Token *p = token_ctx.current; p; p = p->next)
     {
         fprintf(stderr, "Kind:%s val:%s\n", token_str(p->kind), p->val);
     }

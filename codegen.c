@@ -3,7 +3,6 @@
 #include "mycc.h"
 
 
-const char *scope_str(Scope sc);
 Symbol_table *find_scope(Node *node);
 
 // Codegen context instance
@@ -15,13 +14,13 @@ typedef struct { int offset; bool is_param; } LocalAddr;
 // Returns offset == -1 for globals (use symbolic label) and local-statics (use _ls{id} label).
 static LocalAddr find_local_addr(Node *node, const char *name)
 {
-    DBG_PRINT("%s scope is %s\n", __func__, scope_str(node->st->scope));
+    DBG_PRINT("%s scope id:%d depth:%d\n", __func__, node->st->scope_id, node->st->depth);
     Symbol_table *st = find_scope(node);
     Symbol *s;
     bool found = false;
     while (!found)
     {
-        DBG_PRINT("Searching in scope:%s\n", scope_str(st->scope));
+        DBG_PRINT("Searching in scope id:%d depth:%d\n", st->scope_id, st->depth);
         for (s = st->idents; s; s = s->next)
         {
             DBG_PRINT("Ident:%s\n", s->name);
@@ -33,10 +32,10 @@ static LocalAddr find_local_addr(Node *node, const char *name)
     }
     if (!found)
         error("Symbol %s not found!\n", name);
-    if (s->is_local_static || !st->scope.depth)
+    if (s->kind == SYM_STATIC_LOCAL || !st->depth)
         return (LocalAddr){ -1, false };
     DBG_PRINT(";find_local_addr ident:%s got offset %d\n", name, s->offset & 0xffff);
-    return (LocalAddr){ s->offset, s->is_param };
+    return (LocalAddr){ s->offset, s->kind == SYM_PARAM };
 }
 
 
@@ -335,9 +334,9 @@ void gen_varaddr_from_ident(Node *node, const char *name)
     if (la.offset < 0)
     {
         Symbol *sym = node->symbol;
-        if (sym && sym->is_local_static)
+        if (sym && sym->kind == SYM_STATIC_LOCAL)
             printf("    immw    _ls%d\n", sym->offset);
-        else if (sym && sym->is_static)
+        else if (sym && sym->kind == SYM_STATIC_GLOBAL)
             printf("    immw    _s%d_%s\n", sym->tu_index, sym->name);
         else
             printf("    immw    %s\n", name);
@@ -464,7 +463,7 @@ void gen_callfunction(Node *node)
     //
     // Push the params on backwards, the offsets from the symbol table then work
     int param_size = push_args_list(node->u.ident.args);
-    if (node->symbol->is_static)
+    if (node->symbol->kind == SYM_STATIC_GLOBAL)
     {
         char mangled[80];
         snprintf(mangled, sizeof(mangled), "_s%d_%s",
@@ -695,7 +694,7 @@ void gen_expr(Node *node)
     else if (node->kind == ND_IDENT)
     {
         Symbol *sym = node->symbol;
-        if (sym->is_enum_const)
+        if (sym->kind == SYM_ENUM_CONST)
         {
             // Enum constant: inline the integer value; no memory load.
             gen_imm(sym->offset);
@@ -1089,7 +1088,7 @@ bool is_constexpr(Node *n)
 {
     if (n->kind == ND_LITERAL) return true;
     // Enum constants are compile-time integers
-    if (n->kind == ND_IDENT && n->symbol && n->symbol->is_enum_const) return true;
+    if (n->kind == ND_IDENT && n->symbol && n->symbol->kind == SYM_ENUM_CONST) return true;
     // Composite expressions are constexpr only if all operands are.
     if (n->kind == ND_BINOP)
         return is_constexpr(n->u.binop.lhs) && is_constexpr(n->u.binop.rhs);
@@ -1210,7 +1209,7 @@ int int_constexpr(Node *n)
         return int_unaryop(n);
     if (n->kind == ND_BINOP)
         return int_binop(n);
-    if (n->kind == ND_IDENT && n->symbol && n->symbol->is_enum_const)
+    if (n->kind == ND_IDENT && n->symbol && n->symbol->kind == SYM_ENUM_CONST)
         return n->symbol->offset;
     return (int)n->u.literal.ival;
 }
@@ -1272,7 +1271,7 @@ void gen_initlist(Node *n, Symbol *s)
     Type *t = s->type;
 
     int constexpr = count_constexpr(n);
-    if (n->st->scope.depth)
+    if (n->st->depth)
     {
         if (t->base == TB_STRUCT)
         {
@@ -1308,7 +1307,7 @@ void gen_initlist(Node *n, Symbol *s)
     {
         if (t->base == TB_STRUCT)
         {
-            char *data = calloc(1, t->size);
+            char *data = arena_alloc(t->size);
             gen_struct_mem_inits(data, n, t, 0);
             gen_bytes(data, t->size);
         }
@@ -1327,7 +1326,7 @@ void gen_initlist(Node *n, Symbol *s)
         }
         else if (constexpr)
         {
-            char *data = calloc(1, t->size);
+            char *data = arena_alloc(t->size);
             gen_mem_inits(data, n, s, 0, 0, 0);
             gen_bytes(data, t->size);
         }
@@ -1347,9 +1346,9 @@ void gen_decl(Node *node)
     for (Node *n = node->u.declaration.decls; n; n = n->next)
     {
         // Different treatment if at scope 0
-        if (n->st->scope.depth)
+        if (n->st->depth)
         {
-            if (n->kind == ND_DECLARATOR && n->symbol && n->symbol->is_local_static)
+            if (n->kind == ND_DECLARATOR && n->symbol && n->symbol->kind == SYM_STATIC_LOCAL)
             {
                 codegen_ctx.local_statics[codegen_ctx.local_static_count++] = (LocalStaticEntry){
                     n->symbol->offset, n->symbol, n
@@ -1402,7 +1401,7 @@ void gen_decl(Node *node)
                 // Skip bare function prototypes — no data to emit
                 if (istype_function(n->symbol->type)) continue;
                 gen_align();
-                if (n->symbol->is_static)
+                if (n->symbol->kind == SYM_STATIC_GLOBAL)
                 {
                     char mangled[80];
                     snprintf(mangled, sizeof(mangled), "_s%d_%s",
@@ -1565,7 +1564,7 @@ void gen_function(Node *node)
     Node *first_decl = node->u.declaration.decls;
     Node *func_body  = node->u.declaration.func_body;
     Symbol *fsym = first_decl->symbol;
-    if (fsym->is_static)
+    if (fsym->kind == SYM_STATIC_GLOBAL)
         printf("_s%d_%s:\n", fsym->tu_index, fsym->name);
     else
         printf("%s:\n", fsym->name);

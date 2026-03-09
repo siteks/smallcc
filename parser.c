@@ -197,7 +197,7 @@ static char *new_anon_label()
 
 Node *new_node(Node_kind kind, char *val, bool is_expr)
 {
-    Node *node = calloc(1, sizeof(Node));
+    Node *node = arena_alloc(sizeof(Node));
     node->kind = kind;
     node->is_expr = is_expr;
     node->type = t_void;
@@ -205,9 +205,9 @@ Node *new_node(Node_kind kind, char *val, bool is_expr)
     // Store identifier/label strings in union; operators use op_kind instead
     if (val) {
         if (kind == ND_IDENT)
-            node->u.ident.name = strdup(val);
+            node->u.ident.name = arena_strdup(val);
         else if (kind == ND_GOTOSTMT)
-            node->u.label = strdup(val);
+            node->u.label = arena_strdup(val);
     }
     return node;
 }
@@ -548,7 +548,7 @@ static Node *unary_expr()
                 Node *n = new_node(ND_MEMBER, NULL, true);
                 n->op_kind = TK_DOT;
                 n->u.member.base = node;
-                n->u.member.field_name = strdup(expect(TK_IDENT));
+                n->u.member.field_name = arena_strdup(expect(TK_IDENT));
                 node = n;
                 pex_node = n;
                 break;
@@ -559,7 +559,7 @@ static Node *unary_expr()
                 Node *n = new_node(ND_MEMBER, NULL, true);
                 n->op_kind = TK_ARROW;
                 n->u.member.base = node;
-                n->u.member.field_name = strdup(expect(TK_IDENT));
+                n->u.member.field_name = arena_strdup(expect(TK_IDENT));
                 node = n;
                 pex_node = n;
                 break;
@@ -1079,7 +1079,7 @@ static Node *struct_decl(DeclParseState *ds, int depth)
         }
         expect(TK_LBRACE);
         n->symtable = enter_new_scope(false);
-        n->symtable->scope.scope_type = ST_STRUCT;
+        n->symtable->scope_type = ST_STRUCT;
         do
         {
             list_append(&n->u.struct_spec.members, declaration(depth + 1));
@@ -1097,11 +1097,11 @@ static void enum_decl(DeclParseState *ds)
     char *tagname = NULL;
     if (token_ctx.current->kind == TK_IDENT)
     {
-        tagname = strdup(token_ctx.current->val);
+        tagname = arena_strdup(token_ctx.current->val);
         expect(TK_IDENT);
     }
     if (!tagname)
-        tagname = strdup(new_anon_label());
+        tagname = arena_strdup(new_anon_label());
 
     if (token_ctx.current->kind == TK_LBRACE)
     {
@@ -1114,7 +1114,7 @@ static void enum_decl(DeclParseState *ds)
         int next_val = 0;
         while (token_ctx.current->kind != TK_RBRACE)
         {
-            char *ename = strdup(expect(TK_IDENT));
+            char *ename = arena_strdup(expect(TK_IDENT));
             if (token_ctx.current->kind == TK_ASSIGN)
             {
                 expect(TK_ASSIGN);
@@ -1310,7 +1310,7 @@ static Node *stmt()
         if (token_ctx.current->kind == TK_IDENT)
         {
             Symbol *s = find_symbol_st(node->st, token_ctx.current->val, NS_IDENT);
-            if (!s || !s->is_enum_const)
+            if (!s || s->kind != SYM_ENUM_CONST)
                 error("Expected integer constant in case\n");
             node->u.casestmt.value = (long long)s->offset;
             expect(TK_IDENT);
@@ -1343,7 +1343,7 @@ static Node *stmt()
     {
         node->kind = ND_GOTOSTMT;
         expect(TK_GOTO);
-        node->u.label = strdup(expect_ident());
+        node->u.label = arena_strdup(expect_ident());
         expect(TK_SEMICOLON);
     }
     else if (token_ctx.current->kind == TK_IDENT)
@@ -1353,7 +1353,7 @@ static Node *stmt()
         {
             node->kind = ND_LABELSTMT;
             expect(TK_COLON);
-            node->u.labelstmt.name = strdup(name);
+            node->u.labelstmt.name = arena_strdup(name);
             node->u.labelstmt.stmt = stmt();
         }
         else
@@ -1475,7 +1475,7 @@ char *node_str(Node *node)
          node->kind == ND_UNARYOP ? node->u.unaryop.is_function :
          node->kind == ND_MEMBER ? node->u.member.is_function : false) ? "func " : "     ",
         node_val_str(node),
-        node->st ? scope_str(node->st->scope) : "(nil)",
+        node->st ? (node->st->depth ? "local" : "global") : "(nil)",
         node->type ? fulltype_str(node->type) : "",
         (unsigned long long)node->type);
     if (node->kind == ND_DECLARATION)
@@ -1507,75 +1507,58 @@ void for_each_child(Node *node, void (*fn)(Node *child, void *ctx), void *ctx)
     if (!node) return;
     switch (node->kind)
     {
-    // Cat A: expression nodes — dispatch through u.*
+    // Pure-1: single leading Node* child, no list
+    case ND_RETURNSTMT:
+    case ND_EXPRSTMT:
+    case ND_VA_ARG:
+    case ND_VA_END:
+    case ND_ARRAY_DECL:
+    case ND_FUNC_DECL:
+    case ND_TYPE_NAME:
+    case ND_STMT:
+        call_fn(node->u.ch[0], fn, ctx);
+        return;
+
+    // Pure-2: two leading Node* children, no list
     case ND_BINOP:
     case ND_ASSIGN:
-        call_fn(node->u.binop.lhs, fn, ctx);
-        call_fn(node->u.binop.rhs, fn, ctx);
+    case ND_CAST:
+    case ND_COMPOUND_ASSIGN:
+    case ND_WHILESTMT:
+    case ND_DOWHILESTMT:
+    case ND_SWITCHSTMT:
+    case ND_VA_START:
+    case ND_DECLARATOR:
+        call_fn(node->u.ch[0], fn, ctx);
+        call_fn(node->u.ch[1], fn, ctx);
         return;
+
+    // Pure-3: three leading Node* children, no list
+    case ND_TERNARY:
+    case ND_IFSTMT:
+        call_fn(node->u.ch[0], fn, ctx);
+        call_fn(node->u.ch[1], fn, ctx);
+        call_fn(node->u.ch[2], fn, ctx);
+        return;
+
+    // Pure-4: four leading Node* children, no list
+    case ND_FORSTMT:
+        call_fn(node->u.ch[0], fn, ctx);
+        call_fn(node->u.ch[1], fn, ctx);
+        call_fn(node->u.ch[2], fn, ctx);
+        call_fn(node->u.ch[3], fn, ctx);
+        return;
+
+    // Non-pure: char* precedes Node*, or has embedded arg list
     case ND_UNARYOP:
         call_fn(node->u.unaryop.operand, fn, ctx);
         for (Node *a = node->u.unaryop.args; a; a = a->next)
             fn(a, ctx);
         return;
-    case ND_CAST:
-        call_fn(node->u.cast.type_decl, fn, ctx);
-        call_fn(node->u.cast.expr, fn, ctx);
-        return;
-    case ND_TERNARY:
-        call_fn(node->u.ternary.cond, fn, ctx);
-        call_fn(node->u.ternary.then_, fn, ctx);
-        call_fn(node->u.ternary.else_, fn, ctx);
-        return;
-    case ND_COMPOUND_ASSIGN:
-        call_fn(node->u.compound_assign.lhs, fn, ctx);
-        call_fn(node->u.compound_assign.rhs, fn, ctx);
-        return;
     case ND_MEMBER:
         call_fn(node->u.member.base, fn, ctx);
         for (Node *a = node->u.member.args; a; a = a->next)
             fn(a, ctx);
-        return;
-    case ND_VA_START:
-        call_fn(node->u.vastart.ap, fn, ctx);
-        call_fn(node->u.vastart.last, fn, ctx);
-        return;
-    case ND_VA_ARG:
-        call_fn(node->u.vaarg.ap, fn, ctx);
-        return;
-    case ND_VA_END:
-        call_fn(node->u.vaend.ap, fn, ctx);
-        return;
-
-    // Cat B: statement nodes — dispatch through u.*
-    case ND_IFSTMT:
-        call_fn(node->u.ifstmt.cond, fn, ctx);
-        call_fn(node->u.ifstmt.then_, fn, ctx);
-        call_fn(node->u.ifstmt.else_, fn, ctx);
-        return;
-    case ND_WHILESTMT:
-        call_fn(node->u.whilestmt.cond, fn, ctx);
-        call_fn(node->u.whilestmt.body, fn, ctx);
-        return;
-    case ND_FORSTMT:
-        call_fn(node->u.forstmt.init, fn, ctx);
-        call_fn(node->u.forstmt.cond, fn, ctx);
-        call_fn(node->u.forstmt.inc, fn, ctx);
-        call_fn(node->u.forstmt.body, fn, ctx);
-        return;
-    case ND_DOWHILESTMT:
-        call_fn(node->u.dowhile.body, fn, ctx);
-        call_fn(node->u.dowhile.cond, fn, ctx);
-        return;
-    case ND_SWITCHSTMT:
-        call_fn(node->u.switchstmt.selector, fn, ctx);
-        call_fn(node->u.switchstmt.body, fn, ctx);
-        return;
-    case ND_RETURNSTMT:
-        call_fn(node->u.returnstmt.expr, fn, ctx);
-        return;
-    case ND_EXPRSTMT:
-        call_fn(node->u.exprstmt.expr, fn, ctx);
         return;
     case ND_LABELSTMT:
         call_fn(node->u.labelstmt.stmt, fn, ctx);
@@ -1593,29 +1576,6 @@ void for_each_child(Node *node, void (*fn)(Node *child, void *ctx), void *ctx)
     case ND_CASESTMT:
     case ND_DEFAULTSTMT:
     case ND_EMPTY:
-        return;
-
-    // ND_DECLARATOR: migrated to u.declarator
-    case ND_DECLARATOR:
-        call_fn(node->u.declarator.direct_decl, fn, ctx);
-        call_fn(node->u.declarator.init, fn, ctx);
-        return;
-    // ND_ARRAY_DECL: migrated to u.array_decl
-    case ND_ARRAY_DECL:
-        call_fn(node->u.array_decl.size, fn, ctx);
-        return;
-    // ND_FUNC_DECL: migrated to u.func_decl
-    case ND_FUNC_DECL:
-        call_fn(node->u.func_decl.params, fn, ctx);
-        return;
-
-    // ND_TYPE_NAME: migrated to u.type_name (ND_TYPE_NAME is never created currently)
-    case ND_TYPE_NAME:
-        call_fn(node->u.type_name.decl, fn, ctx);
-        return;
-    // ND_STMT: migrated to u.stmt_wrap
-    case ND_STMT:
-        call_fn(node->u.stmt_wrap.body, fn, ctx);
         return;
 
     // ND_PROGRAM: migrated to u.program
@@ -1717,81 +1677,9 @@ const char *get_decl_ident(Node *node)
 // Returns NULL if the kind/child combo doesn't map to a u.* field.
 static Node **get_u_child_slot(Node *n, int child)
 {
-    switch (n->kind)
-    {
-    case ND_BINOP: case ND_ASSIGN:
-        if (child == 0) return &n->u.binop.lhs;
-        if (child == 1) return &n->u.binop.rhs;
-        break;
-    case ND_UNARYOP:
-        if (child == 0) return &n->u.unaryop.operand;
-        break;
-    case ND_CAST:
-        if (child == 0) return &n->u.cast.type_decl;
-        if (child == 1) return &n->u.cast.expr;
-        break;
-    case ND_TERNARY:
-        if (child == 0) return &n->u.ternary.cond;
-        if (child == 1) return &n->u.ternary.then_;
-        if (child == 2) return &n->u.ternary.else_;
-        break;
-    case ND_COMPOUND_ASSIGN:
-        if (child == 0) return &n->u.compound_assign.lhs;
-        if (child == 1) return &n->u.compound_assign.rhs;
-        break;
-    case ND_RETURNSTMT:
-        if (child == 0) return &n->u.returnstmt.expr;
-        break;
-    case ND_IFSTMT:
-        if (child == 0) return &n->u.ifstmt.cond;
-        break;
-    case ND_WHILESTMT:
-        if (child == 0) return &n->u.whilestmt.cond;
-        break;
-    case ND_FORSTMT:
-        if (child == 0) return &n->u.forstmt.init;
-        if (child == 1) return &n->u.forstmt.cond;
-        if (child == 2) return &n->u.forstmt.inc;
-        if (child == 3) return &n->u.forstmt.body;
-        break;
-    case ND_DOWHILESTMT:
-        if (child == 0) return &n->u.dowhile.body;
-        if (child == 1) return &n->u.dowhile.cond;
-        break;
-    case ND_EXPRSTMT:
-        if (child == 0) return &n->u.exprstmt.expr;
-        break;
-    case ND_VA_START:
-        if (child == 0) return &n->u.vastart.ap;
-        if (child == 1) return &n->u.vastart.last;
-        break;
-    case ND_VA_ARG:
-        if (child == 0) return &n->u.vaarg.ap;
-        break;
-    case ND_VA_END:
-        if (child == 0) return &n->u.vaend.ap;
-        break;
-    case ND_DECLARATOR:
-        if (child == 0) return &n->u.declarator.direct_decl;
-        if (child == 1) return &n->u.declarator.init;
-        break;
-    case ND_ARRAY_DECL:
-        if (child == 0) return &n->u.array_decl.size;
-        break;
-    case ND_FUNC_DECL:
-        if (child == 0) return &n->u.func_decl.params;
-        break;
-    case ND_TYPE_NAME:
-        if (child == 0) return &n->u.type_name.decl;
-        break;
-    case ND_STMT:
-        if (child == 0) return &n->u.stmt_wrap.body;
-        break;
-    default:
-        error("get_u_child_slot: unhandled node kind %d (%s)", n->kind, nodestr(n->kind));
-        return NULL;
-    }
-    return NULL;
+    if (child < 0 || child > 3)
+        error("get_u_child_slot: index %d out of range for %s", child, nodestr(n->kind));
+    return &n->u.ch[child];
 }
 
 void insert_cast(Node *n, int child, Type *t)

@@ -10,6 +10,23 @@
 
 void error(const char *fmt, ...);
 
+// ===============================================================
+// Arena Allocator
+// ===============================================================
+// Single bump-pointer arena; all compiler allocations go here.
+// Pre-zeroed, so arena_alloc has calloc semantics.
+// Never reset: Types survive across TUs and some Symbols are
+// carried between TUs, so a single lifetime is simplest.
+typedef struct
+{
+    char   *base;
+    size_t  used;
+    size_t  cap;
+} Arena;
+extern Arena arena;
+void  *arena_alloc(size_t size);
+char  *arena_strdup(const char *s);
+
 // Target architecture constants
 #define WORD_SIZE      2   // size of int and pointer (16-bit target)
 #define FRAME_OVERHEAD 8   // enter saves lr+bp (4 bytes each); params start at bp+8
@@ -244,44 +261,42 @@ typedef enum
     NS_TYPEDEF
 } Namespace;
 
-typedef struct Scope Scope;
-struct Scope
-{
-    int         depth;
-    int         *indices;
-    Scope_type  scope_type;
-};
+typedef enum {
+    SYM_LOCAL,         // stack-allocated local  (lea -offset)
+    SYM_PARAM,         // function parameter     (lea +offset)
+    SYM_GLOBAL,        // non-static global      (immw name)
+    SYM_STATIC_GLOBAL, // file-scope static      (immw _s{tu}_{name})
+    SYM_STATIC_LOCAL,  // local-scope static     (immw _ls{id})
+    SYM_EXTERN,        // extern decl            (no data allocated)
+    SYM_ENUM_CONST,    // enum constant          (offset = integer value)
+} SymbolKind;
 
 struct Symbol
 {
     const char *name;
     Type   *type;
     int     offset;     // Meaning depends on symbol kind:
-                        //   global (depth==0):          byte position in global data area
-                        //   local (is_param==false):    accumulated local size (lea -(go+offset))
-                        //   parameter (is_param):       bytes above bp (lea +(go+offset))
-                        //   enum constant (is_enum_const): integer value (not an address)
-                        //   local static (is_local_static): local_static_counter ID (_ls{id})
-    bool    is_param;
-    bool    is_enum_const;
-    bool    is_static;      // file-scope static → name-mangled label
-    int     tu_index;       // TU that defined this static
-    bool    is_extern_decl; // extern declaration → no data allocation
-    bool    is_local_static;// local-scope static: persistent storage, label = _ls{offset}
+                        //   SYM_GLOBAL:        byte position in global data area
+                        //   SYM_LOCAL:         accumulated local size (lea -(go+offset))
+                        //   SYM_PARAM:         bytes above bp (lea +(go+offset))
+                        //   SYM_ENUM_CONST:    integer value (not an address)
+                        //   SYM_STATIC_LOCAL:  local_static_counter ID (_ls{id})
+    SymbolKind kind;
+    int     tu_index;       // TU that defined a static (SYM_STATIC_GLOBAL / SYM_STATIC_LOCAL)
     Symbol  *next;
 };
 
 typedef struct Symbol_table Symbol_table;
 struct Symbol_table
 {
-    Scope           scope;
+    int             depth;       // scope nesting depth (0 = global)
+    Scope_type      scope_type;  // ST_COMPSTMT or ST_STRUCT
+    int             scope_id;    // monotonic ID assigned at creation (for debug)
     Symbol          *idents;
     Symbol          *tags;
     Symbol          *labels;
     Symbol          *typedefs;
     int             size;
-    int             child_count;
-    Symbol_table    **children;
     Symbol_table    *parent;
 };
 
@@ -325,6 +340,7 @@ struct Node
         struct { long long ival; double fval; char *strval; int strval_len; } literal; // ND_LITERAL
         struct { long long value; int label_id; } casestmt;      // ND_CASESTMT
         struct { int label_id; } defaultstmt;                    // ND_DEFAULTSTMT
+        Node *ch[4];    // positional alias: ch[i] == the i-th leading Node* of any u.* variant
     } u;
     Node            *next;       // sibling link (for linked-list children)
     bool            is_expr;
@@ -404,10 +420,8 @@ extern int current_global_tu;
 // Starting at scope of node, search for symbol in given namespace.
 Symbol *find_symbol(Node *node, const char *name, Namespace nspace);
 
-void set_scope(Scope *sc);
 void leave_scope();
 Symbol_table *enter_new_scope(bool use_last_scope);
-const char *scope_str(Scope sc);
 const char *curr_scope_str();
 
 // Build a Type* from a declaration-context node (typespec + optional declarator child).
@@ -463,11 +477,13 @@ typedef struct TypeContext {
     int local_static_counter;   // NOT reset between TUs
     // Scope tracking
     int scope_depth;
-    int scope_indices[100];
     // Symbol table hierarchy
     Symbol_table *symbol_table;
     Symbol_table *curr_scope_st;
     Symbol_table *last_symbol_table;
+    // Flat list of all scopes created this TU (replaces children[] tree)
+    Symbol_table *scope_list[2048];
+    int           scope_count;
     // Type formatting buffer
     char ft_buf[512];
 } TypeContext;
