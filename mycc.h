@@ -102,6 +102,12 @@ struct Token
     int         loc;
 };
 
+// ---------------------------------------------------------------
+// Preprocessor
+// ---------------------------------------------------------------
+void  reset_preprocessor(void);
+char *preprocess(const char *src, const char *filename);
+
 // bool consume(char *op);
 // bool consume_tk(Token_kind tk);
 char *expect(Token_kind tk);

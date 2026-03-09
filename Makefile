@@ -1,8 +1,10 @@
 
 CFLAGS=-std=c11 -g
 
-mycc: mycc.c tokeniser.c parser.c types.c codegen.c backend.c
-test_all: mycc test_init test_ops test_logops test_func test_longs test_array test_struct test_loops test_goto test_struct_init test_floats test_compound test_remaining test_typedef test_strings test_enum test_variadic test_funcptr
+mycc: mycc.c tokeniser.c parser.c types.c codegen.c backend.c preprocess.c
+sim_c: sim_c.c
+	$(CC) $(CFLAGS) -o sim_c sim_c.c -lm
+test_all: mycc sim_c test_init test_ops test_logops test_func test_longs test_array test_struct test_loops test_goto test_struct_init test_floats test_compound test_remaining test_typedef test_strings test_enum test_variadic test_funcptr test_preprocess
 
 test_init: mycc
 	(source ./test.sh && source tests/test_init.sh)
@@ -58,6 +60,8 @@ test_variadic:mycc
 test_funcptr:mycc
 	(source ./test.sh && source tests/test_funcptr.sh)
 
+test_preprocess: mycc
+	(source ./test.sh && source tests/test_preprocess.sh)
 
 clean:
 	rm -f mycc *.o *~ tmp*

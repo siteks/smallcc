@@ -313,6 +313,9 @@ Token *tokenise(char *p)
     {
         if (isspace(*p)) { p++; continue; }
 
+        // Line comments: skip to end of line
+        if (p[0] == '/' && p[1] == '/') { while (*p && *p != '\n') p++; continue; }
+
         // Punctuators and operators: greedy longest-match via table
         {
             bool matched = false;

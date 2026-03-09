@@ -1,19 +1,23 @@
 #!/bin/bash
 
+TMP_C="_tmp_$$.c"
+TMP_S="tmp_$$.s"
+trap 'rm -f "$TMP_C" "$TMP_S"' EXIT
+
 assert() {
     expected="$1"
     input="$2"
     echo "Input is:$input"
-    printf '%s\n' "$input" > _tmp.c
-    ./mycc -o tmp.s _tmp.c
-    actual=`./cpu3/sim.py tmp.s | tail -1`
+    printf '%s\n' "$input" > "$TMP_C"
+    ./mycc -o "$TMP_S" "$TMP_C"
+    actual=`./sim_c "$TMP_S"`
     final=`echo $actual | awk '{v=int("0x"substr($1,4));if(v>2147483647)v=v-4294967296;print v}'`
 
     if [[ $final = $expected ]]; then
         echo "$input => $final"
     else
         echo "$input => $expected expected, but got $final - $actual"
-        ./cpu2/sim.py tmp.s -v > error.log
+        ./sim_c -v "$TMP_S" > error.log 2>&1
         exit 1
     fi
 }

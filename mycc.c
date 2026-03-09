@@ -70,6 +70,7 @@ static void reset_tu(int tu)
     reset_codegen();
     reset_parser();
     reset_types_state();
+    reset_preprocessor();
 }
 
 
@@ -103,7 +104,9 @@ int main(int argc, char **argv)
 
     for (int tu = 0; tu < tu_count; tu++)
     {
-        char *source = read_file(argv[file_start + tu]);
+        char *raw    = read_file(argv[file_start + tu]);
+        char *source = preprocess(raw, argv[file_start + tu]);
+        free(raw);
 
         reset_tu(tu);
         make_basic_types();
