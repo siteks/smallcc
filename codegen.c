@@ -490,9 +490,9 @@ static const char *node_ident_str(Node *node)
 
 void gen_offset(Node *node)
 {
-    printf(";%s %s %s offset:%d\n", __func__, nodestr(node->kind), node_ident_str(node), node->offset);
+    printf(";%s %s %s offset:%d\n", __func__, nodestr(node->kind), node_ident_str(node), node->u.member.offset);
     // lhs is structure, rhs is member within
-    gen_imm(node->offset);
+    gen_imm(node->u.member.offset);
 }
 void gen_addr(Node *node)
 {
@@ -681,15 +681,15 @@ void gen_expr(Node *node)
     // ===== Literals =====
     else if (node->kind == ND_LITERAL)
     {
-        if (node->strval)
+        if (node->u.literal.strval)
         {
-            int sid = new_strlit(node->strval, node->strval_len);
+            int sid = new_strlit(node->u.literal.strval, node->u.literal.strval_len);
             printf("    immw    _l%d\n", sid);
         }
         else if (istype_fp(node->type))
-            gen_imm_float(node->fval);
+            gen_imm_float(node->u.literal.fval);
         else
-            gen_imm((int)node->ival);
+            gen_imm((int)node->u.literal.ival);
     }
     // ===== Identifiers and function calls =====
     else if (node->kind == ND_IDENT)
@@ -1212,7 +1212,7 @@ int int_constexpr(Node *n)
         return int_binop(n);
     if (n->kind == ND_IDENT && n->symbol && n->symbol->is_enum_const)
         return n->symbol->offset;
-    return (int)n->ival;
+    return (int)n->u.literal.ival;
 }
 
 // Write struct field initializers for a local struct.
@@ -1321,7 +1321,7 @@ void gen_initlist(Node *n, Symbol *s)
             Node *l;
             for(l = n; !is_constexpr(l); l = l->u.initlist.items);
             if (istype_fp(t))
-                emit_float_bytes(l->fval);
+                emit_float_bytes(l->u.literal.fval);
             else
                 gen_word(int_constexpr(l));
         }
@@ -1338,8 +1338,8 @@ void gen_initlist(Node *n, Symbol *s)
 void gen_decl(Node *node)
 {
     printf(";%s declaration\n", __func__);
-    if (node->u.declaration.sclass == TK_TYPEDEF) return;
-    if (node->u.declaration.sclass == TK_EXTERN)  return;  // extern decl → no data emission
+    if (node->u.declaration.sclass == SC_TYPEDEF) return;
+    if (node->u.declaration.sclass == SC_EXTERN)  return;  // extern decl → no data emission
     // The symbol table has all the details needed for declarations.
     // Space is reserved at the start of the compound statement
 
@@ -1367,12 +1367,12 @@ void gen_decl(Node *node)
                 {
                     gen_initlist(init, n->symbol);
                 }
-                else if (init->strval && istype_array(n->symbol->type))
+                else if (init->u.literal.strval && istype_array(n->symbol->type))
                 {
                     // Local char array init from string literal: store bytes one by one
                     int vaddr = -find_local_addr(n, n->symbol->name).offset;
-                    char *str = init->strval;
-                    int   len = init->strval_len + 1;
+                    char *str = init->u.literal.strval;
+                    int   len = init->u.literal.strval_len + 1;
                     for (int i = 0; i < len; i++)
                     {
                         gen_lea(vaddr + i);
@@ -1421,21 +1421,21 @@ void gen_decl(Node *node)
                     {
                         gen_initlist(init, n->symbol);
                     }
-                    else if (init->strval && istype_array(n->symbol->type))
+                    else if (init->u.literal.strval && istype_array(n->symbol->type))
                     {
                         // char s[] = "hello" — emit bytes directly
-                        gen_bytes(init->strval, init->strval_len + 1);
+                        gen_bytes(init->u.literal.strval, init->u.literal.strval_len + 1);
                     }
-                    else if (init->strval)
+                    else if (init->u.literal.strval)
                     {
                         // char *p = "hello" — emit pointer to deferred string data
-                        int sid = new_strlit(init->strval, init->strval_len);
+                        int sid = new_strlit(init->u.literal.strval, init->u.literal.strval_len);
                         printf("    word    _l%d\n", sid);
                     }
                     else
                     {
                         if (istype_fp(n->symbol->type))
-                            emit_float_bytes(init->fval);
+                            emit_float_bytes(init->u.literal.fval);
                         else
                         {
                             int val = int_constexpr(init);
@@ -1496,17 +1496,17 @@ void gen_switchstmt(Node *node)
     for (Node *ch = body->u.compstmt.stmts; ch; ch = ch->next)
     {
         if (ch->kind == ND_CASESTMT) {
-            int lcase   = new_label();
-            ch->offset  = lcase;
+            int lcase              = new_label();
+            ch->u.casestmt.label_id = lcase;
             gen_expr(selector);
             gen_push();
-            gen_imm((int)ch->ival);
+            gen_imm((int)ch->u.casestmt.value);
             gen_eq();
             gen_jnz(lcase);
         } else if (ch->kind == ND_DEFAULTSTMT) {
-            int ldef   = new_label();
-            ch->offset = ldef;
-            ldefault   = ldef;
+            int ldef                   = new_label();
+            ch->u.defaultstmt.label_id = ldef;
+            ldefault                   = ldef;
         }
     }
     if (ldefault >= 0) gen_j(ldefault);
@@ -1518,8 +1518,10 @@ void gen_switchstmt(Node *node)
     gen_adj(-body->symtable->size);
     for (Node *ch = body->u.compstmt.stmts; ch; ch = ch->next)
     {
-        if (ch->kind == ND_CASESTMT || ch->kind == ND_DEFAULTSTMT)
-            gen_label(ch->offset);
+        if (ch->kind == ND_CASESTMT)
+            gen_label(ch->u.casestmt.label_id);
+        else if (ch->kind == ND_DEFAULTSTMT)
+            gen_label(ch->u.defaultstmt.label_id);
         else if (ch->kind == ND_DECLARATION)
             gen_decl(ch);
         else
@@ -1601,15 +1603,15 @@ void gen_code(Node *node, int tu_index)
         {
             if (init->kind == ND_INITLIST)
                 gen_initlist(init, e->sym);
-            else if (init->strval && istype_array(e->sym->type))
-                gen_bytes(init->strval, init->strval_len + 1);
-            else if (init->strval)
+            else if (init->u.literal.strval && istype_array(e->sym->type))
+                gen_bytes(init->u.literal.strval, init->u.literal.strval_len + 1);
+            else if (init->u.literal.strval)
             {
-                int sid = new_strlit(init->strval, init->strval_len);
+                int sid = new_strlit(init->u.literal.strval, init->u.literal.strval_len);
                 printf("    word    _l%d\n", sid);
             }
             else if (istype_fp(e->sym->type))
-                emit_float_bytes(init->fval);
+                emit_float_bytes(init->u.literal.fval);
             else
             {
                 int val = int_constexpr(init);

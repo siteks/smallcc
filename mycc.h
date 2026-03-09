@@ -83,9 +83,8 @@ struct Token
     int         loc;
 };
 
-bool consume(char *op);
-bool consume_tk(Token_kind tk);
-bool is_ident();
+// bool consume(char *op);
+// bool consume_tk(Token_kind tk);
 char *expect(Token_kind tk);
 int expect_number();
 char *expect_ident();
@@ -160,12 +159,21 @@ typedef struct Field Field;
 typedef struct Param Param;
 typedef struct Symbol Symbol;
 
+typedef enum {
+    SC_NONE     = 0,   // no storage class specified
+    SC_AUTO,
+    SC_REGISTER,
+    SC_STATIC,
+    SC_EXTERN,
+    SC_TYPEDEF,
+} StorageClass;
+
 // Parser-local accumulator for declaration specifiers.
 // Passed as a parameter to add_types_and_symbols / type2_from_decl_node.
 typedef struct {
-    Decl_spec  typespec;       // accumulated type-specifier bitmask
-    Token_kind sclass;         // storage-class token (TK_STATIC, TK_EXTERN, etc.)
-    Type      *typedef_type;   // resolved typedef type (set when DS_TYPEDEF is present)
+    Decl_spec   typespec;      // accumulated type-specifier bitmask
+    StorageClass sclass;       // storage class
+    Type        *typedef_type; // resolved typedef type (set when DS_TYPEDEF is present)
 } DeclParseState;
 
 // Linked list of structure members
@@ -287,7 +295,7 @@ struct Node
         char        *label;      // ND_GOTOSTMT: goto label (heap)
         struct { Node *lhs; Node *rhs; } binop;            // ND_BINOP, ND_ASSIGN
         struct { Node *operand; Node *args; bool is_function; bool is_array_deref; } unaryop; // ND_UNARYOP
-        struct { Node *base; char *field_name; Node *args; bool is_function; } member; // ND_MEMBER
+        struct { Node *base; char *field_name; Node *args; bool is_function; int offset; } member; // ND_MEMBER
         struct { Node *cond; Node *then_; Node *else_; } ifstmt;
         struct { Node *cond; Node *body; } whilestmt;
         struct { Node *init; Node *cond; Node *inc; Node *body; } forstmt;
@@ -302,7 +310,7 @@ struct Node
         struct { Node *ap; Node *last; } vastart;           // ND_VA_START
         struct { Node *ap; } vaarg;                         // ND_VA_ARG
         struct { Node *ap; } vaend;                         // ND_VA_END
-        struct { Node *direct_decl; Node *init; } declarator;  // ND_DECLARATOR
+        struct { Node *direct_decl; Node *init; int pointer_level; } declarator;  // ND_DECLARATOR
         struct { Node *size; } array_decl;                       // ND_ARRAY_DECL
         struct { Node *params; } func_decl;                      // ND_FUNC_DECL
         struct { Node *decl; } type_name;                        // ND_TYPE_NAME
@@ -311,17 +319,14 @@ struct Node
         struct { Node *stmts; } compstmt;                        // ND_COMPSTMT
         struct { Node *params; bool is_variadic; } ptype_list;    // ND_PTYPE_LIST
         struct { Node *items; } initlist;                        // ND_INITLIST
-        struct { Node *spec; Node *decls; Node *func_body; Decl_spec typespec; Token_kind sclass; bool is_func_defn; } declaration; // ND_DECLARATION
+        struct { Node *spec; Node *decls; Node *func_body; Decl_spec typespec; StorageClass sclass; bool is_func_defn; } declaration; // ND_DECLARATION
         struct { Node *name; Node *suffixes; } direct_decl;      // ND_DIRECT_DECL
         struct { Node *tag; Node *members; bool is_union; } struct_spec;  // ND_STRUCT
+        struct { long long ival; double fval; char *strval; int strval_len; } literal; // ND_LITERAL
+        struct { long long value; int label_id; } casestmt;      // ND_CASESTMT
+        struct { int label_id; } defaultstmt;                    // ND_DEFAULTSTMT
     } u;
     Node            *next;       // sibling link (for linked-list children)
-    long long       ival;
-    double          fval;
-    char            *strval;
-    int             strval_len;
-    int             offset;
-    int             pointer_level;
     bool            is_expr;
     Token_kind      op_kind;    // for ND_BINOP/UNARYOP/MEMBER: identifies the operator
     Symbol_table    *st;
@@ -350,6 +355,7 @@ void gen_stmt(Node *node);
 const char *nodestr(Node_kind k);
 const char *fulltype_str(Type *t);
 const char *token_str(Token_kind tk);
+const char *sc_str(StorageClass sc);
 bool is_type_name(Token_kind tk);
 
 bool is_sc_spec(Token_kind tk);

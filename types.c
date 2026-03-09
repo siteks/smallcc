@@ -10,7 +10,7 @@ TypeContext type_ctx;
 Symbol *insert_tag(Symbol_table *st, char *ident);
 static Symbol *insert_typedef(Node *node, Type *type, const char *ident);
 static Symbol *new_symbol(Type *type, const char *ident, int offset);
-static Symbol *insert_ident(Node *node, Type *type, const char *ident, bool is_param, Token_kind sclass);
+static Symbol *insert_ident(Node *node, Type *type, const char *ident, bool is_param, StorageClass sclass);
 static Type  *generate_struct_type(Node *decl_node, DeclParseState ds, int depth);
 Symbol_table *find_scope(Node *node);
 static Type  *type_from_declarator(Node *decl, Type *base);
@@ -174,7 +174,7 @@ Type *get_enum_type(Symbol *tag)
 static Type *type_from_declarator(Node *decl, Type *base)
 {
     Type *t = base;
-    for (int i = 0; i < decl->pointer_level; i++)
+    for (int i = 0; i < decl->u.declarator.pointer_level; i++)
         t = get_pointer_type(t);
     return type_from_direct_decl(decl->u.declarator.direct_decl, t);
 }
@@ -199,7 +199,7 @@ static Type *type_from_direct_decl(Node *dd, Type *base)
         if (s->kind == ND_ARRAY_DECL)
         {
             int count = (s->u.array_decl.size && s->u.array_decl.size->kind == ND_LITERAL)
-                        ? (int)s->u.array_decl.size->ival : 0;
+                        ? (int)s->u.array_decl.size->u.literal.ival : 0;
             t = get_array_type(t, count);
         }
         else if (s->kind == ND_FUNC_DECL)
@@ -591,8 +591,8 @@ void add_types_and_symbols(Node *node, DeclParseState ds, bool is_param, int dep
             __func__, ident ? ident : "", fulltype_str(ty));
         // char s[] = "hello" — fix up zero-size array from string literal init
         if (ty->base == TB_ARRAY && ty->u.arr.count == 0
-            && n->u.declarator.init && n->u.declarator.init->strval)
-            ty = get_array_type(ty->u.arr.elem, n->u.declarator.init->strval_len + 1);
+            && n->u.declarator.init && n->u.declarator.init->u.literal.strval)
+            ty = get_array_type(ty->u.arr.elem, n->u.declarator.init->u.literal.strval_len + 1);
         if (first_decl) {
             node->type = ty;
             first_decl = false;
@@ -600,7 +600,7 @@ void add_types_and_symbols(Node *node, DeclParseState ds, bool is_param, int dep
         DBG_PRINT("%s final type %s\n", __func__, fulltype_str(ty));
 
         if (ident) {
-            if (ds.sclass == TK_TYPEDEF)
+            if (ds.sclass == SC_TYPEDEF)
                 n->symbol = insert_typedef(node, ty, ident);
             else
                 n->symbol = insert_ident(node, ty, ident, is_param, ds.sclass);
@@ -767,13 +767,13 @@ static Symbol *new_symbol(Type *type, const char *ident, int offset)
     return n;
 }
 
-static Symbol *insert_ident(Node *node, Type *type, const char *ident, bool is_param, Token_kind sclass)
+static Symbol *insert_ident(Node *node, Type *type, const char *ident, bool is_param, StorageClass sclass)
 {
     DBG_PRINT("%s %s %s\n", __func__, fulltype_str(type), ident);
     Symbol_table *st = node->st;
 
     if (st->scope.depth) {
-        if (sclass == TK_STATIC)
+        if (sclass == SC_STATIC)
         {
             // Local static: persistent storage in data section, not on stack.
             Symbol *n          = new_symbol(type, ident, type_ctx.local_static_counter++);
@@ -789,7 +789,7 @@ static Symbol *insert_ident(Node *node, Type *type, const char *ident, bool is_p
         {
             if (!strcmp(s->name, ident))
             {
-                if (sclass != TK_EXTERN)
+                if (sclass != SC_EXTERN)
                 {
                     // Real definition: upgrade pre-populated extern entry
                     s->is_extern_decl = false;
@@ -799,7 +799,7 @@ static Symbol *insert_ident(Node *node, Type *type, const char *ident, bool is_p
                         s->offset  = st->size;
                         st->size  += type->size;
                     }
-                    if (sclass == TK_STATIC)
+                    if (sclass == SC_STATIC)
                     {
                         s->is_static = true;
                         s->tu_index  = current_global_tu;
@@ -809,13 +809,13 @@ static Symbol *insert_ident(Node *node, Type *type, const char *ident, bool is_p
             }
         }
         // Fresh symbol
-        bool is_extern = (sclass == TK_EXTERN);
+        bool is_extern = (sclass == SC_EXTERN);
         bool is_fn     = istype_function(type);
         int  offset    = st->size;
         if (!is_extern && !is_fn) st->size += type->size;
         Symbol *n         = new_symbol(type, ident, is_extern || is_fn ? 0 : offset);
         n->is_extern_decl = is_extern;
-        if (sclass == TK_STATIC)
+        if (sclass == SC_STATIC)
         {
             n->is_static = true;
             n->tu_index  = current_global_tu;

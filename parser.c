@@ -290,7 +290,7 @@ static Node *primary_expr()
             //  u               u int,          ul int
             //  l                       l int,  ul int
             //  ul                              ul int
-            long long i = node->ival = tk->ival;
+            long long i = node->u.literal.ival = tk->ival;
             if (cs == CS_NONE)
                 if (i >= -32768 && i <= 32767)                      node->type = t_int;
                 else if (i >= -2147483648ll && i <= 2147483647ll)   node->type = t_long;
@@ -316,7 +316,7 @@ static Node *primary_expr()
         if (tk->kind == TK_CONSTFLT)
         {
             //  Floats, double, and long float are all 32 bits
-            double f = node->fval = tk->fval;
+            double f = node->u.literal.fval = tk->fval;
             if (f >= -3.402823466e38 && f <= 3.402823466e38)        node->type = t_float;
             else error("Float constant out of range");
         }
@@ -329,14 +329,14 @@ static Node *primary_expr()
         expect(TK_CHARACTER);
         DBG_PRINT("%s %s\n", c, token_ctx.current->val);
         node = new_node(ND_LITERAL, c, true);
-        node->ival = char_val;
+        node->u.literal.ival = char_val;
         node->type = t_char;
     }
     else if (token_ctx.current->kind == TK_STRING)
     {
         node = new_node(ND_LITERAL, NULL, true);
-        node->strval     = token_ctx.current->val;
-        node->strval_len = (int)token_ctx.current->ival;
+        node->u.literal.strval     = token_ctx.current->val;
+        node->u.literal.strval_len = (int)token_ctx.current->ival;
         node->type       = get_pointer_type(t_char);
         expect(TK_STRING);
     }
@@ -371,7 +371,7 @@ static Node *unary_expr()
             expect(TK_LPAREN);
             Node *tn = type_name();
             expect(TK_RPAREN);
-            node->ival = tn->type->size;
+            node->u.literal.ival = tn->type->size;
         }
         else
         {
@@ -387,7 +387,7 @@ static Node *unary_expr()
             Type *t = (inner->kind == ND_IDENT && inner->symbol)
                        ? inner->symbol->type : inner->type;
             int sz = t ? t->size : 0;
-            node->ival = sz;
+            node->u.literal.ival = sz;
         }
         return node;
     }
@@ -491,7 +491,7 @@ static Node *unary_expr()
                     int mult = arr_at_depth->u.arr.elem->size;
                     array_depth++;
                     Node *stride_lit = new_node(ND_LITERAL, NULL, true);
-                    stride_lit->ival = mult;
+                    stride_lit->u.literal.ival = mult;
                     mul->u.binop.lhs = stride_lit;
                     mul->u.binop.rhs = expr();
                     add->u.binop.lhs = e1;
@@ -723,7 +723,7 @@ void insert_scale(Node *n, int child, int size)
     Node *sc = new_node(ND_BINOP, NULL, true);
     sc->op_kind = TK_STAR;
     Node *lit = new_node(ND_LITERAL, NULL, true);
-    lit->ival = size;
+    lit->u.literal.ival = size;
 
     Node **slot = get_u_child_slot(n, child);
     Node *original = *slot;
@@ -824,12 +824,37 @@ bool is_typequal(Token_kind tk)
         || (tk == TK_VOLATILE);
 }
 
+static StorageClass tk_to_sc(Token_kind tk)
+{
+    switch (tk) {
+        case TK_AUTO:     return SC_AUTO;
+        case TK_REGISTER: return SC_REGISTER;
+        case TK_STATIC:   return SC_STATIC;
+        case TK_EXTERN:   return SC_EXTERN;
+        case TK_TYPEDEF:  return SC_TYPEDEF;
+        default:          return SC_NONE;
+    }
+}
+
+const char *sc_str(StorageClass sc)
+{
+    switch (sc) {
+        case SC_NONE:     return "none";
+        case SC_AUTO:     return "auto";
+        case SC_REGISTER: return "register";
+        case SC_STATIC:   return "static";
+        case SC_EXTERN:   return "extern";
+        case SC_TYPEDEF:  return "typedef";
+        default:          return "?";
+    }
+}
+
 static void parse_decl_specifiers(DeclParseState *ds)
 {
     while (is_sc_spec(token_ctx.current->kind) || is_typespec(token_ctx.current->kind) || is_typequal(token_ctx.current->kind)
            || (token_ctx.current->kind == TK_IDENT && is_typedef_name(token_ctx.current->val) && ds->typespec == 0))
     {
-        if (is_sc_spec(token_ctx.current->kind))  ds->sclass   = token_ctx.current->kind;
+        if (is_sc_spec(token_ctx.current->kind))  ds->sclass = tk_to_sc(token_ctx.current->kind);
         if (is_typespec(token_ctx.current->kind)) ds->typespec |= to_typespec(token_ctx.current->kind);
         if (token_ctx.current->kind == TK_IDENT && is_typedef_name(token_ctx.current->val))
         {
@@ -970,11 +995,11 @@ static Node *declarator()
     // <type-qualifier> ::= const
     //                    | volatile
     Node *node = new_node(ND_DECLARATOR, 0, false);
-    node->pointer_level = 0;
+    node->u.declarator.pointer_level = 0;
     while(token_ctx.current->kind == TK_STAR)
     {
         expect(TK_STAR);
-        node->pointer_level++;
+        node->u.declarator.pointer_level++;
         if (is_typequal(token_ctx.current->kind))
         {
             // TODO record this somehow
@@ -1287,12 +1312,12 @@ static Node *stmt()
             Symbol *s = find_symbol_st(node->st, token_ctx.current->val, NS_IDENT);
             if (!s || !s->is_enum_const)
                 error("Expected integer constant in case\n");
-            node->ival = (long long)s->offset;
+            node->u.casestmt.value = (long long)s->offset;
             expect(TK_IDENT);
         }
         else
         {
-            node->ival = (long long)expect_number();
+            node->u.casestmt.value = (long long)expect_number();
         }
         expect(TK_COLON);
     }
@@ -1456,7 +1481,7 @@ char *node_str(Node *node)
     if (node->kind == ND_DECLARATION)
     {
         p += sprintf(p, "sclass:%s ",
-            token_str(node->u.declaration.sclass));
+            sc_str(node->u.declaration.sclass));
         for (Node *d = node->u.declaration.decls; d; d = d->next)
             if (d->kind == ND_DECLARATOR && d->symbol)
                 p += sprintf(p, "%s | ",
@@ -1466,7 +1491,7 @@ char *node_str(Node *node)
     {
         p += sprintf(p, "%s %d* %s ",
             node_val_str(node),
-            node->pointer_level,
+            node->u.declarator.pointer_level,
             node->kind == ND_ARRAY_DECL ? "array" : "");
     }
     return buf;
@@ -1948,11 +1973,11 @@ static void derive_types_step(Node *n)
         }
         DBG_PRINT("%s looking in lhs type:%016llx for field %s\n", __func__, (unsigned long long)struct_type, field_name);
         Type *base = 0;
-        n->offset = find_offset(struct_type, field_name, &base);
-        if (n->offset < 0)
+        n->u.member.offset = find_offset(struct_type, field_name, &base);
+        if (n->u.member.offset < 0)
             error("Can't find member %s in struct\n", field_name);
         DBG_PRINT("%s found member %s with offset %d basetype %016llx\n", __func__,
-            field_name, n->offset, (unsigned long long)base);
+            field_name, n->u.member.offset, (unsigned long long)base);
         n->type = base;
         // If this is a call through a function-pointer member, resolve to return type
         if (n->u.member.is_function && istype_ptr(n->type)
