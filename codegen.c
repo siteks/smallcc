@@ -15,24 +15,10 @@ typedef struct { int offset; bool is_param; } LocalAddr;
 static LocalAddr find_local_addr(Node *node, const char *name)
 {
     DBG_PRINT("%s scope id:%d depth:%d\n", __func__, node->st->scope_id, node->st->depth);
-    Symbol_table *st = find_scope(node);
-    Symbol *s;
-    bool found = false;
-    while (!found)
-    {
-        DBG_PRINT("Searching in scope id:%d depth:%d\n", st->scope_id, st->depth);
-        for (s = st->symbols; s; s = s->next)
-        {
-            DBG_PRINT("Ident:%s\n", s->name);
-            if (!strcmp(name, s->name)) { found = true; break; }
-        }
-        if (found) break;
-        DBG_PRINT("Not found, going to enclosing scope\n");
-        if (st->parent) st = st->parent;
-    }
-    if (!found)
+    Symbol *s = find_symbol_st(find_scope(node), name, NS_IDENT);
+    if (!s)
         error("Symbol %s not found!\n", name);
-    if (s->kind == SYM_STATIC_LOCAL || !st->depth)
+    if (s->kind == SYM_STATIC_LOCAL || s->kind == SYM_GLOBAL || s->kind == SYM_STATIC_GLOBAL || s->kind == SYM_EXTERN)
         return (LocalAddr){ -1, false };
     DBG_PRINT(";find_local_addr ident:%s got offset %d\n", name, s->offset & 0xffff);
     return (LocalAddr){ s->offset, s->kind == SYM_PARAM };

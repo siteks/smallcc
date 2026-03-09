@@ -3,44 +3,50 @@
 #include "mycc.h"
 
 // Type system context instance
-TypeContext type_ctx;
+TypeContext    type_ctx;
 
-static int next_scope_id = 0;
+static int     next_scope_id = 0;
 
 // Legacy pointer aliases for convenience (these still work because macros define t_*)
 
-Symbol *insert_tag(Symbol_table *st, char *ident);
+Symbol        *insert_tag(Symbol_table *st, char *ident);
 static Symbol *insert_typedef(Node *node, Type *type, const char *ident);
 static Symbol *new_symbol(Type *type, const char *ident, int offset);
 static Symbol *insert_ident(Node *node, Type *type, const char *ident, bool is_param, StorageClass sclass);
-static Type  *generate_struct_type(Node *decl_node, DeclParseState ds, int depth);
-Symbol_table *find_scope(Node *node);
-static Type  *type_from_declarator(Node *decl, Type *base);
-static Type  *type_from_direct_decl(Node *dd, Type *base);
-static Type  *typespec_to_base(Decl_spec typespec);
+static Type   *generate_struct_type(Node *decl_node, DeclParseState ds, int depth);
+Symbol_table  *find_scope(Node *node);
+static Type   *type_from_declarator(Node *decl, Type *base);
+static Type   *type_from_direct_decl(Node *dd, Type *base);
+static Type   *typespec_to_base(Decl_spec typespec);
 
 // ---------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------
-static int do_align(int val, int size)
+static int     do_align(int val, int size)
 {
-    return (val + (size-1)) & ~(size-1);
+    return (val + (size - 1)) & ~(size - 1);
 }
 
 static void append_symbol(Symbol **head, Symbol *sym)
 {
     Symbol *s = *head, *ls = NULL;
-    for (; s; s = s->next) ls = s;
-    if (!ls) *head = sym;
-    else     ls->next = sym;
+    for (; s; s = s->next)
+        ls = s;
+    if (!ls)
+        *head = sym;
+    else
+        ls->next = sym;
 }
 
 static void append_type(Type *t)
 {
     Type *last = 0;
-    for (Type *p = type_ctx.type_list; p; p = p->next) last = p;
-    if (last) last->next = t;
-    else       type_ctx.type_list = t;
+    for (Type *p = type_ctx.type_list; p; p = p->next)
+        last = p;
+    if (last)
+        last->next = t;
+    else
+        type_ctx.type_list = t;
 }
 
 // ---------------------------------------------------------------
@@ -55,19 +61,44 @@ Type *get_basic_type(Type_base base)
 
     Type *t = arena_alloc(sizeof(Type));
     t->base = base;
-    switch (base) {
-        case TB_VOID:              t->size = 0; t->align = 1; break;
-        case TB_CHAR:
-        case TB_UCHAR:             t->size = 1; t->align = 1; break;
-        case TB_SHORT:
-        case TB_USHORT:            t->size = 2; t->align = 2; break;
-        case TB_INT:
-        case TB_UINT:              t->size = 2; t->align = 2; break;
-        case TB_LONG:
-        case TB_ULONG:             t->size = 4; t->align = 4; break;
-        case TB_FLOAT:             t->size = 4; t->align = 4; break;
-        case TB_DOUBLE:            t->size = 4; t->align = 4; break;
-        default:                    t->size = 2; t->align = 2; break;
+    switch (base)
+    {
+    case TB_VOID:
+        t->size  = 0;
+        t->align = 1;
+        break;
+    case TB_CHAR:
+    case TB_UCHAR:
+        t->size  = 1;
+        t->align = 1;
+        break;
+    case TB_SHORT:
+    case TB_USHORT:
+        t->size  = 2;
+        t->align = 2;
+        break;
+    case TB_INT:
+    case TB_UINT:
+        t->size  = 2;
+        t->align = 2;
+        break;
+    case TB_LONG:
+    case TB_ULONG:
+        t->size  = 4;
+        t->align = 4;
+        break;
+    case TB_FLOAT:
+        t->size  = 4;
+        t->align = 4;
+        break;
+    case TB_DOUBLE:
+        t->size  = 4;
+        t->align = 4;
+        break;
+    default:
+        t->size  = 2;
+        t->align = 2;
+        break;
     }
     append_type(t);
     return t;
@@ -79,11 +110,11 @@ Type *get_pointer_type(Type *pointee)
         if (p->base == TB_POINTER && p->u.ptr.pointee == pointee)
             return p;
 
-    Type *t = arena_alloc(sizeof(Type));
-    t->base = TB_POINTER;
+    Type *t          = arena_alloc(sizeof(Type));
+    t->base          = TB_POINTER;
     t->u.ptr.pointee = pointee;
-    t->size  = 2;
-    t->align = 2;
+    t->size          = 2;
+    t->align         = 2;
     append_type(t);
     return t;
 }
@@ -94,12 +125,12 @@ Type *get_array_type(Type *elem, int count)
         if (p->base == TB_ARRAY && p->u.arr.elem == elem && p->u.arr.count == count)
             return p;
 
-    Type *t = arena_alloc(sizeof(Type));
-    t->base = TB_ARRAY;
+    Type *t        = arena_alloc(sizeof(Type));
+    t->base        = TB_ARRAY;
     t->u.arr.elem  = elem;
     t->u.arr.count = count;
-    t->size  = elem->size * count;
-    t->align = elem->align;
+    t->size        = elem->size * count;
+    t->align       = elem->align;
     append_type(t);
     return t;
 }
@@ -108,7 +139,8 @@ static bool params_match(Param *a, Param *b)
 {
     while (a && b)
     {
-        if (a->type != b->type) return false;
+        if (a->type != b->type)
+            return false;
         a = a->next;
         b = b->next;
     }
@@ -118,17 +150,17 @@ static bool params_match(Param *a, Param *b)
 Type *get_function_type(Type *ret, Param *params, bool is_variadic)
 {
     for (Type *p = type_ctx.type_list; p; p = p->next)
-        if (p->base == TB_FUNCTION && p->u.fn.ret == ret && p->u.fn.is_variadic == is_variadic
-            && params_match(p->u.fn.params, params))
+        if (p->base == TB_FUNCTION && p->u.fn.ret == ret && p->u.fn.is_variadic == is_variadic &&
+            params_match(p->u.fn.params, params))
             return p;
 
-    Type *t = arena_alloc(sizeof(Type));
-    t->base = TB_FUNCTION;
+    Type *t             = arena_alloc(sizeof(Type));
+    t->base             = TB_FUNCTION;
     t->u.fn.ret         = ret;
     t->u.fn.params      = params;
     t->u.fn.is_variadic = is_variadic;
-    t->size  = 2;
-    t->align = 2;
+    t->size             = 2;
+    t->align            = 2;
     append_type(t);
     return t;
 }
@@ -139,8 +171,8 @@ Type *get_struct_type(Symbol *tag, Field *members, bool is_union)
         if (p->base == TB_STRUCT && p->u.composite.tag == tag)
             return p;
 
-    Type *t = arena_alloc(sizeof(Type));
-    t->base = TB_STRUCT;
+    Type *t                 = arena_alloc(sizeof(Type));
+    t->base                 = TB_STRUCT;
     t->u.composite.tag      = tag;
     t->u.composite.members  = members;
     t->u.composite.is_union = is_union;
@@ -153,7 +185,7 @@ Type *get_enum_type(Symbol *tag)
     for (Type *p = type_ctx.type_list; p; p = p->next)
         if (p->base == TB_ENUM && p->u.enu.tag == tag)
             return p;
-    Type *t     = arena_alloc(sizeof(Type));
+    Type *t      = arena_alloc(sizeof(Type));
     t->base      = TB_ENUM;
     t->u.enu.tag = tag;
     t->size      = 2;
@@ -189,7 +221,7 @@ static Type *type_from_direct_decl(Node *dd, Type *base)
 
     // Collect suffixes for right-to-left processing
     Node *suf[32];
-    int nsuf = 0;
+    int   nsuf = 0;
     for (Node *s = dd->u.direct_decl.suffixes; s; s = s->next)
         suf[nsuf++] = s;
 
@@ -201,13 +233,14 @@ static Type *type_from_direct_decl(Node *dd, Type *base)
         if (s->kind == ND_ARRAY_DECL)
         {
             int count = (s->u.array_decl.size && s->u.array_decl.size->kind == ND_LITERAL)
-                        ? (int)s->u.array_decl.size->u.literal.ival : 0;
-            t = get_array_type(t, count);
+                            ? (int)s->u.array_decl.size->u.literal.ival
+                            : 0;
+            t         = get_array_type(t, count);
         }
         else if (s->kind == ND_FUNC_DECL)
         {
             bool variadic = s->u.func_decl.params && s->u.func_decl.params->u.ptype_list.is_variadic;
-            t = get_function_type(t, NULL, variadic);
+            t             = get_function_type(t, NULL, variadic);
         }
     }
 
@@ -222,26 +255,40 @@ static Type *type_from_direct_decl(Node *dd, Type *base)
 // ---------------------------------------------------------------
 static Type *typespec_to_base(Decl_spec typespec)
 {
-    switch ((int)typespec) {
-        case DS_VOID:                           return t_void;
-        case DS_CHAR:
-        case DS_SIGNED|DS_CHAR:                 return t_char;
-        case DS_UNSIGNED|DS_CHAR:               return t_uchar;
-        case DS_SHORT:
-        case DS_SIGNED|DS_SHORT:                return t_short;
-        case DS_UNSIGNED|DS_SHORT:              return t_ushort;
-        case DS_INT:
-        case DS_SIGNED|DS_INT:
-        case DS_SIGNED:                         return t_int;
-        case DS_UNSIGNED|DS_INT:
-        case DS_UNSIGNED:                       return t_uint;
-        case DS_LONG:
-        case DS_SIGNED|DS_LONG:                 return t_long;
-        case DS_UNSIGNED|DS_LONG:               return t_ulong;
-        case DS_FLOAT:                          return t_float;
-        case DS_DOUBLE:                         return t_double;
-        case DS_ENUM:                           return t_int;
-        default:                                return t_int;
+    switch ((int)typespec)
+    {
+    case DS_VOID:
+        return t_void;
+    case DS_CHAR:
+    case DS_SIGNED | DS_CHAR:
+        return t_char;
+    case DS_UNSIGNED | DS_CHAR:
+        return t_uchar;
+    case DS_SHORT:
+    case DS_SIGNED | DS_SHORT:
+        return t_short;
+    case DS_UNSIGNED | DS_SHORT:
+        return t_ushort;
+    case DS_INT:
+    case DS_SIGNED | DS_INT:
+    case DS_SIGNED:
+        return t_int;
+    case DS_UNSIGNED | DS_INT:
+    case DS_UNSIGNED:
+        return t_uint;
+    case DS_LONG:
+    case DS_SIGNED | DS_LONG:
+        return t_long;
+    case DS_UNSIGNED | DS_LONG:
+        return t_ulong;
+    case DS_FLOAT:
+        return t_float;
+    case DS_DOUBLE:
+        return t_double;
+    case DS_ENUM:
+        return t_int;
+    default:
+        return t_int;
     }
 }
 
@@ -251,13 +298,20 @@ static Type *typespec_to_base(Decl_spec typespec)
 Type *type2_from_decl_node(Node *node, DeclParseState ds)
 {
     Type *base;
-    if (ds.typespec & DS_TYPEDEF) {
+    if (ds.typespec & DS_TYPEDEF)
+    {
         base = ds.typedef_type;
-    } else if (ds.typespec & (DS_STRUCT | DS_UNION)) {
+    }
+    else if (ds.typespec & (DS_STRUCT | DS_UNION))
+    {
         base = (node->type && node->type != t_void) ? node->type : t_void;
-    } else if (ds.typespec & DS_ENUM) {
+    }
+    else if (ds.typespec & DS_ENUM)
+    {
         base = (node->type && node->type->base == TB_ENUM) ? node->type : t_int;
-    } else {
+    }
+    else
+    {
         base = typespec_to_base(ds.typespec);
     }
     // A declarator may be present (type_name() for casts/sizeof builds ND_DECLARATION
@@ -274,50 +328,102 @@ Type *type2_from_decl_node(Node *node, DeclParseState ds)
 int array_dimensions(Type *t)
 {
     int d = 0;
-    while (t && t->base == TB_ARRAY) { d++; t = t->u.arr.elem; }
+    while (t && t->base == TB_ARRAY)
+    {
+        d++;
+        t = t->u.arr.elem;
+    }
     return d;
 }
 
 Type *array_elem_type(Type *t)
 {
-    while (t && t->base == TB_ARRAY) t = t->u.arr.elem;
+    while (t && t->base == TB_ARRAY)
+        t = t->u.arr.elem;
     return t;
 }
 
 Type *elem_type(Type *t)
 {
-    if (!t) return 0;
-    if (t->base == TB_ARRAY)   return t->u.arr.elem;
-    if (t->base == TB_POINTER) return t->u.ptr.pointee;
+    if (!t)
+        return 0;
+    if (t->base == TB_ARRAY)
+        return t->u.arr.elem;
+    if (t->base == TB_POINTER)
+        return t->u.ptr.pointee;
     return t;
 }
 
 // ---------------------------------------------------------------
 // Type checks
 // ---------------------------------------------------------------
-bool istype_float(Type *t)    { return t && t->base == TB_FLOAT; }
-bool istype_double(Type *t)   { return t && t->base == TB_DOUBLE; }
-bool istype_fp(Type *t)       { return istype_float(t) || istype_double(t); }
-bool istype_char(Type *t)     { return t && t->base == TB_CHAR; }
-bool istype_uchar(Type *t)    { return t && t->base == TB_UCHAR; }
-bool istype_short(Type *t)    { return t && t->base == TB_SHORT; }
-bool istype_ushort(Type *t)   { return t && t->base == TB_USHORT; }
-bool istype_enum(Type *t)     { return t && t->base == TB_ENUM; }
-bool istype_int(Type *t)      { return t && t->base == TB_INT; }
-bool istype_uint(Type *t)     { return t && t->base == TB_UINT; }
-bool istype_long(Type *t)     { return t && t->base == TB_LONG; }
-bool istype_ulong(Type *t)    { return t && t->base == TB_ULONG; }
-bool istype_ptr(Type *t)      { return t && t->base == TB_POINTER; }
-bool istype_array(Type *t)    { return t && t->base == TB_ARRAY; }
-bool istype_function(Type *t) { return t && t->base == TB_FUNCTION; }
+bool istype_float(Type *t)
+{
+    return t && t->base == TB_FLOAT;
+}
+bool istype_double(Type *t)
+{
+    return t && t->base == TB_DOUBLE;
+}
+bool istype_fp(Type *t)
+{
+    return istype_float(t) || istype_double(t);
+}
+bool istype_char(Type *t)
+{
+    return t && t->base == TB_CHAR;
+}
+bool istype_uchar(Type *t)
+{
+    return t && t->base == TB_UCHAR;
+}
+bool istype_short(Type *t)
+{
+    return t && t->base == TB_SHORT;
+}
+bool istype_ushort(Type *t)
+{
+    return t && t->base == TB_USHORT;
+}
+bool istype_enum(Type *t)
+{
+    return t && t->base == TB_ENUM;
+}
+bool istype_int(Type *t)
+{
+    return t && t->base == TB_INT;
+}
+bool istype_uint(Type *t)
+{
+    return t && t->base == TB_UINT;
+}
+bool istype_long(Type *t)
+{
+    return t && t->base == TB_LONG;
+}
+bool istype_ulong(Type *t)
+{
+    return t && t->base == TB_ULONG;
+}
+bool istype_ptr(Type *t)
+{
+    return t && t->base == TB_POINTER;
+}
+bool istype_array(Type *t)
+{
+    return t && t->base == TB_ARRAY;
+}
+bool istype_function(Type *t)
+{
+    return t && t->base == TB_FUNCTION;
+}
 bool istype_intlike(Type *t)
 {
-    if (!t) return false;
-    return t->base == TB_CHAR  || t->base == TB_UCHAR
-        || t->base == TB_SHORT || t->base == TB_USHORT
-        || t->base == TB_INT   || t->base == TB_UINT
-        || t->base == TB_LONG  || t->base == TB_ULONG
-        || t->base == TB_ENUM;
+    if (!t)
+        return false;
+    return t->base == TB_CHAR || t->base == TB_UCHAR || t->base == TB_SHORT || t->base == TB_USHORT ||
+           t->base == TB_INT || t->base == TB_UINT || t->base == TB_LONG || t->base == TB_ULONG ||
+           t->base == TB_ENUM;
 }
 
 // ---------------------------------------------------------------
@@ -332,19 +438,21 @@ void reset_types_state(void)
     Symbol *prev = type_ctx.symbol_table ? type_ctx.symbol_table->symbols : NULL;
     for (Symbol *s = prev; s; s = s->next)
     {
-        if (s->ns != NS_IDENT || s->kind != SYM_EXTERN) continue;
+        if (s->ns != NS_IDENT || s->kind != SYM_EXTERN)
+            continue;
         *tail = s;
         tail  = &s->next;
     }
-    if (carry) *tail = NULL;
+    if (carry)
+        *tail = NULL;
 
     type_ctx.symbol_table          = arena_alloc(sizeof(Symbol_table));
     type_ctx.symbol_table->symbols = carry;
-    type_ctx.curr_scope_st     = type_ctx.symbol_table;
-    type_ctx.last_symbol_table = type_ctx.symbol_table;
-    type_ctx.scope_depth       = 0;
-    type_ctx.scope_count       = 0;
-    next_scope_id              = 0;
+    type_ctx.curr_scope_st         = type_ctx.symbol_table;
+    type_ctx.last_symbol_table     = type_ctx.symbol_table;
+    type_ctx.scope_depth           = 0;
+    type_ctx.scope_count           = 0;
+    next_scope_id                  = 0;
 }
 
 void insert_extern_sym(const char *name, Type *type)
@@ -359,11 +467,11 @@ void insert_extern_sym(const char *name, Type *type)
         }
     }
     // Not present — add a new extern entry (e.g. injected from outside).
-    Symbol *sym  = arena_alloc(sizeof(Symbol));
-    sym->name    = name;
-    sym->type    = type;
-    sym->kind    = SYM_EXTERN;
-    sym->ns      = NS_IDENT;
+    Symbol *sym = arena_alloc(sizeof(Symbol));
+    sym->name   = name;
+    sym->type   = type;
+    sym->kind   = SYM_EXTERN;
+    sym->ns     = NS_IDENT;
     append_symbol(&type_ctx.symbol_table->symbols, sym);
 }
 
@@ -373,7 +481,8 @@ void insert_extern_sym(const char *name, Type *type)
 static void insert_builtin(char *name, Type *type)
 {
     for (Symbol *s = type_ctx.symbol_table->symbols; s; s = s->next)
-        if (s->ns == NS_IDENT && !strcmp(s->name, name)) return;
+        if (s->ns == NS_IDENT && !strcmp(s->name, name))
+            return;
     Symbol *sym = arena_alloc(sizeof(Symbol));
     sym->name   = name;
     sym->type   = type;
@@ -408,10 +517,13 @@ void make_basic_types()
 // ---------------------------------------------------------------
 int find_offset(Type *t, char *field, Type **it)
 {
-    if (!t || t->base != TB_STRUCT) return -1;
+    if (!t || t->base != TB_STRUCT)
+        return -1;
     *it = 0;
-    for (Field *f = t->u.composite.members; f; f = f->next) {
-        if (f->name && !strcmp(field, f->name)) {
+    for (Field *f = t->u.composite.members; f; f = f->next)
+    {
+        if (f->name && !strcmp(field, f->name))
+        {
             *it = f->type;
             return f->offset;
         }
@@ -424,19 +536,25 @@ int find_offset(Type *t, char *field, Type **it)
 // ---------------------------------------------------------------
 static void calc_struct_layout(Type *st)
 {
-    int off = 0;
+    int off       = 0;
     int max_align = 1;
-    for (Field *f = st->u.composite.members; f; f = f->next) {
+    for (Field *f = st->u.composite.members; f; f = f->next)
+    {
         int al = f->type->align ? f->type->align : 1;
-        if (st->u.composite.is_union) {
+        if (st->u.composite.is_union)
+        {
             f->offset = 0;
-            if (f->type->size > off) off = f->type->size;
-        } else {
-            off = do_align(off, al);
+            if (f->type->size > off)
+                off = f->type->size;
+        }
+        else
+        {
+            off       = do_align(off, al);
             f->offset = off;
             off += f->type->size;
         }
-        if (al > max_align) max_align = al;
+        if (al > max_align)
+            max_align = al;
     }
     st->align = max_align;
     st->size  = st->u.composite.is_union ? off : do_align(off, max_align);
@@ -452,9 +570,10 @@ static Type *generate_struct_type(Node *decl_node, DeclParseState ds, int depth)
     if (!struct_node || struct_node->kind != ND_STRUCT)
         error("Should be struct declaration!\n");
 
-    char *tagname = struct_node->u.struct_spec.tag->u.ident.name;
-    Symbol *tag = find_symbol_st(decl_node->st, tagname, NS_TAG);
-    if (!tag) {
+    char   *tagname = struct_node->u.struct_spec.tag->u.ident.name;
+    Symbol *tag     = find_symbol_st(decl_node->st, tagname, NS_TAG);
+    if (!tag)
+    {
 #ifdef DEBUG_ENABLED
         print_type_table();
         print_symbol_table(type_ctx.symbol_table, 0);
@@ -462,56 +581,66 @@ static Type *generate_struct_type(Node *decl_node, DeclParseState ds, int depth)
         error("Tag %s not found\n", tagname);
     }
 
-    if (tag->type == t_void) {
+    if (tag->type == t_void)
+    {
         // Build Field list from struct member declarations
         DBG_PRINT("%s defining struct %s\n", __func__, tagname);
-        Field *fields   = NULL;
+        Field  *fields   = NULL;
         Field **last_ptr = &fields;
 
-        for (Node *d = struct_node->u.struct_spec.members; d; d = d->next) {
-            if (d->kind != ND_DECLARATION) continue;
+        for (Node *d = struct_node->u.struct_spec.members; d; d = d->next)
+        {
+            if (d->kind != ND_DECLARATION)
+                continue;
 
-            bool has_nested_struct = (d->u.declaration.spec != NULL
-                                      && d->u.declaration.spec->kind == ND_STRUCT
-                                      && d->u.declaration.spec->u.struct_spec.members != NULL);
+            bool has_nested_struct =
+                (d->u.declaration.spec != NULL && d->u.declaration.spec->kind == ND_STRUCT &&
+                 d->u.declaration.spec->u.struct_spec.members != NULL);
 
-            for (Node *m = d->u.declaration.decls; m; m = m->next) {
-                if (m->kind != ND_DECLARATOR) continue;
+            for (Node *m = d->u.declaration.decls; m; m = m->next)
+            {
+                if (m->kind != ND_DECLARATOR)
+                    continue;
 
                 Type *base;
-                if (d->u.declaration.typespec & (DS_STRUCT | DS_UNION)) {
-                    if (has_nested_struct) {
-                        DeclParseState member_ds = {0};
-                        member_ds.typespec = d->u.declaration.typespec;
-                        member_ds.sclass = d->u.declaration.sclass;
-                        base = generate_struct_type(d, member_ds, depth + 1);
-                    } else {
-                        Node *sn   = d->u.declaration.spec;
-                        char *stag = sn->u.struct_spec.tag->u.ident.name;
-                        Symbol *stag_sym = find_symbol_st(d->st, stag, NS_TAG);
-                        base = (stag_sym && stag_sym->type) ? stag_sym->type : t_void;
+                if (d->u.declaration.typespec & (DS_STRUCT | DS_UNION))
+                {
+                    if (has_nested_struct)
+                    {
+                        DeclParseState member_ds = { 0 };
+                        member_ds.typespec       = d->u.declaration.typespec;
+                        member_ds.sclass         = d->u.declaration.sclass;
+                        base                     = generate_struct_type(d, member_ds, depth + 1);
                     }
-                } else {
+                    else
+                    {
+                        Node   *sn       = d->u.declaration.spec;
+                        char   *stag     = sn->u.struct_spec.tag->u.ident.name;
+                        Symbol *stag_sym = find_symbol_st(d->st, stag, NS_TAG);
+                        base             = (stag_sym && stag_sym->type) ? stag_sym->type : t_void;
+                    }
+                }
+                else
+                {
                     base = typespec_to_base(d->u.declaration.typespec);
                 }
 
-                Type *mty  = type_from_declarator(m, base);
+                Type       *mty   = type_from_declarator(m, base);
                 const char *fname = get_decl_ident(m);
 
-                Field *f    = arena_alloc(sizeof(Field));
-                f->name     = fname ? arena_strdup(fname) : "";
-                f->type     = mty;
-                *last_ptr   = f;
-                last_ptr    = &f->next;
+                Field      *f     = arena_alloc(sizeof(Field));
+                f->name           = fname ? arena_strdup(fname) : "";
+                f->type           = mty;
+                *last_ptr         = f;
+                last_ptr          = &f->next;
 
-                DBG_PRINT("%s  member '%s' type %s\n",
-                    __func__, f->name, fulltype_str(mty));
+                DBG_PRINT("%s  member '%s' type %s\n", __func__, f->name, fulltype_str(mty));
             }
         }
 
         // Create struct Type entry
-        Type *st   = arena_alloc(sizeof(Type));
-        st->base    = TB_STRUCT;
+        Type *st                 = arena_alloc(sizeof(Type));
+        st->base                 = TB_STRUCT;
         st->u.composite.tag      = tag;
         st->u.composite.members  = fields;
         st->u.composite.is_union = !!(ds.typespec & DS_UNION);
@@ -519,8 +648,9 @@ static Type *generate_struct_type(Node *decl_node, DeclParseState ds, int depth)
         append_type(st);
         tag->type = st;
         return st;
-
-    } else if (struct_node->u.struct_spec.members != NULL) {
+    }
+    else if (struct_node->u.struct_spec.members != NULL)
+    {
         error("Redefinition of tag %s\n", tagname);
     }
     DBG_PRINT("%s referencing existing struct %s\n", __func__, tagname);
@@ -541,78 +671,97 @@ void add_types_and_symbols(Node *node, DeclParseState ds, bool is_param, int dep
     node->u.declaration.sclass   = ds.sclass;
 
     // First pass: handle struct definitions and determine base type
-    Node *spec = node->u.declaration.spec;
-    if (spec && spec->kind == ND_STRUCT) {
-        bool has_body = (spec->u.struct_spec.members != NULL);
+    Node *spec                   = node->u.declaration.spec;
+    if (spec && spec->kind == ND_STRUCT)
+    {
+        bool has_body   = (spec->u.struct_spec.members != NULL);
         bool standalone = (node->u.declaration.decls == NULL);
-        if (!has_body) {
-            if (standalone) {
+        if (!has_body)
+        {
+            if (standalone)
+            {
                 // Standalone incomplete struct (e.g. "struct foo;")
                 DBG_PRINT("%s incomplete struct\n", __func__);
-                Type *t    = generate_struct_type(node, ds, 0);
-                if (spec->symbol) spec->symbol->type = t;
-                node->type  = t;
-            } else {
-                // "struct foo" as type specifier with a declarator
-                Symbol *s   = find_symbol(node, spec->u.struct_spec.tag->u.ident.name, NS_TAG);
-                node->type  = s->type;
+                Type *t = generate_struct_type(node, ds, 0);
+                if (spec->symbol)
+                    spec->symbol->type = t;
+                node->type = t;
             }
-        } else {
+            else
+            {
+                // "struct foo" as type specifier with a declarator
+                Symbol *s  = find_symbol(node, spec->u.struct_spec.tag->u.ident.name, NS_TAG);
+                node->type = s->type;
+            }
+        }
+        else
+        {
             // Full struct definition with body
             spec->symbol = insert_tag(find_scope(node), spec->u.struct_spec.tag->u.ident.name);
-            if (!depth) {
+            if (!depth)
+            {
                 DBG_PRINT("%s creating struct type\n", __func__);
-                Type *t    = generate_struct_type(node, ds, 0);
+                Type *t            = generate_struct_type(node, ds, 0);
                 spec->symbol->type = t;
-                node->type  = t;
+                node->type         = t;
             }
         }
     }
 
     // Determine base type for declarators
     Type *base;
-    if (ds.typespec & DS_TYPEDEF) {
+    if (ds.typespec & DS_TYPEDEF)
+    {
         base = ds.typedef_type ? ds.typedef_type : node->type;
-    } else if (ds.typespec & (DS_STRUCT | DS_UNION)) {
+    }
+    else if (ds.typespec & (DS_STRUCT | DS_UNION))
+    {
         base = (node->type && node->type->base == TB_STRUCT) ? node->type : t_void;
-    } else if (ds.typespec & DS_ENUM) {
+    }
+    else if (ds.typespec & DS_ENUM)
+    {
         base = (node->type && node->type->base == TB_ENUM) ? node->type : t_int;
-    } else {
+    }
+    else
+    {
         base = typespec_to_base(ds.typespec);
     }
 
     // Second pass: process every ND_DECLARATOR child
     bool first_decl = true;
-    for (Node *n = node->u.declaration.decls; n; n = n->next) {
+    for (Node *n = node->u.declaration.decls; n; n = n->next)
+    {
         // Skip declarators when depth > 0: struct/union member symbols are built
         // by generate_struct_type() directly, not by this pass.
         if (n->kind != ND_DECLARATOR || depth)
             continue;
 
         const char *ident = get_decl_ident(n);
-        Type *ty   = type_from_declarator(n, base);
-        DBG_PRINT("%s declarator ident:'%s' type:%s\n",
-            __func__, ident ? ident : "", fulltype_str(ty));
+        Type       *ty    = type_from_declarator(n, base);
+        DBG_PRINT("%s declarator ident:'%s' type:%s\n", __func__, ident ? ident : "", fulltype_str(ty));
         // char s[] = "hello" — fix up zero-size array from string literal init
-        if (ty->base == TB_ARRAY && ty->u.arr.count == 0
-            && n->u.declarator.init && n->u.declarator.init->u.literal.strval)
+        if (ty->base == TB_ARRAY && ty->u.arr.count == 0 && n->u.declarator.init &&
+            n->u.declarator.init->u.literal.strval)
             ty = get_array_type(ty->u.arr.elem, n->u.declarator.init->u.literal.strval_len + 1);
-        if (first_decl) {
+        if (first_decl)
+        {
             node->type = ty;
             first_decl = false;
         }
         DBG_PRINT("%s final type %s\n", __func__, fulltype_str(ty));
 
-        if (ident) {
+        if (ident)
+        {
             if (ds.sclass == SC_TYPEDEF)
                 n->symbol = insert_typedef(node, ty, ident);
             else
                 n->symbol = insert_ident(node, ty, ident, is_param, ds.sclass);
 
             // For struct-typed variables, ensure symbol points to struct type
-            if (node->u.declaration.spec && node->u.declaration.spec->kind == ND_STRUCT) {
+            if (node->u.declaration.spec && node->u.declaration.spec->kind == ND_STRUCT)
+            {
                 DBG_PRINT("%s setting sym type from tag\n", __func__);
-                n->symbol->type = ty;  // ty already wraps struct base
+                n->symbol->type = ty;    // ty already wraps struct base
             }
         }
     }
@@ -629,12 +778,16 @@ Symbol_table *find_scope(Node *node)
 // Probe lookup: walk scope chain from st, return NULL if not found.
 Symbol *find_symbol_st(Symbol_table *st, const char *name, Namespace nspace)
 {
-    for (; st; st = st->parent) {
+    for (; st; st = st->parent)
+    {
         DBG_PRINT("Searching in scope id:%d depth:%d\n", st->scope_id, st->depth);
-        for (Symbol *s = st->symbols; s; s = s->next) {
-            if (s->ns != nspace) continue;
+        for (Symbol *s = st->symbols; s; s = s->next)
+        {
+            if (s->ns != nspace)
+                continue;
             DBG_PRINT("Name:%s\n", s->name);
-            if (!strcmp(name, s->name)) return s;
+            if (!strcmp(name, s->name))
+                return s;
         }
         DBG_PRINT("Not found, going to enclosing scope\n");
     }
@@ -645,33 +798,35 @@ Symbol *find_symbol_st(Symbol_table *st, const char *name, Namespace nspace)
 Symbol *find_symbol(Node *n, const char *name, Namespace nspace)
 {
     Symbol *s = find_symbol_st(find_scope(n), name, nspace);
-    if (!s) {
+    if (!s)
+    {
 #ifdef DEBUG_ENABLED
         print_type_table();
         print_symbol_table(type_ctx.symbol_table, 0);
 #endif
-        error("%s %s not found!\n",
-              nspace == NS_IDENT ? "ident" : nspace == NS_TAG ? "tag" : "label", name);
+        error("%s %s not found!\n", nspace == NS_IDENT ? "ident" : nspace == NS_TAG ? "tag" : "label", name);
     }
     return s;
 }
 
 static Symbol_table *new_st_scope()
 {
-    Symbol_table *nt    = arena_alloc(sizeof(Symbol_table));
-    nt->depth           = type_ctx.scope_depth;
-    nt->scope_type      = ST_COMPSTMT;
-    nt->scope_id        = next_scope_id++;
-    nt->parent          = type_ctx.curr_scope_st;
+    Symbol_table *nt                            = arena_alloc(sizeof(Symbol_table));
+    nt->depth                                   = type_ctx.scope_depth;
+    nt->scope_type                              = ST_COMPSTMT;
+    nt->scope_id                                = next_scope_id++;
+    nt->parent                                  = type_ctx.curr_scope_st;
+    nt->param_offset                            = FRAME_OVERHEAD;
     // Register in flat scope list
     type_ctx.scope_list[type_ctx.scope_count++] = nt;
-    type_ctx.curr_scope_st = nt;
+    type_ctx.curr_scope_st                      = nt;
     return type_ctx.curr_scope_st;
 }
 
 Symbol_table *enter_new_scope(bool use_last_scope)
 {
-    if (use_last_scope) {
+    if (use_last_scope)
+    {
         type_ctx.scope_depth++;
         type_ctx.curr_scope_st = type_ctx.last_symbol_table;
         return type_ctx.last_symbol_table;
@@ -698,7 +853,7 @@ Symbol *insert_tag(Symbol_table *st, char *ident)
             return s;
         }
     Symbol *sym = new_symbol(t_void, ident, 0);
-    sym->ns = NS_TAG;
+    sym->ns     = NS_TAG;
     append_symbol(&st->symbols, sym);
     return sym;
 }
@@ -707,7 +862,7 @@ Symbol *insert_enum_const(Symbol_table *st, Type *ety, char *ident, int value)
 {
     DBG_PRINT("%s %s = %d\n", __func__, ident, value);
     Symbol *sym = new_symbol(ety, ident, value);
-    sym->kind = SYM_ENUM_CONST;
+    sym->kind   = SYM_ENUM_CONST;
     // ns already NS_IDENT from new_symbol
     append_symbol(&st->symbols, sym);
     return sym;
@@ -718,35 +873,114 @@ static Symbol *insert_typedef(Node *node, Type *type, const char *ident)
     DBG_PRINT("%s %s\n", __func__, ident);
     Symbol_table *st = find_scope(node);
     for (Symbol *s = st->symbols; s; s = s->next)
-        if (s->ns == NS_TYPEDEF && !strcmp(s->name, ident)) return s;
+        if (s->ns == NS_TYPEDEF && !strcmp(s->name, ident))
+            return s;
     Symbol *sym = new_symbol(type, ident, 0);
-    sym->ns = NS_TYPEDEF;
+    sym->ns     = NS_TYPEDEF;
     append_symbol(&st->symbols, sym);
     return sym;
 }
 
 bool is_typedef_name(char *name)
 {
-    if (!strcmp(name, "va_list")) return true;
+    if (!strcmp(name, "va_list"))
+        return true;
     return find_symbol_st(type_ctx.curr_scope_st, name, NS_TYPEDEF) != NULL;
 }
 
 Type *find_typedef_type(char *name)
 {
-    if (!strcmp(name, "va_list")) return t_int;
+    if (!strcmp(name, "va_list"))
+        return t_int;
     Symbol *s = find_symbol_st(type_ctx.curr_scope_st, name, NS_TYPEDEF);
-    if (s) return s->type;
+    if (s)
+        return s->type;
     error("typedef '%s' not found\n", name);
     return NULL;
 }
 
 static Symbol *new_symbol(Type *type, const char *ident, int offset)
 {
-    Symbol *n   = arena_alloc(sizeof(Symbol));
-    n->name     = ident;
-    n->type     = type;
-    n->offset   = offset;
-    n->ns       = NS_IDENT;   // default; callers override for NS_TAG/NS_TYPEDEF
+    Symbol *n = arena_alloc(sizeof(Symbol));
+    n->name   = ident;
+    n->type   = type;
+    n->offset = offset;
+    n->ns     = NS_IDENT;    // default; callers override for NS_TAG/NS_TYPEDEF
+    return n;
+}
+
+static Symbol *insert_global_ident(Symbol_table *st, Type *type, const char *ident, StorageClass sclass)
+{
+    // Check for existing entry — dedup for pre-populated externs, upgrade on real definition.
+    for (Symbol *s = st->symbols; s; s = s->next)
+    {
+        if (s->ns != NS_IDENT || strcmp(s->name, ident))
+            continue;
+        if (sclass != SC_EXTERN)
+        {
+            s->type = type;
+            if (!istype_function(type))
+            {
+                s->offset  = st->size;
+                st->size  += type->size;
+            }
+            if (sclass == SC_STATIC)
+            {
+                s->kind     = SYM_STATIC_GLOBAL;
+                s->tu_index = current_global_tu;
+            }
+            else
+            {
+                s->kind = SYM_GLOBAL;
+            }
+        }
+        return s;
+    }
+    // Fresh global symbol
+    bool    is_extern = (sclass == SC_EXTERN);
+    bool    is_fn     = istype_function(type);
+    Symbol *n         = new_symbol(type, ident, (!is_extern && !is_fn) ? st->size : 0);
+    if (!is_extern && !is_fn)
+        st->size += type->size;
+    if (is_extern)
+        n->kind = SYM_EXTERN;
+    else if (sclass == SC_STATIC)
+    {
+        n->kind     = SYM_STATIC_GLOBAL;
+        n->tu_index = current_global_tu;
+    }
+    else
+        n->kind = SYM_GLOBAL;
+    append_symbol(&st->symbols, n);
+    return n;
+}
+
+static Symbol *insert_local_ident(Symbol_table *st, Type *type, const char *ident, bool is_param, StorageClass sclass)
+{
+    if (sclass == SC_STATIC)
+    {
+        // Local static: persistent storage in data section, not on the stack.
+        Symbol *n   = new_symbol(type, ident, type_ctx.local_static_counter++);
+        n->kind     = SYM_STATIC_LOCAL;
+        n->tu_index = current_global_tu;
+        append_symbol(&st->symbols, n);
+        return n;
+    }
+    Symbol *n;
+    if (is_param)
+    {
+        n        = new_symbol(type, ident, st->param_offset);
+        n->kind  = SYM_PARAM;
+        st->param_offset += type->size;
+    }
+    else
+    {
+        st->local_offset += type->size;
+        n        = new_symbol(type, ident, st->local_offset);
+        n->kind  = SYM_LOCAL;
+        st->size += type->size;
+    }
+    append_symbol(&st->symbols, n);
     return n;
 }
 
@@ -754,89 +988,9 @@ static Symbol *insert_ident(Node *node, Type *type, const char *ident, bool is_p
 {
     DBG_PRINT("%s %s %s\n", __func__, fulltype_str(type), ident);
     Symbol_table *st = node->st;
-
-    if (st->depth) {
-        if (sclass == SC_STATIC)
-        {
-            // Local static: persistent storage in data section, not on stack.
-            Symbol *n  = new_symbol(type, ident, type_ctx.local_static_counter++);
-            n->kind    = SYM_STATIC_LOCAL;
-            n->tu_index = current_global_tu;
-            // Do NOT increment st->size — not on the stack.
-            append_symbol(&st->symbols, n);
-            return n;
-        }
-    } else {
-        // Global scope — check for existing entry first (dedup for pre-populated externs)
-        for (Symbol *s = st->symbols; s; s = s->next)
-        {
-            if (s->ns != NS_IDENT) continue;
-            if (!strcmp(s->name, ident))
-            {
-                if (sclass != SC_EXTERN)
-                {
-                    // Real definition: upgrade pre-populated extern entry
-                    s->type = type;
-                    if (!istype_function(type))
-                    {
-                        s->offset  = st->size;
-                        st->size  += type->size;
-                    }
-                    if (sclass == SC_STATIC)
-                    {
-                        s->kind     = SYM_STATIC_GLOBAL;
-                        s->tu_index = current_global_tu;
-                    }
-                    else
-                    {
-                        s->kind = SYM_GLOBAL;
-                    }
-                }
-                return s;
-            }
-        }
-        // Fresh global symbol
-        bool is_extern = (sclass == SC_EXTERN);
-        bool is_fn     = istype_function(type);
-        int  offset    = st->size;
-        if (!is_extern && !is_fn) st->size += type->size;
-        Symbol *n  = new_symbol(type, ident, is_extern || is_fn ? 0 : offset);
-        if (is_extern)
-        {
-            n->kind = SYM_EXTERN;
-        }
-        else if (sclass == SC_STATIC)
-        {
-            n->kind     = SYM_STATIC_GLOBAL;
-            n->tu_index = current_global_tu;
-        }
-        else
-        {
-            n->kind = SYM_GLOBAL;
-        }
-        append_symbol(&st->symbols, n);
-        return n;
-    }
-    // Local / parameter
-    int offset       = 0;
-    int param_offset = FRAME_OVERHEAD;  // params start above saved lr+bp
-    int last_size    = 0;
-    for (Symbol *s = st->symbols; s; s = s->next) {
-        if (s->ns != NS_IDENT) continue;
-        if (s->kind == SYM_PARAM) {
-            param_offset = s->offset;
-            last_size    = s->type->size;
-        } else if (s->kind == SYM_LOCAL) {
-            offset = s->offset;
-        }
-    }
-    offset       += type->size;
-    param_offset += last_size;
-    if (!is_param) st->size += type->size;
-    Symbol *n  = new_symbol(type, ident, is_param ? param_offset : offset);
-    n->kind    = is_param ? SYM_PARAM : SYM_LOCAL;
-    append_symbol(&st->symbols, n);
-    return n;
+    if (!st->depth)
+        return insert_global_ident(st, type, ident, sclass);
+    return insert_local_ident(st, type, ident, is_param, sclass);
 }
 
 // ---------------------------------------------------------------
@@ -867,44 +1021,70 @@ void finalize_local_offsets(void)
 // ---------------------------------------------------------------
 static char *fts2(Type *t, char *p)
 {
-    if (!t) { p += sprintf(p, "null"); return p; }
-    switch (t->base) {
-        case TB_VOID:     p += sprintf(p, "void");   break;
-        case TB_CHAR:     p += sprintf(p, "char");   break;
-        case TB_UCHAR:    p += sprintf(p, "uchar");  break;
-        case TB_SHORT:    p += sprintf(p, "short");  break;
-        case TB_USHORT:   p += sprintf(p, "ushort"); break;
-        case TB_INT:      p += sprintf(p, "int");    break;
-        case TB_UINT:     p += sprintf(p, "uint");   break;
-        case TB_LONG:     p += sprintf(p, "long");   break;
-        case TB_ULONG:    p += sprintf(p, "ulong");  break;
-        case TB_FLOAT:    p += sprintf(p, "float");  break;
-        case TB_DOUBLE:   p += sprintf(p, "double"); break;
-        case TB_POINTER:
-            p += sprintf(p, "ptr(");
-            p  = fts2(t->u.ptr.pointee, p);
-            p += sprintf(p, ")");
-            break;
-        case TB_ARRAY:
-            p += sprintf(p, "arr[%d](", t->u.arr.count);
-            p  = fts2(t->u.arr.elem, p);
-            p += sprintf(p, ")");
-            break;
-        case TB_FUNCTION:
-            p += sprintf(p, "fn(ret=");
-            p  = fts2(t->u.fn.ret, p);
-            p += sprintf(p, ")");
-            break;
-        case TB_STRUCT:
-            p += sprintf(p, "struct{%s}",
-                t->u.composite.tag ? t->u.composite.tag->name : "anon");
-            break;
-        case TB_ENUM:
-            p += sprintf(p, "enum");
-            break;
-        default:
-            p += sprintf(p, "??? (%d)", t->base);
-            break;
+    if (!t)
+    {
+        p += sprintf(p, "null");
+        return p;
+    }
+    switch (t->base)
+    {
+    case TB_VOID:
+        p += sprintf(p, "void");
+        break;
+    case TB_CHAR:
+        p += sprintf(p, "char");
+        break;
+    case TB_UCHAR:
+        p += sprintf(p, "uchar");
+        break;
+    case TB_SHORT:
+        p += sprintf(p, "short");
+        break;
+    case TB_USHORT:
+        p += sprintf(p, "ushort");
+        break;
+    case TB_INT:
+        p += sprintf(p, "int");
+        break;
+    case TB_UINT:
+        p += sprintf(p, "uint");
+        break;
+    case TB_LONG:
+        p += sprintf(p, "long");
+        break;
+    case TB_ULONG:
+        p += sprintf(p, "ulong");
+        break;
+    case TB_FLOAT:
+        p += sprintf(p, "float");
+        break;
+    case TB_DOUBLE:
+        p += sprintf(p, "double");
+        break;
+    case TB_POINTER:
+        p += sprintf(p, "ptr(");
+        p = fts2(t->u.ptr.pointee, p);
+        p += sprintf(p, ")");
+        break;
+    case TB_ARRAY:
+        p += sprintf(p, "arr[%d](", t->u.arr.count);
+        p = fts2(t->u.arr.elem, p);
+        p += sprintf(p, ")");
+        break;
+    case TB_FUNCTION:
+        p += sprintf(p, "fn(ret=");
+        p = fts2(t->u.fn.ret, p);
+        p += sprintf(p, ")");
+        break;
+    case TB_STRUCT:
+        p += sprintf(p, "struct{%s}", t->u.composite.tag ? t->u.composite.tag->name : "anon");
+        break;
+    case TB_ENUM:
+        p += sprintf(p, "enum");
+        break;
+    default:
+        p += sprintf(p, "??? (%d)", t->base);
+        break;
     }
     return p;
 }
@@ -923,45 +1103,53 @@ void print_type_table()
 {
     DBG_PRINT("------ Type table ------\n");
     for (Type *t = type_ctx.type_list; t; t = t->next)
-        DBG_PRINT("  %016llx %s sz:%d al:%d\n",
-            (unsigned long long)t, fulltype_str(t), t->size, t->align);
+        DBG_PRINT("  %016llx %s sz:%d al:%d\n", (unsigned long long)t, fulltype_str(t), t->size, t->align);
 }
 
 void print_symbol_table(Symbol_table *s, int depth)
 {
-    if (depth == 0) {
+    if (depth == 0)
+    {
         DBG_PRINT("------ Symbol table ------\n");
         DBG_PRINT("Scope: id:%-4d depth:%-4d   0x%04x\n", s->scope_id, s->depth, s->size);
-        for (Symbol *sm = s->symbols; sm; sm = sm->next) {
+        for (Symbol *sm = s->symbols; sm; sm = sm->next)
+        {
             if (sm->ns == NS_TAG)
-                DBG_PRINT("%016llx %-10s tag %s\n",
-                    (unsigned long long)sm->type, sm->name, fulltype_str(sm->type));
+                DBG_PRINT(
+                    "%016llx %-10s tag %s\n", (unsigned long long)sm->type, sm->name, fulltype_str(sm->type));
             else
                 DBG_PRINT("%016llx %-10s global 0x%02x %s\n",
-                    (unsigned long long)sm->type, sm->name,
-                    sm->offset, fulltype_str(sm->type));
+                          (unsigned long long)sm->type,
+                          sm->name,
+                          sm->offset,
+                          fulltype_str(sm->type));
         }
         // Print all scopes from flat list
         for (int i = 0; i < type_ctx.scope_count; i++)
             print_symbol_table(type_ctx.scope_list[i], type_ctx.scope_list[i]->depth);
         return;
     }
-    for (int i = 0; i < depth; i++) DBG_PRINT("  ");
+    for (int i = 0; i < depth; i++)
+        DBG_PRINT("  ");
     DBG_PRINT("Scope: id:%-4d depth:%-4d   0x%04x\n", s->scope_id, s->depth, s->size);
-    for (Symbol *sm = s->symbols; sm; sm = sm->next) {
-        for (int i = 0; i < depth; i++) DBG_PRINT("  ");
+    for (Symbol *sm = s->symbols; sm; sm = sm->next)
+    {
+        for (int i = 0; i < depth; i++)
+            DBG_PRINT("  ");
         if (sm->ns == NS_TAG)
-            DBG_PRINT("%016llx %-10s tag %s\n",
-                (unsigned long long)sm->type, sm->name, fulltype_str(sm->type));
+            DBG_PRINT(
+                "%016llx %-10s tag %s\n", (unsigned long long)sm->type, sm->name, fulltype_str(sm->type));
         else
             DBG_PRINT("%016llx %-10s %s 0x%02x %s\n",
-                (unsigned long long)sm->type, sm->name,
-                sm->kind == SYM_PARAM ? "param" : "local",
-                sm->offset, fulltype_str(sm->type));
+                      (unsigned long long)sm->type,
+                      sm->name,
+                      sm->kind == SYM_PARAM ? "param" : "local",
+                      sm->offset,
+                      fulltype_str(sm->type));
     }
 }
 #else
-#define print_type_table() ((void)0)
+#define print_type_table()           ((void)0)
 #define print_symbol_table(s, depth) ((void)0)
 #endif
 
@@ -975,22 +1163,35 @@ const char *curr_scope_str()
     return buf;
 }
 
-
 Decl_spec to_typespec(Token_kind tk)
 {
-    switch (tk) {
-        case TK_VOID:       return DS_VOID;
-        case TK_CHAR:       return DS_CHAR;
-        case TK_SHORT:      return DS_SHORT;
-        case TK_ENUM:       return DS_ENUM;
-        case TK_INT:        return DS_INT;
-        case TK_LONG:       return DS_LONG;
-        case TK_FLOAT:      return DS_FLOAT;
-        case TK_DOUBLE:     return DS_DOUBLE;
-        case TK_SIGNED:     return DS_SIGNED;
-        case TK_UNSIGNED:   return DS_UNSIGNED;
-        case TK_STRUCT:     return DS_STRUCT;
-        case TK_UNION:      return DS_UNION;
-        default:            return 0;
+    switch (tk)
+    {
+    case TK_VOID:
+        return DS_VOID;
+    case TK_CHAR:
+        return DS_CHAR;
+    case TK_SHORT:
+        return DS_SHORT;
+    case TK_ENUM:
+        return DS_ENUM;
+    case TK_INT:
+        return DS_INT;
+    case TK_LONG:
+        return DS_LONG;
+    case TK_FLOAT:
+        return DS_FLOAT;
+    case TK_DOUBLE:
+        return DS_DOUBLE;
+    case TK_SIGNED:
+        return DS_SIGNED;
+    case TK_UNSIGNED:
+        return DS_UNSIGNED;
+    case TK_STRUCT:
+        return DS_STRUCT;
+    case TK_UNION:
+        return DS_UNION;
+    default:
+        return 0;
     }
 }

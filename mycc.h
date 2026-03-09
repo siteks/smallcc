@@ -294,7 +294,9 @@ struct Symbol_table
     Scope_type      scope_type;  // ST_COMPSTMT or ST_STRUCT
     int             scope_id;    // monotonic ID assigned at creation (for debug)
     Symbol          *symbols;    // unified list: idents + tags + typedefs
-    int             size;
+    int             size;        // total bytes of locals declared in this scope
+    int             local_offset; // running byte offset for the next SYM_LOCAL
+    int             param_offset; // running byte offset for the next SYM_PARAM (init: FRAME_OVERHEAD)
     Symbol_table    *parent;
 };
 
