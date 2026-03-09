@@ -4,16 +4,16 @@ assert() {
     expected="$1"
     input="$2"
     echo "Input is:$input"
-    ./mycc "$input" > tmp.s
-    actual=`./cpu3/sim.py tmp.s |tail -1`
-    # echo $actual
-    final=`echo $actual|awk '{v=int("0x"substr($1,4));if (v>2147483647)v=v-4294967296;print v}'`
+    printf '%s\n' "$input" > _tmp.c
+    ./mycc -o tmp.s _tmp.c
+    actual=`./cpu3/sim.py tmp.s | tail -1`
+    final=`echo $actual | awk '{v=int("0x"substr($1,4));if(v>2147483647)v=v-4294967296;print v}'`
 
     if [[ $final = $expected ]]; then
         echo "$input => $final"
     else
         echo "$input => $expected expected, but got $final - $actual"
-        ./cpu2/sim.py tmp.s -v >error.log
+        ./cpu2/sim.py tmp.s -v > error.log
         exit 1
     fi
 }

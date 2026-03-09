@@ -14,11 +14,12 @@ make test_struct    # Run a specific suite (also: test_init, test_ops, test_logo
 make clean          # Remove binaries and temp files
 ```
 
-Run the compiler directly (output is assembly to stdout):
+Run the compiler directly:
 ```bash
-./mycc "int main(){return 5+3;}"
-./mycc file1.c file2.c > out.s && ./cpu3/sim.py out.s
-./mycc "int main(){return 5+3;}" > tmp.s && ./cpu3/sim.py tmp.s
+echo 'int main(){return 5+3;}' > t.c
+./mycc t.c > out.s && ./cpu3/sim.py out.s          # output to stdout
+./mycc -o out.s t.c && ./cpu3/sim.py out.s          # output to file
+./mycc -o out.s file1.c file2.c && ./cpu3/sim.py out.s  # multi-TU
 ```
 
 Tests use `cpu3/sim.py` to execute generated assembly and check the value left in register `r0`. On test failure, verbose output is written to `error.log`. The test harness is in `test.sh`; individual suites are in `tests/`.
@@ -27,11 +28,13 @@ Tests use `cpu3/sim.py` to execute generated assembly and check the value left i
 
 ## Compiler Architecture
 
-Single-pass C89 subset compiler. Input is a C source string or one or more `.c` files. Assembly is written to stdout.
+C89 subset compiler. Input is one or more `.c` files; assembly is written to stdout or a file specified with `-o`. Usage: `mycc [-o outfile] <source.c> [source2.c ...]`.
 
 ### Compilation Pipeline
 
 ```
+Preamble (ssp / jl main / halt) is emitted once before the per-TU loop.
+
 Per-TU loop [mycc.c]:
   reset_codegen()           [codegen.c]     Clear per-TU codegen state
   reset_parser()            [parser.c]      Clear per-TU parser state
@@ -40,11 +43,13 @@ Per-TU loop [mycc.c]:
   prepopulate_extern_syms() [mycc.c]        Inject globals from previous TUs
   tokenise()                [tokeniser.c]   Token linked list
   program()                 [parser.c]      AST (Node tree)
-  propagate_types()         [parser.c]      Annotate AST nodes with resolved Type*
-  gen_code(node, tu_index)  [codegen.c]     Emit assembly to stdout
+  resolve_symbols(root)     [parser.c]      Set ND_IDENT types via symbol table lookup
+  derive_types(root)        [parser.c]      Propagate types bottom-up through the AST
+  insert_coercions(root)    [parser.c]      Insert ND_CAST / stride-scale nodes
+  finalize_local_offsets()  [types.c]       Compute bp-relative offsets for all locals
+  gen_ir(node, tu_index)    [codegen.c]     Walk AST; build flat IR instruction list
+  backend_emit_asm(ir_head) [backend.c]     Walk IR list; emit assembly text
   harvest_globals()         [mycc.c]        Collect non-static globals for next TU
-
-Preamble (ssp / jl main / halt) is emitted once before the loop.
 ```
 
 Every phase prints debug information to stderr.
@@ -54,16 +59,17 @@ Every phase prints debug information to stderr.
 | File | Role |
 |---|---|
 | `mycc.h` | All shared structs, enums, and function prototypes |
-| `mycc.c` | Entry point; per-TU loop; `ExternSym` table; `harvest_globals`/`prepopulate_extern_syms` |
+| `mycc.c` | Entry point; `-o` arg parsing; per-TU loop; `ExternSym` table; `harvest_globals`/`prepopulate_extern_syms` |
 | `tokeniser.c` | Lexer — produces a `Token` linked list |
-| `parser.c` | Recursive-descent parser — builds AST; also contains `propagate_types` and `check_operands` |
+| `parser.c` | Recursive-descent parser — builds AST; `resolve_symbols`, `derive_types`, `insert_coercions` |
 | `types.c` | Type table, symbol table, struct layout, `add_types_and_symbols`, `reset_types_state`, `insert_extern_sym` |
-| `codegen.c` | AST walk; emits assembly pseudoinstructions; `reset_codegen`; static label mangling |
+| `codegen.c` | AST walk; builds flat IR instruction list (`gen_ir`); `reset_codegen`; static label mangling |
+| `backend.c` | IR → assembly emission (`backend_emit_asm`); `set_asm_out`; retargeting point |
 
 ### Key Target Facts
 
 - 16-bit address space: `int` and pointers are **2 bytes**, `long`/`float`/`double` are **4 bytes**
-- `new_node()` initializes `node->type = t_void` (not NULL) — propagate_types guards use `== t_void`
+- `new_node()` initializes `node->type = t_void` (not NULL) — type-propagation guards use `== t_void`
 - Type singletons (`t_int`, `t_void`, etc.) are interned — use pointer equality for comparison
 - Stack starts at `sp = 0x1000`; grows downward; `enter N` saves lr+bp and allocates N bytes
 

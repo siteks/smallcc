@@ -1,6 +1,6 @@
-# Code Generator (`codegen.c`)
+# Code Generator (`codegen.c`) and Backend (`backend.c`)
 
-Walks the annotated AST and prints assembly instructions to stdout.
+`codegen.c` walks the annotated AST and builds a flat linked list of `IRInst` nodes. `backend.c` then walks that list and emits assembly text to the output file (stdout or `-o` target). This split makes `backend.c` the retargeting point: to support a new CPU, replace `backend_emit_asm` while keeping the IR unchanged.
 
 ## Stack Frame Layout
 
@@ -177,11 +177,13 @@ Casts are no-ops when src and dst have the same size. Otherwise:
 
 **Structs**: `gen_struct_inits` (local) and `gen_struct_mem_inits` (global) write each field; nested structs recurse. Partial initializers leave remaining fields zeroed.
 
-## Three-Pass Code Generation
+## IR Construction (`gen_ir`) and Emission (`backend_emit_asm`)
 
-`gen_code(node, tu_index)` sets `current_tu` then makes three passes over the top-level declaration list for the current TU:
+`gen_ir(node, tu_index)` sets `current_tu` then makes three passes over the top-level declaration list for the current TU, appending `IRInst` nodes to `codegen_ctx.ir_head`:
 
-1. **Pass 1**: emit function definitions (follows the preamble inline in the text area).
-2. **Pass 2**: emit global variable declarations (data area after the code). `extern` declarations and bare function prototypes are skipped (no data emitted). Static globals use the mangled label `_s{tu_index}_{name}`.
-3. **Pass 2b**: emit local static variable data collected during pass 1 (`_ls0:`, `_ls1:` etc.). `local_static_counter` is monotonically increasing across TUs. Labels are assigned at symbol-table build time; data is emitted after all global vars.
-4. **Pass 3**: emit deferred string literal data (`_l0:`, `_l1:` etc.), each as a sequence of `byte` directives followed by a null terminator. The `labels` counter and string literal IDs are monotonically increasing across TUs to prevent collisions.
+1. **Pass 1**: append IR for function definitions (text area).
+2. **Pass 2**: append IR for global variable declarations (data area). `extern` declarations and bare function prototypes are skipped. Static globals use the mangled label `_s{tu_index}_{name}`.
+3. **Pass 2b**: append IR for local static variable data collected during pass 1 (`_ls{id}:` labels). `local_static_counter` is monotonically increasing across TUs; labels are assigned at symbol-table build time.
+4. **Pass 3**: append IR for deferred string literal data (`_l{id}:` labels), each as a sequence of `IR_BYTE` nodes followed by a null terminator. Label IDs are monotonically increasing across TUs.
+
+After `gen_ir` returns, the caller invokes `backend_emit_asm(codegen_ctx.ir_head)` to walk the IR list and write assembly text. An optimisation pass (`optimise_ir`) could be inserted between the two calls.

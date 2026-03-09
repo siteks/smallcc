@@ -1,5 +1,4 @@
 
-#include <sys/stat.h>
 #include "mycc.h"
 
 // ---------------------------------------------------------------
@@ -76,26 +75,35 @@ static void reset_tu(int tu)
 
 int main(int argc, char **argv)
 {
-    if (argc < 2)
+    // Parse -o outfile
+    FILE *out = stdout;
+    int file_start = 1;
+    if (argc >= 3 && strcmp(argv[1], "-o") == 0)
     {
-        fprintf(stderr, "Usage: mycc <source.c> [source2.c ...] | mycc \"C code\"\n");
+        out = fopen(argv[2], "w");
+        if (!out) { perror(argv[2]); return 1; }
+        file_start = 3;
+    }
+
+    if (argc <= file_start)
+    {
+        fprintf(stderr, "Usage: mycc [-o outfile] <source.c> [source2.c ...]\n");
         return 1;
     }
 
-    struct stat st;
-    bool file_mode = (stat(argv[1], &st) == 0 && S_ISREG(st.st_mode));
+    set_asm_out(out);
 
-    int tu_count = file_mode ? (argc - 1) : 1;
+    int tu_count = argc - file_start;
 
     // Preamble emitted exactly once
-    printf(".text=0\n");
-    printf("    ssp     0x1000\n");
-    printf("    jl      main\n");
-    printf("    halt\n");
+    fprintf(out, ".text=0\n");
+    fprintf(out, "    ssp     0x1000\n");
+    fprintf(out, "    jl      main\n");
+    fprintf(out, "    halt\n");
 
     for (int tu = 0; tu < tu_count; tu++)
     {
-        char *source = file_mode ? read_file(argv[tu + 1]) : argv[1];
+        char *source = read_file(argv[file_start + tu]);
 
         reset_tu(tu);
         make_basic_types();
@@ -121,12 +129,13 @@ int main(int argc, char **argv)
         print_type_table();
 #endif
 
-        gen_code(node, tu);
+        gen_ir(node, tu);
+        backend_emit_asm(codegen_ctx.ir_head);
         harvest_globals();
-
-        if (file_mode) free(source);
+        free(source);
     }
 
+    if (out != stdout) fclose(out);
     return 0;
 }
 

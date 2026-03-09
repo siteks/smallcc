@@ -355,10 +355,10 @@ void print_tree(Node *node, int depth);
 void for_each_child(Node *node, void (*fn)(Node *child, void *ctx), void *ctx);
 
 // ---------------------------------------------------------------
-// Code gen
+// Code gen (IR construction)
 // ---------------------------------------------------------------
 
-void gen_code(Node *node, int tu_index);
+void gen_ir(Node *node, int tu_index);
 void reset_codegen(void);
 void gen_preamble(void);
 void gen_pop();
@@ -464,8 +464,8 @@ Symbol *find_symbol_st(Symbol_table *st, const char *name, Namespace nspace);
 // ===============================================================
 // IR (Intermediate Representation)
 // ===============================================================
-// A flat linked list of IRInst nodes is built during AST traversal.
-// ir_emit_asm() walks the list and prints assembly text to stdout.
+// A flat linked list of IRInst nodes is built during AST traversal by gen_ir().
+// backend_emit_asm() walks the list and prints assembly text to the output file.
 
 typedef enum {
     IR_IMM,
@@ -567,7 +567,7 @@ typedef struct CodegenContext {
     // Goto labels
     LabelEntry label_table[64];
     int label_table_size;
-    // IR instruction list (built during gen_*, flushed by ir_emit_asm at end of gen_code)
+    // IR instruction list (built during gen_*, emitted by backend_emit_asm after gen_ir)
     IRInst *ir_head;
     IRInst *ir_tail;
 } CodegenContext;
@@ -593,5 +593,12 @@ extern CodegenContext codegen_ctx;
 
 // Convenience alias used throughout codegen and types.
 #define current_global_tu (type_ctx.current_tu)
+
+// ---------------------------------------------------------------
+// Backend (IR → assembly)
+// ---------------------------------------------------------------
+
+void set_asm_out(FILE *f);
+void backend_emit_asm(IRInst *ir);
 
 #endif

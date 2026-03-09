@@ -33,7 +33,6 @@ static int new_strlit(char *data, int len)
 }
 
 int new_label();
-static void ir_emit_asm(IRInst *ir);
 
 void reset_codegen(void)
 {
@@ -378,108 +377,120 @@ void gen_addr(Node *node)
     else
         error("Expecting lvalue\n");
 }
+typedef enum
+{
+    TC_INVALID = 0,
+    TC_S1,   // char           (1-byte signed)
+    TC_U1,   // uchar          (1-byte unsigned)
+    TC_S2,   // short, int     (2-byte signed)
+    TC_U2,   // ushort, uint, pointer, enum  (2-byte unsigned)
+    TC_S4,   // long           (4-byte signed)
+    TC_U4,   // ulong          (4-byte unsigned)
+    TC_FP,   // float, double  (4-byte IEEE 754)
+} TypeClass;
+
+static const TypeClass type_class_table[] =
+{
+    [TB_VOID]     = TC_INVALID,
+    [TB_CHAR]     = TC_S1,
+    [TB_UCHAR]    = TC_U1,
+    [TB_SHORT]    = TC_S2,
+    [TB_USHORT]   = TC_U2,
+    [TB_INT]      = TC_S2,
+    [TB_UINT]     = TC_U2,
+    [TB_LONG]     = TC_S4,
+    [TB_ULONG]    = TC_U4,
+    [TB_FLOAT]    = TC_FP,
+    [TB_DOUBLE]   = TC_FP,
+    [TB_POINTER]  = TC_U2,
+    [TB_ARRAY]    = TC_INVALID,
+    [TB_FUNCTION] = TC_INVALID,
+    [TB_STRUCT]   = TC_INVALID,
+    [TB_ENUM]     = TC_U2,
+};
+
+typedef enum
+{
+    COP_NOOP = 0,
+    COP_SXB,    // IR_SXB
+    COP_SXW,    // IR_SXW
+    COP_T8,     // push; immw 0xff;   and
+    COP_T16,    // push; immw 0xffff; and
+    COP_ITOF_1, // IR_SXB; IR_ITOF
+    COP_ITOF_2, // IR_SXW; IR_ITOF
+    COP_ITOF_4, // IR_ITOF
+    COP_FTOI_1, // IR_FTOI; push; immw 0xff;   and
+    COP_FTOI_2, // IR_FTOI; push; immw 0xffff; and
+    COP_FTOI_4, // IR_FTOI
+} CastOp;
+
+#define N   COP_NOOP
+#define B   COP_SXB
+#define W   COP_SXW
+#define T8  COP_T8
+#define T16 COP_T16
+#define I1  COP_ITOF_1
+#define I2  COP_ITOF_2
+#define I4  COP_ITOF_4
+#define F1  COP_FTOI_1
+#define F2  COP_FTOI_2
+#define F4  COP_FTOI_4
+
+//                           dst→  INV  S1   U1   S2   U2   S4   U4   FP
+static const CastOp cast_table[8][8] =
+{
+    /* src INV */ {                 N,   N,   N,   N,   N,   N,   N,   N  },
+    /* src S1  */ {                 N,   N,   N,   B,   B,   B,   B,   I1 },
+    /* src U1  */ {                 N,   N,   N,   N,   N,   T16, T16, I1 },
+    /* src S2  */ {                 N,   T8,  T8,  N,   N,   W,   W,   I2 },
+    /* src U2  */ {                 N,   T8,  T8,  N,   N,   T16, T16, I2 },
+    /* src S4  */ {                 N,   T8,  T8,  T16, T16, N,   N,   I4 },
+    /* src U4  */ {                 N,   T8,  T8,  T16, T16, N,   N,   I4 },
+    /* src FP  */ {                 N,   F1,  F1,  F2,  F2,  F4,  F4,  N  },
+};
+
+#undef N
+#undef B
+#undef W
+#undef T8
+#undef T16
+#undef I1
+#undef I2
+#undef I4
+#undef F1
+#undef F2
+#undef F4
+
+static void emit_cast_op(CastOp op)
+{
+    switch (op)
+    {
+    case COP_NOOP:   return;
+    case COP_SXB:    ir_append(IR_SXB,  0, NULL); return;
+    case COP_SXW:    ir_append(IR_SXW,  0, NULL); return;
+    case COP_T8:
+        ir_append(IR_PUSH, 0, NULL); ir_append(IR_IMM, 0xff,   NULL); ir_append(IR_AND, 0, NULL); return;
+    case COP_T16:
+        ir_append(IR_PUSH, 0, NULL); ir_append(IR_IMM, 0xffff, NULL); ir_append(IR_AND, 0, NULL); return;
+    case COP_ITOF_1: ir_append(IR_SXB,  0, NULL); ir_append(IR_ITOF, 0, NULL); return;
+    case COP_ITOF_2: ir_append(IR_SXW,  0, NULL); ir_append(IR_ITOF, 0, NULL); return;
+    case COP_ITOF_4: ir_append(IR_ITOF, 0, NULL); return;
+    case COP_FTOI_1:
+        ir_append(IR_FTOI, 0, NULL); ir_append(IR_PUSH, 0, NULL); ir_append(IR_IMM, 0xff,   NULL); ir_append(IR_AND, 0, NULL); return;
+    case COP_FTOI_2:
+        ir_append(IR_FTOI, 0, NULL); ir_append(IR_PUSH, 0, NULL); ir_append(IR_IMM, 0xffff, NULL); ir_append(IR_AND, 0, NULL); return;
+    case COP_FTOI_4: ir_append(IR_FTOI, 0, NULL); return;
+    }
+}
+
 void gen_cast(Type *src, Type *dst)
 {
-    //                  dest
-    //          uc  c   s   us  e   i   u   l   ul  p   f   d
-    //      uc  .   .   z   z   z   z   z   z   z   z 
-    //      c   .   .   s   s   s   s   s   s   s   s      
-    //  s   s   m   m   .   .   .   .   .   s   s   .        
-    //  s   us  m   m   .   .   .   .   .   z   z   .        
-    //  r   e   m   m   .   .   .   .   .   z   z   .        
-    //  c   i   m   m   .   .   .   .   .   s   s   .        
-    //      u   m   m   .   .   .   .   .   z   z   .        
-    //      l   tm  tm  t   t   t   t   t   .   .   t         
-    //      ul  tm  tm  t   t   t   t   t   .   .   t         
-    //      p   m   m   .   .   .   .   .   z   z   .        
-    //      f                                           .   .
-    //      d                                           .   . 
-
-    // src is in reg
-    // dst is in reg
-
-
-    // Value in reg is in src type, needs to be converted to dst type
-    if (src == dst)
-        return;
-    if (istype_intlike(src) && istype_fp(dst))
-    {
-        if (src->size == 1) ir_append(IR_SXB,   0, NULL);
-        else if (src->size == 2) ir_append(IR_SXW,   0, NULL);
-        ir_append(IR_ITOF,  0, NULL);
-        return;
-    }
-    if (istype_fp(src) && istype_intlike(dst))
-    {
-        ir_append(IR_FTOI,  0, NULL);
-        if (dst->size < 4)
-        {
-            ir_append(IR_PUSH,  0, NULL);
-            ir_append(IR_IMM, dst->size == 1 ? 0xff : 0xffff, NULL);
-            ir_append(IR_AND,   0, NULL);
-        }
-        return;
-    }
-    if (src->size == 1 && dst->size == 1)
-        return;
-    if (src->size == 2 && dst->size == 2)
-        return;
-    if (istype_uchar(src) && dst->size == 2)
-        // Zero extend, assume already zero in top 8 bits
-        return;
-    if (istype_fp(src) && istype_fp(dst))
-        // floats and doubles are the same
-        return;
-    if ((istype_long(src) || istype_ulong(src)) && dst->size == 2)
-    {
-        // Truncate
-        ir_append(IR_PUSH,  0, NULL);
-        ir_append(IR_IMM, 0xffff, NULL);
-        ir_append(IR_AND,   0, NULL);
-        return;
-    }
-    if ((istype_long(src) || istype_ulong(src)) && dst->size == 1)
-    {
-        // Truncate
-        ir_append(IR_PUSH,  0, NULL);
-        ir_append(IR_IMM, 0xff, NULL);
-        ir_append(IR_AND,   0, NULL);
-        return;
-    }
-    if (src->size == 2 && dst->size == 1)
-    {
-        // Mask top 8 bits. 
-        // The high word is first on the stack, highest address (little endian)
-        ir_append(IR_PUSH,  0, NULL);
-        ir_append(IR_IMM, 0xff, NULL);
-        ir_append(IR_AND,   0, NULL);
-        return;
-    }
-    if (istype_char(src) && dst->size == 2)
-    {
-        // Sign extend
-        ir_append(IR_SXB,   0, NULL);
-        return;
-    }
-    if (istype_char(src) && (istype_long(dst) || istype_ulong(dst)))
-    {
-        ir_append(IR_SXB,   0, NULL);
-        return;
-    }
-    if ((istype_short(src) || istype_int(src)) && (istype_long(dst) || istype_ulong(dst)))
-    {
-        ir_append(IR_SXW,   0, NULL);
-        return;
-    }
-    if ((istype_uchar(src) || istype_uint(src) || istype_enum(src) || istype_ptr(src)) 
-        && (istype_long(dst) || istype_ulong(dst)))
-    {
-        // Zero extend
-        ir_append(IR_PUSH,  0, NULL);
-        ir_append(IR_IMM, 0xffff, NULL);
-        ir_append(IR_AND,   0, NULL);
-        return;
-    }
+    if (src == dst) return;
+    TypeClass sc = (src->base < (int)(sizeof type_class_table / sizeof *type_class_table))
+                   ? type_class_table[src->base] : TC_INVALID;
+    TypeClass dc = (dst->base < (int)(sizeof type_class_table / sizeof *type_class_table))
+                   ? type_class_table[dst->base] : TC_INVALID;
+    emit_cast_op(cast_table[sc][dc]);
 }
 // Emit the arithmetic/comparison instruction for binary op `op`.
 // Assumes lhs is already on the stack and rhs is in r0.
@@ -1399,7 +1410,7 @@ void gen_function(Node *node)
     gen_stmt(func_body);
     ir_append(IR_RET,   0, NULL);
 }
-void gen_code(Node *node, int tu_index)
+void gen_ir(Node *node, int tu_index)
 {
 
     // Pass 1: emit function definitions (text area)
@@ -1456,122 +1467,6 @@ void gen_code(Node *node, int tu_index)
         ir_append(IR_ALIGN, 0, NULL);
         ir_append(IR_LABEL, codegen_ctx.strlits[i].id, NULL);
         gen_bytes(codegen_ctx.strlits[i].data, codegen_ctx.strlits[i].len + 1);
-    }
-    ir_emit_asm(codegen_ctx.ir_head);
-}
-
-// -----------------------------------------------------------------------
-// IR backend: walk the IR list and emit assembly text to stdout.
-// -----------------------------------------------------------------------
-
-static const char *ir_opname[] = {
-    [IR_ADD]     = "add",
-    [IR_SUB]     = "sub",
-    [IR_MUL]     = "mul",
-    [IR_DIV]     = "div",
-    [IR_MOD]     = "mod",
-    [IR_LB]      = "lb",
-    [IR_LW]      = "lw",
-    [IR_LL]      = "ll",
-    [IR_SB]      = "sb",
-    [IR_SW]      = "sw",
-    [IR_SL]      = "sl",
-    [IR_RET]     = "ret",
-    [IR_PUSH]    = "push",
-    [IR_PUSHW]   = "pushw",
-    [IR_POP]     = "pop",
-    [IR_POPW]    = "popw",
-    [IR_SXB]     = "sxb",
-    [IR_SXW]     = "sxw",
-    [IR_FADD]    = "fadd",
-    [IR_FSUB]    = "fsub",
-    [IR_FMUL]    = "fmul",
-    [IR_FDIV]    = "fdiv",
-    [IR_ITOF]    = "itof",
-    [IR_FTOI]    = "ftoi",
-    [IR_EQ]      = "eq",
-    [IR_NE]      = "ne",
-    [IR_LT]      = "lt",
-    [IR_LE]      = "le",
-    [IR_GT]      = "gt",
-    [IR_GE]      = "ge",
-    [IR_FLT]     = "flt",
-    [IR_FLE]     = "fle",
-    [IR_FGT]     = "fgt",
-    [IR_FGE]     = "fge",
-    [IR_SHL]     = "shl",
-    [IR_SHR]     = "shr",
-    [IR_AND]     = "and",
-    [IR_OR]      = "or",
-    [IR_XOR]     = "xor",
-    [IR_JLI]     = "jli",
-    [IR_PUTCHAR] = "putchar",
-    [IR_ALIGN]   = "align",
-};
-
-static void ir_emit_asm(IRInst *ir)
-{
-    for (IRInst *p = ir; p; p = p->next)
-    {
-        switch (p->op)
-        {
-        case IR_LABEL:
-            printf("_l%d:\n", p->operand);
-            break;
-        case IR_SYMLABEL:
-            printf("%s:\n", p->sym);
-            break;
-        case IR_COMMENT:
-            printf(";%s\n", p->sym);
-            break;
-        case IR_IMM:
-            if (p->sym)
-            {
-                printf("    immw    %s\n", p->sym);
-            }
-            else
-            {
-                unsigned u = (unsigned)p->operand;
-                printf("    immw    0x%04x\n", u & 0xffff);
-                if (u > 0xffff)
-                    printf("    immwh   0x%04x\n", (u >> 16) & 0xffff);
-            }
-            break;
-        case IR_LEA:
-            printf("    lea     %d\n", p->operand);
-            break;
-        case IR_J:
-            printf("    j       _l%d\n", p->operand);
-            break;
-        case IR_JZ:
-            printf("    jz      _l%d\n", p->operand);
-            break;
-        case IR_JNZ:
-            printf("    jnz     _l%d\n", p->operand);
-            break;
-        case IR_JL:
-            printf("    jl      %s\n", p->sym);
-            break;
-        case IR_ENTER:
-            printf("    enter   %d\n", p->operand);
-            break;
-        case IR_ADJ:
-            printf("    adj     %d\n", p->operand);
-            break;
-        case IR_WORD:
-            if (p->sym)
-                printf("    word    %s\n", p->sym);
-            else
-                printf("    word    0x%04x\n", p->operand & 0xffff);
-            break;
-        case IR_BYTE:
-            printf("    byte    0x%02x\n", p->operand & 0xff);
-            break;
-        default:
-            if (p->op < (int)(sizeof(ir_opname) / sizeof(ir_opname[0])) && ir_opname[p->op])
-                printf("    %s\n", ir_opname[p->op]);
-            break;
-        }
     }
 }
 

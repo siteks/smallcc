@@ -381,14 +381,17 @@ bool istype_intlike(Type *t)  // any integer or pointer type (for pointer arithm
 
 ---
 
-## Per-Translation-Unit Compilation (`mycc.c` + `types.c` + `codegen.c`)
+## Per-Translation-Unit Compilation (`mycc.c` + `types.c` + `codegen.c` + `backend.c`)
 
-The compiler supports true per-TU compilation when invoked with `.c` file arguments. Each file is compiled independently with its own symbol table; the combined assembly is emitted as a single stream to stdout. The assembler resolves all label references, so cross-TU calls work without object files.
+The compiler supports true per-TU compilation. Each file is compiled independently with its own symbol table; the combined assembly is emitted as a single stream. The assembler resolves all label references, so cross-TU calls work without object files.
 
-### Input Modes
+### Invocation
 
-- **String mode** (`./mycc "C code"`): single TU; `tu_index = 0`. Identical to previous behaviour.
-- **File mode** (`./mycc a.c b.c ...`): detected by `fopen(argv[1])` succeeding. One TU per file, compiled in argument order. The preamble is emitted once before the loop.
+```
+mycc [-o outfile] <source.c> [source2.c ...]
+```
+
+Assembly is written to `outfile` when `-o` is given; otherwise to stdout. Each `.c` argument is one translation unit, compiled in argument order. The preamble is emitted once before the per-TU loop.
 
 ### Per-TU State Reset
 
@@ -417,7 +420,7 @@ static ExternSym extern_syms[1024];
 static int       extern_sym_count = 0;
 ```
 
-**`harvest_globals()`** (called after `gen_code`): walks `symbol_table->idents` of the just-compiled TU and appends any symbol that is not `is_static`, not `is_extern_decl`, and not `putchar`. Deduplication prevents double-adding.
+**`harvest_globals()`** (called after `backend_emit_asm`): walks `symbol_table->idents` of the just-compiled TU and appends any symbol that is not `is_static`, not `is_extern_decl`, and not `putchar`. Deduplication prevents double-adding.
 
 **`prepopulate_extern_syms()`** (called before each TU's `program()`): calls `insert_extern_sym()` for each accumulated symbol. This makes previously-defined globals visible to the new TU without requiring explicit `extern` declarations.
 
@@ -425,15 +428,15 @@ static int       extern_sym_count = 0;
 
 ### Static Symbol Mangling
 
-File-scope `static` symbols are TU-private. The label name in emitted assembly is mangled from `foo` to `_s{tu_index}_foo` in three sites in `codegen.c`:
+File-scope `static` symbols are TU-private. The label name is mangled from `foo` to `_s{tu_index}_foo` at three IR-append sites in `codegen.c`:
 
-| Site | Code |
+| Site | IR emitted |
 |---|---|
-| `gen_function` (function label) | `printf("_s%d_%s:\n", fsym->tu_index, fsym->name)` |
-| `gen_callfunction` (direct call) | `gen_jl("_s{tu_index}_{name}")` |
-| `gen_varaddr_from_ident` (global address) | `printf("    immw    _s%d_%s\n", sym->tu_index, sym->name)` |
+| `gen_function` (function label) | `ir_append(IR_SYMLABEL, 0, "_s{tu_index}_{name}")` |
+| `gen_callfunction` (direct call) | `ir_append(IR_JL, 0, "_s{tu_index}_{name}")` |
+| `gen_varaddr_from_ident` (global address) | `ir_append(IR_IMM, 0, "_s{tu_index}_{name}")` |
 
-`is_static` and `tu_index` are set on the `Symbol` by `insert_ident()` in `types.c` when `node->sclass == TK_STATIC` at global scope.
+`backend_emit_asm` in `backend.c` turns these IR nodes into assembly text. `is_static` and `tu_index` are set on the `Symbol` by `insert_ident()` in `types.c` when `node->sclass == TK_STATIC` at global scope.
 
 ### Extern Declaration Handling
 
