@@ -162,7 +162,6 @@ static Node *type_name();
 static Node *assign_expr();
 static Node *expr();
 static Node *stmt();
-static Node *func_def();
 static Node *declarator();
 static Node *init_declarator();
 static Node *declaration(int depth);
@@ -226,9 +225,9 @@ static Node *primary_expr()
 {
     DBG_FUNC_TOKEN(token_ctx.current);
     Node *node;
-    if (token_ctx.current->kind == TK_IDENT && !strcmp(token_ctx.current->val, "va_start"))
+    if (token_ctx.current->kind == TK_VA_START)
     {
-        expect(TK_IDENT);
+        expect(TK_VA_START);
         expect(TK_LPAREN);
         node = new_node(ND_VA_START, NULL, true);
         node->type = t_void;
@@ -238,9 +237,9 @@ static Node *primary_expr()
         expect(TK_RPAREN);
         return node;
     }
-    else if (token_ctx.current->kind == TK_IDENT && !strcmp(token_ctx.current->val, "va_arg"))
+    else if (token_ctx.current->kind == TK_VA_ARG)
     {
-        expect(TK_IDENT);
+        expect(TK_VA_ARG);
         expect(TK_LPAREN);
         node = new_node(ND_VA_ARG, NULL, true);
         node->ch[0] = assign_expr();   // ap
@@ -250,9 +249,9 @@ static Node *primary_expr()
         expect(TK_RPAREN);
         return node;
     }
-    else if (token_ctx.current->kind == TK_IDENT && !strcmp(token_ctx.current->val, "va_end"))
+    else if (token_ctx.current->kind == TK_VA_END)
     {
-        expect(TK_IDENT);
+        expect(TK_VA_END);
         expect(TK_LPAREN);
         node = new_node(ND_VA_END, NULL, true);
         node->type = t_void;
@@ -407,7 +406,10 @@ static Node *unary_expr()
             || token_ctx.current->kind == TK_CONSTFLT
             || token_ctx.current->kind == TK_CHARACTER
             || token_ctx.current->kind == TK_STRING
-            || token_ctx.current->kind == TK_LPAREN)
+            || token_ctx.current->kind == TK_LPAREN
+            || token_ctx.current->kind == TK_VA_START
+            || token_ctx.current->kind == TK_VA_ARG
+            || token_ctx.current->kind == TK_VA_END)
     {
         node = primary_expr();
         if (node->kind == ND_IDENT)
@@ -901,12 +903,6 @@ static Node *param_type_list()
     type_ctx.last_symbol_table = node->symtable;
     return node;
 }
-static Node *constant_expr()
-{
-    // C89 §3.4: constant-expression ::= conditional-expression
-    DBG_FUNC();
-    return cond_expr();
-}
 static Node *direct_decl()
 {
     DBG_FUNC();
@@ -934,7 +930,7 @@ static Node *direct_decl()
             list_append(&node->ch[1], arr);   // suffixes list
             if (token_ctx.current->kind != TK_RBRACKET)
             {
-                arr->ch[0] = constant_expr();  // size
+                arr->ch[0] = cond_expr();  // size
             }
             expect(TK_RBRACKET);
         }
@@ -1458,11 +1454,6 @@ char *node_str(Node *node)
     return buf;
 }
 
-static void call_fn(Node *child, void (*fn)(Node *, void *), void *ctx)
-{
-    if (child) fn(child, ctx);
-}
-
 void for_each_child(Node *node, void (*fn)(Node *child, void *ctx), void *ctx)
 {
     if (!node) return;
@@ -1477,7 +1468,7 @@ void for_each_child(Node *node, void (*fn)(Node *child, void *ctx), void *ctx)
     case ND_FUNC_DECL:
     case ND_STMT:
     case ND_LABELSTMT:
-        call_fn(node->ch[0], fn, ctx);
+        if (node->ch[0]) fn(node->ch[0], ctx);
         return;
 
     // Two-child nodes (ch[0], ch[1], no linked-list children)
@@ -1490,36 +1481,36 @@ void for_each_child(Node *node, void (*fn)(Node *child, void *ctx), void *ctx)
     case ND_SWITCHSTMT:
     case ND_VA_START:
     case ND_DECLARATOR:
-        call_fn(node->ch[0], fn, ctx);
-        call_fn(node->ch[1], fn, ctx);
+        if (node->ch[0]) fn(node->ch[0], ctx);
+        if (node->ch[1]) fn(node->ch[1], ctx);
         return;
 
     // Three-child nodes
     case ND_TERNARY:
     case ND_IFSTMT:
-        call_fn(node->ch[0], fn, ctx);
-        call_fn(node->ch[1], fn, ctx);
-        call_fn(node->ch[2], fn, ctx);
+        if (node->ch[0]) fn(node->ch[0], ctx);
+        if (node->ch[1]) fn(node->ch[1], ctx);
+        if (node->ch[2]) fn(node->ch[2], ctx);
         return;
 
     // Four-child nodes
     case ND_FORSTMT:
-        call_fn(node->ch[0], fn, ctx);
-        call_fn(node->ch[1], fn, ctx);
-        call_fn(node->ch[2], fn, ctx);
-        call_fn(node->ch[3], fn, ctx);
+        if (node->ch[0]) fn(node->ch[0], ctx);
+        if (node->ch[1]) fn(node->ch[1], ctx);
+        if (node->ch[2]) fn(node->ch[2], ctx);
+        if (node->ch[3]) fn(node->ch[3], ctx);
         return;
 
     // UNARYOP: ch[0]=operand, ch[1]=args list (for deref calls)
     case ND_UNARYOP:
-        call_fn(node->ch[0], fn, ctx);
+        if (node->ch[0]) fn(node->ch[0], ctx);
         for (Node *a = node->ch[1]; a; a = a->next)
             fn(a, ctx);
         return;
 
     // MEMBER: ch[0]=base, ch[1]=args list
     case ND_MEMBER:
-        call_fn(node->ch[0], fn, ctx);
+        if (node->ch[0]) fn(node->ch[0], ctx);
         for (Node *a = node->ch[1]; a; a = a->next)
             fn(a, ctx);
         return;
@@ -1570,27 +1561,27 @@ void for_each_child(Node *node, void (*fn)(Node *child, void *ctx), void *ctx)
     }
     // ND_DECLARATION: ch[0]=spec, ch[1]=decls list, ch[2]=func_body
     case ND_DECLARATION:
-        call_fn(node->ch[0], fn, ctx);
+        if (node->ch[0]) fn(node->ch[0], ctx);
         for (Node *c = node->ch[1]; c; c = c->next)
             fn(c, ctx);
-        call_fn(node->ch[2], fn, ctx);
+        if (node->ch[2]) fn(node->ch[2], ctx);
         return;
     // ND_DIRECT_DECL: ch[0]=name, ch[1]=suffixes list
     case ND_DIRECT_DECL:
-        call_fn(node->ch[0], fn, ctx);
+        if (node->ch[0]) fn(node->ch[0], ctx);
         for (Node *c = node->ch[1]; c; c = c->next)
             fn(c, ctx);
         return;
     // ND_STRUCT: ch[0]=tag, ch[1]=members list
     case ND_STRUCT:
-        call_fn(node->ch[0], fn, ctx);
+        if (node->ch[0]) fn(node->ch[0], ctx);
         for (Node *c = node->ch[1]; c; c = c->next)
             fn(c, ctx);
         return;
 
     // ND_TYPE_NAME: ch[0]=decl
     case ND_TYPE_NAME:
-        call_fn(node->ch[0], fn, ctx);
+        if (node->ch[0]) fn(node->ch[0], ctx);
         return;
 
     default:

@@ -76,6 +76,8 @@ typedef enum
     TK_VOID, TK_CHAR, TK_SHORT, TK_INT, TK_LONG,
     TK_FLOAT, TK_DOUBLE, TK_SIGNED, TK_UNSIGNED, TK_STRUCT, TK_UNION, TK_ENUM,
     TK_TYPEDEF, TK_INVALID, TK_ELLIPSIS,
+// Variadic intrinsic keywords
+    TK_VA_START, TK_VA_ARG, TK_VA_END,
 // Pseudo-tokens used in Node.op_kind only; never emitted by the tokeniser
     TK_POST_INC, TK_POST_DEC,
 } Token_kind;
