@@ -483,6 +483,7 @@ static void insert_builtin(char *name, Type *type)
     sym->type   = type;
     sym->offset = 0;
     sym->ns     = NS_IDENT;
+    sym->kind   = SYM_BUILTIN;
     append_symbol(&type_ctx.symbol_table->symbols, sym);
 }
 

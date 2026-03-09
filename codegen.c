@@ -410,7 +410,7 @@ void gen_callfunction_via_deref(Node *node)
 void gen_callfunction(Node *node)
 {
     // putchar(c) is a CPU builtin
-    if (!strcmp(node->symbol->name, "putchar"))
+    if (node->symbol->kind == SYM_BUILTIN)
     {
         if (!node->ch[0] || node->ch[0]->next)
             error("putchar requires exactly 1 argument\n");

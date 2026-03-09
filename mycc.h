@@ -270,6 +270,7 @@ typedef enum {
     SYM_STATIC_LOCAL,  // local-scope static     (immw _ls{id})
     SYM_EXTERN,        // extern decl            (no data allocated)
     SYM_ENUM_CONST,    // enum constant          (offset = integer value)
+    SYM_BUILTIN,       // compiler-pre-declared (putchar etc.)
 } SymbolKind;
 
 struct Symbol
