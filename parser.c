@@ -875,7 +875,7 @@ static Node *param_declaration()
 
     Node *node = make_decl_node(&ds, spec, decls);
     // At this point, we can add the symbols and types to the tables
-    add_types_and_symbols(node, ds, true, 0);
+    add_types_and_symbols(node, ds, true, false);
     return node;
 }
 static Node *param_type_list()
@@ -1127,7 +1127,7 @@ static Node *declaration(int depth)
             if (token_ctx.current->kind == TK_LBRACE)
             {
                 Node *node = make_decl_node(&ds, spec, decls);
-                add_types_and_symbols(node, ds, false, 0);
+                add_types_and_symbols(node, ds, false, false);
                 parser_ctx.current_function = node;
                 // This is the first compound statement of a
                 // function, so we need to use the scope
@@ -1144,7 +1144,7 @@ static Node *declaration(int depth)
     // At this point, we can add the symbols and types to the tables
     // We don't add struct members but we do add tags
     Node *node = make_decl_node(&ds, spec, decls);
-    add_types_and_symbols(node, ds, false, depth);
+    add_types_and_symbols(node, ds, false, depth != 0);
     return node;
 }
 static Node *comp_stmt(bool use_last_scope)

@@ -360,13 +360,9 @@ bool istype_float(Type *t)
 {
     return t && t->base == TB_FLOAT;
 }
-bool istype_double(Type *t)
-{
-    return t && t->base == TB_DOUBLE;
-}
 bool istype_fp(Type *t)
 {
-    return istype_float(t) || istype_double(t);
+    return t && (t->base == TB_FLOAT || t->base == TB_DOUBLE);
 }
 bool istype_char(Type *t)
 {
@@ -667,7 +663,7 @@ static Type *generate_struct_type(Node *decl_node, DeclParseState ds, int depth)
 // ---------------------------------------------------------------
 // add_types_and_symbols
 // ---------------------------------------------------------------
-void add_types_and_symbols(Node *node, DeclParseState ds, bool is_param, int depth)
+void add_types_and_symbols(Node *node, DeclParseState ds, bool is_param, bool is_struct_member)
 {
     DBG_FUNC();
     if (node->kind != ND_DECLARATION)
@@ -705,7 +701,7 @@ void add_types_and_symbols(Node *node, DeclParseState ds, bool is_param, int dep
         {
             // Full struct definition with body
             spec->symbol = insert_tag(node->st, spec->ch[0]->u.ident.name);   // tag name
-            if (!depth)
+            if (!is_struct_member)
             {
                 DBG_PRINT("%s creating struct type\n", __func__);
                 Type *t            = generate_struct_type(node, ds, 0);
@@ -738,9 +734,9 @@ void add_types_and_symbols(Node *node, DeclParseState ds, bool is_param, int dep
     bool first_decl = true;
     for (Node *n = node->ch[1]; n; n = n->next)   // decls list
     {
-        // Skip declarators when depth > 0: struct/union member symbols are built
+        // Skip declarators for struct members: they are built
         // by generate_struct_type() directly, not by this pass.
-        if (n->kind != ND_DECLARATOR || depth)
+        if (n->kind != ND_DECLARATOR || is_struct_member)
             continue;
 
         const char *ident = get_decl_ident(n);

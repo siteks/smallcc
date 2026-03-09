@@ -377,7 +377,6 @@ Node *new_node(Node_kind kind, char *val, bool is_expr);
 
 
 bool istype_float(Type *t);
-bool istype_double(Type *t);
 bool istype_fp(Type *t);      // float or double
 bool istype_char(Type *t);
 bool istype_uchar(Type *t);
@@ -420,7 +419,7 @@ const char *curr_scope_str();
 // Build a Type* from a declaration-context node (typespec + optional declarator child).
 Type *type2_from_decl_node(Node *node, DeclParseState ds);
 
-void add_types_and_symbols(Node *node, DeclParseState ds, bool is_param, int depth);
+void add_types_and_symbols(Node *node, DeclParseState ds, bool is_param, bool is_struct_member);
 Type *elem_type(Type *t);
 int find_offset(Type *t, char *field, Type **it);
 
