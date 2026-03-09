@@ -26,26 +26,22 @@ static int     do_align(int val, int size)
     return (val + (size - 1)) & ~(size - 1);
 }
 
-static void append_symbol(Symbol **head, Symbol *sym)
+static void append_symbol(Symbol_table *st, Symbol *sym)
 {
-    Symbol *s = *head, *ls = NULL;
-    for (; s; s = s->next)
-        ls = s;
-    if (!ls)
-        *head = sym;
+    if (!st->symbols_tail)
+        st->symbols = sym;
     else
-        ls->next = sym;
+        st->symbols_tail->next = sym;
+    st->symbols_tail = sym;
 }
 
 static void append_type(Type *t)
 {
-    Type *last = 0;
-    for (Type *p = type_ctx.type_list; p; p = p->next)
-        last = p;
-    if (last)
-        last->next = t;
-    else
+    if (!type_ctx.type_list_tail)
         type_ctx.type_list = t;
+    else
+        type_ctx.type_list_tail->next = t;
+    type_ctx.type_list_tail = t;
 }
 
 // ---------------------------------------------------------------
@@ -365,20 +361,22 @@ void reset_types_state(void)
     // Carry over SYM_EXTERN symbols from the previous TU's global scope.
     // These are the cross-TU globals marked by harvest_globals.
     // Statics, putchar, and unresolved externs are excluded and not preserved.
-    Symbol *carry = NULL, **tail = &carry;
+    Symbol *carry = NULL, *carry_tail = NULL;
     Symbol *prev = type_ctx.symbol_table ? type_ctx.symbol_table->symbols : NULL;
     for (Symbol *s = prev; s; s = s->next)
     {
         if (s->ns != NS_IDENT || s->kind != SYM_EXTERN)
             continue;
-        *tail = s;
-        tail  = &s->next;
+        if (!carry) carry = s;
+        else        carry_tail->next = s;
+        carry_tail = s;
     }
-    if (carry)
-        *tail = NULL;
+    if (carry_tail)
+        carry_tail->next = NULL;
 
-    type_ctx.symbol_table          = arena_alloc(sizeof(Symbol_table));
-    type_ctx.symbol_table->symbols = carry;
+    type_ctx.symbol_table               = arena_alloc(sizeof(Symbol_table));
+    type_ctx.symbol_table->symbols      = carry;
+    type_ctx.symbol_table->symbols_tail = carry_tail;
     type_ctx.curr_scope_st         = type_ctx.symbol_table;
     type_ctx.last_symbol_table     = type_ctx.symbol_table;
     type_ctx.scope_depth           = 0;
@@ -403,7 +401,7 @@ void insert_extern_sym(const char *name, Type *type)
     sym->type   = type;
     sym->kind   = SYM_EXTERN;
     sym->ns     = NS_IDENT;
-    append_symbol(&type_ctx.symbol_table->symbols, sym);
+    append_symbol(type_ctx.symbol_table, sym);
 }
 
 // ---------------------------------------------------------------
@@ -420,7 +418,7 @@ static void insert_builtin(char *name, Type *type)
     sym->offset = 0;
     sym->ns     = NS_IDENT;
     sym->kind   = SYM_BUILTIN;
-    append_symbol(&type_ctx.symbol_table->symbols, sym);
+    append_symbol(type_ctx.symbol_table, sym);
 }
 
 void make_basic_types()
@@ -449,7 +447,7 @@ void make_basic_types()
     va->type   = t_int;
     va->ns     = NS_TYPEDEF;
     va->kind   = SYM_GLOBAL;
-    append_symbol(&type_ctx.symbol_table->symbols, va);
+    append_symbol(type_ctx.symbol_table, va);
 }
 
 // ---------------------------------------------------------------
@@ -790,7 +788,7 @@ Symbol *insert_tag(Symbol_table *st, char *ident)
         }
     Symbol *sym = new_symbol(t_void, ident, 0);
     sym->ns     = NS_TAG;
-    append_symbol(&st->symbols, sym);
+    append_symbol(st, sym);
     return sym;
 }
 
@@ -800,7 +798,7 @@ Symbol *insert_enum_const(Symbol_table *st, Type *ety, char *ident, int value)
     Symbol *sym = new_symbol(ety, ident, value);
     sym->kind   = SYM_ENUM_CONST;
     // ns already NS_IDENT from new_symbol
-    append_symbol(&st->symbols, sym);
+    append_symbol(st, sym);
     return sym;
 }
 
@@ -813,7 +811,7 @@ static Symbol *insert_typedef(Node *node, Type *type, const char *ident)
             return s;
     Symbol *sym = new_symbol(type, ident, 0);
     sym->ns     = NS_TYPEDEF;
-    append_symbol(&st->symbols, sym);
+    append_symbol(st, sym);
     return sym;
 }
 
@@ -883,7 +881,7 @@ static Symbol *insert_global_ident(Symbol_table *st, Type *type, const char *ide
     }
     else
         n->kind = SYM_GLOBAL;
-    append_symbol(&st->symbols, n);
+    append_symbol(st, n);
     return n;
 }
 
@@ -895,7 +893,7 @@ static Symbol *insert_local_ident(Symbol_table *st, Type *type, const char *iden
         Symbol *n   = new_symbol(type, ident, type_ctx.local_static_counter++);
         n->kind     = SYM_STATIC_LOCAL;
         n->tu_index = current_global_tu;
-        append_symbol(&st->symbols, n);
+        append_symbol(st, n);
         return n;
     }
     Symbol *n;
@@ -912,7 +910,7 @@ static Symbol *insert_local_ident(Symbol_table *st, Type *type, const char *iden
         n->kind  = SYM_LOCAL;
         st->size += type->size;
     }
-    append_symbol(&st->symbols, n);
+    append_symbol(st, n);
     return n;
 }
 

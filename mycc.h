@@ -295,7 +295,8 @@ struct Symbol_table
     int             depth;       // scope nesting depth (0 = global)
     Scope_type      scope_type;  // ST_COMPSTMT or ST_STRUCT
     int             scope_id;    // monotonic ID assigned at creation (for debug)
-    Symbol          *symbols;    // unified list: idents + tags + typedefs
+    Symbol          *symbols;      // unified list: idents + tags + typedefs
+    Symbol          *symbols_tail; // tail of symbols list (O(1) append)
     int             size;        // total bytes of locals declared in this scope
     int             local_offset; // running byte offset for the next SYM_LOCAL
     int             param_offset; // running byte offset for the next SYM_PARAM (init: FRAME_OVERHEAD)
@@ -466,6 +467,7 @@ Symbol *find_symbol_st(Symbol_table *st, const char *name, Namespace nspace);
 
 typedef struct TypeContext {
     Type *type_list;            // linked list of all interned types
+    Type *type_list_tail;       // tail of type_list (O(1) append)
     // Basic type singletons
     Type *t_void;
     Type *t_char;
