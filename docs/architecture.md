@@ -40,7 +40,7 @@ struct Token {
 
 ## Parser (`parser.c`)
 
-A hand-written recursive-descent parser. Also owns `propagate_types` and arithmetic-conversion helpers.
+A hand-written recursive-descent parser. Also owns the three-pass type resolution: `resolve_symbols`, `derive_types`, and `insert_coercions`.
 
 ### C89 Grammar Supported
 
@@ -121,82 +121,89 @@ primary-expr        → ident | constant | string-literal | "(" expr ")"
 ### AST Node Kinds
 
 ```c
-ND_PROGRAM       // root; children are top-level declarations
-ND_FUNCTION      // not used (functions are ND_DECLARATION with is_func_defn)
-ND_DECLARATION   // variable or function declaration
-ND_DECLARATOR    // declarator part of a declaration
-ND_DIRECT_DECL   // direct declarator (name + suffix)
-ND_ARRAY_DECL    // "[N]" suffix
-ND_FUNC_DECL     // "(params)" suffix
-ND_PTYPE_LIST    // parameter type list
-ND_TYPE_NAME     // type name in a cast
-ND_STRUCT        // struct/union specifier
-ND_UNION         // (unused; structs cover both)
-ND_MEMBER        // "." or "->" member access — children: [struct_expr, field_ident]
-ND_COMPSTMT      // "{}" block — children: declarations and statements
-ND_EXPRSTMT      // expression statement
-ND_IFSTMT        // if — children: [cond, then] or [cond, then, else]
-ND_WHILESTMT     // while — children: [cond, body]
-ND_FORSTMT       // for — children: [init, cond, inc, body] (ND_EMPTY for absent parts)
-                 //   if init is a declaration, node->symtable holds its implicit scope
-ND_DOWHILESTMT   // do-while — children: [body, cond]
-ND_SWITCHSTMT    // switch — children: [selector, body_compstmt]
-ND_CASESTMT      // case N: — ival holds the constant; no children
-ND_DEFAULTSTMT   // default: — no children
-ND_BREAKSTMT     // break; — no children
-ND_CONTINUESTMT  // continue; — no children
-ND_GOTOSTMT      // goto ident; — val = target label name
-ND_LABELSTMT     // ident: stmt — val = label name; child[0] = statement
-ND_EMPTY         // absent for-loop part (init/cond/inc omitted)
-ND_RETURNSTMT    // return — children: [expr] or empty
-ND_STMT          // generic wrapper
-ND_ASSIGN        // "=" — children: [lhs, rhs]
-ND_COMPOUND_ASSIGN // compound assignment (+=, -=, *=, /=, etc.) — children: [lhs, rhs]; op_kind = base op (e.g. TK_PLUS for +=); avoids double-eval of lhs
-ND_BINOP         // binary op (val = "+", "-", "*", "/", "==", etc.)
-ND_UNARYOP       // unary op (val = "+", "-", "*", "&", "~", "!", "++", "--", "post++", "post--")
-ND_CAST          // explicit cast — children: [ND_DECLARATION type placeholder, expr]
-ND_TERNARY       // "?:" — children: [cond, then_expr, else_expr]
-ND_IDENT         // variable or function reference (val = name)
-ND_LITERAL       // integer, float, or string constant
-ND_INITLIST      // initializer list "{…}"
-ND_CONSTEXPR     // constant expression
-ND_VA_START      // va_start(ap, last) — children: [ap, last]
-ND_VA_ARG        // va_arg(ap, type) — child: [ap]; node->type = requested type
-ND_VA_END        // va_end(ap) — no-op
-ND_PARAM_LIST    // (unused directly)
-ND_DECLSTMT      // (unused directly)
-ND_EXPR          // (unused directly)
+ND_PROGRAM       // root; ch[0] is head of top-level declaration linked list (->next)
+ND_DECLARATION   // variable or function declaration; u.declaration holds specifiers
+ND_DECLARATOR    // declarator; u.declarator.pointer_level = star count; ch[1] = initializer
+ND_DIRECT_DECL   // direct declarator (name + suffix list via ->next)
+ND_ARRAY_DECL    // "[N]" suffix; ch[0] = size expr (NULL if unspecified)
+ND_FUNC_DECL     // "(params)" suffix; ch[0] = ND_PTYPE_LIST
+ND_PTYPE_LIST    // parameter type list; u.ptype_list.is_variadic; params via ->next
+ND_TYPE_NAME     // type name in a cast or sizeof
+ND_STRUCT        // struct/union specifier; u.struct_spec.is_union; node->symtable = member scope
+ND_MEMBER        // "." or "->" access; ch[0] = struct expr; u.member.{field_name,offset,is_function}
+ND_COMPSTMT      // "{}" block; node->symtable = scope; statements via ch[0] linked list
+ND_EXPRSTMT      // expression statement; ch[0] = expr
+ND_IFSTMT        // if; ch[0]=cond, ch[1]=then, ch[2]=else (NULL if absent)
+ND_WHILESTMT     // while; ch[0]=cond, ch[1]=body
+ND_FORSTMT       // for; ch[0]=init, ch[1]=cond, ch[2]=inc, ch[3]=body (ND_EMPTY if absent)
+                 //   node->symtable = hidden for-init scope (non-NULL only when init is a decl)
+ND_DOWHILESTMT   // do-while; ch[0]=body, ch[1]=cond
+ND_SWITCHSTMT    // switch; ch[0]=selector, ch[1]=body compstmt
+ND_CASESTMT      // case N:; u.casestmt.{value, label_id}
+ND_DEFAULTSTMT   // default:; u.defaultstmt.label_id
+ND_BREAKSTMT     // break;
+ND_CONTINUESTMT  // continue;
+ND_GOTOSTMT      // goto ident; u.label = target label name
+ND_LABELSTMT     // ident: stmt; u.labelstmt.name; ch[0] = statement
+ND_EMPTY         // absent for-loop init/cond/inc
+ND_RETURNSTMT    // return; ch[0] = expr (NULL for void return)
+ND_STMT          // generic statement wrapper
+ND_ASSIGN        // "="; ch[0]=lhs, ch[1]=rhs
+ND_COMPOUND_ASSIGN // +=, -=, etc.; ch[0]=lhs, ch[1]=rhs; op_kind = base operator token
+ND_BINOP         // binary op; op_kind = operator token; ch[0]=lhs, ch[1]=rhs
+ND_UNARYOP       // unary op; op_kind = operator token; ch[0]=operand
+                 //   u.unaryop.is_function: call through dereferenced fn-ptr
+                 //   u.unaryop.is_array_deref: address-only (no load) for non-last array dim
+ND_CAST          // explicit cast; ch[0]=ND_DECLARATION (type), ch[1]=expr
+ND_TERNARY       // ?:; ch[0]=cond, ch[1]=then, ch[2]=else
+ND_IDENT         // name; u.ident.name; u.ident.is_function = has postfix call
+ND_LITERAL       // constant; u.literal.{ival, fval, strval, strval_len}
+ND_INITLIST      // initializer list; items via ch[0] linked list
+ND_VA_START      // va_start(ap, last); ch[0]=ap, ch[1]=last_param
+ND_VA_ARG        // va_arg(ap, type); ch[0]=ap; node->type = requested type
+ND_VA_END        // va_end(ap); no-op
 ND_UNDEFINED
 ```
 
-### Node Struct (key fields)
+### Node Struct
+
+Nodes use a tagged union (`u`) for kind-specific payload and a fixed 4-slot child array (`ch[4]`) for positional children. A `next` pointer links siblings in list contexts (e.g. top-level declarations, statement lists inside a compound).
 
 ```c
 struct Node {
     Node_kind    kind;
-    char         val[64];       // operator or name string
-    long long    ival;          // integer constant value
-    double       fval;          // float constant value
-    char         *strval;       // heap-allocated decoded string literal content (NULL if not a string)
-    int          strval_len;    // byte length of strval (excluding null terminator)
-    Node       **children;
-    int          child_count;
-    int          offset;        // struct member byte offset (ND_MEMBER)
-    int          pointer_level; // number of pointer stars in declarator
-    bool         is_expr;       // node participates in type propagation
-    bool         is_func_defn;  // true for function definitions (not just decls)
-    bool         is_function;   // true when ident/unaryop has postfix "(args)" applied —
-                                //   marks this node as a call site (or dereference-call)
-    bool         is_array_deref;// true for array subscript UNARYOP "+" (no load)
-    bool         is_variadic;   // true for variadic function/param-type-list
-    Decl_spec    typespec;      // parser-internal bitmask (DS_INT | DS_UNSIGNED etc.)
-    Token_kind   sclass;        // storage class specifier
-    Token_kind   op_kind;       // for ND_BINOP/UNARYOP/MEMBER: identifies the operator
-    Symbol_table *st;           // scope this node belongs to (set during parsing)
-    Symbol_table *symtable;     // symbol table for compound statements
-    Symbol       *symbol;       // resolved symbol (set during add_types_and_symbols)
-    Type        *type;         // resolved type (set during propagate_types)
-                                // NOTE: new_node() initialises type = t_void (not NULL)
+
+    // Positional child slots. ch[0..3] default to NULL (arena zeroes memory).
+    Node        *ch[4];
+
+    // Kind-specific payload — only the matching union member is valid.
+    union {
+        struct { char *name; bool is_function; }                  ident;       // ND_IDENT
+        char                                                      *label;      // ND_GOTOSTMT
+        struct { bool is_function; bool is_array_deref; }         unaryop;     // ND_UNARYOP
+        struct { char *field_name; bool is_function; int offset; } member;     // ND_MEMBER
+        struct { char *name; }                                    labelstmt;   // ND_LABELSTMT
+        struct { int pointer_level; }                             declarator;  // ND_DECLARATOR
+        struct { bool is_variadic; }                              ptype_list;  // ND_PTYPE_LIST
+        struct { Decl_spec typespec; StorageClass sclass;
+                 bool is_func_defn; }                             declaration; // ND_DECLARATION
+        struct { bool is_union; }                                 struct_spec; // ND_STRUCT
+        struct { long long ival; double fval;
+                 char *strval; int strval_len; }                  literal;     // ND_LITERAL
+        struct { long long value; int label_id; }                 casestmt;    // ND_CASESTMT
+        struct { int label_id; }                                  defaultstmt; // ND_DEFAULTSTMT
+    } u;
+
+    Node        *next;       // sibling link (linked-list children, e.g. stmts in compstmt)
+    bool         is_expr;    // participates in type propagation
+    Token_kind   op_kind;    // ND_BINOP/UNARYOP/MEMBER: identifies the operator
+    Symbol_table *st;        // innermost scope at this node (set during parsing)
+    Symbol_table *symtable;  // ND_COMPSTMT: its own scope
+                             // ND_FORSTMT: hidden for-init scope (NULL if init is not a decl)
+                             // ND_STRUCT: the struct-member parsing scope
+    Symbol      *symbol;     // resolved symbol (set during resolve_symbols / add_types_and_symbols)
+    Type        *type;       // resolved type (set during resolve_symbols / derive_types)
+                             // NOTE: new_node() initialises type = t_void (not NULL)
 };
 ```
 
@@ -204,27 +211,34 @@ struct Node {
 
 `E1[E2]` is rewritten in the parser (not in a separate pass) as pointer arithmetic:
 
-- **Pointer subscript** (base has pointer type): creates `ND_UNARYOP "*"` wrapping `ND_BINOP "+"(ptr, idx)`. `propagate_types` inserts stride scaling.
+- **Pointer subscript** (base has pointer type): creates `ND_UNARYOP "*"` wrapping `ND_BINOP "+"(ptr, idx)`. `insert_coercions` inserts stride scaling.
 - **Not the last array dimension** (e.g., `a[i]` where `a` is `int[3][4]`): creates `ND_UNARYOP "+"` with `is_array_deref = true` and `node->type` set to the element-at-that-depth type. No load is generated; the address is passed through.
 - **Last array dimension** (e.g., `a[i]` where `a` is `int[4]`): creates `ND_UNARYOP "*"` with `node->type` set to the leaf element type. A load is generated.
 
 For array subscripts the child is `ND_BINOP "+"` with children `[base_addr, ND_BINOP "*" [stride_constant, index_expr]]`.
 
-### Type Propagation (`propagate_types`)
+### Three-Pass Type Resolution
 
-Post-order (children first) tree walk. For each node:
+Type annotation is split across three sequential passes called from `mycc.c` after parsing:
 
-- `ND_IDENT` (not struct member, `is_expr == true` only): `node->type = find_symbol(…)->type`
-- `ND_MEMBER`: looks up field in `lhs->type->u.composite.members`, sets `node->offset` and `node->type`; for `"->"` the lhs pointer is automatically dereferenced; when `is_function=true` (call through member fn-ptr), `node->type` is resolved to the function's return type
-- `ND_BINOP` (is_expr): calls `check_operands()` → inserts arithmetic-conversion casts, returns lhs type; then comparison/logical operators (`< <= > >= == != && ||`) force `node->type = t_int` regardless of operand type
-- `ND_UNARYOP` (is_expr): calls `check_unary_operand()` → for `*` returns `elem_type(child->type)`; preserves parser-set types (guards with `if (node->type == t_void)`)
-- `ND_RETURNSTMT`: inserts a cast if return type differs from expression type
+**Pass 1 — `resolve_symbols(root)`** (post-order)
+- `ND_IDENT` (`is_expr == true`): `node->type = find_symbol_st(node->st, name, NS_IDENT)->type`; `node->symbol` is also set.
+- `ND_MEMBER`: looks up the field in `lhs->type->u.composite.members`; sets `u.member.offset` and `node->type`; for `"->"` the lhs pointer is automatically dereferenced; when `u.member.is_function` (call through member fn-ptr), `node->type` is resolved to the function's return type.
+
+**Pass 2 — `derive_types(root)`** (post-order, pure — no AST mutations)
+- `ND_BINOP` (`is_expr`): `binop_result_type(lhs, rhs, op)` returns the usual-arithmetic-conversion result type; comparison/logical operators force result to `t_int`.
+- `ND_UNARYOP` (`is_expr`): `unary_result_type(operand, op)` — for `*` returns `elem_type(child->type)`; preserves parser-set types when `node->type != t_void`.
+- `ND_CAST`: result type taken from the type-declaration child.
+
+**Pass 3 — `insert_coercions(root)`** (post-order, mutates AST)
+- Inserts `ND_CAST` nodes for arithmetic conversions (e.g. `char → int`, `int → long`) and for `ND_RETURNSTMT` when the expression type differs from the declared return type.
+- Inserts stride-scale multiplications for pointer arithmetic (`ND_BINOP "+"` where one operand is a pointer/array — multiplies the integer operand by `elem_type->size`).
 
 ### Scope Tracking and `last_symbol_table`
 
-The global `last_symbol_table` always points to the most recently created scope from `enter_new_scope(false)`. `comp_stmt(true)` uses it to re-enter the scope created by `param_type_list` (so function parameters and body variables share a scope).
+`type_ctx.last_symbol_table` always points to the most recently created scope from `enter_new_scope()`. `comp_stmt(true)` uses it to re-enter the scope created by `param_type_list`, so function parameters and body variables share a scope.
 
-**Important:** `param_type_list` explicitly restores `last_symbol_table = node->symtable` after `leave_scope()`. This prevents inner `param_type_list` calls (from function-pointer declarators such as `int (*fp)(int)`) from overwriting `last_symbol_table` and corrupting the outer function's scope chain.
+**Important:** `param_type_list` explicitly restores `type_ctx.last_symbol_table = node->symtable` after `leave_scope()`. This prevents inner `param_type_list` calls (e.g. from function-pointer declarators such as `int (*fp)(int)`) from overwriting it and corrupting the outer function's scope chain.
 
 ---
 
@@ -300,13 +314,23 @@ Type *get_enum_type(Symbol *tag);
 
 ### Type Derivation
 
-Type construction from AST nodes is done directly by two static helpers in `types.c` (no intermediate derivation string):
+Declaration specifiers accumulated during parsing are stored in a `DeclParseState`:
 
-`type_from_declarator(Node *decl, Type *base)` walks an `ND_DECLARATOR` node: applies pointer stars to `base` (innermost), then calls `type_from_direct_decl` for array/function suffixes.
+```c
+typedef struct {
+    Decl_spec    typespec;      // accumulated keyword bitmask (DS_INT | DS_UNSIGNED etc.)
+    StorageClass sclass;        // SC_NONE / SC_STATIC / SC_EXTERN / SC_TYPEDEF etc.
+    Type        *typedef_type;  // resolved Type* when DS_TYPEDEF is set
+} DeclParseState;
+```
+
+Type construction from AST nodes is done by two static helpers in `types.c`:
+
+`type_from_declarator(Node *decl, Type *base)` walks an `ND_DECLARATOR` node: applies `u.declarator.pointer_level` pointer stars to `base`, then calls `type_from_direct_decl` for array/function suffixes.
 
 `type_from_direct_decl(Node *dd, Type *base)` walks an `ND_DIRECT_DECL` node: applies array (`ND_ARRAY_DECL`) and function suffixes right-to-left (rightmost = innermost), then recurses for grouped inner declarators (e.g. `(*fp)`).
 
-`type2_from_decl_node(Node *node)` is the public entry point (used by the parser for casts and `sizeof`). It determines the base type from `node->typespec` and applies the first declarator child if present. When `node->typespec & DS_TYPEDEF`, the base is taken from `node->type` directly.
+`type2_from_decl_node(Node *node, DeclParseState ds)` is the public entry point (used by the parser for casts and `sizeof`). It determines the base type from `ds.typespec` (or `ds.typedef_type` when `DS_TYPEDEF` is set) and applies the first declarator child if present.
 
 ### Struct Layout
 
@@ -319,46 +343,63 @@ Type construction from AST nodes is done directly by two static helpers in `type
 
 ### Symbol Table
 
-The symbol table is a **tree of `Symbol_table` nodes** mirroring the lexical scope hierarchy.
+Symbols and scopes use three supporting enums:
+
+```c
+// Which C name space a symbol belongs to
+typedef enum { NS_IDENT, NS_TAG, NS_TYPEDEF } Namespace;
+
+// Distinguishes compound-statement scopes from struct-member scopes
+typedef enum { ST_COMPSTMT, ST_STRUCT } Scope_type;
+
+// Symbol kind — encodes storage/addressing class
+typedef enum {
+    SYM_LOCAL,         // stack-allocated local  (lea -offset)
+    SYM_PARAM,         // function parameter     (lea +offset)
+    SYM_GLOBAL,        // non-static global      (immw name)
+    SYM_STATIC_GLOBAL, // file-scope static      (immw _s{tu}_{name})
+    SYM_STATIC_LOCAL,  // local-scope static     (immw _ls{id})
+    SYM_EXTERN,        // extern decl            (no data allocated)
+    SYM_ENUM_CONST,    // enum constant          (offset = integer value, no load)
+    SYM_BUILTIN,       // compiler-pre-declared  (putchar etc.)
+} SymbolKind;
+```
+
+`Symbol_table` nodes form a chain via `parent` pointers. Each scope holds a single unified symbol list (identifiers, tags, and typedefs are distinguished by the `ns` field):
 
 ```c
 struct Symbol_table {
-    Scope           scope;          // depth + indices identifying this scope
-    Symbol         *idents;         // NS_IDENT linked list
-    Symbol         *tags;           // NS_TAG linked list (struct/union tags)
-    Symbol         *members;        // NS_MEMBER (unused; struct members are in Type)
-    Symbol         *labels;         // NS_LABEL
-    Symbol         *typedefs;       // NS_TYPEDEF linked list (typedef names)
-    int             size;           // bytes of locals in this scope
-    int             global_offset;  // accumulated offset from parent scopes (for nested locals)
-    int             child_count;
-    Symbol_table  **children;
-    Symbol_table   *parent;
+    int          depth;        // nesting depth (0 = global)
+    Scope_type   scope_type;   // ST_COMPSTMT or ST_STRUCT
+    int          scope_id;     // monotonic ID assigned at creation (for debug)
+    Symbol      *symbols;      // unified list: all namespaces, filtered by ns field
+    Symbol      *symbols_tail; // tail pointer (O(1) append)
+    int          size;         // total bytes of SYM_LOCAL symbols in this scope
+    int          local_offset; // running byte offset for the next SYM_LOCAL
+    int          param_offset; // running byte offset for the next SYM_PARAM (init: FRAME_OVERHEAD)
+    Symbol_table *parent;
 };
 
 struct Symbol {
-    char   *name;
-    Type  *type;
-    int     offset;        // see addressing below
-    bool    is_param;
-    bool    is_enum_const; // true for enum constants (use offset as integer value, no load)
-    bool    is_static;     // file-scope static — label mangled to _s{tu_index}_{name}
-    int     tu_index;      // TU that defined this static (set by insert_ident)
-    bool    is_extern_decl; // extern declaration — no data allocation; upgraded on definition
-    bool    is_local_static;// local-scope static: persistent data section, label = _ls{offset}
-    Symbol *next;
+    const char  *name;
+    Type        *type;
+    int          offset;    // meaning depends on kind — see below
+    SymbolKind   kind;
+    Namespace    ns;        // NS_IDENT | NS_TAG | NS_TYPEDEF
+    int          tu_index;  // TU index for SYM_STATIC_GLOBAL / SYM_STATIC_LOCAL
+    Symbol      *next;
 };
 ```
 
-**Scope addressing:** A scope is identified by `(depth, indices[])`. E.g., depth=2, indices=[3,1] means: the 1st child of the 3rd child of the root. Scopes are created by `enter_new_scope()` and released by `leave_scope()`.
+**Symbol offset semantics (by `kind`):**
+- `SYM_GLOBAL`: byte position in the global data area (label index in assembly).
+- `SYM_LOCAL`: bp-relative offset below frame base; address = `lea -(local_offset)`.
+- `SYM_PARAM`: bp-relative offset above frame base; address = `lea +(param_offset)`.
+- `SYM_ENUM_CONST`: the integer constant value; no memory address involved.
+- `SYM_STATIC_LOCAL`: the `local_static_counter` ID; label = `_ls{offset}`.
+- `SYM_STATIC_GLOBAL`, `SYM_EXTERN`, `SYM_BUILTIN`: addressed by label name.
 
-**Symbol offsets:**
-- **Global** (`depth == 0`): `offset` is the byte position in the global data area (used as a label name in assembly).
-- **Local** (`is_param == false`): `offset` is the accumulated size of locals declared before this one in the current (and enclosing) scopes. Used as `lea -(global_offset + offset)`.
-- **Parameter** (`is_param == true`): `offset` starts at 8 (above saved lr and bp) and increases for each parameter. Used as `lea (global_offset + offset)`.
-- **Enum constant** (`is_enum_const == true`): `offset` holds the integer value; no memory address.
-
-`find_local_addr(node, name)` (codegen.c, static) searches from `node->st` upward, returning `LocalAddr { int offset; bool is_param; }`. `offset` is `global_offset + symbol->offset` for locals/params; `-1` for globals (depth 0) and local statics (which use their `_ls{id}` label instead). The `is_param` flag distinguishes parameters from locals for `lea` sign direction.
+`find_local_addr(node, name)` in `codegen.c` searches from `node->st` upward, returning `LocalAddr { int offset; bool is_param; }`. Returns `offset == -1` for globals and local statics (use label instead).
 
 ### Key Helper Functions
 
@@ -403,7 +444,7 @@ reset_codegen()      // clears strlit_count, loop_depth, label_table_size
 reset_parser()       // clears current_function
                      // does NOT reset anon_index — monotonically increasing across TUs
 reset_types_state()  // allocates a fresh symbol_table / curr_scope_st / last_symbol_table
-                     // resets scope_depth and scope_indices
+                     // resets scope_depth and scope_id counter
                      // does NOT touch the 'types' linked list or t_int/t_void singletons
                      // (Type* pointers from previous TUs remain valid)
 ```
@@ -420,11 +461,11 @@ static ExternSym extern_syms[1024];
 static int       extern_sym_count = 0;
 ```
 
-**`harvest_globals()`** (called after `backend_emit_asm`): walks `symbol_table->idents` of the just-compiled TU and appends any symbol that is not `is_static`, not `is_extern_decl`, and not `putchar`. Deduplication prevents double-adding.
+**`harvest_globals()`** (called after `backend_emit_asm`): walks `symbol_table->symbols` of the just-compiled TU (filtering for `ns == NS_IDENT`) and appends any symbol whose `kind` is not `SYM_STATIC_GLOBAL`, `SYM_STATIC_LOCAL`, `SYM_EXTERN`, or `SYM_BUILTIN`. Deduplication prevents double-adding.
 
 **`prepopulate_extern_syms()`** (called before each TU's `program()`): calls `insert_extern_sym()` for each accumulated symbol. This makes previously-defined globals visible to the new TU without requiring explicit `extern` declarations.
 
-**`insert_extern_sym()`** (in `types.c`): inserts a symbol into the fresh global scope with `is_extern_decl = true` and no data allocation (`st->size` is not incremented). Skipped if the name is already present (e.g. `putchar`).
+**`insert_extern_sym()`** (in `types.c`): inserts a symbol into the fresh global scope with `kind = SYM_EXTERN` and no data allocation (`st->size` is not incremented). Skipped if the name is already present.
 
 ### Static Symbol Mangling
 
@@ -436,14 +477,14 @@ File-scope `static` symbols are TU-private. The label name is mangled from `foo`
 | `gen_callfunction` (direct call) | `ir_append(IR_JL, 0, "_s{tu_index}_{name}")` |
 | `gen_varaddr_from_ident` (global address) | `ir_append(IR_IMM, 0, "_s{tu_index}_{name}")` |
 
-`backend_emit_asm` in `backend.c` turns these IR nodes into assembly text. `is_static` and `tu_index` are set on the `Symbol` by `insert_ident()` in `types.c` when `node->sclass == TK_STATIC` at global scope.
+`backend_emit_asm` in `backend.c` turns these IR nodes into assembly text. `kind = SYM_STATIC_GLOBAL` and `tu_index` are set on the `Symbol` by `insert_ident()` in `types.c` when `sclass == SC_STATIC` at global scope.
 
 ### Extern Declaration Handling
 
-When `insert_ident()` sees `node->sclass == TK_EXTERN` at global scope it:
+When `insert_ident()` sees `sclass == SC_EXTERN` at global scope it:
 - Does **not** increment `st->size` (no data allocated).
-- Sets `sym->is_extern_decl = true`.
+- Sets `sym->kind = SYM_EXTERN`.
 
-When a real definition arrives for the same name (in the same or a later TU), `insert_ident()` finds the existing entry and upgrades it: clears `is_extern_decl`, updates the type, and allocates data offset.
+When a real definition arrives for the same name (in the same or a later TU), `insert_ident()` finds the existing entry and upgrades it: sets `kind` to `SYM_GLOBAL`, updates the type, and allocates data offset.
 
-`gen_decl()` skips entire `extern` declarations (`node->sclass == TK_EXTERN → return`) and bare function prototypes (`istype_function(n->symbol->type) → continue`) so no spurious labels or data are emitted.
+`gen_decl()` skips entire `extern` declarations (`sym->kind == SYM_EXTERN → return`) and bare function prototypes (`istype_function(sym->type) → continue`) so no spurious labels or data are emitted.
