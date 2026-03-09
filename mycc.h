@@ -50,7 +50,7 @@ typedef enum
     TK_EMPTY, TK_IDENT, TK_CONSTFLT, TK_CONSTINT, TK_CHARACTER, TK_STRING, TK_LPAREN, TK_RPAREN, TK_LBRACE,
     TK_RBRACE, TK_LBRACKET, TK_RBRACKET, TK_COMMA, TK_SEMICOLON, TK_COLON, TK_EQ, TK_NE,
     TK_GE, TK_GT, TK_LE, TK_LT, TK_SHIFTR, TK_SHIFTL, TK_ASSIGN, TK_PLUS,
-    TK_MINUS, TK_STAR, TK_SLASH, TK_AMPERSAND, TK_TWIDDLE, TK_BANG, TK_EOF, TK_INC,
+    TK_MINUS, TK_STAR, TK_SLASH, TK_AMPERSAND, TK_TILDE, TK_BANG, TK_EOF, TK_INC,
     TK_DEC, TK_DOT, TK_ARROW, TK_LOGAND, TK_LOGOR, TK_BITOR, TK_BITXOR, TK_PLUS_ASSIGN,
     TK_MINUS_ASSIGN, TK_STAR_ASSIGN, TK_SLASH_ASSIGN, TK_AMP_ASSIGN, TK_BITOR_ASSIGN, TK_BITXOR_ASSIGN, TK_SHIFTL_ASSIGN, TK_SHIFTR_ASSIGN,
     TK_PERCENT, TK_QUESTION, TK_PERCENT_ASSIGN, TK_AUTO, TK_BREAK, TK_CASE, TK_CONST, TK_CONTINUE,
@@ -60,11 +60,9 @@ typedef enum
     TK_VOID, TK_CHAR, TK_UCHAR, TK_SHORT, TK_USHORT, TK_INT, TK_UINT, TK_LONG,
     TK_ULONG, TK_FLOAT, TK_DOUBLE, TK_SIGNED, TK_UNSIGNED, TK_STRUCT, TK_UNION, TK_ENUM,
     TK_TYPEDEF, TK_INVALID, TK_ELLIPSIS,
+// Pseudo-tokens used in Node.op_kind only; never emitted by the tokeniser
+    TK_POST_INC, TK_POST_DEC,
 } Token_kind;
-
-// Pseudo-tokens for postfix ++/-- (used in Node.u.op)
-#define TK_POST_INC 0x1000
-#define TK_POST_DEC 0x1001
 
 
 struct Keyword
@@ -162,6 +160,14 @@ typedef struct Type Type;
 typedef struct Field Field;
 typedef struct Param Param;
 typedef struct Symbol Symbol;
+
+// Parser-local accumulator for declaration specifiers.
+// Passed as a parameter to add_types_and_symbols / type2_from_decl_node.
+typedef struct {
+    Decl_spec  typespec;       // accumulated type-specifier bitmask
+    Token_kind sclass;         // storage-class token (TK_STATIC, TK_EXTERN, etc.)
+    Type      *typedef_type;   // resolved typedef type (set when DS_TYPEDEF is present)
+} DeclParseState;
 
 // Linked list of structure members
 struct Field
@@ -267,7 +273,6 @@ struct Symbol_table
     Symbol          *labels;
     Symbol          *typedefs;
     int             size;
-    int             global_offset;
     int             child_count;
     Symbol_table    **children;
     Symbol_table    *parent;
@@ -279,11 +284,11 @@ struct Node
 {
     Node_kind       kind;
     union {
-        char        *ident;      // ND_IDENT: variable/function name (heap)
+        struct { char *name; Node *args; bool is_function; } ident; // ND_IDENT: variable/function name + call args
         char        *label;      // ND_GOTOSTMT: goto label (heap)
         struct { Node *lhs; Node *rhs; } binop;            // ND_BINOP, ND_ASSIGN
-        struct { Node *operand; } unaryop;                  // ND_UNARYOP
-        struct { Node *base; char *field_name; } member;    // ND_MEMBER
+        struct { Node *operand; Node *args; bool is_function; bool is_array_deref; } unaryop; // ND_UNARYOP
+        struct { Node *base; char *field_name; Node *args; bool is_function; } member; // ND_MEMBER
         struct { Node *cond; Node *then_; Node *else_; } ifstmt;
         struct { Node *cond; Node *body; } whilestmt;
         struct { Node *init; Node *cond; Node *inc; Node *body; } forstmt;
@@ -298,22 +303,27 @@ struct Node
         struct { Node *ap; Node *last; } vastart;           // ND_VA_START
         struct { Node *ap; } vaarg;                         // ND_VA_ARG
         struct { Node *ap; } vaend;                         // ND_VA_END
+        struct { Node *direct_decl; Node *init; } declarator;  // ND_DECLARATOR
+        struct { Node *size; } array_decl;                       // ND_ARRAY_DECL
+        struct { Node *params; } func_decl;                      // ND_FUNC_DECL
+        struct { Node *decl; } type_name;                        // ND_TYPE_NAME
+        struct { Node *body; } stmt_wrap;                        // ND_STMT
+        struct { Node *decls; } program;                         // ND_PROGRAM
+        struct { Node *stmts; } compstmt;                        // ND_COMPSTMT
+        struct { Node *params; bool is_variadic; } ptype_list;    // ND_PTYPE_LIST
+        struct { Node *items; } initlist;                        // ND_INITLIST
+        struct { Node *spec; Node *decls; Node *func_body; Decl_spec typespec; Token_kind sclass; bool is_func_defn; } declaration; // ND_DECLARATION
+        struct { Node *name; Node *suffixes; } direct_decl;      // ND_DIRECT_DECL
+        struct { Node *tag; Node *members; bool is_union; } struct_spec;  // ND_STRUCT
     } u;
+    Node            *next;       // sibling link (for linked-list children)
     long long       ival;
     double          fval;
     char            *strval;
     int             strval_len;
-    Node            **children;     // Cat C nodes + function call args
-    int             child_count;
     int             offset;
     int             pointer_level;
     bool            is_expr;
-    bool            is_func_defn;
-    bool            is_function;
-    bool            is_array_deref;
-    bool            is_variadic;
-    Decl_spec       typespec;
-    Token_kind      sclass;
     Token_kind      op_kind;    // for ND_BINOP/UNARYOP/MEMBER: identifies the operator
     Symbol_table    *st;
     Symbol_table    *symtable;  // ND_COMPSTMT: its own scope.
@@ -325,10 +335,8 @@ struct Node
 
 Node *program();
 void print_tree(Node *node, int depth);
-// Walk a node's logical children. Cat A (expressions) and Cat B (statements) store
-// children in u.* union fields; Cat C (containers: ND_PROGRAM, ND_COMPSTMT,
-// ND_DECLARATION, ND_DECLARATOR, ND_INITLIST etc.) store them in children[].
-// fn is called for each child in declaration order.
+// Walk a node's logical children. All nodes store children in u.* union fields
+// or sibling linked lists (->next). fn is called for each child in declaration order.
 void for_each_child(Node *node, void (*fn)(Node *child, void *ctx), void *ctx);
 
 // ---------------------------------------------------------------
@@ -348,7 +356,9 @@ bool is_type_name(Token_kind tk);
 bool is_sc_spec(Token_kind tk);
 bool is_typespec(Token_kind tk);
 bool is_typequal(Token_kind tk);
-void propagate_types(Node *p, Node *n);
+void resolve_symbols(Node *root);
+void derive_types(Node *root);
+void insert_coercions(Node *root);
 Node *new_node(Node_kind kind, char *val, bool is_expr);
 
 
@@ -380,6 +390,7 @@ const char *get_decl_ident(Node *node);
 void make_basic_types();
 
 void reset_types_state(void);
+void finalize_local_offsets(void);
 void insert_extern_sym(const char *name, Type *type);
 void reset_parser(void);
 
@@ -395,9 +406,9 @@ const char *scope_str(Scope sc);
 const char *curr_scope_str();
 
 // Build a Type* from a declaration-context node (typespec + optional declarator child).
-Type *type2_from_decl_node(Node *node);
+Type *type2_from_decl_node(Node *node, DeclParseState ds);
 
-void add_types_and_symbols(Node *node, bool is_param, int depth);
+void add_types_and_symbols(Node *node, DeclParseState ds, bool is_param, int depth);
 Type *elem_type(Type *t);
 int find_offset(Type *t, char *field, Type **it);
 
@@ -420,8 +431,9 @@ Type *get_array_type(Type *elem, int count);
 Type *get_function_type(Type *ret, Param *params, bool is_variadic);
 Type *get_struct_type(Symbol *tag, Field *members, bool is_union);
 Type *get_enum_type(Symbol *tag);
-Symbol *insert_tag(Node *node, char *ident);
-Symbol *insert_enum_const(Node *node, Type *ety, char *ident, int value);
+Symbol *insert_tag(Symbol_table *st, char *ident);
+Symbol *insert_enum_const(Symbol_table *st, Type *ety, char *ident, int value);
+Symbol *find_symbol_st(Symbol_table *st, const char *name, Namespace nspace);
 
 // ===============================================================
 // Context Struct Definitions (must come after type definitions)

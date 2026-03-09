@@ -57,16 +57,6 @@ static void harvest_globals(void)
 
 static void reset_tu(int tu)
 {
-    // Zero-initialize all context structs on first call
-    static bool initialized = false;
-    if (!initialized) {
-        memset(&type_ctx, 0, sizeof(type_ctx));
-        memset(&token_ctx, 0, sizeof(token_ctx));
-        memset(&parser_ctx, 0, sizeof(parser_ctx));
-        memset(&codegen_ctx, 0, sizeof(codegen_ctx));
-        memset(&extern_ctx, 0, sizeof(extern_ctx));
-        initialized = true;
-    }
     current_global_tu = tu;
     reset_codegen();
     reset_parser();
@@ -117,7 +107,10 @@ int main(int argc, char **argv)
         print_symbol_table(type_ctx.symbol_table, 0);
         print_type_table();
 #endif
-        propagate_types(0, node);
+        resolve_symbols(node);
+        derive_types(node);
+        insert_coercions(node);
+        finalize_local_offsets();
 #ifdef DEBUG_ENABLED
         print_tree(node, 0);
         print_symbol_table(type_ctx.symbol_table, 0);

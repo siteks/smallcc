@@ -15,9 +15,6 @@ typedef struct { int offset; bool is_param; } LocalAddr;
 // Returns offset == -1 for globals (use symbolic label) and local-statics (use _ls{id} label).
 static LocalAddr find_local_addr(Node *node, const char *name)
 {
-    // Get the offset from bp of the local variable in node.
-    // Go to scope in node, then search for variable name in that scope,
-    // and successively enclosing scopes, until found.
     DBG_PRINT("%s scope is %s\n", __func__, scope_str(node->st->scope));
     Symbol_table *st = find_scope(node);
     Symbol *s;
@@ -28,42 +25,18 @@ static LocalAddr find_local_addr(Node *node, const char *name)
         for (s = st->idents; s; s = s->next)
         {
             DBG_PRINT("Ident:%s\n", s->name);
-            if (!strcmp(name, s->name))
-            {
-                found = true;
-                break;
-            }
+            if (!strcmp(name, s->name)) { found = true; break; }
         }
-        if (found)
-            break;
-        // Not found in this scope, go to enclosing scope
+        if (found) break;
         DBG_PRINT("Not found, going to enclosing scope\n");
-        if (st->parent)
-            st = st->parent;
+        if (st->parent) st = st->parent;
     }
     if (!found)
         error("Symbol %s not found!\n", name);
-
-    if (s->is_local_static)
+    if (s->is_local_static || !st->scope.depth)
         return (LocalAddr){ -1, false };
-
-    // Compute global_offset dynamically: sum of all non-global ancestor scope sizes.
-    // This is correct even for C99-style mixed declarations, where the parse-time
-    // st->global_offset may have been captured before later siblings were added.
-    int global_offset = 0;
-    Symbol_table *ancestor = st->parent;
-    while (ancestor && ancestor->scope.depth > 0)
-    {
-        global_offset += ancestor->size;
-        ancestor = ancestor->parent;
-    }
-    int offset = global_offset + s->offset;
-    if (!st->scope.depth)
-        // If at top scope, addresses are codegen_ctx.label_counter
-        offset = -1;
-    printf(";%s ident:%s at scope:%s %s got offset %d\n", __func__, name, scope_str(st->scope),
-        s->is_param ? "is param" : "", offset & 0xffff);
-    return (LocalAddr){ offset, s->is_param };
+    DBG_PRINT(";find_local_addr ident:%s got offset %d\n", name, s->offset & 0xffff);
+    return (LocalAddr){ s->offset, s->is_param };
 }
 
 
@@ -381,7 +354,7 @@ void gen_varaddr(Node *node)
     if (node->kind != ND_IDENT)
         error("Expecting local var got %s", nodestr(node->kind));
     
-    gen_varaddr_from_ident(node, node->u.ident);
+    gen_varaddr_from_ident(node, node->u.ident.name);
 }
 void gen_preamble(void)
 {
@@ -408,26 +381,35 @@ void gen_fill(int offset, int size)
 void gen_expr(Node *node);
 void gen_varaddr(Node *node);
 
-// Push args right-to-left from children[start_idx..child_count-1].
-// Returns total param bytes pushed.
-static int push_args(Node *node, int start_idx)
+// Push function call args from a linked list (right-to-left onto stack).
+// Returns total bytes pushed.
+static int push_args_list(Node *first_arg)
 {
-    int param_size = 0;
-    for (int i = node->child_count - 1; i >= start_idx; i--)
+    // Collect args into a temporary array for right-to-left pushing
+    Node *args[64];
+    int n = 0;
+    for (Node *a = first_arg; a; a = a->next)
     {
-        gen_expr(node->children[i]);
-        int s = node->children[i]->type->size;
-        if (s == 0) s = WORD_SIZE;  // function designator decay to pointer size
+        if (n >= 64) error("Too many function arguments\n");
+        args[n++] = a;
+    }
+    int param_size = 0;
+    for (int i = n - 1; i >= 0; i--)
+    {
+        gen_expr(args[i]);
+        int s = args[i]->type->size;
+        if (s == 0) s = WORD_SIZE;  // function designator decays to pointer size
         if (s == 2) gen_pushw(); else gen_push();
         param_size += s;
     }
     return param_size;
 }
 
+
 // Indirect call through function pointer variable: fp(args)
 void gen_callfunction_via_ptr(Node *node)
 {
-    int param_size = push_args(node, 0);
+    int param_size = push_args_list(node->u.ident.args);
     gen_varaddr(node);
     gen_ld(node->symbol->type->size);
     gen_jli();
@@ -437,8 +419,7 @@ void gen_callfunction_via_ptr(Node *node)
 // Indirect call through dereferenced pointer: (*fp)(args)
 void gen_callfunction_via_deref(Node *node)
 {
-    // Args are in children[0+] (operand is in u.unaryop.operand, not children)
-    int param_size = push_args(node, 0);
+    int param_size = push_args_list(node->u.unaryop.args);
     gen_expr(node->u.unaryop.operand);
     gen_jli();
     gen_adj(param_size);
@@ -449,8 +430,9 @@ void gen_callfunction(Node *node)
     // putchar(c) is a CPU builtin
     if (!strcmp(node->symbol->name, "putchar"))
     {
-        if (node->child_count != 1) error("putchar requires 1 argument\n");
-        gen_expr(node->children[0]);
+        if (!node->u.ident.args || node->u.ident.args->next)
+            error("putchar requires exactly 1 argument\n");
+        gen_expr(node->u.ident.args);
         printf("    putchar\n");
         return;
     }
@@ -481,7 +463,7 @@ void gen_callfunction(Node *node)
     // pc is set to saved link address, returning to the caller.
     //
     // Push the params on backwards, the offsets from the symbol table then work
-    int param_size = push_args(node, 0);
+    int param_size = push_args_list(node->u.ident.args);
     if (node->symbol->is_static)
     {
         char mangled[80];
@@ -500,7 +482,7 @@ static const char *node_ident_str(Node *node)
 {
     if (!node) return "";
     if (node->kind == ND_IDENT)
-        return node->u.ident ? node->u.ident : "";
+        return node->u.ident.name ? node->u.ident.name : "";
     if (node->kind == ND_LABELSTMT || node->kind == ND_GOTOSTMT)
         return node->u.label ? node->u.label : "";
     return "";
@@ -718,7 +700,7 @@ void gen_expr(Node *node)
             // Enum constant: inline the integer value; no memory load.
             gen_imm(sym->offset);
         }
-        else if (node->is_function)
+        else if (node->u.ident.is_function)
         {
             // Call context: the identifier appears as the callee of a call expression.
             if (istype_function(sym->type))
@@ -762,7 +744,7 @@ void gen_expr(Node *node)
             }
             break;
         case TK_STAR:
-            if (node->is_function)
+            if (node->u.unaryop.is_function)
             {
                 // (*fp)(args) — indirect call through dereferenced pointer
                 gen_callfunction_via_deref(node);
@@ -782,7 +764,7 @@ void gen_expr(Node *node)
             gen_imm(0);
             gen_eq();
             break;
-        case TK_TWIDDLE:
+        case TK_TILDE:
             gen_expr(operand);
             gen_push();
             gen_imm(0xffffffff);
@@ -899,10 +881,10 @@ void gen_expr(Node *node)
         gen_cast(node->u.cast.expr->type, node->type);
     }
     // ===== Member access =====
-    else if (node->kind == ND_MEMBER && node->is_function)
+    else if (node->kind == ND_MEMBER && node->u.member.is_function)
     {
         // Call through a function-pointer struct member: s.fp(args) or s->fp(args)
-        int param_size = push_args(node, 2);
+        int param_size = push_args_list(node->u.member.args);
         gen_addr(node);
         gen_ld(WORD_SIZE);  // load function pointer (pointer-sized)
         gen_jli();
@@ -1120,8 +1102,11 @@ int count_constexpr(Node *n)
     if (is_constexpr(n))
         return 1;
     int count = 0;
-    for(int i = 0; i < n->child_count; i++)
-        count += count_constexpr(n->children[i]);
+    if (n->kind == ND_INITLIST)
+    {
+        for (Node *c = n->u.initlist.items; c; c = c->next)
+            count += count_constexpr(c);
+    }
     return count;
 }
 void gen_inits(Node *n, Symbol *s, int vaddr, int offset, int depth)
@@ -1137,12 +1122,12 @@ void gen_inits(Node *n, Symbol *s, int vaddr, int offset, int depth)
 
     // Recurse through initlist
     int ptr = offset;
-    for(int i = 0; i < n->child_count; i++)
-        if (is_constexpr(n->children[i]))
+    for (Node *item = n->u.initlist.items; item; item = item->next)
+        if (is_constexpr(item))
         {
             gen_lea(vaddr + ptr);
             gen_push();
-            gen_expr(n->children[i]);
+            gen_expr(item);
             gen_st(elem_sz);
             ptr += elem_sz;
         }
@@ -1153,7 +1138,7 @@ void gen_inits(Node *n, Symbol *s, int vaddr, int offset, int depth)
             if (ptr != offset)
                 // If we've done anything on this row, advance to next row
                 new_offset = offset + row_stride;
-            gen_inits(n->children[i], s, vaddr, new_offset, depth + 1);
+            gen_inits(item, s, vaddr, new_offset, depth + 1);
             // Now out of level, we move on a whole row
             offset = new_offset + row_stride;
             DBG_PRINT("out of inits, now inc offset to %d\n", offset);
@@ -1174,10 +1159,10 @@ void gen_mem_inits(char *data, Node *n, Symbol *s, int vaddr, int offset, int de
 
     // Recurse through initlist
     int ptr = offset;
-    for(int i = 0; i < n->child_count; i++)
-        if (is_constexpr(n->children[i]))
+    for (Node *item = n->u.initlist.items; item; item = item->next)
+        if (is_constexpr(item))
         {
-            int val = int_constexpr(n->children[i]);
+            int val = int_constexpr(item);
             data[vaddr + ptr]       = val & 0xff;
             if (elem_sz > 1)
                 data[vaddr + ptr + 1]   = (val >> 8) & 0xff;
@@ -1190,7 +1175,7 @@ void gen_mem_inits(char *data, Node *n, Symbol *s, int vaddr, int offset, int de
             if (ptr != offset)
                 // If we've done anything on this row, advance to next row
                 new_offset = offset + row_stride;
-            gen_mem_inits(data, n->children[i], s, vaddr, new_offset, depth + 1);
+            gen_mem_inits(data, item, s, vaddr, new_offset, depth + 1);
             // Now out of level, we move on a whole row
             offset = new_offset + row_stride;
             DBG_PRINT("out of inits, now inc offset to %d\n", offset);
@@ -1236,9 +1221,8 @@ int int_constexpr(Node *n)
 static void gen_struct_inits(Node *n, int vaddr, Type *st)
 {
     Field *f = st->u.composite.members;
-    for (int i = 0; i < n->child_count && f; i++, f = f->next)
+    for (Node *child = n->u.initlist.items; child && f; child = child->next, f = f->next)
     {
-        Node *child = n->children[i];
         if (child->kind == ND_INITLIST)
         {
             if (f->type->base == TB_STRUCT)
@@ -1260,9 +1244,8 @@ static void gen_struct_inits(Node *n, int vaddr, Type *st)
 static void gen_struct_mem_inits(char *data, Node *n, Type *st, int base)
 {
     Field *f = st->u.composite.members;
-    for (int i = 0; i < n->child_count && f; i++, f = f->next)
+    for (Node *child = n->u.initlist.items; child && f; child = child->next, f = f->next)
     {
-        Node *child = n->children[i];
         if (child->kind == ND_INITLIST)
         {
             if (f->type->base == TB_STRUCT)
@@ -1304,7 +1287,7 @@ void gen_initlist(Node *n, Symbol *s)
             if (constexpr != 1)
                 error("Should be exactly one constexpr in initialiser\n");
             Node *l;
-            for(l = n; !is_constexpr(l); l = l->children[0]);
+            for(l = n; !is_constexpr(l); l = l->u.initlist.items);
             gen_varaddr_from_ident(n, s->name);
             gen_push();
             gen_expr(l);
@@ -1336,7 +1319,7 @@ void gen_initlist(Node *n, Symbol *s)
             if (constexpr != 1)
                 error("Should be exactly one constexpr in initialiser\n");
             Node *l;
-            for(l = n; !is_constexpr(l); l = l->children[0]);
+            for(l = n; !is_constexpr(l); l = l->u.initlist.items);
             if (istype_fp(t))
                 emit_float_bytes(l->fval);
             else
@@ -1355,15 +1338,14 @@ void gen_initlist(Node *n, Symbol *s)
 void gen_decl(Node *node)
 {
     printf(";%s declaration\n", __func__);
-    if (node->sclass == TK_TYPEDEF) return;
-    if (node->sclass == TK_EXTERN)  return;  // extern decl → no data emission
+    if (node->u.declaration.sclass == TK_TYPEDEF) return;
+    if (node->u.declaration.sclass == TK_EXTERN)  return;  // extern decl → no data emission
     // The symbol table has all the details needed for declarations.
     // Space is reserved at the start of the compound statement
 
     // Iterate over declarators, generating code for initialisations
-    for(int i = 0; i < node->child_count; i++)
+    for (Node *n = node->u.declaration.decls; n; n = n->next)
     {
-        Node *n = node->children[i];
         // Different treatment if at scope 0
         if (n->st->scope.depth)
         {
@@ -1374,22 +1356,23 @@ void gen_decl(Node *node)
                 };
                 continue;
             }
-            if (n->kind == ND_DECLARATOR && n->child_count == 2)
+            if (n->kind == ND_DECLARATOR && n->u.declarator.init != NULL)
             {
                 // This is an initialiser.
                 // Get ident from symbol table
                 if (!n->symbol)
                     error("Missing symbol!\n");
-                if (n->children[1]->kind == ND_INITLIST)
+                Node *init = n->u.declarator.init;
+                if (init->kind == ND_INITLIST)
                 {
-                    gen_initlist(n->children[1], n->symbol);
+                    gen_initlist(init, n->symbol);
                 }
-                else if (n->children[1]->strval && istype_array(n->symbol->type))
+                else if (init->strval && istype_array(n->symbol->type))
                 {
                     // Local char array init from string literal: store bytes one by one
                     int vaddr = -find_local_addr(n, n->symbol->name).offset;
-                    char *str = n->children[1]->strval;
-                    int   len = n->children[1]->strval_len + 1;
+                    char *str = init->strval;
+                    int   len = init->strval_len + 1;
                     for (int i = 0; i < len; i++)
                     {
                         gen_lea(vaddr + i);
@@ -1402,7 +1385,7 @@ void gen_decl(Node *node)
                 {
                     gen_varaddr_from_ident(n, n->symbol->name);
                     gen_push();
-                    gen_expr(n->children[1]);
+                    gen_expr(init);
                     gen_st(n->symbol->type->size);
                 }
             }
@@ -1430,31 +1413,32 @@ void gen_decl(Node *node)
                     gen_symlabel(n->symbol->name);
                 // If there is no init, we make space
 
-                if (n->child_count == 2)
+                if (n->u.declarator.init != NULL)
                 {
                     // Initialiser
-                    if (n->children[1]->kind == ND_INITLIST)
+                    Node *init = n->u.declarator.init;
+                    if (init->kind == ND_INITLIST)
                     {
-                        gen_initlist(n->children[1], n->symbol);
+                        gen_initlist(init, n->symbol);
                     }
-                    else if (n->children[1]->strval && istype_array(n->symbol->type))
+                    else if (init->strval && istype_array(n->symbol->type))
                     {
                         // char s[] = "hello" — emit bytes directly
-                        gen_bytes(n->children[1]->strval, n->children[1]->strval_len + 1);
+                        gen_bytes(init->strval, init->strval_len + 1);
                     }
-                    else if (n->children[1]->strval)
+                    else if (init->strval)
                     {
                         // char *p = "hello" — emit pointer to deferred string data
-                        int sid = new_strlit(n->children[1]->strval, n->children[1]->strval_len);
+                        int sid = new_strlit(init->strval, init->strval_len);
                         printf("    word    _l%d\n", sid);
                     }
                     else
                     {
                         if (istype_fp(n->symbol->type))
-                            emit_float_bytes(n->children[1]->fval);
+                            emit_float_bytes(init->fval);
                         else
                         {
-                            int val = int_constexpr(n->children[1]);
+                            int val = int_constexpr(init);
                             gen_word(val);
                         }
                     }
@@ -1472,9 +1456,8 @@ void gen_compstmt(Node *node)
     printf(";%s\n", __func__);
     // Make space on stack for this scope's locals
     gen_adj(-node->symtable->size);
-    for(int i = 0; i < node->child_count; i++)
+    for (Node *n = node->u.compstmt.stmts; n; n = n->next)
     {
-        Node *n = node->children[i];
         if (n->kind == ND_DECLARATION)
             gen_decl(n);
         else
@@ -1510,8 +1493,8 @@ void gen_switchstmt(Node *node)
     int lbreak     = new_label();
     int ldefault   = -1;
     // Phase 1: assign codegen_ctx.label_counter to cases and emit comparisons
-    for (int i = 0; i < body->child_count; i++) {
-        Node *ch = body->children[i];
+    for (Node *ch = body->u.compstmt.stmts; ch; ch = ch->next)
+    {
         if (ch->kind == ND_CASESTMT) {
             int lcase   = new_label();
             ch->offset  = lcase;
@@ -1533,8 +1516,8 @@ void gen_switchstmt(Node *node)
     codegen_ctx.cont_labels[codegen_ctx.loop_depth]  = -1;
     codegen_ctx.loop_depth++;
     gen_adj(-body->symtable->size);
-    for (int i = 0; i < body->child_count; i++) {
-        Node *ch = body->children[i];
+    for (Node *ch = body->u.compstmt.stmts; ch; ch = ch->next)
+    {
         if (ch->kind == ND_CASESTMT || ch->kind == ND_DEFAULTSTMT)
             gen_label(ch->offset);
         else if (ch->kind == ND_DECLARATION)
@@ -1566,7 +1549,7 @@ void gen_stmt(Node *node)
     case ND_DEFAULTSTMT:
     case ND_EMPTY:                              return;
     case ND_RETURNSTMT:  gen_returnstmt(node);  return;
-    case ND_STMT:        gen_stmt(node->children[0]); return;
+    case ND_STMT:        gen_stmt(node->u.stmt_wrap.body); return;
     default:;
     }
 }
@@ -1577,15 +1560,17 @@ void gen_param_list(Node *node)
 void gen_function(Node *node)
 {
     printf(";%s\n", __func__);
-    Symbol *fsym = node->children[0]->symbol;
+    Node *first_decl = node->u.declaration.decls;
+    Node *func_body  = node->u.declaration.func_body;
+    Symbol *fsym = first_decl->symbol;
     if (fsym->is_static)
         printf("_s%d_%s:\n", fsym->tu_index, fsym->name);
     else
         printf("%s:\n", fsym->name);
     codegen_ctx.label_table_size = 0;
-    collect_labels(node->children[1]);
-    gen_param_list(node->children[0]);
-    gen_stmt(node->children[1]);
+    collect_labels(func_body);
+    gen_param_list(first_decl);
+    gen_stmt(func_body);
     gen_return();
 }
 void gen_code(Node *node, int tu_index)
@@ -1593,16 +1578,16 @@ void gen_code(Node *node, int tu_index)
     printf(";%s\n", __func__);
 
     // Pass 1: emit function definitions (text area)
-    for(int i = 0; i < node->child_count; i++)
+    for (Node *c = node->u.program.decls; c; c = c->next)
     {
-        if (node->children[i]->kind == ND_DECLARATION && node->children[i]->is_func_defn)
-            gen_function(node->children[i]);
+        if (c->kind == ND_DECLARATION && c->u.declaration.is_func_defn)
+            gen_function(c);
     }
     // Pass 2: emit global variable declarations (data area)
-    for(int i = 0; i < node->child_count; i++)
+    for (Node *c = node->u.program.decls; c; c = c->next)
     {
-        if (node->children[i]->kind == ND_DECLARATION && !node->children[i]->is_func_defn)
-            gen_decl(node->children[i]);
+        if (c->kind == ND_DECLARATION && !c->u.declaration.is_func_defn)
+            gen_decl(c);
     }
     // Pass 2b: local static data collected during pass 1 (function codegen).
     for (int i = 0; i < codegen_ctx.local_static_count; i++)
@@ -1611,9 +1596,9 @@ void gen_code(Node *node, int tu_index)
         Node *n = e->decl_node;
         gen_align();
         printf("_ls%d:\n", e->id);
-        if (n->child_count == 2)
+        Node *init = n->u.declarator.init;
+        if (init != NULL)
         {
-            Node *init = n->children[1];
             if (init->kind == ND_INITLIST)
                 gen_initlist(init, e->sym);
             else if (init->strval && istype_array(e->sym->type))
@@ -1624,10 +1609,10 @@ void gen_code(Node *node, int tu_index)
                 printf("    word    _l%d\n", sid);
             }
             else if (istype_fp(e->sym->type))
-                emit_float_bytes(n->children[1]->fval);
+                emit_float_bytes(init->fval);
             else
             {
-                int val = int_constexpr(n->children[1]);
+                int val = int_constexpr(init);
                 gen_word(val);
             }
         }
