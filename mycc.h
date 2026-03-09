@@ -257,7 +257,6 @@ typedef enum
 {
     NS_IDENT,
     NS_TAG,
-    NS_LABEL,
     NS_TYPEDEF
 } Namespace;
 
@@ -305,42 +304,34 @@ typedef struct Node Node;
 struct Node
 {
     Node_kind       kind;
+    // Positional child slots — all Node* children live here (see slot assignments in codegen.md).
+    // ch[0..3] are NULL by default (arena_alloc zeroes memory).
+    Node            *ch[4];
     union {
-        struct { char *name; Node *args; bool is_function; } ident; // ND_IDENT: variable/function name + call args
-        char        *label;      // ND_GOTOSTMT: goto label (heap)
-        struct { Node *lhs; Node *rhs; } binop;            // ND_BINOP, ND_ASSIGN
-        struct { Node *operand; Node *args; bool is_function; bool is_array_deref; } unaryop; // ND_UNARYOP
-        struct { Node *base; char *field_name; Node *args; bool is_function; int offset; } member; // ND_MEMBER
-        struct { Node *cond; Node *then_; Node *else_; } ifstmt;
-        struct { Node *cond; Node *body; } whilestmt;
-        struct { Node *init; Node *cond; Node *inc; Node *body; } forstmt;
-        struct { Node *body; Node *cond; } dowhile;         // ND_DOWHILESTMT
-        struct { Node *selector; Node *body; } switchstmt;  // ND_SWITCHSTMT
-        struct { Node *expr; } returnstmt;                  // ND_RETURNSTMT
-        struct { char *name; Node *stmt; } labelstmt;       // ND_LABELSTMT
-        struct { Node *expr; } exprstmt;                    // ND_EXPRSTMT
-        struct { Node *type_decl; Node *expr; } cast;       // ND_CAST
-        struct { Node *cond; Node *then_; Node *else_; } ternary; // ND_TERNARY
-        struct { Node *lhs; Node *rhs; } compound_assign; // ND_COMPOUND_ASSIGN
-        struct { Node *ap; Node *last; } vastart;           // ND_VA_START
-        struct { Node *ap; } vaarg;                         // ND_VA_ARG
-        struct { Node *ap; } vaend;                         // ND_VA_END
-        struct { Node *direct_decl; Node *init; int pointer_level; } declarator;  // ND_DECLARATOR
-        struct { Node *size; } array_decl;                       // ND_ARRAY_DECL
-        struct { Node *params; } func_decl;                      // ND_FUNC_DECL
-        struct { Node *decl; } type_name;                        // ND_TYPE_NAME
-        struct { Node *body; } stmt_wrap;                        // ND_STMT
-        struct { Node *decls; } program;                         // ND_PROGRAM
-        struct { Node *stmts; } compstmt;                        // ND_COMPSTMT
-        struct { Node *params; bool is_variadic; } ptype_list;    // ND_PTYPE_LIST
-        struct { Node *items; } initlist;                        // ND_INITLIST
-        struct { Node *spec; Node *decls; Node *func_body; Decl_spec typespec; StorageClass sclass; bool is_func_defn; } declaration; // ND_DECLARATION
-        struct { Node *name; Node *suffixes; } direct_decl;      // ND_DIRECT_DECL
-        struct { Node *tag; Node *members; bool is_union; } struct_spec;  // ND_STRUCT
-        struct { long long ival; double fval; char *strval; int strval_len; } literal; // ND_LITERAL
-        struct { long long value; int label_id; } casestmt;      // ND_CASESTMT
-        struct { int label_id; } defaultstmt;                    // ND_DEFAULTSTMT
-        Node *ch[4];    // positional alias: ch[i] == the i-th leading Node* of any u.* variant
+        // ND_IDENT: variable/function name + call-flag
+        struct { char *name; bool is_function; } ident;
+        // ND_GOTOSTMT: goto target label name
+        char        *label;
+        // ND_UNARYOP: flags
+        struct { bool is_function; bool is_array_deref; } unaryop;
+        // ND_MEMBER: field name + flags
+        struct { char *field_name; bool is_function; int offset; } member;
+        // ND_LABELSTMT: label name
+        struct { char *name; } labelstmt;
+        // ND_DECLARATOR: pointer indirection count + init (init stored in ch[1])
+        struct { int pointer_level; } declarator;
+        // ND_PTYPE_LIST: variadic flag
+        struct { bool is_variadic; } ptype_list;
+        // ND_DECLARATION: type specifier bitmask, storage class, func-defn flag
+        struct { Decl_spec typespec; StorageClass sclass; bool is_func_defn; } declaration;
+        // ND_STRUCT: union-vs-struct flag
+        struct { bool is_union; } struct_spec;
+        // ND_LITERAL: integer/float/string value
+        struct { long long ival; double fval; char *strval; int strval_len; } literal;
+        // ND_CASESTMT: case constant value + assigned label id
+        struct { long long value; int label_id; } casestmt;
+        // ND_DEFAULTSTMT: assigned label id
+        struct { int label_id; } defaultstmt;
     } u;
     Node            *next;       // sibling link (for linked-list children)
     bool            is_expr;
@@ -421,7 +412,8 @@ extern int current_global_tu;
 Symbol *find_symbol(Node *node, const char *name, Namespace nspace);
 
 void leave_scope();
-Symbol_table *enter_new_scope(bool use_last_scope);
+Symbol_table *enter_new_scope(void);
+Symbol_table *reenter_last_scope(void);
 const char *curr_scope_str();
 
 // Build a Type* from a declaration-context node (typespec + optional declarator child).

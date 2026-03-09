@@ -14,7 +14,6 @@ static Symbol *insert_typedef(Node *node, Type *type, const char *ident);
 static Symbol *new_symbol(Type *type, const char *ident, int offset);
 static Symbol *insert_ident(Node *node, Type *type, const char *ident, bool is_param, StorageClass sclass);
 static Type   *generate_struct_type(Node *decl_node, DeclParseState ds, int depth);
-Symbol_table  *find_scope(Node *node);
 static Type   *type_from_declarator(Node *decl, Type *base);
 static Type   *type_from_direct_decl(Node *dd, Type *base);
 static Type   *typespec_to_base(Decl_spec typespec);
@@ -210,19 +209,19 @@ static Type *type_from_declarator(Node *decl, Type *base)
     Type *t = base;
     for (int i = 0; i < decl->u.declarator.pointer_level; i++)
         t = get_pointer_type(t);
-    return type_from_direct_decl(decl->u.declarator.direct_decl, t);
+    return type_from_direct_decl(decl->ch[0], t);   // direct_decl
 }
 
 static Type *type_from_direct_decl(Node *dd, Type *base)
 {
-    // u.direct_decl.name is ND_IDENT or ND_DECLARATOR (for grouped inner declarators).
-    // u.direct_decl.suffixes is a linked list of ND_ARRAY_DECL and ND_FUNC_DECL nodes.
-    Node *name = dd->u.direct_decl.name;
+    // ch[0]=name (ND_IDENT or ND_DECLARATOR for grouped inner declarators).
+    // ch[1]=suffixes linked list (ND_ARRAY_DECL and ND_FUNC_DECL nodes).
+    Node *name = dd->ch[0];
 
     // Collect suffixes for right-to-left processing
     Node *suf[32];
     int   nsuf = 0;
-    for (Node *s = dd->u.direct_decl.suffixes; s; s = s->next)
+    for (Node *s = dd->ch[1]; s; s = s->next)   // suffixes list
         suf[nsuf++] = s;
 
     // Apply array/function suffixes right-to-left (rightmost = innermost)
@@ -232,14 +231,14 @@ static Type *type_from_direct_decl(Node *dd, Type *base)
         Node *s = suf[i];
         if (s->kind == ND_ARRAY_DECL)
         {
-            int count = (s->u.array_decl.size && s->u.array_decl.size->kind == ND_LITERAL)
-                            ? (int)s->u.array_decl.size->u.literal.ival
+            int count = (s->ch[0] && s->ch[0]->kind == ND_LITERAL)   // size
+                            ? (int)s->ch[0]->u.literal.ival
                             : 0;
             t         = get_array_type(t, count);
         }
         else if (s->kind == ND_FUNC_DECL)
         {
-            bool variadic = s->u.func_decl.params && s->u.func_decl.params->u.ptype_list.is_variadic;
+            bool variadic = s->ch[0] && s->ch[0]->u.ptype_list.is_variadic;   // params
             t             = get_function_type(t, NULL, variadic);
         }
     }
@@ -316,7 +315,7 @@ Type *type2_from_decl_node(Node *node, DeclParseState ds)
     }
     // A declarator may be present (type_name() for casts/sizeof builds ND_DECLARATION
     // with a declarator stored as the first entry in u.declaration.decls).
-    Node *first_decl = node->u.declaration.decls;
+    Node *first_decl = node->ch[1];   // decls list head
     if (first_decl && first_decl->kind == ND_DECLARATOR)
         return type_from_declarator(first_decl, base);
     return base;
@@ -510,6 +509,14 @@ void make_basic_types()
     Param *p = arena_alloc(sizeof(Param));
     p->type  = t_int;
     insert_builtin("putchar", get_function_type(t_int, p, false));
+
+    // Register va_list as a typedef for int so the normal typedef path handles it.
+    Symbol *va = arena_alloc(sizeof(Symbol));
+    va->name   = "va_list";
+    va->type   = t_int;
+    va->ns     = NS_TYPEDEF;
+    va->kind   = SYM_GLOBAL;
+    append_symbol(&type_ctx.symbol_table->symbols, va);
 }
 
 // ---------------------------------------------------------------
@@ -566,11 +573,11 @@ static void calc_struct_layout(Type *st)
 static Type *generate_struct_type(Node *decl_node, DeclParseState ds, int depth)
 {
     DBG_FUNC();
-    Node *struct_node = decl_node->u.declaration.spec;
+    Node *struct_node = decl_node->ch[0];   // spec
     if (!struct_node || struct_node->kind != ND_STRUCT)
         error("Should be struct declaration!\n");
 
-    char   *tagname = struct_node->u.struct_spec.tag->u.ident.name;
+    char   *tagname = struct_node->ch[0]->u.ident.name;   // tag node name
     Symbol *tag     = find_symbol_st(decl_node->st, tagname, NS_TAG);
     if (!tag)
     {
@@ -588,16 +595,16 @@ static Type *generate_struct_type(Node *decl_node, DeclParseState ds, int depth)
         Field  *fields   = NULL;
         Field **last_ptr = &fields;
 
-        for (Node *d = struct_node->u.struct_spec.members; d; d = d->next)
+        for (Node *d = struct_node->ch[1]; d; d = d->next)   // members list
         {
             if (d->kind != ND_DECLARATION)
                 continue;
 
             bool has_nested_struct =
-                (d->u.declaration.spec != NULL && d->u.declaration.spec->kind == ND_STRUCT &&
-                 d->u.declaration.spec->u.struct_spec.members != NULL);
+                (d->ch[0] != NULL && d->ch[0]->kind == ND_STRUCT &&
+                 d->ch[0]->ch[1] != NULL);   // spec exists and has members list
 
-            for (Node *m = d->u.declaration.decls; m; m = m->next)
+            for (Node *m = d->ch[1]; m; m = m->next)   // decls list
             {
                 if (m->kind != ND_DECLARATOR)
                     continue;
@@ -614,8 +621,8 @@ static Type *generate_struct_type(Node *decl_node, DeclParseState ds, int depth)
                     }
                     else
                     {
-                        Node   *sn       = d->u.declaration.spec;
-                        char   *stag     = sn->u.struct_spec.tag->u.ident.name;
+                        Node   *sn       = d->ch[0];   // spec
+                        char   *stag     = sn->ch[0]->u.ident.name;   // tag name
                         Symbol *stag_sym = find_symbol_st(d->st, stag, NS_TAG);
                         base             = (stag_sym && stag_sym->type) ? stag_sym->type : t_void;
                     }
@@ -649,7 +656,7 @@ static Type *generate_struct_type(Node *decl_node, DeclParseState ds, int depth)
         tag->type = st;
         return st;
     }
-    else if (struct_node->u.struct_spec.members != NULL)
+    else if (struct_node->ch[1] != NULL)   // members list exists
     {
         error("Redefinition of tag %s\n", tagname);
     }
@@ -671,11 +678,11 @@ void add_types_and_symbols(Node *node, DeclParseState ds, bool is_param, int dep
     node->u.declaration.sclass   = ds.sclass;
 
     // First pass: handle struct definitions and determine base type
-    Node *spec                   = node->u.declaration.spec;
+    Node *spec                   = node->ch[0];   // spec
     if (spec && spec->kind == ND_STRUCT)
     {
-        bool has_body   = (spec->u.struct_spec.members != NULL);
-        bool standalone = (node->u.declaration.decls == NULL);
+        bool has_body   = (spec->ch[1] != NULL);   // members list
+        bool standalone = (node->ch[1] == NULL);   // decls list
         if (!has_body)
         {
             if (standalone)
@@ -690,14 +697,14 @@ void add_types_and_symbols(Node *node, DeclParseState ds, bool is_param, int dep
             else
             {
                 // "struct foo" as type specifier with a declarator
-                Symbol *s  = find_symbol(node, spec->u.struct_spec.tag->u.ident.name, NS_TAG);
+                Symbol *s  = find_symbol(node, spec->ch[0]->u.ident.name, NS_TAG);   // tag name
                 node->type = s->type;
             }
         }
         else
         {
             // Full struct definition with body
-            spec->symbol = insert_tag(find_scope(node), spec->u.struct_spec.tag->u.ident.name);
+            spec->symbol = insert_tag(node->st, spec->ch[0]->u.ident.name);   // tag name
             if (!depth)
             {
                 DBG_PRINT("%s creating struct type\n", __func__);
@@ -729,7 +736,7 @@ void add_types_and_symbols(Node *node, DeclParseState ds, bool is_param, int dep
 
     // Second pass: process every ND_DECLARATOR child
     bool first_decl = true;
-    for (Node *n = node->u.declaration.decls; n; n = n->next)
+    for (Node *n = node->ch[1]; n; n = n->next)   // decls list
     {
         // Skip declarators when depth > 0: struct/union member symbols are built
         // by generate_struct_type() directly, not by this pass.
@@ -740,9 +747,9 @@ void add_types_and_symbols(Node *node, DeclParseState ds, bool is_param, int dep
         Type       *ty    = type_from_declarator(n, base);
         DBG_PRINT("%s declarator ident:'%s' type:%s\n", __func__, ident ? ident : "", fulltype_str(ty));
         // char s[] = "hello" — fix up zero-size array from string literal init
-        if (ty->base == TB_ARRAY && ty->u.arr.count == 0 && n->u.declarator.init &&
-            n->u.declarator.init->u.literal.strval)
-            ty = get_array_type(ty->u.arr.elem, n->u.declarator.init->u.literal.strval_len + 1);
+        if (ty->base == TB_ARRAY && ty->u.arr.count == 0 && n->ch[1] &&   // init
+            n->ch[1]->u.literal.strval)
+            ty = get_array_type(ty->u.arr.elem, n->ch[1]->u.literal.strval_len + 1);
         if (first_decl)
         {
             node->type = ty;
@@ -758,7 +765,7 @@ void add_types_and_symbols(Node *node, DeclParseState ds, bool is_param, int dep
                 n->symbol = insert_ident(node, ty, ident, is_param, ds.sclass);
 
             // For struct-typed variables, ensure symbol points to struct type
-            if (node->u.declaration.spec && node->u.declaration.spec->kind == ND_STRUCT)
+            if (node->ch[0] && node->ch[0]->kind == ND_STRUCT)   // spec
             {
                 DBG_PRINT("%s setting sym type from tag\n", __func__);
                 n->symbol->type = ty;    // ty already wraps struct base
@@ -770,11 +777,6 @@ void add_types_and_symbols(Node *node, DeclParseState ds, bool is_param, int dep
 // ---------------------------------------------------------------
 // Symbol table
 // ---------------------------------------------------------------
-Symbol_table *find_scope(Node *node)
-{
-    return node->st;
-}
-
 // Probe lookup: walk scope chain from st, return NULL if not found.
 Symbol *find_symbol_st(Symbol_table *st, const char *name, Namespace nspace)
 {
@@ -797,14 +799,14 @@ Symbol *find_symbol_st(Symbol_table *st, const char *name, Namespace nspace)
 // Fatal lookup: error if the symbol is not found.
 Symbol *find_symbol(Node *n, const char *name, Namespace nspace)
 {
-    Symbol *s = find_symbol_st(find_scope(n), name, nspace);
+    Symbol *s = find_symbol_st(n->st, name, nspace);
     if (!s)
     {
 #ifdef DEBUG_ENABLED
         print_type_table();
         print_symbol_table(type_ctx.symbol_table, 0);
 #endif
-        error("%s %s not found!\n", nspace == NS_IDENT ? "ident" : nspace == NS_TAG ? "tag" : "label", name);
+        error("%s %s not found!\n", nspace == NS_IDENT ? "ident" : "tag", name);
     }
     return s;
 }
@@ -823,17 +825,18 @@ static Symbol_table *new_st_scope()
     return type_ctx.curr_scope_st;
 }
 
-Symbol_table *enter_new_scope(bool use_last_scope)
+Symbol_table *enter_new_scope(void)
 {
-    if (use_last_scope)
-    {
-        type_ctx.scope_depth++;
-        type_ctx.curr_scope_st = type_ctx.last_symbol_table;
-        return type_ctx.last_symbol_table;
-    }
     type_ctx.scope_depth++;
     type_ctx.last_symbol_table = new_st_scope();
     type_ctx.curr_scope_st     = type_ctx.last_symbol_table;
+    return type_ctx.last_symbol_table;
+}
+
+Symbol_table *reenter_last_scope(void)
+{
+    type_ctx.scope_depth++;
+    type_ctx.curr_scope_st = type_ctx.last_symbol_table;
     return type_ctx.last_symbol_table;
 }
 
@@ -871,7 +874,7 @@ Symbol *insert_enum_const(Symbol_table *st, Type *ety, char *ident, int value)
 static Symbol *insert_typedef(Node *node, Type *type, const char *ident)
 {
     DBG_PRINT("%s %s\n", __func__, ident);
-    Symbol_table *st = find_scope(node);
+    Symbol_table *st = node->st;
     for (Symbol *s = st->symbols; s; s = s->next)
         if (s->ns == NS_TYPEDEF && !strcmp(s->name, ident))
             return s;
@@ -883,15 +886,11 @@ static Symbol *insert_typedef(Node *node, Type *type, const char *ident)
 
 bool is_typedef_name(char *name)
 {
-    if (!strcmp(name, "va_list"))
-        return true;
     return find_symbol_st(type_ctx.curr_scope_st, name, NS_TYPEDEF) != NULL;
 }
 
 Type *find_typedef_type(char *name)
 {
-    if (!strcmp(name, "va_list"))
-        return t_int;
     Symbol *s = find_symbol_st(type_ctx.curr_scope_st, name, NS_TYPEDEF);
     if (s)
         return s->type;

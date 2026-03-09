@@ -3,8 +3,6 @@
 #include "mycc.h"
 
 
-Symbol_table *find_scope(Node *node);
-
 // Codegen context instance
 CodegenContext codegen_ctx;
 
@@ -15,7 +13,7 @@ typedef struct { int offset; bool is_param; } LocalAddr;
 static LocalAddr find_local_addr(Node *node, const char *name)
 {
     DBG_PRINT("%s scope id:%d depth:%d\n", __func__, node->st->scope_id, node->st->depth);
-    Symbol *s = find_symbol_st(find_scope(node), name, NS_IDENT);
+    Symbol *s = find_symbol_st(node->st, name, NS_IDENT);
     if (!s)
         error("Symbol %s not found!\n", name);
     if (s->kind == SYM_STATIC_LOCAL || s->kind == SYM_GLOBAL || s->kind == SYM_STATIC_GLOBAL || s->kind == SYM_EXTERN)
@@ -338,7 +336,6 @@ void gen_varaddr(Node *node)
 {
     if (node->kind != ND_IDENT)
         error("Expecting local var got %s", nodestr(node->kind));
-    
     gen_varaddr_from_ident(node, node->u.ident.name);
 }
 void gen_preamble(void)
@@ -394,7 +391,7 @@ static int push_args_list(Node *first_arg)
 // Indirect call through function pointer variable: fp(args)
 void gen_callfunction_via_ptr(Node *node)
 {
-    int param_size = push_args_list(node->u.ident.args);
+    int param_size = push_args_list(node->ch[0]);   // args list
     gen_varaddr(node);
     gen_ld(node->symbol->type->size);
     gen_jli();
@@ -404,8 +401,8 @@ void gen_callfunction_via_ptr(Node *node)
 // Indirect call through dereferenced pointer: (*fp)(args)
 void gen_callfunction_via_deref(Node *node)
 {
-    int param_size = push_args_list(node->u.unaryop.args);
-    gen_expr(node->u.unaryop.operand);
+    int param_size = push_args_list(node->ch[1]);   // args list
+    gen_expr(node->ch[0]);                           // operand (function pointer expr)
     gen_jli();
     gen_adj(param_size);
 }
@@ -415,9 +412,9 @@ void gen_callfunction(Node *node)
     // putchar(c) is a CPU builtin
     if (!strcmp(node->symbol->name, "putchar"))
     {
-        if (!node->u.ident.args || node->u.ident.args->next)
+        if (!node->ch[0] || node->ch[0]->next)
             error("putchar requires exactly 1 argument\n");
-        gen_expr(node->u.ident.args);
+        gen_expr(node->ch[0]);
         printf("    putchar\n");
         return;
     }
@@ -448,7 +445,7 @@ void gen_callfunction(Node *node)
     // pc is set to saved link address, returning to the caller.
     //
     // Push the params on backwards, the offsets from the symbol table then work
-    int param_size = push_args_list(node->u.ident.args);
+    int param_size = push_args_list(node->ch[0]);   // args list
     if (node->symbol->kind == SYM_STATIC_GLOBAL)
     {
         char mangled[80];
@@ -468,8 +465,10 @@ static const char *node_ident_str(Node *node)
     if (!node) return "";
     if (node->kind == ND_IDENT)
         return node->u.ident.name ? node->u.ident.name : "";
-    if (node->kind == ND_LABELSTMT || node->kind == ND_GOTOSTMT)
+    if (node->kind == ND_GOTOSTMT)
         return node->u.label ? node->u.label : "";
+    if (node->kind == ND_LABELSTMT)
+        return node->u.labelstmt.name ? node->u.labelstmt.name : "";
     return "";
 }
 
@@ -488,14 +487,14 @@ void gen_addr(Node *node)
     }
     else if (node->kind == ND_UNARYOP && node->op_kind == TK_STAR)
     {
-        gen_expr(node->u.unaryop.operand);
+        gen_expr(node->ch[0]);   // operand
     }
     else if (node->kind == ND_MEMBER)
     {
         if (node->op_kind == TK_ARROW)
-            gen_expr(node->u.member.base);    // load pointer value
+            gen_expr(node->ch[0]);    // base: load pointer value
         else
-            gen_addr(node->u.member.base);    // struct base address
+            gen_addr(node->ch[0]);    // base: struct base address
         gen_push();
         gen_offset(node);
         gen_add();
@@ -612,8 +611,8 @@ void gen_expr(Node *node)
     // ===== Binary operators =====
     if (node->kind == ND_BINOP)
     {
-        Node *lhs = node->u.binop.lhs;
-        Node *rhs = node->u.binop.rhs;
+        Node *lhs = node->ch[0];
+        Node *rhs = node->ch[1];
         if (node->op_kind == TK_COMMA)
         {
             gen_expr(lhs);    // evaluate for side effects
@@ -705,8 +704,7 @@ void gen_expr(Node *node)
     // ===== Unary operators =====
     else if (node->kind == ND_UNARYOP)
     {
-        // Use u.unaryop.operand directly
-        Node *operand = node->u.unaryop.operand;
+        Node *operand = node->ch[0];   // operand
         switch (node->op_kind)
         {
         case TK_PLUS:
@@ -799,8 +797,8 @@ void gen_expr(Node *node)
     // ===== Assignment =====
     else if (node->kind == ND_ASSIGN)
     {
-        Node *lhs = node->u.binop.lhs;
-        Node *rhs = node->u.binop.rhs;
+        Node *lhs = node->ch[0];
+        Node *rhs = node->ch[1];
         gen_addr(lhs);
         gen_push();
         gen_expr(rhs);
@@ -818,8 +816,8 @@ void gen_expr(Node *node)
         //   gen_expr(rhs)  → r0 = rhs
         //   op             → r0 = old_val op rhs; stack: [addr]
         //   store          → mem[addr] = r0; stack: []
-        Node *lhs = node->u.compound_assign.lhs;
-        Node *rhs = node->u.compound_assign.rhs;
+        Node *lhs = node->ch[0];
+        Node *rhs = node->ch[1];
         int sz = lhs->type ? lhs->type->size : 2;
         gen_addr(lhs);
         gen_push();
@@ -859,17 +857,15 @@ void gen_expr(Node *node)
     // ===== Cast =====
     else if (node->kind == ND_CAST)
     {
-        // The type conversion is defined by the type of the expression in child 1 and the
-        // type of the cast
-        // Use u.cast.expr directly
-        gen_expr(node->u.cast.expr);
-        gen_cast(node->u.cast.expr->type, node->type);
+        // ch[0]=type_decl (not evaluated), ch[1]=expr to cast
+        gen_expr(node->ch[1]);
+        gen_cast(node->ch[1]->type, node->type);
     }
     // ===== Member access =====
     else if (node->kind == ND_MEMBER && node->u.member.is_function)
     {
         // Call through a function-pointer struct member: s.fp(args) or s->fp(args)
-        int param_size = push_args_list(node->u.member.args);
+        int param_size = push_args_list(node->ch[1]);   // args list
         gen_addr(node);
         gen_ld(WORD_SIZE);  // load function pointer (pointer-sized)
         gen_jli();
@@ -883,9 +879,9 @@ void gen_expr(Node *node)
     // ===== Ternary =====
     else if (node->kind == ND_TERNARY)
     {
-        Node *cond  = node->u.ternary.cond;
-        Node *then_ = node->u.ternary.then_;
-        Node *else_ = node->u.ternary.else_;
+        Node *cond  = node->ch[0];
+        Node *then_ = node->ch[1];
+        Node *else_ = node->ch[2];
         int l_else = new_label();
         int l_end  = new_label();
         gen_expr(cond);
@@ -901,8 +897,8 @@ void gen_expr(Node *node)
     {
         // va_start(ap, last_param)
         // ap = bp + last_param_offset + last_param_size
-        Node *ap_node  = node->u.vastart.ap;
-        Node *lp_node  = node->u.vastart.last;
+        Node *ap_node  = node->ch[0];   // ap
+        Node *lp_node  = node->ch[1];   // last
         int param_off  = lp_node->symbol->offset;
         int param_size = lp_node->symbol->type->size;
         gen_addr(ap_node);                       // r0 = &ap
@@ -915,7 +911,7 @@ void gen_expr(Node *node)
         // va_arg(ap, T) where T has size s
         // Returns *old_ap, advances ap by s
         int s         = node->type->size;
-        Node *ap_node = node->u.vaarg.ap;
+        Node *ap_node = node->ch[0];   // ap
         // Save old ap value
         gen_addr(ap_node);    // r0 = &ap
         gen_ld(WORD_SIZE);    // r0 = ap (current vararg pointer)
@@ -946,7 +942,7 @@ void gen_return()
 void gen_returnstmt(Node *node)
 {
     printf(";%s\n", __func__);
-    Node *expr = node->u.returnstmt.expr;
+    Node *expr = node->ch[0];   // return expr (NULL if bare return)
     if (expr)
     {
         // Must have an expression
@@ -959,9 +955,9 @@ void gen_ifstmt(Node *node)
 {
     printf(";%s\n", __func__);
     // Structure is expr, stmt, [stmt]
-    Node *cond = node->u.ifstmt.cond;
-    Node *then_ = node->u.ifstmt.then_;
-    Node *else_ = node->u.ifstmt.else_;
+    Node *cond = node->ch[0];
+    Node *then_ = node->ch[1];
+    Node *else_ = node->ch[2];
     int l_else = new_label();
     gen_expr(cond);
     gen_jz(l_else);
@@ -982,8 +978,8 @@ void gen_whilestmt(Node *node)
 {
     printf(";%s\n", __func__);
     if (codegen_ctx.loop_depth >= 64) error("too deeply nested");
-    Node *cond = node->u.whilestmt.cond;
-    Node *body = node->u.whilestmt.body;
+    Node *cond = node->ch[0];
+    Node *body = node->ch[1];
     int lloop   = new_label();
     int lbreak  = new_label();
     codegen_ctx.break_labels[codegen_ctx.loop_depth] = lbreak;
@@ -1002,10 +998,10 @@ void gen_forstmt(Node *node)
 {
     printf(";%s\n", __func__);
     if (codegen_ctx.loop_depth >= 64) error("too deeply nested");
-    Node *init = node->u.forstmt.init;
-    Node *cond = node->u.forstmt.cond;
-    Node *inc  = node->u.forstmt.inc;
-    Node *body = node->u.forstmt.body;
+    Node *init = node->ch[0];
+    Node *cond = node->ch[1];
+    Node *inc  = node->ch[2];
+    Node *body = node->ch[3];
     // If the init was a declaration, node->symtable holds the for-init scope.
     if (node->symtable)
         gen_adj(-node->symtable->size);
@@ -1038,8 +1034,8 @@ void gen_dowhilestmt(Node *node)
 {
     printf(";%s\n", __func__);
     if (codegen_ctx.loop_depth >= 64) error("too deeply nested");
-    Node *body = node->u.dowhile.body;
-    Node *cond = node->u.dowhile.cond;
+    Node *body = node->ch[0];
+    Node *cond = node->ch[1];
     int lloop  = new_label();
     int lcont  = new_label();
     int lbreak = new_label();
@@ -1068,7 +1064,7 @@ void gen_continuestmt(Node *node)
 }
 void gen_exprstmt(Node *node)
 {
-    gen_expr(node->u.exprstmt.expr);
+    gen_expr(node->ch[0]);   // expr
 }
 bool is_constexpr(Node *n)
 {
@@ -1077,9 +1073,9 @@ bool is_constexpr(Node *n)
     if (n->kind == ND_IDENT && n->symbol && n->symbol->kind == SYM_ENUM_CONST) return true;
     // Composite expressions are constexpr only if all operands are.
     if (n->kind == ND_BINOP)
-        return is_constexpr(n->u.binop.lhs) && is_constexpr(n->u.binop.rhs);
+        return is_constexpr(n->ch[0]) && is_constexpr(n->ch[1]);
     if (n->kind == ND_UNARYOP)
-        return is_constexpr(n->u.unaryop.operand);
+        return is_constexpr(n->ch[0]);   // operand
     return false;
 }
 int count_constexpr(Node *n)
@@ -1089,7 +1085,7 @@ int count_constexpr(Node *n)
     int count = 0;
     if (n->kind == ND_INITLIST)
     {
-        for (Node *c = n->u.initlist.items; c; c = c->next)
+        for (Node *c = n->ch[0]; c; c = c->next)   // items list
             count += count_constexpr(c);
     }
     return count;
@@ -1107,7 +1103,7 @@ void gen_inits(Node *n, Symbol *s, int vaddr, int offset, int depth)
 
     // Recurse through initlist
     int ptr = offset;
-    for (Node *item = n->u.initlist.items; item; item = item->next)
+    for (Node *item = n->ch[0]; item; item = item->next)   // items list
         if (is_constexpr(item))
         {
             gen_lea(vaddr + ptr);
@@ -1144,7 +1140,7 @@ void gen_mem_inits(char *data, Node *n, Symbol *s, int vaddr, int offset, int de
 
     // Recurse through initlist
     int ptr = offset;
-    for (Node *item = n->u.initlist.items; item; item = item->next)
+    for (Node *item = n->ch[0]; item; item = item->next)   // items list
         if (is_constexpr(item))
         {
             int val = int_constexpr(item);
@@ -1170,15 +1166,15 @@ void gen_mem_inits(char *data, Node *n, Symbol *s, int vaddr, int offset, int de
 
 int int_unaryop(Node *n)
 {
-    int i = int_constexpr(n->u.unaryop.operand);
+    int i = int_constexpr(n->ch[0]);   // operand
     if (n->op_kind == TK_MINUS)
         return -i;
     return i;
 }
 int int_binop(Node *n)
 {
-    int i = int_constexpr(n->u.binop.lhs);
-    int j = int_constexpr(n->u.binop.rhs);
+    int i = int_constexpr(n->ch[0]);   // lhs
+    int j = int_constexpr(n->ch[1]);   // rhs
     switch (n->op_kind)
     {
         case TK_PLUS:  return i + j;
@@ -1206,7 +1202,7 @@ int int_constexpr(Node *n)
 static void gen_struct_inits(Node *n, int vaddr, Type *st)
 {
     Field *f = st->u.composite.members;
-    for (Node *child = n->u.initlist.items; child && f; child = child->next, f = f->next)
+    for (Node *child = n->ch[0]; child && f; child = child->next, f = f->next)   // items list
     {
         if (child->kind == ND_INITLIST)
         {
@@ -1229,7 +1225,7 @@ static void gen_struct_inits(Node *n, int vaddr, Type *st)
 static void gen_struct_mem_inits(char *data, Node *n, Type *st, int base)
 {
     Field *f = st->u.composite.members;
-    for (Node *child = n->u.initlist.items; child && f; child = child->next, f = f->next)
+    for (Node *child = n->ch[0]; child && f; child = child->next, f = f->next)   // items list
     {
         if (child->kind == ND_INITLIST)
         {
@@ -1272,7 +1268,7 @@ void gen_initlist(Node *n, Symbol *s)
             if (constexpr != 1)
                 error("Should be exactly one constexpr in initialiser\n");
             Node *l;
-            for(l = n; !is_constexpr(l); l = l->u.initlist.items);
+            for(l = n; !is_constexpr(l); l = l->ch[0]);   // items list head
             gen_varaddr_from_ident(n, s->name);
             gen_push();
             gen_expr(l);
@@ -1304,7 +1300,7 @@ void gen_initlist(Node *n, Symbol *s)
             if (constexpr != 1)
                 error("Should be exactly one constexpr in initialiser\n");
             Node *l;
-            for(l = n; !is_constexpr(l); l = l->u.initlist.items);
+            for(l = n; !is_constexpr(l); l = l->ch[0]);   // items list head
             if (istype_fp(t))
                 emit_float_bytes(l->u.literal.fval);
             else
@@ -1329,7 +1325,7 @@ void gen_decl(Node *node)
     // Space is reserved at the start of the compound statement
 
     // Iterate over declarators, generating code for initialisations
-    for (Node *n = node->u.declaration.decls; n; n = n->next)
+    for (Node *n = node->ch[1]; n; n = n->next)   // decls list
     {
         // Different treatment if at scope 0
         if (n->st->depth)
@@ -1341,13 +1337,13 @@ void gen_decl(Node *node)
                 };
                 continue;
             }
-            if (n->kind == ND_DECLARATOR && n->u.declarator.init != NULL)
+            if (n->kind == ND_DECLARATOR && n->ch[1] != NULL)   // init
             {
                 // This is an initialiser.
                 // Get ident from symbol table
                 if (!n->symbol)
                     error("Missing symbol!\n");
-                Node *init = n->u.declarator.init;
+                Node *init = n->ch[1];   // init
                 if (init->kind == ND_INITLIST)
                 {
                     gen_initlist(init, n->symbol);
@@ -1398,10 +1394,10 @@ void gen_decl(Node *node)
                     gen_symlabel(n->symbol->name);
                 // If there is no init, we make space
 
-                if (n->u.declarator.init != NULL)
+                if (n->ch[1] != NULL)   // init
                 {
                     // Initialiser
-                    Node *init = n->u.declarator.init;
+                    Node *init = n->ch[1];   // init
                     if (init->kind == ND_INITLIST)
                     {
                         gen_initlist(init, n->symbol);
@@ -1441,7 +1437,7 @@ void gen_compstmt(Node *node)
     printf(";%s\n", __func__);
     // Make space on stack for this scope's locals
     gen_adj(-node->symtable->size);
-    for (Node *n = node->u.compstmt.stmts; n; n = n->next)
+    for (Node *n = node->ch[0]; n; n = n->next)   // stmts list
     {
         if (n->kind == ND_DECLARATION)
             gen_decl(n);
@@ -1462,8 +1458,8 @@ static int find_label_id(char *name)
 void gen_labelstmt(Node *node)
 {
     gen_label(find_label_id(node->u.labelstmt.name));
-    if (node->u.labelstmt.stmt)
-        gen_stmt(node->u.labelstmt.stmt);
+    if (node->ch[0])   // stmt
+        gen_stmt(node->ch[0]);
 }
 void gen_gotostmt(Node *node)
 {
@@ -1473,12 +1469,12 @@ void gen_switchstmt(Node *node)
 {
     printf(";%s\n", __func__);
     if (codegen_ctx.loop_depth >= 64) error("too deeply nested");
-    Node *selector = node->u.switchstmt.selector;
-    Node *body     = node->u.switchstmt.body; // ND_COMPSTMT
+    Node *selector = node->ch[0];
+    Node *body     = node->ch[1]; // ND_COMPSTMT
     int lbreak     = new_label();
     int ldefault   = -1;
     // Phase 1: assign codegen_ctx.label_counter to cases and emit comparisons
-    for (Node *ch = body->u.compstmt.stmts; ch; ch = ch->next)
+    for (Node *ch = body->ch[0]; ch; ch = ch->next)   // stmts list
     {
         if (ch->kind == ND_CASESTMT) {
             int lcase              = new_label();
@@ -1501,7 +1497,7 @@ void gen_switchstmt(Node *node)
     codegen_ctx.cont_labels[codegen_ctx.loop_depth]  = -1;
     codegen_ctx.loop_depth++;
     gen_adj(-body->symtable->size);
-    for (Node *ch = body->u.compstmt.stmts; ch; ch = ch->next)
+    for (Node *ch = body->ch[0]; ch; ch = ch->next)   // stmts list
     {
         if (ch->kind == ND_CASESTMT)
             gen_label(ch->u.casestmt.label_id);
@@ -1536,7 +1532,7 @@ void gen_stmt(Node *node)
     case ND_DEFAULTSTMT:
     case ND_EMPTY:                              return;
     case ND_RETURNSTMT:  gen_returnstmt(node);  return;
-    case ND_STMT:        gen_stmt(node->u.stmt_wrap.body); return;
+    case ND_STMT:        gen_stmt(node->ch[0]); return;   // body
     default:;
     }
 }
@@ -1547,8 +1543,8 @@ void gen_param_list(Node *node)
 void gen_function(Node *node)
 {
     printf(";%s\n", __func__);
-    Node *first_decl = node->u.declaration.decls;
-    Node *func_body  = node->u.declaration.func_body;
+    Node *first_decl = node->ch[1];   // decls list head
+    Node *func_body  = node->ch[2];   // func_body
     Symbol *fsym = first_decl->symbol;
     if (fsym->kind == SYM_STATIC_GLOBAL)
         printf("_s%d_%s:\n", fsym->tu_index, fsym->name);
@@ -1565,13 +1561,13 @@ void gen_code(Node *node, int tu_index)
     printf(";%s\n", __func__);
 
     // Pass 1: emit function definitions (text area)
-    for (Node *c = node->u.program.decls; c; c = c->next)
+    for (Node *c = node->ch[0]; c; c = c->next)   // decls list
     {
         if (c->kind == ND_DECLARATION && c->u.declaration.is_func_defn)
             gen_function(c);
     }
     // Pass 2: emit global variable declarations (data area)
-    for (Node *c = node->u.program.decls; c; c = c->next)
+    for (Node *c = node->ch[0]; c; c = c->next)   // decls list
     {
         if (c->kind == ND_DECLARATION && !c->u.declaration.is_func_defn)
             gen_decl(c);
@@ -1583,7 +1579,7 @@ void gen_code(Node *node, int tu_index)
         Node *n = e->decl_node;
         gen_align();
         printf("_ls%d:\n", e->id);
-        Node *init = n->u.declarator.init;
+        Node *init = n->ch[1];   // init
         if (init != NULL)
         {
             if (init->kind == ND_INITLIST)

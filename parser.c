@@ -232,9 +232,9 @@ static Node *primary_expr()
         expect(TK_LPAREN);
         node = new_node(ND_VA_START, NULL, true);
         node->type = t_void;
-        node->u.vastart.ap = assign_expr();
+        node->ch[0] = assign_expr();   // ap
         expect(TK_COMMA);
-        node->u.vastart.last = assign_expr();
+        node->ch[1] = assign_expr();   // last
         expect(TK_RPAREN);
         return node;
     }
@@ -243,7 +243,7 @@ static Node *primary_expr()
         expect(TK_IDENT);
         expect(TK_LPAREN);
         node = new_node(ND_VA_ARG, NULL, true);
-        node->u.vaarg.ap = assign_expr();
+        node->ch[0] = assign_expr();   // ap
         expect(TK_COMMA);
         Node *tn = type_name();           // type to fetch
         node->type = tn->type;
@@ -256,7 +256,7 @@ static Node *primary_expr()
         expect(TK_LPAREN);
         node = new_node(ND_VA_END, NULL, true);
         node->type = t_void;
-        node->u.vaend.ap = assign_expr();
+        node->ch[0] = assign_expr();   // ap
         expect(TK_RPAREN);
         return node;
     }
@@ -400,7 +400,7 @@ static Node *unary_expr()
         token_ctx.current = token_ctx.current->next;  // consume the operator token_ctx.current
         node = new_node(ND_UNARYOP, NULL, true);
         node->op_kind = k;
-        node->u.unaryop.operand = unary_expr();
+        node->ch[0] = unary_expr();   // operand
     }
     else if (token_ctx.current->kind == TK_IDENT
             || token_ctx.current->kind == TK_CONSTINT
@@ -452,12 +452,12 @@ static Node *unary_expr()
                         Type *elem = sub_type->u.ptr.pointee;
                         Node *add_node = new_node(ND_BINOP, NULL, true);
                         add_node->op_kind = TK_PLUS;
-                        add_node->u.binop.lhs = e1;
-                        add_node->u.binop.rhs = idx;
+                        add_node->ch[0] = e1;
+                        add_node->ch[1] = idx;
                         node = new_node(ND_UNARYOP, NULL, true);
                         node->op_kind = TK_STAR;
                         node->type = elem;
-                        node->u.unaryop.operand = add_node;
+                        node->ch[0] = add_node;   // operand
                         break;
                     }
                     if (!s)
@@ -492,52 +492,30 @@ static Node *unary_expr()
                     array_depth++;
                     Node *stride_lit = new_node(ND_LITERAL, NULL, true);
                     stride_lit->u.literal.ival = mult;
-                    mul->u.binop.lhs = stride_lit;
-                    mul->u.binop.rhs = expr();
-                    add->u.binop.lhs = e1;
-                    add->u.binop.rhs = mul;
-                    outer_unary->u.unaryop.operand = add;
+                    mul->ch[0] = stride_lit;
+                    mul->ch[1] = expr();
+                    add->ch[0] = e1;
+                    add->ch[1] = mul;
+                    outer_unary->ch[0] = add;   // operand
                     expect(TK_RBRACKET);
                     break;
                 }
             case(TK_LPAREN):
-                // Function call: route args into the appropriate u.*.args linked list
+                // Function call: route args into ch[0] (IDENT) or ch[1] (UNARYOP/MEMBER)
+                // and set is_function flag in u.*.
                 expect(TK_LPAREN);
                 if (pex_node->kind == ND_IDENT)         pex_node->u.ident.is_function = true;
                 else if (pex_node->kind == ND_UNARYOP)  pex_node->u.unaryop.is_function = true;
                 else if (pex_node->kind == ND_MEMBER)   pex_node->u.member.is_function = true;
                 if (token_ctx.current->kind != TK_RPAREN)
                 {
-                    if (node->kind == ND_IDENT)
+                    // ND_IDENT args → ch[0]; ND_UNARYOP args → ch[1]; ND_MEMBER args → ch[1]
+                    int args_slot = (node->kind == ND_IDENT) ? 0 : 1;
+                    list_append(&node->ch[args_slot], assign_expr());
+                    while (token_ctx.current->kind == TK_COMMA)
                     {
-                        list_append(&node->u.ident.args, assign_expr());
-                        while (token_ctx.current->kind == TK_COMMA)
-                        {
-                            token_ctx.current = token_ctx.current->next;
-                            list_append(&node->u.ident.args, assign_expr());
-                        }
-                    }
-                    else if (node->kind == ND_UNARYOP)
-                    {
-                        list_append(&node->u.unaryop.args, assign_expr());
-                        while (token_ctx.current->kind == TK_COMMA)
-                        {
-                            token_ctx.current = token_ctx.current->next;
-                            list_append(&node->u.unaryop.args, assign_expr());
-                        }
-                    }
-                    else if (node->kind == ND_MEMBER)
-                    {
-                        list_append(&node->u.member.args, assign_expr());
-                        while (token_ctx.current->kind == TK_COMMA)
-                        {
-                            token_ctx.current = token_ctx.current->next;
-                            list_append(&node->u.member.args, assign_expr());
-                        }
-                    }
-                    else
-                    {
-                        error("Unexpected node kind %s at function call\n", nodestr(node->kind));
+                        token_ctx.current = token_ctx.current->next;
+                        list_append(&node->ch[args_slot], assign_expr());
                     }
                 }
                 expect(TK_RPAREN);
@@ -547,8 +525,9 @@ static Node *unary_expr()
                 expect(token_ctx.current->kind);
                 Node *n = new_node(ND_MEMBER, NULL, true);
                 n->op_kind = TK_DOT;
-                n->u.member.base = node;
+                n->ch[0] = node;                                    // base
                 n->u.member.field_name = arena_strdup(expect(TK_IDENT));
+                // ch[1] = args list (set by TK_LPAREN handler if called)
                 node = n;
                 pex_node = n;
                 break;
@@ -558,8 +537,9 @@ static Node *unary_expr()
                 expect(TK_ARROW);
                 Node *n = new_node(ND_MEMBER, NULL, true);
                 n->op_kind = TK_ARROW;
-                n->u.member.base = node;
+                n->ch[0] = node;                                    // base
                 n->u.member.field_name = arena_strdup(expect(TK_IDENT));
+                // ch[1] = args list (set by TK_LPAREN handler if called)
                 node = n;
                 pex_node = n;
                 break;
@@ -572,7 +552,7 @@ static Node *unary_expr()
                 token_ctx.current = token_ctx.current->next;
                 Node *n = new_node(ND_UNARYOP, op, true);
                 n->op_kind = post_k;
-                n->u.unaryop.operand = node;
+                n->ch[0] = node;   // operand
                 node = n;
                 break;
             }
@@ -649,8 +629,8 @@ static Node *cast_expr()
         node->type = tn->type;
         expect(TK_RPAREN);
         Node *cexpr = cast_expr();
-        node->u.cast.type_decl = tn;
-        node->u.cast.expr = cexpr;
+        node->ch[0] = tn;     // type_decl
+        node->ch[1] = cexpr;  // expr
         return node;
     }
     else
@@ -677,8 +657,8 @@ static Node *parse_binop(Node *(*sub_parser)(void), const Token_kind *ops)
         expect(k);
         Node *enode = new_node(ND_BINOP, NULL, true);
         enode->op_kind = k;
-        enode->u.binop.lhs = node;
-        enode->u.binop.rhs = sub_parser();
+        enode->ch[0] = node;             // lhs
+        enode->ch[1] = sub_parser();     // rhs
         node = enode;
     }
     return node;
@@ -717,7 +697,6 @@ static Node *bitor_expr()  { return parse_binop(bitxor_expr,  ops_bitor);  }
 static Node *logand_expr() { return parse_binop(bitor_expr,   ops_logand); }
 static Node *logor_expr()  { return parse_binop(logand_expr,  ops_logor);  }
 
-static Node **get_u_child_slot(Node *n, int child);
 void insert_scale(Node *n, int child, int size)
 {
     Node *sc = new_node(ND_BINOP, NULL, true);
@@ -725,12 +704,11 @@ void insert_scale(Node *n, int child, int size)
     Node *lit = new_node(ND_LITERAL, NULL, true);
     lit->u.literal.ival = size;
 
-    Node **slot = get_u_child_slot(n, child);
-    Node *original = *slot;
+    Node *original = n->ch[child];
 
-    sc->u.binop.lhs = lit;
-    sc->u.binop.rhs = original;
-    *slot = sc;
+    sc->ch[0] = lit;       // lhs
+    sc->ch[1] = original;  // rhs
+    n->ch[child] = sc;
 }
 static Node *assign_expr();
 static Node *cond_expr()
@@ -741,10 +719,10 @@ static Node *cond_expr()
         return node;
     token_ctx.current = token_ctx.current->next;    // consume '?'
     Node *tnode = new_node(ND_TERNARY, NULL, true);
-    tnode->u.ternary.cond = node;
-    tnode->u.ternary.then_ = expr();
+    tnode->ch[0] = node;         // cond
+    tnode->ch[1] = expr();       // then_
     expect(TK_COLON);
-    tnode->u.ternary.else_ = cond_expr();
+    tnode->ch[2] = cond_expr();  // else_
     return tnode;
 }
 static Node *assign_expr()
@@ -754,8 +732,8 @@ static Node *assign_expr()
     if (token_ctx.current->kind == TK_ASSIGN)
     {
         Node *anode = new_node(ND_ASSIGN, expect(TK_ASSIGN), true);
-        anode->u.binop.lhs = node;
-        anode->u.binop.rhs = assign_expr();
+        anode->ch[0] = node;          // lhs
+        anode->ch[1] = assign_expr(); // rhs
         return anode;
     }
     // Compound assignment: a op= b
@@ -774,8 +752,8 @@ static Node *assign_expr()
         token_ctx.current = token_ctx.current->next;        // consume compound token_ctx.current
         Node *anode = new_node(ND_COMPOUND_ASSIGN, NULL, true);
         anode->op_kind = op_tk;
-        anode->u.compound_assign.lhs = node;
-        anode->u.compound_assign.rhs = assign_expr();
+        anode->ch[0] = node;          // lhs
+        anode->ch[1] = assign_expr(); // rhs
         return anode;
     }
     return node;
@@ -789,8 +767,8 @@ Node *expr()
         token_ctx.current = token_ctx.current->next;
         Node *enode = new_node(ND_BINOP, NULL, true);
         enode->op_kind = TK_COMMA;
-        enode->u.binop.lhs = node;
-        enode->u.binop.rhs = assign_expr();
+        enode->ch[0] = node;             // lhs
+        enode->ch[1] = assign_expr();    // rhs
         node = enode;
     }
     return node;
@@ -868,8 +846,9 @@ static void parse_decl_specifiers(DeclParseState *ds)
 static Node *make_decl_node(DeclParseState *ds, Node *spec, Node *decls)
 {
     Node *node = new_node(ND_DECLARATION, NULL, false);
-    node->u.declaration.spec    = spec;
-    node->u.declaration.decls   = decls;
+    node->ch[0] = spec;           // spec
+    node->ch[1] = decls;          // decls list head
+    // ch[2] = func_body (set by declaration() if this is a function definition)
     node->u.declaration.typespec = ds->typespec;
     node->u.declaration.sclass   = ds->sclass;
     // Propagate typedef_type into node->type for use by type2_from_decl_node
@@ -915,10 +894,10 @@ static Node *param_type_list()
 {
     DBG_FUNC();
     Node *node = new_node(ND_PTYPE_LIST, 0, false);
-    node->symtable = enter_new_scope(false);
+    node->symtable = enter_new_scope();
     while(token_ctx.current->kind != TK_RPAREN)
     {
-        list_append(&node->u.ptype_list.params, param_declaration());
+        list_append(&node->ch[0], param_declaration());   // params list
         if (token_ctx.current->kind == TK_COMMA)
         {
             expect(TK_COMMA);
@@ -953,12 +932,12 @@ static Node *direct_decl()
     Node *node = new_node(ND_DIRECT_DECL, 0, false);
     if (token_ctx.current->kind == TK_IDENT)
     {
-        node->u.direct_decl.name = new_node(ND_IDENT, expect(TK_IDENT), false);
+        node->ch[0] = new_node(ND_IDENT, expect(TK_IDENT), false);   // name
     }
     else if (token_ctx.current->kind == TK_LPAREN)
     {
         expect(TK_LPAREN);
-        node->u.direct_decl.name = declarator();
+        node->ch[0] = declarator();   // name (grouped declarator like (*fp))
         expect(TK_RPAREN);
     }
     while(true)
@@ -966,20 +945,20 @@ static Node *direct_decl()
         if (token_ctx.current->kind == TK_LBRACKET)
         {
             Node *arr = new_node(ND_ARRAY_DECL, expect(TK_LBRACKET), false);
-            list_append(&node->u.direct_decl.suffixes, arr);
+            list_append(&node->ch[1], arr);   // suffixes list
             if (token_ctx.current->kind != TK_RBRACKET)
             {
-                arr->u.array_decl.size = constant_expr();
+                arr->ch[0] = constant_expr();  // size
             }
             expect(TK_RBRACKET);
         }
         else if (token_ctx.current->kind == TK_LPAREN)
         {
             Node *fn = new_node(ND_FUNC_DECL, expect(TK_LPAREN), false);
-            list_append(&node->u.direct_decl.suffixes, fn);
+            list_append(&node->ch[1], fn);   // suffixes list
             // ND_FUNC_DECL kind itself signals "function suffix"; no is_function field needed
             // TODO can also be identifier
-            fn->u.func_decl.params = param_type_list();
+            fn->ch[0] = param_type_list();   // params
             expect(TK_RPAREN);
         }
         else
@@ -1006,18 +985,19 @@ static Node *declarator()
             expect(token_ctx.current->kind);
         }
     }
-    node->u.declarator.direct_decl = direct_decl();
+    node->ch[0] = direct_decl();   // direct_decl
+    // ch[1] = init (set by init_declarator() if there is an initializer)
     return node;
 }
 static Node *initializer();
 static Node *initializer_list()
 {
     Node *node = new_node(ND_INITLIST, 0, false);
-    list_append(&node->u.initlist.items, initializer());
+    list_append(&node->ch[0], initializer());   // items list
     while (token_ctx.current->kind == TK_COMMA)
     {
         expect(TK_COMMA);
-        list_append(&node->u.initlist.items, initializer());
+        list_append(&node->ch[0], initializer());
     }
     return node;
 }
@@ -1048,7 +1028,7 @@ static Node *init_declarator()
     if (token_ctx.current->kind == TK_ASSIGN)
     {
         expect(TK_ASSIGN);
-        node->u.declarator.init = initializer();
+        node->ch[1] = initializer();   // init
     }
     return node;
 }
@@ -1066,7 +1046,7 @@ static Node *struct_decl(DeclParseState *ds, int depth)
         // Declarations using incomplete types are only valid if a pointer
         n = new_node(ND_STRUCT, 0, false);
         n->u.struct_spec.is_union = (ds->typespec & DS_UNION) != 0;
-        n->u.struct_spec.tag = new_node(ND_IDENT, expect(TK_IDENT), false);
+        n->ch[0] = new_node(ND_IDENT, expect(TK_IDENT), false);   // tag
     }
     if (token_ctx.current->kind == TK_LBRACE)
     {
@@ -1075,14 +1055,14 @@ static Node *struct_decl(DeclParseState *ds, int depth)
             // Anonymous struct or union definition
             n = new_node(ND_STRUCT, 0, false);
             n->u.struct_spec.is_union = (ds->typespec & DS_UNION) != 0;
-            n->u.struct_spec.tag = new_node(ND_IDENT, new_anon_label(), false);
+            n->ch[0] = new_node(ND_IDENT, new_anon_label(), false);   // tag
         }
         expect(TK_LBRACE);
-        n->symtable = enter_new_scope(false);
+        n->symtable = enter_new_scope();
         n->symtable->scope_type = ST_STRUCT;
         do
         {
-            list_append(&n->u.struct_spec.members, declaration(depth + 1));
+            list_append(&n->ch[1], declaration(depth + 1));   // members list
         }
         while (token_ctx.current->kind != TK_RBRACE);
         leave_scope();
@@ -1170,7 +1150,7 @@ static Node *declaration(int depth)
                 // This is the first compound statement of a
                 // function, so we need to use the scope
                 // created in the parameter list
-                node->u.declaration.func_body = comp_stmt(true);
+                node->ch[2] = comp_stmt(true);   // func_body
                 node->u.declaration.is_func_defn = true;
                 return node;
             }
@@ -1189,7 +1169,7 @@ static Node *comp_stmt(bool use_last_scope)
 {
     DBG_FUNC();
     Node *node      = new_node(ND_COMPSTMT, 0, false);
-    node->symtable  = enter_new_scope(use_last_scope);
+    node->symtable  = use_last_scope ? reenter_last_scope() : enter_new_scope();
     DBG_PRINT("%s\n", curr_scope_str());
     if (token_ctx.current->kind == TK_LBRACE)
     {
@@ -1200,9 +1180,9 @@ static Node *comp_stmt(bool use_last_scope)
         {
             if (is_sc_spec(token_ctx.current->kind) || is_typespec(token_ctx.current->kind) || is_typequal(token_ctx.current->kind)
                 || (token_ctx.current->kind == TK_IDENT && is_typedef_name(token_ctx.current->val)))
-                list_append(&node->u.compstmt.stmts, declaration(0));
+                list_append(&node->ch[0], declaration(0));   // stmts list
             else
-                list_append(&node->u.compstmt.stmts, stmt());
+                list_append(&node->ch[0], stmt());
         }
         expect(TK_RBRACE);
     }
@@ -1215,21 +1195,21 @@ static Node *stmt()
     Node *node = new_node(ND_STMT, 0, false);
     if (token_ctx.current->kind == TK_LBRACE)
     {
-        node->u.stmt_wrap.body = comp_stmt(false);
+        node->ch[0] = comp_stmt(false);   // ND_STMT child
     }
     else if (token_ctx.current->kind == TK_IF)
     {
         node->kind = ND_IFSTMT;
         expect(TK_IF);
         expect(TK_LPAREN);
-        node->u.ifstmt.cond = expr();
+        node->ch[0] = expr();   // cond
         expect(TK_RPAREN);
-        node->u.ifstmt.then_ = stmt();
-        node->u.ifstmt.else_ = NULL;
+        node->ch[1] = stmt();   // then_
+        // ch[2] = else_ (NULL by default)
         if (token_ctx.current->kind == TK_ELSE)
         {
             expect(TK_ELSE);
-            node->u.ifstmt.else_ = stmt();
+            node->ch[2] = stmt();   // else_
         }
     }
     else if (token_ctx.current->kind == TK_WHILE)
@@ -1237,9 +1217,9 @@ static Node *stmt()
         node->kind = ND_WHILESTMT;
         expect(TK_WHILE);
         expect(TK_LPAREN);
-        node->u.whilestmt.cond = expr();
+        node->ch[0] = expr();   // cond
         expect(TK_RPAREN);
-        node->u.whilestmt.body = stmt();
+        node->ch[1] = stmt();   // body
     }
     else if (token_ctx.current->kind == TK_FOR)
     {
@@ -1253,7 +1233,7 @@ static Node *stmt()
         {
             // C99 for-init declaration: for (int i = 0; ...).
             // Enter an implicit scope so the variable is confined to the loop.
-            node->symtable = enter_new_scope(false);
+            node->symtable = enter_new_scope();
             init = declaration(0);   // declaration() consumes the ';'
         }
         else if (token_ctx.current->kind == TK_SEMICOLON)
@@ -1266,20 +1246,20 @@ static Node *stmt()
             init = expr();
             expect(TK_SEMICOLON);
         }
-        node->u.forstmt.init = init;
+        node->ch[0] = init;   // init
         // condition (optional; absent = infinite loop)
         if (token_ctx.current->kind == TK_SEMICOLON)
-            node->u.forstmt.cond = new_node(ND_EMPTY, 0, false);
+            node->ch[1] = new_node(ND_EMPTY, 0, false);   // cond
         else
-            node->u.forstmt.cond = expr();
+            node->ch[1] = expr();
         expect(TK_SEMICOLON);
         // increment (optional)
         if (token_ctx.current->kind == TK_RPAREN)
-            node->u.forstmt.inc = new_node(ND_EMPTY, 0, false);
+            node->ch[2] = new_node(ND_EMPTY, 0, false);   // inc
         else
-            node->u.forstmt.inc = expr();
+            node->ch[2] = expr();
         expect(TK_RPAREN);
-        node->u.forstmt.body = stmt();
+        node->ch[3] = stmt();   // body
         if (node->symtable)
             leave_scope();
     }
@@ -1287,10 +1267,10 @@ static Node *stmt()
     {
         node->kind = ND_DOWHILESTMT;
         expect(TK_DO);
-        node->u.dowhile.body = stmt();
+        node->ch[0] = stmt();   // body
         expect(TK_WHILE);
         expect(TK_LPAREN);
-        node->u.dowhile.cond = expr();
+        node->ch[1] = expr();   // cond
         expect(TK_RPAREN);
         expect(TK_SEMICOLON);
     }
@@ -1299,9 +1279,9 @@ static Node *stmt()
         node->kind = ND_SWITCHSTMT;
         expect(TK_SWITCH);
         expect(TK_LPAREN);
-        node->u.switchstmt.selector = expr();
+        node->ch[0] = expr();              // selector
         expect(TK_RPAREN);
-        node->u.switchstmt.body = comp_stmt(false);
+        node->ch[1] = comp_stmt(false);    // body
     }
     else if (token_ctx.current->kind == TK_CASE)
     {
@@ -1354,13 +1334,13 @@ static Node *stmt()
             node->kind = ND_LABELSTMT;
             expect(TK_COLON);
             node->u.labelstmt.name = arena_strdup(name);
-            node->u.labelstmt.stmt = stmt();
+            node->ch[0] = stmt();   // labeled statement
         }
         else
         {
             unget_token();
             node->kind = ND_EXPRSTMT;
-            node->u.exprstmt.expr = expr();
+            node->ch[0] = expr();   // expr
             expect(TK_SEMICOLON);
         }
     }
@@ -1369,13 +1349,13 @@ static Node *stmt()
         node->kind = ND_RETURNSTMT;
         expect(TK_RETURN);
         if (token_ctx.current->kind != TK_SEMICOLON)
-            node->u.returnstmt.expr = expr();
+            node->ch[0] = expr();   // return expr
         expect(TK_SEMICOLON);
     }
     else if (token_ctx.current->kind != TK_SEMICOLON)
     {
         node->kind = ND_EXPRSTMT;
-        node->u.exprstmt.expr = expr();
+        node->ch[0] = expr();   // expr
         expect(TK_SEMICOLON);
     }
     return node;
@@ -1386,7 +1366,7 @@ Node *program()
     Node *node = new_node(ND_PROGRAM, 0, false);
     while(!at_eof())
     {
-        list_append(&node->u.program.decls, declaration(0));
+        list_append(&node->ch[0], declaration(0));   // decls list
     }
     return node;
 }
@@ -1449,10 +1429,10 @@ static const char *node_val_str(Node *node)
         case ND_GOTOSTMT:
             return node->u.label ? node->u.label : "";
         case ND_DECLARATOR:
-            return "";  // name is in u.declarator.direct_decl
+            return "";  // name is in ch[0] (direct_decl)
         case ND_DIRECT_DECL:
         {
-            Node *nm = node->u.direct_decl.name;
+            Node *nm = node->ch[0];   // name
             return (nm && nm->kind == ND_IDENT && nm->u.ident.name) ? nm->u.ident.name : "";
         }
         default:
@@ -1473,7 +1453,7 @@ char *node_str(Node *node)
         (node->kind == ND_DECLARATION && node->u.declaration.is_func_defn) ? "fdef " :
         (node->kind == ND_IDENT ? node->u.ident.is_function :
          node->kind == ND_UNARYOP ? node->u.unaryop.is_function :
-         node->kind == ND_MEMBER ? node->u.member.is_function : false) ? "func " : "     ",
+         node->kind == ND_MEMBER ? node->u.member.is_function : 0) ? "func " : "     ",
         node_val_str(node),
         node->st ? (node->st->depth ? "local" : "global") : "(nil)",
         node->type ? fulltype_str(node->type) : "",
@@ -1482,7 +1462,7 @@ char *node_str(Node *node)
     {
         p += sprintf(p, "sclass:%s ",
             sc_str(node->u.declaration.sclass));
-        for (Node *d = node->u.declaration.decls; d; d = d->next)
+        for (Node *d = node->ch[1]; d; d = d->next)   // decls list
             if (d->kind == ND_DECLARATOR && d->symbol)
                 p += sprintf(p, "%s | ",
                     fulltype_str(d->symbol->type));
@@ -1491,7 +1471,7 @@ char *node_str(Node *node)
     {
         p += sprintf(p, "%s %d* %s ",
             node_val_str(node),
-            node->u.declarator.pointer_level,
+            node->kind == ND_DECLARATOR ? node->u.declarator.pointer_level : 0,
             node->kind == ND_ARRAY_DECL ? "array" : "");
     }
     return buf;
@@ -1507,19 +1487,19 @@ void for_each_child(Node *node, void (*fn)(Node *child, void *ctx), void *ctx)
     if (!node) return;
     switch (node->kind)
     {
-    // Pure-1: single leading Node* child, no list
+    // Single-child nodes (ch[0] only, no linked-list children)
     case ND_RETURNSTMT:
     case ND_EXPRSTMT:
     case ND_VA_ARG:
     case ND_VA_END:
     case ND_ARRAY_DECL:
     case ND_FUNC_DECL:
-    case ND_TYPE_NAME:
     case ND_STMT:
-        call_fn(node->u.ch[0], fn, ctx);
+    case ND_LABELSTMT:
+        call_fn(node->ch[0], fn, ctx);
         return;
 
-    // Pure-2: two leading Node* children, no list
+    // Two-child nodes (ch[0], ch[1], no linked-list children)
     case ND_BINOP:
     case ND_ASSIGN:
     case ND_CAST:
@@ -1529,46 +1509,47 @@ void for_each_child(Node *node, void (*fn)(Node *child, void *ctx), void *ctx)
     case ND_SWITCHSTMT:
     case ND_VA_START:
     case ND_DECLARATOR:
-        call_fn(node->u.ch[0], fn, ctx);
-        call_fn(node->u.ch[1], fn, ctx);
+        call_fn(node->ch[0], fn, ctx);
+        call_fn(node->ch[1], fn, ctx);
         return;
 
-    // Pure-3: three leading Node* children, no list
+    // Three-child nodes
     case ND_TERNARY:
     case ND_IFSTMT:
-        call_fn(node->u.ch[0], fn, ctx);
-        call_fn(node->u.ch[1], fn, ctx);
-        call_fn(node->u.ch[2], fn, ctx);
+        call_fn(node->ch[0], fn, ctx);
+        call_fn(node->ch[1], fn, ctx);
+        call_fn(node->ch[2], fn, ctx);
         return;
 
-    // Pure-4: four leading Node* children, no list
+    // Four-child nodes
     case ND_FORSTMT:
-        call_fn(node->u.ch[0], fn, ctx);
-        call_fn(node->u.ch[1], fn, ctx);
-        call_fn(node->u.ch[2], fn, ctx);
-        call_fn(node->u.ch[3], fn, ctx);
+        call_fn(node->ch[0], fn, ctx);
+        call_fn(node->ch[1], fn, ctx);
+        call_fn(node->ch[2], fn, ctx);
+        call_fn(node->ch[3], fn, ctx);
         return;
 
-    // Non-pure: char* precedes Node*, or has embedded arg list
+    // UNARYOP: ch[0]=operand, ch[1]=args list (for deref calls)
     case ND_UNARYOP:
-        call_fn(node->u.unaryop.operand, fn, ctx);
-        for (Node *a = node->u.unaryop.args; a; a = a->next)
+        call_fn(node->ch[0], fn, ctx);
+        for (Node *a = node->ch[1]; a; a = a->next)
             fn(a, ctx);
         return;
+
+    // MEMBER: ch[0]=base, ch[1]=args list
     case ND_MEMBER:
-        call_fn(node->u.member.base, fn, ctx);
-        for (Node *a = node->u.member.args; a; a = a->next)
+        call_fn(node->ch[0], fn, ctx);
+        for (Node *a = node->ch[1]; a; a = a->next)
             fn(a, ctx);
         return;
-    case ND_LABELSTMT:
-        call_fn(node->u.labelstmt.stmt, fn, ctx);
+
+    // IDENT: ch[0]=args list (for direct calls)
+    case ND_IDENT:
+        for (Node *a = node->ch[0]; a; a = a->next)
+            fn(a, ctx);
         return;
 
     // Leaf nodes — no children to visit
-    case ND_IDENT:
-        for (Node *a = node->u.ident.args; a; a = a->next)
-            fn(a, ctx);
-        return;
     case ND_LITERAL:
     case ND_GOTOSTMT:
     case ND_BREAKSTMT:
@@ -1578,52 +1559,57 @@ void for_each_child(Node *node, void (*fn)(Node *child, void *ctx), void *ctx)
     case ND_EMPTY:
         return;
 
-    // ND_PROGRAM: migrated to u.program
+    // ND_PROGRAM: ch[0] = decls list head
     case ND_PROGRAM:
     {
-        for (Node *c = node->u.program.decls; c; c = c->next)
+        for (Node *c = node->ch[0]; c; c = c->next)
             fn(c, ctx);
         return;
     }
-    // ND_COMPSTMT: migrated to u.compstmt
+    // ND_COMPSTMT: ch[0] = stmts list head
     case ND_COMPSTMT:
     {
-        for (Node *c = node->u.compstmt.stmts; c; c = c->next)
+        for (Node *c = node->ch[0]; c; c = c->next)
             fn(c, ctx);
         return;
     }
-    // ND_PTYPE_LIST: migrated to u.ptype_list
+    // ND_PTYPE_LIST: ch[0] = params list head
     case ND_PTYPE_LIST:
     {
-        for (Node *c = node->u.ptype_list.params; c; c = c->next)
+        for (Node *c = node->ch[0]; c; c = c->next)
             fn(c, ctx);
         return;
     }
-    // ND_INITLIST: migrated to u.initlist
+    // ND_INITLIST: ch[0] = items list head
     case ND_INITLIST:
     {
-        for (Node *c = node->u.initlist.items; c; c = c->next)
+        for (Node *c = node->ch[0]; c; c = c->next)
             fn(c, ctx);
         return;
     }
-    // ND_DECLARATION: migrated to u.declaration
+    // ND_DECLARATION: ch[0]=spec, ch[1]=decls list, ch[2]=func_body
     case ND_DECLARATION:
-        call_fn(node->u.declaration.spec, fn, ctx);
-        for (Node *c = node->u.declaration.decls; c; c = c->next)
+        call_fn(node->ch[0], fn, ctx);
+        for (Node *c = node->ch[1]; c; c = c->next)
             fn(c, ctx);
-        call_fn(node->u.declaration.func_body, fn, ctx);
+        call_fn(node->ch[2], fn, ctx);
         return;
-    // ND_DIRECT_DECL: migrated to u.direct_decl
+    // ND_DIRECT_DECL: ch[0]=name, ch[1]=suffixes list
     case ND_DIRECT_DECL:
-        call_fn(node->u.direct_decl.name, fn, ctx);
-        for (Node *c = node->u.direct_decl.suffixes; c; c = c->next)
+        call_fn(node->ch[0], fn, ctx);
+        for (Node *c = node->ch[1]; c; c = c->next)
             fn(c, ctx);
         return;
-    // ND_STRUCT: migrated to u.struct_spec
+    // ND_STRUCT: ch[0]=tag, ch[1]=members list
     case ND_STRUCT:
-        call_fn(node->u.struct_spec.tag, fn, ctx);
-        for (Node *c = node->u.struct_spec.members; c; c = c->next)
+        call_fn(node->ch[0], fn, ctx);
+        for (Node *c = node->ch[1]; c; c = c->next)
             fn(c, ctx);
+        return;
+
+    // ND_TYPE_NAME: ch[0]=decl
+    case ND_TYPE_NAME:
+        call_fn(node->ch[0], fn, ctx);
         return;
 
     default:
@@ -1652,17 +1638,17 @@ void print_tree(Node *node, int depth)
 
 const char *get_decl_ident(Node *node)
 {
-    // ND_DECLARATOR: name is in u.declarator.direct_decl
+    // ND_DECLARATOR: name is in ch[0] (direct_decl)
     if (node->kind == ND_DECLARATOR)
     {
-        if (node->u.declarator.direct_decl)
-            return get_decl_ident(node->u.declarator.direct_decl);
+        if (node->ch[0])
+            return get_decl_ident(node->ch[0]);
         return 0;
     }
-    // ND_DIRECT_DECL: name is in u.direct_decl.name
+    // ND_DIRECT_DECL: name is in ch[0]
     if (node->kind == ND_DIRECT_DECL)
     {
-        Node *name = node->u.direct_decl.name;
+        Node *name = node->ch[0];
         if (!name) return 0;
         if (name->kind == ND_IDENT)
             return name->u.ident.name;
@@ -1673,14 +1659,6 @@ const char *get_decl_ident(Node *node)
 
 
 
-// Get pointer to the Nth u.* child slot for node kinds that use tagged union fields.
-// Returns NULL if the kind/child combo doesn't map to a u.* field.
-static Node **get_u_child_slot(Node *n, int child)
-{
-    if (child < 0 || child > 3)
-        error("get_u_child_slot: index %d out of range for %s", child, nodestr(n->kind));
-    return &n->u.ch[child];
-}
 
 void insert_cast(Node *n, int child, Type *t)
 {
@@ -1688,21 +1666,20 @@ void insert_cast(Node *n, int child, Type *t)
     Node *c = new_node(ND_CAST, 0, true);
     Node *placeholder = new_node(ND_DECLARATION, 0, false);
 
-    Node **slot = get_u_child_slot(n, child);
-    Node *original = *slot;
+    Node *original = n->ch[child];
 
-    c->u.cast.type_decl = placeholder;
-    c->u.cast.expr = original;
+    c->ch[0] = placeholder;  // type_decl
+    c->ch[1] = original;     // expr
     c->type = t;
-    *slot = c;
+    n->ch[child] = c;
 }
 // Insert ND_CAST nodes for implicit arithmetic conversions (C89 §3.2.1.5 usual arithmetic conversions).
 static void insert_binop_coercions(Node *n)
 {
     // Promotions use the *original* lhs/rhs types for checks; insert_cast
-    // replaces n->u.binop.lhs/rhs in place.
-    Node *lhs = n->u.binop.lhs;
-    Node *rhs = n->u.binop.rhs;
+    // replaces n->ch[0]/ch[1] in place.
+    Node *lhs = n->ch[0];
+    Node *rhs = n->ch[1];
     DBG_PRINT("%s %016llx %016llx\n", __func__, (unsigned long long)lhs->type, (unsigned long long)rhs->type);
 
     // Float/double: one side pulls the other up
@@ -1741,7 +1718,7 @@ static void insert_binop_coercions(Node *n)
 // Insert ND_CAST nodes for implicit integer promotions in a unary expression (C89 §3.2.1.1).
 static void insert_unary_coercions(Node *n)
 {
-    Node *lhs = n->u.unaryop.operand;
+    Node *lhs = n->ch[0];   // operand
     DBG_PRINT("%s %016llx\n", __func__, (unsigned long long)lhs->type);
 
     // Dereference, address-of, and increment/decrement: no promotion needed.
@@ -1801,7 +1778,7 @@ void resolve_symbols(Node *root)
 // promotions and conversions, without inserting any cast nodes.
 static Type *binop_result_type(Node *n)
 {
-    Type *l = n->u.binop.lhs->type, *r = n->u.binop.rhs->type;
+    Type *l = n->ch[0]->type, *r = n->ch[1]->type;
     // If either operand type is unknown (t_void), defer — can't determine result type.
     // Internal stride literals (created by the parser, not typed) have t_void.
     if (l == t_void || r == t_void) return t_void;
@@ -1829,7 +1806,7 @@ static Type *binop_result_type(Node *n)
 // without inserting any cast nodes.
 static Type *unary_result_type(Node *n)
 {
-    Type *t = n->u.unaryop.operand->type;
+    Type *t = n->ch[0]->type;   // operand
     if (n->op_kind == TK_STAR)       return elem_type(t);
     if (n->op_kind == TK_AMPERSAND)  return get_pointer_type(t);
     if (n->op_kind == TK_INC  || n->op_kind == TK_DEC ||
@@ -1847,9 +1824,9 @@ static void derive_types_step(Node *n)
     DBG_PRINT("derive_types: %s\n", node_str(n));
     if (n->kind == ND_MEMBER)
     {
-        if (!n->u.member.base || !n->u.member.field_name)
+        if (!n->ch[0] || !n->u.member.field_name)
             error("Malformed struct reference\n");
-        Node *lhs = n->u.member.base;
+        Node *lhs = n->ch[0];   // base
         char *field_name = n->u.member.field_name;
         // For ->, dereference the pointer to get the struct type
         Type *struct_type = lhs->type;
@@ -1875,11 +1852,11 @@ static void derive_types_step(Node *n)
     if (n->is_expr)
     {
         if (n->kind == ND_TERNARY)
-            n->type = n->u.ternary.then_->type;
+            n->type = n->ch[1]->type;   // then_
         if (n->kind == ND_BINOP)
         {
             if (n->op_kind == TK_COMMA)
-                n->type = n->u.binop.rhs->type;
+                n->type = n->ch[1]->type;   // rhs
             else
             {
                 n->type = binop_result_type(n);
@@ -1899,8 +1876,8 @@ static void derive_types_step(Node *n)
         }
     }
     if (n->kind == ND_COMPOUND_ASSIGN)
-        n->type = n->u.compound_assign.lhs->type;
-    if (n->kind == ND_RETURNSTMT && n->u.returnstmt.expr)
+        n->type = n->ch[0]->type;   // lhs
+    if (n->kind == ND_RETURNSTMT && n->ch[0])   // expr
     {
         n->type = parser_ctx.current_function->type->u.fn.ret;
         DBG_PRINT("%s found return stmt with expr, type of func:%s:\n", __func__, fulltype_str(n->type));
@@ -1923,8 +1900,8 @@ static void insert_coercions_step(Node *n)
         insert_binop_coercions(n);
         // Scale pointer arithmetic: if one side is a pointer and the other an integer,
         // scale the integer by the size of the pointed-to element.
-        Node *lhs = n->u.binop.lhs;
-        Node *rhs = n->u.binop.rhs;
+        Node *lhs = n->ch[0];
+        Node *rhs = n->ch[1];
         if (is_unscaled_ptr(lhs) && istype_intlike(rhs->type))
             insert_scale(n, 1, elem_type(lhs->type)->size);
         else if (is_unscaled_ptr(rhs) && istype_intlike(lhs->type))
@@ -1935,15 +1912,15 @@ static void insert_coercions_step(Node *n)
     if (n->kind == ND_COMPOUND_ASSIGN)
     {
         // If RHS type differs from LHS type, cast RHS so codegen uses consistent ops.
-        Node *lhs = n->u.compound_assign.lhs;
-        Node *rhs = n->u.compound_assign.rhs;
+        Node *lhs = n->ch[0];
+        Node *rhs = n->ch[1];
         Type *lhs_type = lhs->type;
         if (rhs->type != lhs_type)
             insert_cast(n, 1, lhs_type);
     }
-    if (n->kind == ND_RETURNSTMT && n->u.returnstmt.expr)
+    if (n->kind == ND_RETURNSTMT && n->ch[0])   // expr
     {
-        Node *expr = n->u.returnstmt.expr;
+        Node *expr = n->ch[0];
         if (n->type != expr->type)
             insert_cast(n, 0, n->type);
     }
