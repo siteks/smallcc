@@ -63,7 +63,16 @@ test_funcptr:mycc
 test_preprocess: mycc
 	(source ./test.sh && source tests/test_preprocess.sh)
 
-clean:
-	rm -f mycc *.o *~ tmp*
+test_cases: mycc sim_c
+	python3 -m pytest tests/cases/ -q
 
-.PHONY: test clean
+test_cases_v: mycc sim_c
+	python3 -m pytest tests/cases/ -v
+
+test_cases_parallel: mycc sim_c
+	python3 -m pytest tests/cases/ -n auto -q
+
+clean:
+	rm -f mycc sim_c *.o *~ tmp*
+
+.PHONY: test_cases test_cases_v test_cases_parallel clean

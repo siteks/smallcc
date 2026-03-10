@@ -1,0 +1,2 @@
+// EXPECT_R0: 4
+int main() { int a=32; a>>=3; return a; }
