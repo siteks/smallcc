@@ -333,6 +333,20 @@ Token *tokenise(char *p)
             continue;
         }
 
+        // Block comments: skip to closing */
+        if (p[0] == '/' && p[1] == '*')
+        {
+            cur_col += 2; p += 2;
+            while (*p && !(p[0] == '*' && p[1] == '/'))
+            {
+                if (*p == '\n') { cur_line++; cur_col = 1; }
+                else cur_col++;
+                p++;
+            }
+            if (*p) { cur_col += 2; p += 2; }  // skip closing */
+            continue;
+        }
+
         // Punctuators and operators: greedy longest-match via table
         {
             bool matched = false;
