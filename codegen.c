@@ -332,7 +332,7 @@ void gen_callfunction(Node *node)
         char mangled[80];
         snprintf(mangled, sizeof(mangled), "_s%d_%s",
                  node->symbol->tu_index, node->symbol->name);
-        ir_append(IR_JL, 0, mangled);
+        ir_append(IR_JL, 0, arena_strdup(mangled));
     }
     else
         ir_append(IR_JL, 0, node->symbol->name);
@@ -1250,7 +1250,7 @@ void gen_decl(Node *node)
                     char mangled[80];
                     snprintf(mangled, sizeof(mangled), "_s%d_%s",
                              n->symbol->tu_index, n->symbol->name);
-                    ir_append(IR_SYMLABEL, 0, mangled);
+                    ir_append(IR_SYMLABEL, 0, arena_strdup(mangled));
                 }
                 else
                     ir_append(IR_SYMLABEL, 0, n->symbol->name);

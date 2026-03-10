@@ -68,6 +68,11 @@ static int pp_cond_depth;
 #define PP_MAX_INCLUDE_DEPTH 32
 static int pp_include_depth;
 
+/* ---- System include directory (for <> includes) ---- */
+static const char *pp_sysinclude_dir = NULL;
+
+void set_include_dir(const char *dir) { pp_sysinclude_dir = dir; }
+
 /* ------------------------------------------------------------------ */
 
 static int currently_emitting(void)
@@ -441,16 +446,38 @@ char *preprocess(const char *src, const char *filename)
                 }
                 else if (strcmp(dir, "include") == 0)
                 {
-                    if (*lp != '"')
-                        error("preprocess: only #include \"file\" is supported");
-                    lp++; /* skip opening '"' */
                     char   inc_name[256];
                     size_t n = 0;
-                    while (*lp && *lp != '"' && n + 1 < sizeof(inc_name))
-                        inc_name[n++] = *lp++;
-                    inc_name[n] = '\0';
+                    char  *resolved = NULL;
 
-                    char *resolved = resolve_include_path(filename, inc_name);
+                    if (*lp == '"')
+                    {
+                        lp++; /* skip opening '"' */
+                        while (*lp && *lp != '"' && n + 1 < sizeof(inc_name))
+                            inc_name[n++] = *lp++;
+                        inc_name[n] = '\0';
+                        resolved = resolve_include_path(filename, inc_name);
+                    }
+                    else if (*lp == '<')
+                    {
+                        lp++; /* skip '<' */
+                        while (*lp && *lp != '>' && n + 1 < sizeof(inc_name))
+                            inc_name[n++] = *lp++;
+                        inc_name[n] = '\0';
+                        if (!pp_sysinclude_dir)
+                            error("preprocess: no system include directory set for <%s>", inc_name);
+                        size_t dlen = strlen(pp_sysinclude_dir);
+                        resolved = malloc(dlen + 1 + n + 1);
+                        if (!resolved) error("preprocess: malloc failed");
+                        memcpy(resolved, pp_sysinclude_dir, dlen);
+                        resolved[dlen] = '/';
+                        memcpy(resolved + dlen + 1, inc_name, n + 1);
+                    }
+                    else
+                    {
+                        error("preprocess: #include requires \"file\" or <file>");
+                    }
+
                     char *raw      = pp_read_file(resolved);
                     char *expanded = preprocess(raw, resolved);
                     buf_appends(&out, expanded);

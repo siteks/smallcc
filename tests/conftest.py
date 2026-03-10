@@ -96,8 +96,10 @@ class CTestItem(pytest.Item):
 
             if 'EXPECT_STDOUT' in meta:
                 # putchar output goes to stderr
-                assert sim.stderr == meta['EXPECT_STDOUT'], \
-                    f"putchar output {sim.stderr!r}, expected {meta['EXPECT_STDOUT']!r}"
+                # Interpret escape sequences in the expected string
+                expected_out = meta['EXPECT_STDOUT'].replace('\\n', '\n').replace('\\t', '\t')
+                assert sim.stderr == expected_out, \
+                    f"putchar output {sim.stderr!r}, expected {expected_out!r}"
 
     def repr_failure(self, excinfo):
         return str(excinfo.value)

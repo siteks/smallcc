@@ -1,5 +1,6 @@
 
 #include "smallcc.h"
+#include <dirent.h>
 
 // ---------------------------------------------------------------
 // Arena allocator
@@ -86,27 +87,102 @@ static void reset_tu(int tu)
 }
 
 
+static void get_compiler_dir(const char *argv0, char *dir, size_t cap)
+{
+    strncpy(dir, argv0, cap - 1);
+    dir[cap - 1] = '\0';
+    char *slash = strrchr(dir, '/');
+    if (slash)
+        *slash = '\0';
+    else
+        strncpy(dir, ".", cap - 1);
+}
+
+static int compare_str(const void *a, const void *b)
+{
+    return strcmp(*(const char **)a, *(const char **)b);
+}
+
+static int scan_lib_files(const char *lib_dir, char **files, int max_files)
+{
+    DIR *d = opendir(lib_dir);
+    if (!d) return 0;
+    int count = 0;
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL && count < max_files)
+    {
+        const char *name = ent->d_name;
+        size_t len = strlen(name);
+        if (len < 3 || strcmp(name + len - 2, ".c") != 0) continue;
+        size_t plen = strlen(lib_dir) + 1 + len + 1;
+        char *path = malloc(plen);
+        if (!path) error("out of memory");
+        snprintf(path, plen, "%s/%s", lib_dir, name);
+        files[count++] = path;
+    }
+    closedir(d);
+    qsort(files, count, sizeof(char *), compare_str);
+    return count;
+}
+
 int main(int argc, char **argv)
 {
-    // Parse -o outfile
+    // Parse flags: -o outfile, -stats
     FILE *out = stdout;
     int file_start = 1;
-    if (argc >= 3 && strcmp(argv[1], "-o") == 0)
+    bool show_stats = false;
+
+    while (file_start < argc && argv[file_start][0] == '-')
     {
-        out = fopen(argv[2], "w");
-        if (!out) { perror(argv[2]); return 1; }
-        file_start = 3;
+        if (strcmp(argv[file_start], "-o") == 0 && file_start + 1 < argc)
+        {
+            out = fopen(argv[file_start + 1], "w");
+            if (!out) { perror(argv[file_start + 1]); return 1; }
+            file_start += 2;
+        }
+        else if (strcmp(argv[file_start], "-stats") == 0)
+        {
+            show_stats = true;
+            file_start++;
+        }
+        else
+        {
+            fprintf(stderr, "smallcc: unknown option: %s\n", argv[file_start]);
+            return 1;
+        }
     }
 
     if (argc <= file_start)
     {
-        fprintf(stderr, "Usage: smallcc [-o outfile] <source.c> [source2.c ...]\n");
+        fprintf(stderr, "Usage: smallcc [-o outfile] [-stats] <source.c> [source2.c ...]\n");
         return 1;
     }
 
     set_asm_out(out);
 
-    int tu_count = argc - file_start;
+    // Determine compiler binary directory for include/ and lib/ resolution
+    char compiler_dir[4096];
+    get_compiler_dir(argv[0], compiler_dir, sizeof(compiler_dir));
+
+    // Set system include directory
+    char include_dir[4096];
+    snprintf(include_dir, sizeof(include_dir), "%s/include", compiler_dir);
+    set_include_dir(include_dir);
+
+    // Collect lib/*.c files (prepended before user files)
+    char lib_dir[4096];
+    snprintf(lib_dir, sizeof(lib_dir), "%s/lib", compiler_dir);
+    char *lib_files[64];
+    int lib_count = scan_lib_files(lib_dir, lib_files, 64);
+
+    int user_count = argc - file_start;
+    int tu_count = lib_count + user_count;
+
+    // Build unified file list: lib files first, then user files
+    char **all_files = malloc(tu_count * sizeof(char *));
+    if (!all_files) error("out of memory");
+    for (int i = 0; i < lib_count; i++)  all_files[i] = lib_files[i];
+    for (int i = 0; i < user_count; i++) all_files[lib_count + i] = argv[file_start + i];
 
     // Preamble emitted exactly once
     fprintf(out, ".text=0\n");
@@ -114,11 +190,16 @@ int main(int argc, char **argv)
     fprintf(out, "    jl      main\n");
     fprintf(out, "    halt\n");
 
+    if (show_stats)
+        fprintf(stderr, "%-4s  %-10s  %8s  %8s\n", "TU", "file", "arena_before", "arena_used");
+
     for (int tu = 0; tu < tu_count; tu++)
     {
-        token_ctx.filename = argv[file_start + tu];
-        char *raw    = read_file(argv[file_start + tu]);
-        char *source = preprocess(raw, argv[file_start + tu]);
+        size_t arena_before = arena.used;
+
+        token_ctx.filename = all_files[tu];
+        char *raw    = read_file(all_files[tu]);
+        char *source = preprocess(raw, all_files[tu]);
 
         reset_tu(tu);
         make_basic_types();
@@ -148,7 +229,19 @@ int main(int argc, char **argv)
         backend_emit_asm(codegen_ctx.ir_head);
         harvest_globals();
         free(source);
+
+        if (show_stats)
+        {
+            size_t tu_used = arena.used - arena_before;
+            fprintf(stderr, "%-4d  %-10s  %8zu  %8zu\n",
+                    tu, all_files[tu], arena_before, tu_used);
+        }
     }
+
+    if (show_stats)
+        fprintf(stderr, "arena total: %zu / %zu bytes (%.1f%%)\n",
+                arena.used, arena.cap,
+                100.0 * (double)arena.used / (double)arena.cap);
 
     if (out != stdout) fclose(out);
     return 0;

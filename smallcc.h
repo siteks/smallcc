@@ -621,4 +621,7 @@ extern CodegenContext codegen_ctx;
 void set_asm_out(FILE *f);
 void backend_emit_asm(IRInst *ir);
 
+// Preprocessor
+void set_include_dir(const char *dir);
+
 #endif
