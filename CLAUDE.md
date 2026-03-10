@@ -28,19 +28,27 @@ Tests use `cpu3/sim.py` to execute generated assembly and check the value left i
 
 ## Compiler Architecture
 
-C89 subset compiler. Input is one or more `.c` files; assembly is written to stdout or a file specified with `-o`. Usage: `smallcc [-o outfile] <source.c> [source2.c ...]`.
+C89 subset compiler. Input is one or more `.c` files; assembly is written to stdout or a file specified with `-o`. Usage: `smallcc [-o outfile] [-stats] <source.c> [source2.c ...]`.
 
 ### Compilation Pipeline
 
 ```
+Startup [smallcc.c]:
+  get_compiler_dir(argv[0])                 Locate the directory of the compiler binary
+  set_include_dir("$bindir/include")        Set system header search path for #include <>
+  scan_lib_files("$bindir/lib")             Collect lib/*.c — prepended before user files
+
 Preamble (ssp / jl main / halt) is emitted once before the per-TU loop.
 
-Per-TU loop [smallcc.c]:
+Per-TU loop [smallcc.c]  (lib TUs first, then user TUs):
+  read_file()               [smallcc.c]     Read source bytes from disk
+  preprocess()              [preprocess.c]  Macro expansion, #include, #ifdef/#endif
   reset_codegen()           [codegen.c]     Clear per-TU codegen state
   reset_parser()            [parser.c]      Clear per-TU parser state
-  reset_types_state()       [types.c]       Fresh symbol/scope tables (type list preserved)
+  reset_types_state()       [types.c]       Fresh symbol/scope tables (type list preserved;
+                                            SYM_EXTERN symbols carried forward from prev TU)
+  reset_preprocessor()      [preprocess.c]  Clear macro table and include-depth counter
   make_basic_types()        [types.c]       Populate/reuse global type table
-  prepopulate_extern_syms() [smallcc.c]        Inject globals from previous TUs
   tokenise()                [tokeniser.c]   Token linked list
   program()                 [parser.c]      AST (Node tree)
   resolve_symbols(root)     [parser.c]      Set ND_IDENT types via symbol table lookup
@@ -49,22 +57,29 @@ Per-TU loop [smallcc.c]:
   finalize_local_offsets()  [types.c]       Compute bp-relative offsets for all locals
   gen_ir(node, tu_index)    [codegen.c]     Walk AST; build flat IR instruction list
   backend_emit_asm(ir_head) [backend.c]     Walk IR list; emit assembly text
-  harvest_globals()         [smallcc.c]        Collect non-static globals for next TU
+  harvest_globals()         [smallcc.c]     Mark non-static globals SYM_EXTERN for next TU
 ```
 
-Every phase prints debug information to stderr.
+Every phase prints debug information to stderr. `-stats` prints per-TU and total arena usage to stderr after compilation.
 
 ### Source Files
 
 | File | Role |
 |---|---|
 | `smallcc.h` | All shared structs, enums, and function prototypes |
-| `smallcc.c` | Entry point; `-o` arg parsing; per-TU loop; `ExternSym` table; `harvest_globals`/`prepopulate_extern_syms` |
+| `smallcc.c` | Entry point; flag parsing (`-o`, `-stats`); lib scanning; include-dir setup; per-TU loop; `harvest_globals` |
+| `preprocess.c` | Preprocessor — `#define`/`#undef`, `#ifdef`/`#ifndef`/`#else`/`#endif`, `#include "f"`/`#include <f>`; `set_include_dir()` |
 | `tokeniser.c` | Lexer — produces a `Token` linked list |
 | `parser.c` | Recursive-descent parser — builds AST; `resolve_symbols`, `derive_types`, `insert_coercions` |
 | `types.c` | Type table, symbol table, struct layout, `add_types_and_symbols`, `reset_types_state`, `insert_extern_sym` |
 | `codegen.c` | AST walk; builds flat IR instruction list (`gen_ir`); `reset_codegen`; static label mangling |
 | `backend.c` | IR → assembly emission (`backend_emit_asm`); `set_asm_out`; retargeting point |
+| `lib/stdio.c` | `printf` (`%d %s %c %%`), `puts` — compiled as TU 0 automatically |
+| `lib/stdlib.c` | `abs` — compiled as TU 1 automatically |
+| `lib/string.c` | `strlen`, `strcmp`, `strcpy`, `strcat` — compiled as TU 2 automatically |
+| `include/stdio.h` | Declarations for `putchar`, `puts`, `printf` |
+| `include/stdlib.h` | Declaration for `abs`; `#define NULL 0` |
+| `include/string.h` | Declarations for `strlen`, `strcmp`, `strcpy`, `strcat` |
 
 ### Key Target Facts
 

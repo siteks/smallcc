@@ -1,8 +1,48 @@
 # Compiler Architecture
 
+## Preprocessor (`preprocess.c`)
+
+Runs before the tokeniser on each translation unit. Transforms raw source text into preprocessed text that is fed to `tokenise()`.
+
+### Features
+
+| Directive | Behaviour |
+|---|---|
+| `#define NAME body` | Object-like macro; body expanded on use |
+| `#define NAME(p, …) body` | Function-like macro; parameters substituted |
+| `#undef NAME` | Remove macro |
+| `#ifdef NAME` / `#ifndef NAME` | Conditional compilation (nestable) |
+| `#else` / `#endif` | Complement / close conditional block |
+| `#include "file"` | Resolved relative to the including file's directory |
+| `#include <file>` | Resolved in the system include directory (`set_include_dir()`) |
+
+Unknown directives are silently ignored. Adjacent string literals are **not** concatenated here; that is done by the tokeniser.
+
+### API
+
+```c
+char *preprocess(const char *src, const char *filename);
+  // Returns a malloc'd, null-terminated preprocessed string.
+  // filename is used for relative #include resolution and error messages.
+
+void reset_preprocessor(void);
+  // Clears the macro table and resets the include-depth counter.
+  // Called once per TU before preprocessing begins.
+
+void set_include_dir(const char *dir);
+  // Sets the directory searched for #include <file>.
+  // Called once at startup from smallcc.c using the compiler binary's directory.
+```
+
+### System Include Directory
+
+`smallcc.c` calls `get_compiler_dir(argv[0])` to find the directory containing the compiler binary, then passes `$bindir/include` to `set_include_dir()`. This lets `#include <stdio.h>` resolve to `include/stdio.h` next to the binary regardless of the working directory.
+
+---
+
 ## Tokeniser (`tokeniser.c`)
 
-Converts the input string to a singly-linked list of `Token` structs.
+Converts the preprocessed string to a singly-linked list of `Token` structs.
 
 ### Token Struct
 
@@ -13,7 +53,9 @@ struct Token {
     char        *val;   // text of the token
     double      fval;   // parsed float value
     long long   ival;   // parsed integer value (also string literal length for TK_STRING)
-    int         loc;    // character position in source
+    int         loc;    // character position in source (legacy; prefer line/col)
+    int         line;   // 1-based line number
+    int         col;    // 1-based column number
 };
 ```
 
@@ -429,43 +471,54 @@ The compiler supports true per-TU compilation. Each file is compiled independent
 ### Invocation
 
 ```
-smallcc [-o outfile] <source.c> [source2.c ...]
+smallcc [-o outfile] [-stats] <source.c> [source2.c ...]
 ```
 
-Assembly is written to `outfile` when `-o` is given; otherwise to stdout. Each `.c` argument is one translation unit, compiled in argument order. The preamble is emitted once before the per-TU loop.
+Assembly is written to `outfile` when `-o` is given; otherwise to stdout. `-stats` prints per-TU arena allocation sizes and total arena usage to stderr.
+
+#### Standard Library Auto-Prepend
+
+At startup, `smallcc.c` locates the directory containing the compiler binary (`get_compiler_dir(argv[0])`), then:
+
+1. Calls `set_include_dir("$bindir/include")` so `#include <>` headers resolve correctly.
+2. Scans `$bindir/lib/*.c` alphabetically (`scan_lib_files()`). Each `.c` found there is compiled as an implicit TU **before** the user's files.
+
+This means `lib/stdio.c`, `lib/stdlib.c`, and `lib/string.c` are always compiled first (TUs 0–2). Their global symbols are propagated to later TUs via the `SYM_EXTERN` carry-forward mechanism in `reset_types_state()`. User code can call `printf`, `strlen`, etc. without any explicit `extern` declaration.
+
+If `lib/` does not exist next to the binary, the scan silently returns 0 files and no lib TUs are added.
+
+Each `.c` argument is one user translation unit, compiled in argument order after the lib TUs. The preamble is emitted once before the per-TU loop.
 
 ### Per-TU State Reset
 
-At the start of each TU, three reset functions are called:
+At the start of each TU, four reset functions are called:
 
 ```c
-reset_codegen()      // clears strlit_count, loop_depth, label_table_size
-                     // does NOT reset 'labels' — monotonically increasing across TUs
-reset_parser()       // clears current_function
-                     // does NOT reset anon_index — monotonically increasing across TUs
-reset_types_state()  // allocates a fresh symbol_table / curr_scope_st / last_symbol_table
-                     // resets scope_depth and scope_id counter
-                     // does NOT touch the 'types' linked list or t_int/t_void singletons
-                     // (Type* pointers from previous TUs remain valid)
+reset_codegen()        // clears strlit_count, loop_depth, label_table_size
+                       // does NOT reset 'labels' — monotonically increasing across TUs
+reset_parser()         // clears current_function
+                       // does NOT reset anon_index — monotonically increasing across TUs
+reset_types_state()    // carries SYM_EXTERN symbols from previous TU's global scope into
+                       // a fresh symbol_table / curr_scope_st / last_symbol_table;
+                       // resets scope_depth and scope_id counter;
+                       // does NOT touch the 'types' linked list or t_int/t_void singletons
+                       // (Type* pointers from previous TUs remain valid)
+reset_preprocessor()   // clears macro table; resets include-depth counter
 ```
 
-After reset, `make_basic_types()` re-populates the basic type singletons (they are found in the existing `types` list and reused, not duplicated).
+After reset, `make_basic_types()` re-populates the basic type singletons (found in the existing `types` list and reused, not duplicated).
 
-### Extern Symbol Table (`smallcc.c`)
+### Cross-TU Global Propagation
 
-A flat `ExternSym[]` array accumulates non-static global symbols after each TU:
+There is no separate `ExternSym[]` array. The mechanism is simpler:
 
-```c
-typedef struct { char *name; Type *type; } ExternSym;
-static ExternSym extern_syms[1024];
-static int       extern_sym_count = 0;
-```
+**`harvest_globals()`** (called after `backend_emit_asm`): walks the just-compiled TU's global `symbol_table->symbols` and calls `insert_extern_sym()` for each `NS_IDENT` symbol that is not `SYM_STATIC_GLOBAL`, `SYM_STATIC_LOCAL`, `SYM_EXTERN`, or `SYM_BUILTIN`.
 
-**`harvest_globals()`** (called after `backend_emit_asm`): walks `symbol_table->symbols` of the just-compiled TU (filtering for `ns == NS_IDENT`) and appends any symbol whose `kind` is not `SYM_STATIC_GLOBAL`, `SYM_STATIC_LOCAL`, `SYM_EXTERN`, or `SYM_BUILTIN`. Deduplication prevents double-adding.
+**`insert_extern_sym()`** (in `types.c`): marks the symbol `SYM_EXTERN` in the current global scope (or inserts a new `SYM_EXTERN` entry if not already present).
 
-**`prepopulate_extern_syms()`** (called before each TU's `program()`): calls `insert_extern_sym()` for each accumulated symbol. This makes previously-defined globals visible to the new TU without requiring explicit `extern` declarations.
+**`reset_types_state()`**: when creating the next TU's fresh symbol table, it walks the previous TU's global scope and copies all `SYM_EXTERN` entries into the new table. This carry-forward is the actual propagation mechanism — no separate data structure is needed.
 
-**`insert_extern_sym()`** (in `types.c`): inserts a symbol into the fresh global scope with `kind = SYM_EXTERN` and no data allocation (`st->size` is not incremented). Skipped if the name is already present.
+The net effect: globals defined in TU N are visible as `SYM_EXTERN` symbols in TU N+1, N+2, …, without requiring the user to write `extern` declarations. This is how lib TUs make `printf`, `strlen`, etc. available to user code.
 
 ### Static Symbol Mangling
 
