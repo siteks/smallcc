@@ -1680,6 +1680,8 @@ static void post_order_walk(Node *n, NodeVisitor fn)
 static void resolve_symbols_step(Node *n)
 {
     if (n->kind == ND_IDENT && n->is_expr)
+        // find_symbol calls error() and exits if the name is not found,
+        // so the dereference is safe: a missing symbol is a compile error, not a crash.
         n->type = find_symbol(n, n->u.ident.name, NS_IDENT)->type;
 }
 

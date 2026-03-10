@@ -203,9 +203,10 @@ char *expect(Token_kind tk)
     }
     else
     {
+        int loc = token_ctx.current->loc < 1024 ? token_ctx.current->loc : 1023;
         char space[1024];
-        memset(space, 0x20, 1024);
-        space[token_ctx.current->loc] = 0;
+        memset(space, 0x20, loc);
+        space[loc] = 0;
         fprintf(stderr, "%s\n", token_ctx.user_input);
         fprintf(stderr, "%s^\n", space);
         error("Expecting '%s' got '%s'\n", token_str(tk), token_str(token_ctx.current->kind));

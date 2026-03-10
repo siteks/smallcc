@@ -751,6 +751,8 @@ static Symbol_table *new_st_scope()
     nt->parent                                  = type_ctx.curr_scope_st;
     nt->param_offset                            = FRAME_OVERHEAD;
     // Register in flat scope list
+    if (type_ctx.scope_count >= MAX_SCOPES)
+        error("too many scopes in translation unit (max %d)", MAX_SCOPES);
     type_ctx.scope_list[type_ctx.scope_count++] = nt;
     type_ctx.curr_scope_st                      = nt;
     return type_ctx.curr_scope_st;

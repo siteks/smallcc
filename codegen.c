@@ -24,6 +24,8 @@ static LocalAddr find_local_addr(Node *node, const char *name)
 
 static int new_strlit(char *data, int len)
 {
+    if (codegen_ctx.strlit_count >= MAX_STRLITS)
+        error("too many string literals (max %d)", MAX_STRLITS);
     int id = codegen_ctx.label_counter++;
     codegen_ctx.strlits[codegen_ctx.strlit_count].id   = id;
     codegen_ctx.strlits[codegen_ctx.strlit_count].data = data;
@@ -72,6 +74,8 @@ static void collect_labels(Node *node)
 {
     if (node->kind == ND_LABELSTMT)
     {
+        if (codegen_ctx.label_table_size >= MAX_LABEL_TABLE)
+            error("too many goto labels in function (max %d)", MAX_LABEL_TABLE);
         codegen_ctx.label_table[codegen_ctx.label_table_size].label_id = new_label();
         strncpy(codegen_ctx.label_table[codegen_ctx.label_table_size].name, node->u.labelstmt.name, 63);
         codegen_ctx.label_table_size++;
@@ -1188,6 +1192,8 @@ void gen_decl(Node *node)
         {
             if (n->kind == ND_DECLARATOR && n->symbol && n->symbol->kind == SYM_STATIC_LOCAL)
             {
+                if (codegen_ctx.local_static_count >= MAX_LOCAL_STATICS)
+                    error("too many local static variables (max %d)", MAX_LOCAL_STATICS);
                 codegen_ctx.local_statics[codegen_ctx.local_static_count++] = (LocalStaticEntry){
                     n->symbol->offset, n->symbol, n
                 };

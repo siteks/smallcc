@@ -46,7 +46,7 @@ static char *read_file(const char *path)
     fseek(f, 0, SEEK_END);
     long sz = ftell(f);
     rewind(f);
-    char *buf = malloc(sz + 1);
+    char *buf = arena_alloc(sz + 1);
     fread(buf, 1, sz, f);
     buf[sz] = '\0';
     fclose(f);
@@ -106,7 +106,6 @@ int main(int argc, char **argv)
     {
         char *raw    = read_file(argv[file_start + tu]);
         char *source = preprocess(raw, argv[file_start + tu]);
-        free(raw);
 
         reset_tu(tu);
         make_basic_types();

@@ -510,6 +510,12 @@ typedef struct IRInst {
 } IRInst;
 
 // ===============================================================
+// Capacity constants for fixed-size arrays in context structs
+#define MAX_STRLITS         512
+#define MAX_LOCAL_STATICS   512
+#define MAX_LABEL_TABLE     64
+#define MAX_SCOPES          2048
+
 // Context Struct Definitions (must come after type definitions)
 // ===============================================================
 
@@ -538,7 +544,7 @@ typedef struct TypeContext {
     Symbol_table *curr_scope_st;
     Symbol_table *last_symbol_table;
     // Flat list of all scopes created this TU (replaces children[] tree)
-    Symbol_table *scope_list[2048];
+    Symbol_table *scope_list[MAX_SCOPES];
     int           scope_count;
     // Type formatting buffer
     char ft_buf[512];
@@ -565,13 +571,13 @@ typedef struct CodegenContext {
     int break_labels[64];       // break target stack
     int cont_labels[64];        // continue target stack
     // String literals
-    StrLit strlits[512];
+    StrLit strlits[MAX_STRLITS];
     int strlit_count;
     // Local static variables
-    LocalStaticEntry local_statics[512];
+    LocalStaticEntry local_statics[MAX_LOCAL_STATICS];
     int local_static_count;
     // Goto labels
-    LabelEntry label_table[64];
+    LabelEntry label_table[MAX_LABEL_TABLE];
     int label_table_size;
     // IR instruction list (built during gen_*, emitted by backend_emit_asm after gen_ir)
     IRInst *ir_head;
