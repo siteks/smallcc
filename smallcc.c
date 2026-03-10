@@ -103,26 +103,81 @@ static int compare_str(const void *a, const void *b)
     return strcmp(*(const char **)a, *(const char **)b);
 }
 
-static int scan_lib_files(const char *lib_dir, char **files, int max_files)
+// Quick scan of a source file's raw text for #include <header> directives.
+// For each "<header>" found, if lib_dir/header.c exists it is added to files[].
+// Does not run the full preprocessor — just looks for the literal pattern.
+// Conservative: a header inside a dead #ifdef branch will still trigger
+// lib compilation, which is fine.
+static int collect_needed_libs(char **user_files, int user_count,
+                                const char *lib_dir,
+                                char **files, int max_files)
 {
-    DIR *d = opendir(lib_dir);
-    if (!d) return 0;
-    int count = 0;
-    struct dirent *ent;
-    while ((ent = readdir(d)) != NULL && count < max_files)
+    // Collect unique header stems that have a matching lib/*.c
+    char seen[64][64];
+    int  seen_count = 0;
+    int  lib_count  = 0;
+
+    for (int u = 0; u < user_count; u++)
     {
-        const char *name = ent->d_name;
-        size_t len = strlen(name);
-        if (len < 3 || strcmp(name + len - 2, ".c") != 0) continue;
-        size_t plen = strlen(lib_dir) + 1 + len + 1;
-        char *path = malloc(plen);
-        if (!path) error("out of memory");
-        snprintf(path, plen, "%s/%s", lib_dir, name);
-        files[count++] = path;
+        FILE *f = fopen(user_files[u], "r");
+        if (!f) continue;
+        char line[1024];
+        while (fgets(line, sizeof(line), f))
+        {
+            // Look for: #include <name>
+            const char *p = line;
+            while (*p == ' ' || *p == '\t') p++;
+            if (*p != '#') continue;
+            p++;
+            while (*p == ' ' || *p == '\t') p++;
+            if (strncmp(p, "include", 7) != 0) continue;
+            p += 7;
+            while (*p == ' ' || *p == '\t') p++;
+            if (*p != '<') continue;
+            p++;
+            char hdr[64];
+            size_t n = 0;
+            while (*p && *p != '>' && n + 1 < sizeof(hdr))
+                hdr[n++] = *p++;
+            hdr[n] = '\0';
+            if (!n) continue;
+
+            // Strip extension to get stem (stdio.h -> stdio)
+            char stem[64];
+            strncpy(stem, hdr, sizeof(stem) - 1);
+            stem[sizeof(stem) - 1] = '\0';
+            char *dot = strrchr(stem, '.');
+            if (dot) *dot = '\0';
+
+            // Check if already queued
+            int already = 0;
+            for (int i = 0; i < seen_count; i++)
+                if (strcmp(seen[i], stem) == 0) { already = 1; break; }
+            if (already) continue;
+
+            // Check if lib/stem.c exists
+            char path[4096];
+            snprintf(path, sizeof(path), "%s/%s.c", lib_dir, stem);
+            FILE *lf = fopen(path, "r");
+            if (!lf) continue;
+            fclose(lf);
+
+            // Record it
+            strncpy(seen[seen_count++], stem, 63);
+            if (lib_count < max_files)
+            {
+                char *p2 = malloc(strlen(path) + 1);
+                if (!p2) error("out of memory");
+                strcpy(p2, path);
+                files[lib_count++] = p2;
+            }
+        }
+        fclose(f);
     }
-    closedir(d);
-    qsort(files, count, sizeof(char *), compare_str);
-    return count;
+
+    // Sort so compilation order is deterministic (alphabetical by stem)
+    qsort(files, lib_count, sizeof(char *), compare_str);
+    return lib_count;
 }
 
 int main(int argc, char **argv)
@@ -169,11 +224,12 @@ int main(int argc, char **argv)
     snprintf(include_dir, sizeof(include_dir), "%s/include", compiler_dir);
     set_include_dir(include_dir);
 
-    // Collect lib/*.c files (prepended before user files)
+    // Collect lib/*.c files for headers actually #include'd by user files
     char lib_dir[4096];
     snprintf(lib_dir, sizeof(lib_dir), "%s/lib", compiler_dir);
     char *lib_files[64];
-    int lib_count = scan_lib_files(lib_dir, lib_files, 64);
+    int lib_count = collect_needed_libs(argv + file_start, argc - file_start,
+                                        lib_dir, lib_files, 64);
 
     int user_count = argc - file_start;
     int tu_count = lib_count + user_count;
