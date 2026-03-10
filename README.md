@@ -25,14 +25,24 @@ Detailed information in `docs/`.
 ## Compile and test
 
 ```
+# Build compiler and run tests
 make
 make test_cases_v
+
+# Compile and run hello world
+$ ./smallcc -o hello.s -stats tests/cases/stdlib/hello.c 
+TU    file        arena_before  arena_used
+0     ./lib/stdio.c         0     53944
+1     tests/cases/stdlib/hello.c     53944      9568
+arena total: 63512 / 16777216 bytes (0.4%)
+$ ./sim_c  hello.s 
+Hello world
+r0:00000000 sp:1000 bp:0000 lr:0229 pc:0007 H:1
+
 ```
 
 ## TODO
 
-* Basic standard library
 * Peephole optimiser
 * Clean backend separation and alternative targets
-  
   
