@@ -73,7 +73,8 @@ test_cases_parallel: mycc sim_c
 	python3 -m pytest tests/cases/ -n auto -q
 
 clean:
-	rm -f mycc sim_c *.o *~ tmp*
+	rm -f mycc sim_c mycc_* *.o *~ tmp* _tmp*.c test.s *.lst error.log
+	rm -rf .pytest_cache __pycache__ cpu3/__pycache__
 
 help:
 	@echo "Build"

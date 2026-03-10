@@ -1,7 +1,29 @@
-__pycache__
-.DS_Store
-*.o
-tmp*
-a.out
+# Build outputs
 mycc
+sim_c
+mycc_*
+*.o
+a.out
+*.dSYM/
 
+# Temp files from build/test
+tmp*
+_tmp*.c
+test.s
+*.lst
+error.log
+
+# Debug/log output
+dbg*.txt
+err.txt
+parse.log
+*.bak
+
+# IDE
+.vscode/
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
