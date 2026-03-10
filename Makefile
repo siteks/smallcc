@@ -75,6 +75,7 @@ test_cases_parallel: mycc sim_c
 clean:
 	rm -f mycc sim_c mycc_* *.o *~ tmp* _tmp*.c test.s *.lst error.log
 	rm -rf .pytest_cache __pycache__ cpu3/__pycache__
+	rm -rf *.dSYM
 
 help:
 	@echo "Build"
