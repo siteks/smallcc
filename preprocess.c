@@ -1,5 +1,5 @@
 
-#include "mycc.h"
+#include "smallcc.h"
 
 /* ======================================================
    Minimum Viable Preprocessor
@@ -92,7 +92,7 @@ void reset_preprocessor(void)
     pp_include_depth = 0;
 }
 
-/* ---- File I/O (local copy keeps read_file in mycc.c static) ---- */
+/* ---- File I/O (local copy keeps read_file in smallcc.c static) ---- */
 static char *pp_read_file(const char *path)
 {
     FILE *f = fopen(path, "r");

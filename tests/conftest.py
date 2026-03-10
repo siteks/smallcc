@@ -66,13 +66,13 @@ class CTestItem(pytest.Item):
 
             # Compile
             proc = subprocess.run(
-                [str(root / 'mycc'), '-o', asm] + files,
+                [str(root / 'smallcc'), '-o', asm] + files,
                 capture_output=True, text=True
             )
 
             if 'EXPECT_COMPILE_FAIL' in meta:
                 assert proc.returncode != 0, \
-                    f"expected compile failure but mycc exited 0\nstderr:\n{proc.stderr}"
+                    f"expected compile failure but smallcc exited 0\nstderr:\n{proc.stderr}"
                 return
 
             assert proc.returncode == 0, \

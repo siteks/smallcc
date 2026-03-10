@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Build & Test
 
 ```bash
-make mycc           # Build the compiler
+make smallcc           # Build the compiler
 make test_all       # Run all test suites
 make test_struct    # Run a specific suite (also: test_init, test_ops, test_logops, test_func,
                     # test_longs, test_array, test_loops, test_goto, test_struct_init,
@@ -17,9 +17,9 @@ make clean          # Remove binaries and temp files
 Run the compiler directly:
 ```bash
 echo 'int main(){return 5+3;}' > t.c
-./mycc t.c > out.s && ./cpu3/sim.py out.s          # output to stdout
-./mycc -o out.s t.c && ./cpu3/sim.py out.s          # output to file
-./mycc -o out.s file1.c file2.c && ./cpu3/sim.py out.s  # multi-TU
+./smallcc t.c > out.s && ./cpu3/sim.py out.s          # output to stdout
+./smallcc -o out.s t.c && ./cpu3/sim.py out.s          # output to file
+./smallcc -o out.s file1.c file2.c && ./cpu3/sim.py out.s  # multi-TU
 ```
 
 Tests use `cpu3/sim.py` to execute generated assembly and check the value left in register `r0`. On test failure, verbose output is written to `error.log`. The test harness is in `test.sh`; individual suites are in `tests/`.
@@ -28,19 +28,19 @@ Tests use `cpu3/sim.py` to execute generated assembly and check the value left i
 
 ## Compiler Architecture
 
-C89 subset compiler. Input is one or more `.c` files; assembly is written to stdout or a file specified with `-o`. Usage: `mycc [-o outfile] <source.c> [source2.c ...]`.
+C89 subset compiler. Input is one or more `.c` files; assembly is written to stdout or a file specified with `-o`. Usage: `smallcc [-o outfile] <source.c> [source2.c ...]`.
 
 ### Compilation Pipeline
 
 ```
 Preamble (ssp / jl main / halt) is emitted once before the per-TU loop.
 
-Per-TU loop [mycc.c]:
+Per-TU loop [smallcc.c]:
   reset_codegen()           [codegen.c]     Clear per-TU codegen state
   reset_parser()            [parser.c]      Clear per-TU parser state
   reset_types_state()       [types.c]       Fresh symbol/scope tables (type list preserved)
   make_basic_types()        [types.c]       Populate/reuse global type table
-  prepopulate_extern_syms() [mycc.c]        Inject globals from previous TUs
+  prepopulate_extern_syms() [smallcc.c]        Inject globals from previous TUs
   tokenise()                [tokeniser.c]   Token linked list
   program()                 [parser.c]      AST (Node tree)
   resolve_symbols(root)     [parser.c]      Set ND_IDENT types via symbol table lookup
@@ -49,7 +49,7 @@ Per-TU loop [mycc.c]:
   finalize_local_offsets()  [types.c]       Compute bp-relative offsets for all locals
   gen_ir(node, tu_index)    [codegen.c]     Walk AST; build flat IR instruction list
   backend_emit_asm(ir_head) [backend.c]     Walk IR list; emit assembly text
-  harvest_globals()         [mycc.c]        Collect non-static globals for next TU
+  harvest_globals()         [smallcc.c]        Collect non-static globals for next TU
 ```
 
 Every phase prints debug information to stderr.
@@ -58,8 +58,8 @@ Every phase prints debug information to stderr.
 
 | File | Role |
 |---|---|
-| `mycc.h` | All shared structs, enums, and function prototypes |
-| `mycc.c` | Entry point; `-o` arg parsing; per-TU loop; `ExternSym` table; `harvest_globals`/`prepopulate_extern_syms` |
+| `smallcc.h` | All shared structs, enums, and function prototypes |
+| `smallcc.c` | Entry point; `-o` arg parsing; per-TU loop; `ExternSym` table; `harvest_globals`/`prepopulate_extern_syms` |
 | `tokeniser.c` | Lexer — produces a `Token` linked list |
 | `parser.c` | Recursive-descent parser — builds AST; `resolve_symbols`, `derive_types`, `insert_coercions` |
 | `types.c` | Type table, symbol table, struct layout, `add_types_and_symbols`, `reset_types_state`, `insert_extern_sym` |

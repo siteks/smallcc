@@ -1,5 +1,5 @@
 
-#include "mycc.h"
+#include "smallcc.h"
 
 
 // Codegen context instance

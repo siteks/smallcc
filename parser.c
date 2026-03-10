@@ -1,5 +1,5 @@
 
-#include "mycc.h"
+#include "smallcc.h"
 
 // Grammer
 // translation-unit ::= external-declaration*

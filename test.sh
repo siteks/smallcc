@@ -9,7 +9,7 @@ assert() {
     input="$2"
     echo "Input is:$input"
     printf '%s\n' "$input" > "$TMP_C"
-    ./mycc -o "$TMP_S" "$TMP_C"
+    ./smallcc -o "$TMP_S" "$TMP_C"
     actual=`./sim_c "$TMP_S"`
     final=`echo $actual | awk '{v=int("0x"substr($1,4));if(v>2147483647)v=v-4294967296;print v}'`
 

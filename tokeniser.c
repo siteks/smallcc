@@ -6,7 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "mycc.h"
+#include "smallcc.h"
 
 // Tokenizer context instance
 TokenContext token_ctx;

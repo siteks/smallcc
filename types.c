@@ -1,6 +1,6 @@
 
 
-#include "mycc.h"
+#include "smallcc.h"
 
 // Type system context instance
 TypeContext    type_ctx;

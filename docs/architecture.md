@@ -219,7 +219,7 @@ For array subscripts the child is `ND_BINOP "+"` with children `[base_addr, ND_B
 
 ### Three-Pass Type Resolution
 
-Type annotation is split across three sequential passes called from `mycc.c` after parsing:
+Type annotation is split across three sequential passes called from `smallcc.c` after parsing:
 
 **Pass 1 — `resolve_symbols(root)`** (post-order)
 - `ND_IDENT` (`is_expr == true`): `node->type = find_symbol_st(node->st, name, NS_IDENT)->type`; `node->symbol` is also set.
@@ -242,7 +242,7 @@ Type annotation is split across three sequential passes called from `mycc.c` aft
 
 ---
 
-## Type System (`types.c` + `mycc.h`)
+## Type System (`types.c` + `smallcc.h`)
 
 ### Type Representation: `Type`
 
@@ -422,14 +422,14 @@ bool istype_intlike(Type *t)  // any integer or pointer type (for pointer arithm
 
 ---
 
-## Per-Translation-Unit Compilation (`mycc.c` + `types.c` + `codegen.c` + `backend.c`)
+## Per-Translation-Unit Compilation (`smallcc.c` + `types.c` + `codegen.c` + `backend.c`)
 
 The compiler supports true per-TU compilation. Each file is compiled independently with its own symbol table; the combined assembly is emitted as a single stream. The assembler resolves all label references, so cross-TU calls work without object files.
 
 ### Invocation
 
 ```
-mycc [-o outfile] <source.c> [source2.c ...]
+smallcc [-o outfile] <source.c> [source2.c ...]
 ```
 
 Assembly is written to `outfile` when `-o` is given; otherwise to stdout. Each `.c` argument is one translation unit, compiled in argument order. The preamble is emitted once before the per-TU loop.
@@ -451,7 +451,7 @@ reset_types_state()  // allocates a fresh symbol_table / curr_scope_st / last_sy
 
 After reset, `make_basic_types()` re-populates the basic type singletons (they are found in the existing `types` list and reused, not duplicated).
 
-### Extern Symbol Table (`mycc.c`)
+### Extern Symbol Table (`smallcc.c`)
 
 A flat `ExternSym[]` array accumulates non-static global symbols after each TU:
 

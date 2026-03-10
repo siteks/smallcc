@@ -1,85 +1,85 @@
 
 CFLAGS=-std=c11 -g
 
-mycc: mycc.c tokeniser.c parser.c types.c codegen.c backend.c preprocess.c
+smallcc: smallcc.c tokeniser.c parser.c types.c codegen.c backend.c preprocess.c
 sim_c: sim_c.c
 	$(CC) $(CFLAGS) -o sim_c sim_c.c -lm
-test_all: mycc sim_c test_init test_ops test_logops test_func test_longs test_array test_struct test_loops test_goto test_struct_init test_floats test_compound test_remaining test_typedef test_strings test_enum test_variadic test_funcptr test_preprocess
+test_all: smallcc sim_c test_init test_ops test_logops test_func test_longs test_array test_struct test_loops test_goto test_struct_init test_floats test_compound test_remaining test_typedef test_strings test_enum test_variadic test_funcptr test_preprocess
 
-test_init: mycc
+test_init: smallcc
 	(source ./test.sh && source tests/test_init.sh)
 
-test_ops: mycc
+test_ops: smallcc
 	(source ./test.sh && source tests/test_ops.sh)
 
-test_logops: mycc
+test_logops: smallcc
 	(source ./test.sh && source tests/test_logops.sh)
 
-test_func:mycc
+test_func:smallcc
 	(source ./test.sh && source tests/test_func.sh)
 
-test_longs:mycc
+test_longs:smallcc
 	(source ./test.sh && source tests/test_longs.sh)
 
-test_array:mycc
+test_array:smallcc
 	(source ./test.sh && source tests/test_array.sh)
 
-test_struct:mycc
+test_struct:smallcc
 	(source ./test.sh && source tests/test_struct.sh)
 
-test_loops:mycc
+test_loops:smallcc
 	(source ./test.sh && source tests/test_loops.sh)
 
-test_goto:mycc
+test_goto:smallcc
 	(source ./test.sh && source tests/test_goto.sh)
 
-test_struct_init:mycc
+test_struct_init:smallcc
 	(source ./test.sh && source tests/test_struct_init.sh)
 
-test_floats:mycc
+test_floats:smallcc
 	(source ./test.sh && source tests/test_floats.sh)
 
-test_compound:mycc
+test_compound:smallcc
 	(source ./test.sh && source tests/test_compound.sh)
 
-test_remaining:mycc
+test_remaining:smallcc
 	(source ./test.sh && source tests/test_remaining.sh)
 
-test_typedef:mycc
+test_typedef:smallcc
 	(source ./test.sh && source tests/test_typedef.sh)
 
-test_strings:mycc
+test_strings:smallcc
 	(source ./test.sh && source tests/test_strings.sh)
 
-test_enum:mycc
+test_enum:smallcc
 	(source ./test.sh && source tests/test_enum.sh)
 
-test_variadic:mycc
+test_variadic:smallcc
 	(source ./test.sh && source tests/test_variadic.sh)
 
-test_funcptr:mycc
+test_funcptr:smallcc
 	(source ./test.sh && source tests/test_funcptr.sh)
 
-test_preprocess: mycc
+test_preprocess: smallcc
 	(source ./test.sh && source tests/test_preprocess.sh)
 
-test_cases: mycc sim_c
+test_cases: smallcc sim_c
 	python3 -m pytest tests/cases/ -q
 
-test_cases_v: mycc sim_c
+test_cases_v: smallcc sim_c
 	python3 -m pytest tests/cases/ -v
 
-test_cases_parallel: mycc sim_c
+test_cases_parallel: smallcc sim_c
 	python3 -m pytest tests/cases/ -n auto -q
 
 clean:
-	rm -f mycc sim_c mycc_* *.o *~ tmp* _tmp*.c test.s *.lst error.log
+	rm -f smallcc sim_c mycc_* *.o *~ tmp* _tmp*.c test.s *.lst error.log
 	rm -rf .pytest_cache __pycache__ cpu3/__pycache__
 	rm -rf *.dSYM
 
 help:
 	@echo "Build"
-	@echo "  mycc                 Build the compiler"
+	@echo "  smallcc                 Build the compiler"
 	@echo "  sim_c                Build the C simulator"
 	@echo ""
 	@echo "Test (bash suites, sequential)"

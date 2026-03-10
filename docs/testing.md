@@ -7,7 +7,7 @@ Two test systems run in parallel:
 - **Bash test suites** (`tests/test_*.sh`) — the original harness, driven by `make test_all`. Tests are C snippets embedded as strings in shell scripts.
 - **pytest test cases** (`tests/cases/`) — newer file-based harness. Each test is a standalone `.c` file with metadata in magic comments. Supports multi-TU tests, compile-failure tests, and stdout capture.
 
-Both systems share the same compiler (`mycc`) and simulator (`sim_c`).
+Both systems share the same compiler (`smallcc`) and simulator (`sim_c`).
 
 ---
 
@@ -59,7 +59,7 @@ All values are hex. `r0` is 32-bit; `sp`, `bp`, `lr`, `pc` are 16-bit. `H:1` mea
 `cpu3/sim.py` remains the reference ISA implementation. Use it to cross-check `sim_c` if results look wrong:
 
 ```bash
-./mycc -o /tmp/t.s t.c
+./smallcc -o /tmp/t.s t.c
 ./sim_c /tmp/t.s
 ./cpu3/sim.py /tmp/t.s 2>/dev/null | tail -1   # strips assembler debug noise
 ```
@@ -84,7 +84,7 @@ On failure, `sim_c -v` output is written to `error.log` for inspection.
 
 Each suite is a shell script in `tests/`. The `assert` function in `test.sh` does:
 1. Write the input string to a temp `.c` file.
-2. Compile with `mycc -o`.
+2. Compile with `smallcc -o`.
 3. Simulate with `sim_c`; parse `r0` from the output.
 4. Compare the signed integer value of `r0` against the expected value.
 
@@ -137,7 +137,7 @@ int main() { int x = -1; return x; }
 int main() { return 1 }   // missing semicolon
 ```
 
-`mycc` must exit non-zero. The test passes if it does. Useful for parser error-recovery tests and deliberate unsupported-syntax checks.
+`smallcc` must exit non-zero. The test passes if it does. Useful for parser error-recovery tests and deliberate unsupported-syntax checks.
 
 #### Check putchar output
 
@@ -177,9 +177,9 @@ int main() { return add(3, 4); }
 int add(int a, int b) { return a + b; }
 ```
 
-The `FILES` list is compiled as a single `mycc` invocation:
+The `FILES` list is compiled as a single `smallcc` invocation:
 ```bash
-./mycc -o out.s tests/cases/multifile/lib.c tests/cases/multifile/main.c
+./smallcc -o out.s tests/cases/multifile/lib.c tests/cases/multifile/main.c
 ```
 
 Only the file containing `FILES` needs `EXPECT_*` keys.
@@ -189,7 +189,7 @@ Only the file containing `FILES` needs `EXPECT_*` keys.
 | Key | Value | Meaning |
 |---|---|---|
 | `EXPECT_R0` | signed decimal integer | Expected value of `r0` after execution |
-| `EXPECT_COMPILE_FAIL` | (no value) | `mycc` must exit non-zero |
+| `EXPECT_COMPILE_FAIL` | (no value) | `smallcc` must exit non-zero |
 | `EXPECT_STDOUT` | string | Exact string expected from `putchar` calls |
 | `FILES` | space-separated filenames | Multi-TU: compile all listed files (relative to this file's directory) |
 

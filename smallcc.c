@@ -1,5 +1,5 @@
 
-#include "mycc.h"
+#include "smallcc.h"
 
 // ---------------------------------------------------------------
 // Arena allocator
@@ -88,7 +88,7 @@ int main(int argc, char **argv)
 
     if (argc <= file_start)
     {
-        fprintf(stderr, "Usage: mycc [-o outfile] <source.c> [source2.c ...]\n");
+        fprintf(stderr, "Usage: smallcc [-o outfile] <source.c> [source2.c ...]\n");
         return 1;
     }
 

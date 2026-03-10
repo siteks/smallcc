@@ -1,5 +1,5 @@
 
-#include "mycc.h"
+#include "smallcc.h"
 
 
 static FILE *asm_out = NULL;
