@@ -506,7 +506,7 @@ static Type *generate_struct_type(Node *decl_node, DeclParseState ds, int depth)
     DBG_FUNC();
     Node *struct_node = decl_node->ch[0];   // spec
     if (!struct_node || struct_node->kind != ND_STRUCT)
-        error("Should be struct declaration!\n");
+        src_error(decl_node->line, decl_node->col, "Should be struct declaration!");
 
     char   *tagname = struct_node->ch[0]->u.ident.name;   // tag node name
     Symbol *tag     = find_symbol_st(decl_node->st, tagname, NS_TAG);
@@ -516,7 +516,7 @@ static Type *generate_struct_type(Node *decl_node, DeclParseState ds, int depth)
         print_type_table();
         print_symbol_table(type_ctx.symbol_table, 0);
 #endif
-        error("Tag %s not found\n", tagname);
+        src_error(decl_node->line, decl_node->col, "Tag %s not found", tagname);
     }
 
     if (tag->type == t_void)
@@ -589,7 +589,7 @@ static Type *generate_struct_type(Node *decl_node, DeclParseState ds, int depth)
     }
     else if (struct_node->ch[1] != NULL)   // members list exists
     {
-        error("Redefinition of tag %s\n", tagname);
+        src_error(struct_node->line, struct_node->col, "Redefinition of tag %s", tagname);
     }
     DBG_PRINT("%s referencing existing struct %s\n", __func__, tagname);
     return tag->type;
@@ -602,7 +602,7 @@ void add_types_and_symbols(Node *node, DeclParseState ds, bool is_param, bool is
 {
     DBG_FUNC();
     if (node->kind != ND_DECLARATION)
-        error("Node should be ND_DECLARATION\n");
+        src_error(node->line, node->col, "Node should be ND_DECLARATION");
 
     // Store ds fields into the node for later use by generate_struct_type
     node->u.declaration.typespec = ds.typespec;
@@ -737,7 +737,7 @@ Symbol *find_symbol(Node *n, const char *name, Namespace nspace)
         print_type_table();
         print_symbol_table(type_ctx.symbol_table, 0);
 #endif
-        error("%s %s not found!\n", nspace == NS_IDENT ? "ident" : "tag", name);
+        src_error(n->line, n->col, "%s %s not found!", nspace == NS_IDENT ? "ident" : "tag", name);
     }
     return s;
 }

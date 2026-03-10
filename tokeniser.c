@@ -197,19 +197,16 @@ char *expect(Token_kind tk)
     DBG_PRINT("%s %s\n", __func__, token_ctx.current->val);
     if (token_ctx.current->kind == tk)
     {
+        token_ctx.last_line = token_ctx.current->line;
+        token_ctx.last_col  = token_ctx.current->col;
         char *val           = token_ctx.current->val;
         token_ctx.current   = token_ctx.current->next;
         return val;
     }
     else
     {
-        int loc = token_ctx.current->loc < 1024 ? token_ctx.current->loc : 1023;
-        char space[1024];
-        memset(space, 0x20, loc);
-        space[loc] = 0;
-        fprintf(stderr, "%s\n", token_ctx.user_input);
-        fprintf(stderr, "%s^\n", space);
-        error("Expecting '%s' got '%s'\n", token_str(tk), token_str(token_ctx.current->kind));
+        src_error(token_ctx.current->line, token_ctx.current->col,
+                  "Expected '%s' got '%s'", token_str(tk), token_str(token_ctx.current->kind));
     }
     return 0;
 }
@@ -224,11 +221,14 @@ int expect_number()
 {
     if (token_ctx.current->kind == TK_CONSTINT)
     {
+        token_ctx.last_line = token_ctx.current->line;
+        token_ctx.last_col  = token_ctx.current->col;
         int val           = (int)token_ctx.current->ival;
         token_ctx.current = token_ctx.current->next;
         return val;
     }
-    error("Expected integer constant, got '%s'\n", token_ctx.current->val);
+    src_error(token_ctx.current->line, token_ctx.current->col,
+              "Expected integer constant, got '%s'", token_ctx.current->val);
     return 0;
 }
 
@@ -236,11 +236,14 @@ char *expect_ident()
 {
     if (token_ctx.current->kind == TK_IDENT)
     {
+        token_ctx.last_line = token_ctx.current->line;
+        token_ctx.last_col  = token_ctx.current->col;
         char *val         = token_ctx.current->val;
         token_ctx.current = token_ctx.current->next;
         return val;
     }
-    error("Expected identifier, got '%s'\n", token_ctx.current->val);
+    src_error(token_ctx.current->line, token_ctx.current->col,
+              "Expected identifier, got '%s'", token_ctx.current->val);
     return 0;
 }
 
@@ -310,12 +313,25 @@ Token *tokenise(char *p)
     head.next   = NULL;
     Token *cur  = &head;
 
+    int cur_line = 1, cur_col = 1;
+
     while (*p)
     {
-        if (isspace(*p)) { p++; continue; }
+        if (isspace(*p))
+        {
+            if (*p == '\n') { cur_line++; cur_col = 1; }
+            else cur_col++;
+            p++;
+            continue;
+        }
 
         // Line comments: skip to end of line
-        if (p[0] == '/' && p[1] == '/') { while (*p && *p != '\n') p++; continue; }
+        if (p[0] == '/' && p[1] == '/')
+        {
+            cur_col += 2; p += 2;
+            while (*p && *p != '\n') { cur_col++; p++; }
+            continue;
+        }
 
         // Punctuators and operators: greedy longest-match via table
         {
@@ -325,6 +341,9 @@ Token *tokenise(char *p)
                 if (!strncmp(p, pt->str, pt->len))
                 {
                     cur = new_token(pt->kind, cur, p, pt->len);
+                    cur->line = cur_line;
+                    cur->col  = cur_col;
+                    cur_col += pt->len;
                     p += pt->len;
                     matched = true;
                     break;
@@ -336,11 +355,15 @@ Token *tokenise(char *p)
         // Keywords and identifiers
         if (isalpha(*p) || *p == '_')
         {
+            int tok_line = cur_line, tok_col = cur_col;
             char *q = p;
             while (*q && (isalnum(*q) || *q == '_')) q++;
             int l   = q - p;
             Token_kind tk = find_token(p, l);
             cur = new_token(tk, cur, p, l);
+            cur->line = tok_line;
+            cur->col  = tok_col;
+            cur_col += l;
             p = q;
             continue;
         }
@@ -351,6 +374,8 @@ Token *tokenise(char *p)
             // floats may be followed by f, l
             //
             // Try both and use whichever decodes more characters
+            int tok_line = cur_line, tok_col = cur_col;
+            char *p_start = p;
             char *q;
             int ilen, flen;
             long long ival = strtol(p, &q, 0);
@@ -377,25 +402,34 @@ Token *tokenise(char *p)
                 cur         = new_token(TK_CONSTINT, cur, p, q - p);
                 cur->ival   = ival;
             }
+            cur->line = tok_line;
+            cur->col  = tok_col;
+            cur_col += (int)(q - p_start);
             p = q;
             continue;
         }
 
         if (*p == '\'')
         {
+            int tok_line = cur_line, tok_col = cur_col;
             char ch;
             int adv = decode_string_char(p + 1, &ch);
             if (p[1 + adv] != '\'')
-                error("Unterminated character constant\n");
+                src_error(tok_line, tok_col, "Unterminated character constant");
             cur = new_token(TK_CHARACTER, cur, &ch, 1);
-            p += 1 + adv + 1;  // opening quote + char/escape + closing quote
+            cur->line = tok_line;
+            cur->col  = tok_col;
+            int advance = 1 + adv + 1;
+            cur_col += advance;
+            p += advance;  // opening quote + char/escape + closing quote
             continue;
         }
 
         if (*p == '"')
         {
+            int tok_line = cur_line, tok_col = cur_col;
             char *start = p;
-            p++;  // skip opening "
+            cur_col++; p++;  // skip opening "
             int cap = 64, len = 0;
             char *buf = malloc(cap);
             // Handle adjacent string literals: "abc" "def" → "abcdef"
@@ -407,13 +441,20 @@ Token *tokenise(char *p)
                     char c;
                     int adv = decode_string_char(p, &c);
                     buf[len++] = c;
+                    // Track col; escape sequences don't contain newlines in practice
+                    cur_col += adv;
                     p += adv;
                 }
-                if (*p == '"') p++;  // skip closing "
+                if (*p == '"') { cur_col++; p++; }  // skip closing "
                 // Skip whitespace and check for another string literal
                 char *q = p;
-                while (isspace(*q)) q++;
-                if (*q == '"') { p = q + 1; } else break;
+                while (*q)
+                {
+                    if (*q == '\n') { cur_line++; cur_col = 1; q++; }
+                    else if (isspace(*q)) { cur_col++; q++; }
+                    else break;
+                }
+                if (*q == '"') { cur_col++; p = q + 1; } else { p = q; break; }
             } while (1);
             buf[len] = 0;
             Token *strtok = arena_alloc(sizeof(Token));
@@ -422,14 +463,18 @@ Token *tokenise(char *p)
             free(buf);
             strtok->ival = len;
             strtok->loc  = start - token_ctx.user_input;
+            strtok->line = tok_line;
+            strtok->col  = tok_col;
             cur->next = strtok;
             cur = strtok;
             continue;
         }
 
-        error("Unexpected input %s\n", p);
+        src_error(cur_line, cur_col, "Unexpected input '%c'", *p);
     }
-    new_token(TK_EOF, cur, p, 0);
+    Token *eof_tok = new_token(TK_EOF, cur, p, 0);
+    eof_tok->line = cur_line;
+    eof_tok->col  = cur_col;
     return head.next;
 }
 

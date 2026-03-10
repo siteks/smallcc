@@ -14,7 +14,7 @@ static LocalAddr find_local_addr(Node *node, const char *name)
     DBG_PRINT("%s scope id:%d depth:%d\n", __func__, node->st->scope_id, node->st->depth);
     Symbol *s = find_symbol_st(node->st, name, NS_IDENT);
     if (!s)
-        error("Symbol %s not found!\n", name);
+        src_error(node->line, node->col, "Symbol %s not found!", name);
     if (s->kind == SYM_STATIC_LOCAL || s->kind == SYM_GLOBAL || s->kind == SYM_STATIC_GLOBAL || s->kind == SYM_EXTERN)
         return (LocalAddr){ -1, false };
     DBG_PRINT(";find_local_addr ident:%s got offset %d\n", name, s->offset & 0xffff);
@@ -223,7 +223,7 @@ void gen_varaddr_from_ident(Node *node, const char *name)
 void gen_varaddr(Node *node)
 {
     if (node->kind != ND_IDENT)
-        error("Expecting local var got %s", nodestr(node->kind));
+        src_error(node->line, node->col, "Expecting local var got %s", nodestr(node->kind));
     gen_varaddr_from_ident(node, node->u.ident.name);
 }
 void gen_fill(int offset, int size)
@@ -253,7 +253,7 @@ static int push_args_list(Node *first_arg)
     int n = 0;
     for (Node *a = first_arg; a; a = a->next)
     {
-        if (n >= 64) error("Too many function arguments\n");
+        if (n >= 64) error("Too many function arguments");
         args[n++] = a;
     }
     int param_size = 0;
@@ -294,7 +294,7 @@ void gen_callfunction(Node *node)
     if (node->symbol->kind == SYM_BUILTIN)
     {
         if (!node->ch[0] || node->ch[0]->next)
-            error("putchar requires exactly 1 argument\n");
+            src_error(node->line, node->col, "putchar requires exactly 1 argument");
         gen_expr(node->ch[0]);
         ir_append(IR_PUTCHAR, 0, NULL);
         return;
@@ -379,7 +379,7 @@ void gen_addr(Node *node)
         ir_append(IR_ADD,   0, NULL);
     }
     else
-        error("Expecting lvalue\n");
+        src_error(node->line, node->col, "Expecting lvalue");
 }
 typedef enum
 {
@@ -691,7 +691,7 @@ void gen_expr(Node *node)
             break;
         }
         #pragma clang diagnostic pop
-        default: error("unary op_kind %d not handled in codegen", node->op_kind);
+        default: src_error(node->line, node->col, "unary op_kind %d not handled in codegen", node->op_kind);
         }
     }
     // ===== Assignment =====
@@ -916,13 +916,13 @@ void gen_dowhilestmt(Node *node)
 void gen_breakstmt(Node *node)
 {
     if (codegen_ctx.loop_depth == 0)
-        error("break outside loop or switch\n");
+        src_error(node->line, node->col, "break outside loop or switch");
     ir_append(IR_J, codegen_ctx.break_labels[codegen_ctx.loop_depth - 1], NULL);
 }
 void gen_continuestmt(Node *node)
 {
     if (codegen_ctx.loop_depth == 0)
-        error("continue outside loop\n");
+        src_error(node->line, node->col, "continue outside loop");
     ir_append(IR_J, codegen_ctx.cont_labels[codegen_ctx.loop_depth - 1], NULL);
 }
 void gen_exprstmt(Node *node)

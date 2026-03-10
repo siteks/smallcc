@@ -38,6 +38,18 @@ void error(const char *fmt, ...)
     exit(1);
 }
 
+void src_error(int line, int col, const char *fmt, ...)
+{
+    fprintf(stderr, "%s:%d:%d: error: ",
+            token_ctx.filename ? token_ctx.filename : "?", line, col);
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fprintf(stderr, "\n");
+    exit(1);
+}
+
 
 static char *read_file(const char *path)
 {
@@ -104,6 +116,7 @@ int main(int argc, char **argv)
 
     for (int tu = 0; tu < tu_count; tu++)
     {
+        token_ctx.filename = argv[file_start + tu];
         char *raw    = read_file(argv[file_start + tu]);
         char *source = preprocess(raw, argv[file_start + tu]);
 

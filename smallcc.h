@@ -9,6 +9,7 @@
 #include <string.h>
 
 void error(const char *fmt, ...);
+void src_error(int line, int col, const char *fmt, ...) __attribute__((noreturn));
 
 // ===============================================================
 // Arena Allocator
@@ -100,6 +101,8 @@ struct Token
     double      fval;
     long long   ival;
     int         loc;
+    int         line;   // 1-based line number in source
+    int         col;    // 1-based column number
 };
 
 // ---------------------------------------------------------------
@@ -344,6 +347,8 @@ struct Node
         struct { int label_id; } defaultstmt;
     } u;
     Node            *next;       // sibling link (for linked-list children)
+    int             line;        // source line where this node was parsed
+    int             col;         // source column
     bool            is_expr;
     Token_kind      op_kind;    // for ND_BINOP/UNARYOP/MEMBER: identifies the operator
     Symbol_table    *st;
@@ -553,6 +558,9 @@ typedef struct TypeContext {
 typedef struct TokenContext {
     Token *current;             // current token
     char *user_input;           // input source string
+    const char *filename;       // current source file (set per TU)
+    int last_line;              // line of most recently consumed token
+    int last_col;               // col  of most recently consumed token
 } TokenContext;
 
 typedef struct ParserContext {

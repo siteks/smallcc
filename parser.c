@@ -201,6 +201,8 @@ Node *new_node(Node_kind kind, char *val, bool is_expr)
     node->is_expr = is_expr;
     node->type = t_void;
     node->st   = type_ctx.curr_scope_st;
+    node->line = token_ctx.last_line;
+    node->col  = token_ctx.last_col;
     // Store identifier/label strings in union; operators use op_kind instead
     if (val) {
         if (kind == ND_IDENT)
@@ -294,31 +296,31 @@ static Node *primary_expr()
             if (cs == CS_NONE)
                 if (i >= -32768 && i <= 32767)                      node->type = t_int;
                 else if (i >= -2147483648ll && i <= 2147483647ll)   node->type = t_long;
-                else error("Integer constant out of range");
+                else src_error(tk->line, tk->col, "Integer constant out of range");
             else if (cs == CS_OX)
                 if (i >= -32768 && i <= 32767)                      node->type = t_int;
                 else if (i >= 0 && i <= 65535)                      node->type = t_uint;
                 else if (i >= -2147483648ll && i <= 2147483647ll)   node->type = t_long;
                 else if (i >= 0 && i <= 4294967295ll)               node->type = t_ulong;
-                else error("Integer constant out of range");
+                else src_error(tk->line, tk->col, "Integer constant out of range");
             else if ((cs & ~CS_OX) == CS_U)
                 if (i >= 0 && i <= 65535)                           node->type = t_uint;
                 else if (i >= 0 && i <= 4294967295ll)               node->type = t_ulong;
-                else error("Integer constant out of range");
+                else src_error(tk->line, tk->col, "Integer constant out of range");
             else if ((cs & ~CS_OX) == CS_L)
                 if (i >= -2147483648ll && i <= 2147483647ll)        node->type = t_long;
                 else if (i >= 0 && i <= 4294967295ll)               node->type = t_ulong;
-                else error("Integer constant out of range");
+                else src_error(tk->line, tk->col, "Integer constant out of range");
             else if ((cs & ~CS_OX) == CS_UL){
                 if (i >= 0 && i <= 4294967295ll)                    node->type = t_ulong;
-                else error("Integer constant out of range");}
+                else src_error(tk->line, tk->col, "Integer constant out of range");}
         }
         if (tk->kind == TK_CONSTFLT)
         {
             //  Floats, double, and long float are all 32 bits
             double f = node->u.literal.fval = tk->fval;
             if (f >= -3.402823466e38 && f <= 3.402823466e38)        node->type = t_float;
-            else error("Float constant out of range");
+            else src_error(tk->line, tk->col, "Float constant out of range");
         }
     }
     else if (token_ctx.current->kind == TK_CHARACTER)
@@ -363,6 +365,8 @@ static Node *unary_expr()
     Node *node = 0;
     if (token_ctx.current->kind == TK_SIZEOF)
     {
+        token_ctx.last_line = token_ctx.current->line;
+        token_ctx.last_col  = token_ctx.current->col;
         token_ctx.current = token_ctx.current->next;
         node = new_node(ND_LITERAL, NULL, true);
         node->type = t_int;
@@ -397,6 +401,8 @@ static Node *unary_expr()
             ||  token_ctx.current->kind == TK_BANG || token_ctx.current->kind == TK_TILDE)
     {
         Token_kind k = token_ctx.current->kind;
+        token_ctx.last_line = token_ctx.current->line;
+        token_ctx.last_col  = token_ctx.current->col;
         token_ctx.current = token_ctx.current->next;  // consume the operator token_ctx.current
         node = new_node(ND_UNARYOP, NULL, true);
         node->op_kind = k;
@@ -464,18 +470,18 @@ static Node *unary_expr()
                         break;
                     }
                     if (!s)
-                        error("No ident before left bracket\n");
+                        src_error(token_ctx.current->line, token_ctx.current->col, "No ident before left bracket");
                     expect(token_ctx.current->kind);
                     Node *e1 = node;
                     // Walk type chain to current array depth
                     Type *arr_at_depth = s->type;
                     for (int _d = 0; _d < array_depth; _d++) {
                         if (arr_at_depth->base != TB_ARRAY)
-                            error("Too many dimensions for array type %s\n", fulltype_str(s->type));
+                            src_error(node->line, node->col, "Too many dimensions for array type %s", fulltype_str(s->type));
                         arr_at_depth = arr_at_depth->u.arr.elem;
                     }
                     if (arr_at_depth->base != TB_ARRAY)
-                        error("Too many dimensions for array type %s\n", fulltype_str(s->type));
+                        src_error(node->line, node->col, "Too many dimensions for array type %s", fulltype_str(s->type));
                     bool last_dim = (arr_at_depth->u.arr.elem->base != TB_ARRAY);
                     Node *outer_unary = new_node(ND_UNARYOP, NULL, true);
                     if (last_dim) {
@@ -518,6 +524,8 @@ static Node *unary_expr()
                     nl_append(&args, assign_expr());
                     while (token_ctx.current->kind == TK_COMMA)
                     {
+                        token_ctx.last_line = token_ctx.current->line;
+                        token_ctx.last_col  = token_ctx.current->col;
                         token_ctx.current = token_ctx.current->next;
                         nl_append(&args, assign_expr());
                     }
@@ -554,6 +562,8 @@ static Node *unary_expr()
             {
                 Token_kind post_k = (token_ctx.current->kind == TK_INC) ? TK_POST_INC : TK_POST_DEC;
                 char *op = (token_ctx.current->kind == TK_INC) ? "post++" : "post--";
+                token_ctx.last_line = token_ctx.current->line;
+                token_ctx.last_col  = token_ctx.current->col;
                 token_ctx.current = token_ctx.current->next;
                 Node *n = new_node(ND_UNARYOP, op, true);
                 n->op_kind = post_k;
@@ -708,6 +718,8 @@ static Node *cond_expr()
     Node *node = logor_expr();
     if (token_ctx.current->kind != TK_QUESTION)
         return node;
+    token_ctx.last_line = token_ctx.current->line;
+    token_ctx.last_col  = token_ctx.current->col;
     token_ctx.current = token_ctx.current->next;    // consume '?'
     Node *tnode = new_node(ND_TERNARY, NULL, true);
     tnode->ch[0] = node;         // cond
@@ -740,6 +752,8 @@ static Node *assign_expr()
         if (token_ctx.current->kind == ca_map[i].compound) { op_tk = ca_map[i].base; break; }
     if (op_tk != TK_EMPTY)
     {
+        token_ctx.last_line = token_ctx.current->line;
+        token_ctx.last_col  = token_ctx.current->col;
         token_ctx.current = token_ctx.current->next;        // consume compound token_ctx.current
         Node *anode = new_node(ND_COMPOUND_ASSIGN, NULL, true);
         anode->op_kind = op_tk;
@@ -755,6 +769,8 @@ Node *expr()
     Node *node = assign_expr();
     while (token_ctx.current->kind == TK_COMMA)
     {
+        token_ctx.last_line = token_ctx.current->line;
+        token_ctx.last_col  = token_ctx.current->col;
         token_ctx.current = token_ctx.current->next;
         Node *enode = new_node(ND_BINOP, NULL, true);
         enode->op_kind = TK_COMMA;
@@ -1285,7 +1301,7 @@ static Node *stmt()
         {
             Symbol *s = find_symbol_st(node->st, token_ctx.current->val, NS_IDENT);
             if (!s || s->kind != SYM_ENUM_CONST)
-                error("Expected integer constant in case\n");
+                src_error(token_ctx.current->line, token_ctx.current->col, "Expected integer constant in case");
             node->u.casestmt.value = (long long)s->offset;
             expect(TK_IDENT);
         }
@@ -1526,7 +1542,7 @@ void for_each_child(Node *node, void (*fn)(Node *child, void *ctx), void *ctx)
 {
     if (!node) return;
     if (node->kind >= ND_UNDEFINED)
-        error("for_each_child: unhandled node kind %d (%s)\n", node->kind, nodestr(node->kind));
+        src_error(node->line, node->col, "for_each_child: unhandled node kind %d (%s)", node->kind, nodestr(node->kind));
     const NodeShape *sh = &node_shapes[node->kind];
     for (int i = 0; i < 4; i++)
     {
@@ -1729,7 +1745,7 @@ static void derive_types_step(Node *n)
     if (n->kind == ND_MEMBER)
     {
         if (!n->ch[0] || !n->u.member.field_name)
-            error("Malformed struct reference\n");
+            src_error(n->line, n->col, "Malformed struct reference");
         Node *lhs = n->ch[0];   // base
         char *field_name = n->u.member.field_name;
         // For ->, dereference the pointer to get the struct type
@@ -1737,14 +1753,14 @@ static void derive_types_step(Node *n)
         if (n->op_kind == TK_ARROW)
         {
             if (!istype_ptr(struct_type))
-                error("'->' requires pointer type\n");
+                src_error(n->line, n->col, "'->' requires pointer type");
             struct_type = struct_type->u.ptr.pointee;
         }
         DBG_PRINT("%s looking in lhs type:%016llx for field %s\n", __func__, (unsigned long long)struct_type, field_name);
         Type *base = 0;
         n->u.member.offset = find_offset(struct_type, field_name, &base);
         if (n->u.member.offset < 0)
-            error("Can't find member %s in struct\n", field_name);
+            src_error(n->line, n->col, "Can't find member %s in struct", field_name);
         DBG_PRINT("%s found member %s with offset %d basetype %016llx\n", __func__,
             field_name, n->u.member.offset, (unsigned long long)base);
         n->type = base;
