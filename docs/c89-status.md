@@ -34,10 +34,10 @@ Preprocessor excluded. Features are assessed against ANSI C89/ISO C90.
 |---|---|---|
 | Arithmetic `+ - * /` | ✅ | |
 | Modulo `%` | ✅ | |
-| Compound assignment `+= -= *= /= %= &= \|= ^= <<= >>=` | ✅ | Desugared to `lhs = lhs op rhs` in parser |
+| Compound assignment `+= -= *= /= %= &= \|= ^= <<= >>=` | ✅ | `ND_COMPOUND_ASSIGN` node in codegen (not desugared); avoids double-evaluation of LHS (e.g. `a[i++] += 1`) |
 | Ternary `? :` | ✅ | ND_TERNARY node; right-associative via `cond_expr()` |
 | Comma operator `,` (in expressions) | ✅ | `expr()` loops on commas; function args use `assign_expr()` |
-| `sizeof` | ✅ | `sizeof(type-name)` and `sizeof(ident)`; complex exprs not supported |
+| `sizeof` | ⚠️ | `sizeof(type-name)` and `sizeof(ident)` work; `sizeof` applied to any other expression (e.g. `sizeof(*p)`, `sizeof(a[0])`, `sizeof(s.x)`, `sizeof(a+b)`) is not supported |
 | Pre/post `++ --` | ✅ | |
 | Unary `+ - ~ !` | ✅ | |
 | Address-of `&` | ✅ | |
@@ -65,7 +65,7 @@ Preprocessor excluded. Features are assessed against ANSI C89/ISO C90.
 | `void` | ✅ | |
 | Pointers | ✅ | Including pointer arithmetic |
 | Arrays (1-D and N-D) | ✅ | |
-| `struct` | ✅ | Including nested structs and correct member offsets |
+| `struct` | ✅ | Including nested structs, correct member offsets, assignment (`s1 = s2`), and return by value (hidden-pointer ABI) |
 | `union` | ✅ | All members at offset 0; `is_union` flag in Type sets size = max member size |
 | `enum` | ✅ | Tagged and anonymous enums; implicit/explicit/negative values; enum variables; sizeof(enum); case labels with enum constants |
 | `typedef` | ✅ | Scalar, pointer, struct/union aliases; lexical scoping with shadowing |
@@ -85,7 +85,7 @@ Preprocessor excluded. Features are assessed against ANSI C89/ISO C90.
 | `auto` | ⚠️ | Parsed; no semantic difference from default local |
 | `register` | ⚠️ | Parsed; ignored (no register allocator) |
 | `static` (file scope) | ✅ | Internal linkage: label mangled to `_s{tu_index}_{name}`; invisible to other TUs |
-| `static` (local) | ✅ | Persistent storage in data section; label `_ls{id}`; compile-time-constant initializers only |
+| `static` (local) | ✅ | Persistent storage in data section; label `_ls{id}`; compile-time-constant initializers only (no function calls, no other variables — violations produce wrong code silently rather than an error) |
 | `extern` | ✅ | Suppresses data allocation; real definition upgrades the symbol; cross-TU globals pre-populated automatically |
 | Forward declarations | ✅ | Functions declared before their definition resolve correctly via label references in assembly |
 | K&R (old-style) function definitions | N/A | Deliberately not supported; ANSI prototype style only |
@@ -106,11 +106,13 @@ Preprocessor excluded. Features are assessed against ANSI C89/ISO C90.
 
 | Feature | Status | Notes |
 |---|---|---|
-| Function definitions with prototypes | ✅ | |
-| Parameter passing (value) | ✅ | |
+| Function definitions with prototypes | ✅ | `int f(void)` (no params) and `int f()` (treated as no params) both accepted; the distinction between "zero params" and "unspecified params" is not enforced |
+| Parameter passing (value) — scalars | ✅ | |
+| Parameter passing (value) — structs | ✅ | Hidden-copy ABI: caller allocates a copy buffer, copies the struct, passes a pointer; callee accesses transparently. `va_arg(ap, struct P)` not supported — see variadic row. |
 | Return values | ✅ | |
 | Recursion | ✅ | |
 | Variadic functions (`...`) | ✅ | `va_list` (typedef'd to `int`), `va_start`, `va_arg`, `va_end`; `putchar` CPU builtin (opcode 0x1e) |
+| `va_arg` with struct type | ❌ | `va_arg(ap, struct P)` is not supported; the `va_arg` implementation reads a fixed-size slot sized by `sizeof(type)` but struct args are passed as hidden pointers under the struct-by-value ABI, so the two mechanisms are incompatible. Pass a `struct P *` and dereference instead. |
 
 ## Type Conversion and Promotion
 
@@ -134,10 +136,10 @@ These behaviors are correct for the current 16-bit target (`sizeof(int) == sizeo
 
 ## Summary
 
-**Implemented and working**: basic scalar types, pointers, 1-D/N-D arrays, structs, unions, `float`/`double` (IEEE 754 arithmetic, comparisons, int↔float casts), `if`/`while`/`for`/`do-while`, `switch`/`case`/`default`, `break`, `continue`, `goto`, labeled statements, all arithmetic and bitwise operators including `%`, all comparison and logical operators, unary `+ - ~ ! &` and dereference `*`, pre/post-increment/decrement, struct/union member access (`.` and `->`), explicit casts, array subscripting, function definitions and calls (multi-arg, recursive), integer constants (decimal/hex/octal), floating-point constants, string literals, compound assignment (`+=` `-=` `*=` `/=` `%=` `&=` `|=` `^=` `<<=` `>>=`), ternary `?:`, comma operator, `sizeof(type)`/`sizeof(ident)`, `typedef` (scalar/pointer/struct aliases with lexical scoping), `enum` (tagged/anonymous, implicit/explicit/negative values, enum variables, enum constants in expressions and case labels), variadic functions (`va_list`/`va_start`/`va_arg`/`va_end`), function pointers (declare, assign, call via `fp(args)`, `(*fp)(args)`, `s.fp(args)`, `s->fp(args)`, pass as arguments and parameters), per-TU compilation with `static` internal linkage and cross-TU `extern` resolution, `static` local variables (persistent storage in data section, compile-time-constant initializers, independent between functions).
+**Implemented and working**: basic scalar types, pointers, 1-D/N-D arrays, structs (including assignment, pass by value, and return by value via hidden-pointer ABI), unions, `float`/`double` (IEEE 754 arithmetic, comparisons, int↔float casts), `if`/`while`/`for`/`do-while`, `switch`/`case`/`default`, `break`, `continue`, `goto`, labeled statements, all arithmetic and bitwise operators including `%`, all comparison and logical operators, unary `+ - ~ ! &` and dereference `*`, pre/post-increment/decrement, struct/union member access (`.` and `->`), explicit casts, array subscripting, function definitions and calls (multi-arg, recursive), integer constants (decimal/hex/octal), floating-point constants, string literals, compound assignment (`+=` `-=` `*=` `/=` `%=` `&=` `|=` `^=` `<<=` `>>=`), ternary `?:`, comma operator, `sizeof(type)`/`sizeof(ident)`, `typedef` (scalar/pointer/struct aliases with lexical scoping), `enum` (tagged/anonymous, implicit/explicit/negative values, enum variables, enum constants in expressions and case labels), variadic functions (`va_list`/`va_start`/`va_arg`/`va_end`), function pointers (declare, assign, call via `fp(args)`, `(*fp)(args)`, `s.fp(args)`, `s->fp(args)`, pass as arguments and parameters), per-TU compilation with `static` internal linkage and cross-TU `extern` resolution, `static` local variables (persistent storage in data section, compile-time-constant initializers, independent between functions).
 
 **Partially working**: `const`/`volatile` (stored, not enforced), `auto`/`register` (parsed, ignored), integer promotions in function arguments (not applied at call sites; harmless on this target — see Target-Dependent Arithmetic Notes).
 
-**Not yet implemented**: bit fields (deliberate), `sizeof(complex_expr)`, calling through a function-pointer stored in an array element.
+**Not yet implemented**: bit fields (deliberate), `sizeof` on non-trivial expressions, calling through a function-pointer stored in an array element, predefined macros (`__FILE__`, `__LINE__`, `__DATE__`, `__TIME__`, `__STDC__`), `#error` directive (silently ignored instead of halting compilation), `va_arg` with struct type (use `struct P *` instead).
 
 **Extensions beyond C89**: `//` line comments; declarations anywhere in a block (C99); `for`-init declarations (C99).

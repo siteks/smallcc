@@ -44,6 +44,8 @@ void reset_codegen(void)
     codegen_ctx.label_table_size  = 0;
     codegen_ctx.ir_head           = NULL;
     codegen_ctx.ir_tail           = NULL;
+    codegen_ctx.adj_depth         = 0;
+    codegen_ctx.current_fn_ret_type = NULL;
     memset(codegen_ctx.break_labels, 0, sizeof(codegen_ctx.break_labels));
     memset(codegen_ctx.cont_labels,  0, sizeof(codegen_ctx.cont_labels));
     // 'codegen_ctx.label_counter' is NOT reset — monotonically increasing across TUs.
@@ -216,7 +218,14 @@ void gen_varaddr_from_ident(Node *node, const char *name)
             ir_append(IR_IMM, 0, name);
     }
     else if (la.is_param)
+    {
+        Symbol *sym = find_symbol_st(node->st, name, NS_IDENT);
         ir_append(IR_LEA, la.offset, NULL);
+        // Struct params are passed by pointer (hidden copy ABI): dereference the pointer
+        // to get the struct base address, making access transparent to all callers.
+        if (sym && sym->type->base == TB_STRUCT)
+            gen_ld(WORD_SIZE);
+    }
     else
         ir_append(IR_LEA, -la.offset, NULL);
 }
@@ -244,8 +253,11 @@ void gen_fill(int offset, int size)
 // Everything below here uses pseudoinstructions
 //--------------------------------------------------------------------------------
 
+// Forward declarations (bodies appear after gen_struct_copy is defined)
+static int push_struct_arg(Node *arg, int copybuf_lea);
+
 // Push function call args from a linked list (right-to-left onto stack).
-// Returns total bytes pushed.
+// Returns total bytes pushed (not counting copy buffer allocations, which are tracked via adj_depth).
 static int push_args_list(Node *first_arg)
 {
     // Collect args into a temporary array for right-to-left pushing
@@ -256,36 +268,208 @@ static int push_args_list(Node *first_arg)
         if (n >= 64) error("Too many function arguments");
         args[n++] = a;
     }
+
+    // Phase 1 (right-to-left): allocate copy buffers for struct args via adj.
+    //   This must happen before any pushw so that the param-pointer pushws are contiguous.
+    //   Record the bp-relative LEA offset of each copy buffer.
+    int copybuf_leas[64];
+    for (int i = n - 1; i >= 0; i--)
+    {
+        Node *arg = args[i];
+        if (arg->type && arg->type->base == TB_STRUCT)
+        {
+            int sz = arg->type->size;
+            copybuf_leas[i] = -(codegen_ctx.adj_depth + sz);
+            ir_append(IR_ADJ, -sz, NULL);
+            codegen_ctx.adj_depth += sz;
+        }
+        else
+            copybuf_leas[i] = 0;   // unused for non-struct args
+    }
+
+    // Phase 2 (right-to-left): copy each struct arg into its copy buffer.
+    //   No adj changes here; only balanced push/pop pairs.
+    for (int i = n - 1; i >= 0; i--)
+    {
+        Node *arg = args[i];
+        if (arg->type && arg->type->base == TB_STRUCT)
+            push_struct_arg(arg, copybuf_leas[i]);
+    }
+
+    // Phase 3 (right-to-left): push all param values (copy buffer ptrs or scalar values).
     int param_size = 0;
     for (int i = n - 1; i >= 0; i--)
     {
-        gen_expr(args[i]);
-        int s = args[i]->type->size;
-        if (s == 0) s = WORD_SIZE;  // function designator decays to pointer size
-        if (s == 2) ir_append(IR_PUSHW, 0, NULL); else ir_append(IR_PUSH,  0, NULL);
-        param_size += s;
+        Node *arg = args[i];
+        if (arg->type && arg->type->base == TB_STRUCT)
+        {
+            // Push the copy buffer address as a 2-byte pointer param
+            ir_append(IR_LEA, copybuf_leas[i], NULL);
+            ir_append(IR_PUSHW, 0, NULL);
+            param_size += WORD_SIZE;
+        }
+        else
+        {
+            gen_expr(arg);
+            int s = arg->type ? arg->type->size : 0;
+            if (s == 0) s = WORD_SIZE;  // function designator decays to pointer size
+            if (s == 4) ir_append(IR_PUSH, 0, NULL); else ir_append(IR_PUSHW, 0, NULL);
+            param_size += s;
+        }
     }
     return param_size;
 }
 
+// Copy fields of a struct from src to dst.
+// src_slot_bp and dst_slot_bp are bp-relative offsets pointing to stack slots
+// that hold the base addresses of the source and destination structs respectively.
+// These slots are assumed to be already on the stack (pushed before the call).
+static void gen_copy_fields(int src_slot_bp, int dst_slot_bp, Field *fields, int base_off)
+{
+    for (Field *f = fields; f; f = f->next)
+    {
+        int off = base_off + f->offset;
+        if (f->type->base == TB_STRUCT)
+        {
+            gen_copy_fields(src_slot_bp, dst_slot_bp,
+                            f->type->u.composite.members, off);
+        }
+        else
+        {
+            // dst field addr: load dst base ptr, add offset
+            ir_append(IR_LEA, dst_slot_bp, NULL);
+            gen_ld(WORD_SIZE);
+            ir_append(IR_PUSH, 0, NULL);
+            ir_append(IR_IMM, off, NULL);
+            ir_append(IR_ADD, 0, NULL);
+            ir_append(IR_PUSH, 0, NULL);
+
+            // src field value: load src base ptr, add offset, load value
+            ir_append(IR_LEA, src_slot_bp, NULL);
+            gen_ld(WORD_SIZE);
+            ir_append(IR_PUSH, 0, NULL);
+            ir_append(IR_IMM, off, NULL);
+            ir_append(IR_ADD, 0, NULL);
+            gen_ld(f->type->size);
+
+            gen_st(f->type->size);
+        }
+    }
+}
+
+static void gen_struct_copy(int src_slot_bp, int dst_slot_bp, Type *st)
+{
+    gen_copy_fields(src_slot_bp, dst_slot_bp, st->u.composite.members, 0);
+}
+
+// Copy a struct arg into its pre-allocated copy buffer.
+// copybuf_lea: bp-relative LEA offset of the copy buffer (allocated in phase 1 of push_args_list).
+// At this point: sp = bp - adj_depth (no extra non-adj pushes in flight).
+// The copy uses balanced push/pop pairs, leaving sp and adj_depth unchanged on exit.
+static int push_struct_arg(Node *arg, int copybuf_lea)
+{
+    int adj_before = codegen_ctx.adj_depth;
+
+    // Evaluate the source struct: r0 = src base address.
+    // adj_depth may grow if gen_expr allocates a retbuf for a struct-returning call.
+    gen_expr(arg);
+    ir_append(IR_PUSH, 0, NULL);                          // stack: [src_addr]
+    // sp = bp - adj_depth - 4 (adj_depth may have grown)
+    int src_slot = -(codegen_ctx.adj_depth + 4);
+
+    ir_append(IR_LEA, copybuf_lea, NULL);                 // r0 = copy buffer address
+    ir_append(IR_PUSH, 0, NULL);                          // stack: [src_addr, dst_addr]
+    int dst_slot = -(codegen_ctx.adj_depth + 8);
+
+    gen_struct_copy(src_slot, dst_slot, arg->type);
+
+    ir_append(IR_ADJ, 8, NULL);                           // pop the two address slots
+
+    // Free any retbuf allocated by gen_expr(arg)
+    int retbuf_sz = codegen_ctx.adj_depth - adj_before;
+    if (retbuf_sz > 0)
+    {
+        ir_append(IR_ADJ, retbuf_sz, NULL);
+        codegen_ctx.adj_depth -= retbuf_sz;
+    }
+
+    return 0;   // no param_size contribution here (pushw is done in phase 3 of push_args_list)
+}
 
 // Indirect call through function pointer variable: fp(args)
 void gen_callfunction_via_ptr(Node *node)
 {
-    int param_size = push_args_list(node->ch[0]);   // args list
+    // Check if function pointer returns a struct
+    Type *fn_type  = node->symbol->type->u.ptr.pointee;
+    Type *ret_type = fn_type->u.fn.ret;
+    bool struct_ret = (ret_type && ret_type->base == TB_STRUCT);
+    int retbuf_bp_off = 0;
+    if (struct_ret)
+    {
+        int sz = ret_type->size;
+        retbuf_bp_off = -(codegen_ctx.adj_depth + sz);
+        codegen_ctx.adj_depth += sz;
+        ir_append(IR_ADJ, -sz, NULL);
+    }
+    int adj_before_args = codegen_ctx.adj_depth;
+    int param_size = push_args_list(node->ch[0]);   // user args (right-to-left)
+    if (struct_ret)
+    {
+        ir_append(IR_LEA, retbuf_bp_off, NULL);
+        ir_append(IR_PUSHW, 0, NULL);
+        param_size += WORD_SIZE;
+    }
     gen_varaddr(node);
     gen_ld(node->symbol->type->size);
     ir_append(IR_JLI,   0, NULL);
     ir_append(IR_ADJ, param_size, NULL);
+    // Free copy buffers allocated by push_struct_arg calls
+    int copybuf_sz = codegen_ctx.adj_depth - adj_before_args;
+    if (copybuf_sz > 0)
+    {
+        ir_append(IR_ADJ, copybuf_sz, NULL);
+        codegen_ctx.adj_depth -= copybuf_sz;
+    }
+    if (struct_ret)
+        ir_append(IR_LEA, retbuf_bp_off, NULL);
 }
 
 // Indirect call through dereferenced pointer: (*fp)(args)
 void gen_callfunction_via_deref(Node *node)
 {
-    int param_size = push_args_list(node->ch[1]);   // args list
+    // Determine return type via operand's pointee function type
+    Type *ptr_type = node->ch[0]->type;
+    Type *fn_type  = (ptr_type && istype_ptr(ptr_type)) ? ptr_type->u.ptr.pointee : ptr_type;
+    Type *ret_type = (fn_type && istype_function(fn_type)) ? fn_type->u.fn.ret : NULL;
+    bool struct_ret = (ret_type && ret_type->base == TB_STRUCT);
+    int retbuf_bp_off = 0;
+    if (struct_ret)
+    {
+        int sz = ret_type->size;
+        retbuf_bp_off = -(codegen_ctx.adj_depth + sz);
+        codegen_ctx.adj_depth += sz;
+        ir_append(IR_ADJ, -sz, NULL);
+    }
+    int adj_before_args = codegen_ctx.adj_depth;
+    int param_size = push_args_list(node->ch[1]);   // user args (right-to-left)
+    if (struct_ret)
+    {
+        ir_append(IR_LEA, retbuf_bp_off, NULL);
+        ir_append(IR_PUSHW, 0, NULL);
+        param_size += WORD_SIZE;
+    }
     gen_expr(node->ch[0]);                           // operand (function pointer expr)
     ir_append(IR_JLI,   0, NULL);
     ir_append(IR_ADJ, param_size, NULL);
+    // Free copy buffers allocated by push_struct_arg calls
+    int copybuf_sz = codegen_ctx.adj_depth - adj_before_args;
+    if (copybuf_sz > 0)
+    {
+        ir_append(IR_ADJ, copybuf_sz, NULL);
+        codegen_ctx.adj_depth -= copybuf_sz;
+    }
+    if (struct_ret)
+        ir_append(IR_LEA, retbuf_bp_off, NULL);
 }
 
 void gen_callfunction(Node *node)
@@ -299,34 +483,29 @@ void gen_callfunction(Node *node)
         ir_append(IR_PUTCHAR, 0, NULL);
         return;
     }
-    // We have to call the function. This means setting up the
-    // parameters on the stack.
-    //
-    // Call structure is thus:
-    //  4n  param n
-    //      ..
-    //  12  param 1
-    //  8   param 0     <- sp on entry
-    //  4   link
-    //  0   old bp      <- bp set to this
-    //  -4  local 0
-    //  -8  local 1
-    //  ..
-    //  -4n  local n     <- sp set to this after entry
-    //
-    // Parameters are push onto the stack. On entry, the lr, holding the
-    // return address is saved, and the old bp is saved. The sp is then adjusted
-    // by the space required for this local scope variables. These are accessed 
-    // through the bp with an offset from the symbol table. Each time we enter
-    // a new scope, the sp is adjusted to make space for the new locals, each
-    // time the end of a scope is reached, the sp is adjusted back the other way
-    // to reclaim the space.
-    //
-    // At the end of the function, ret sets the sp to bp, old bp is restored, then
-    // pc is set to saved link address, returning to the caller.
-    //
+    // Check if function returns a struct (hidden retbuf ABI)
+    Type *ret_type = node->symbol->type->u.fn.ret;
+    bool struct_ret = (ret_type && ret_type->base == TB_STRUCT);
+    int retbuf_bp_off = 0;  // bp-relative offset of the retbuf (only valid if struct_ret)
+    if (struct_ret)
+    {
+        // Allocate retbuf on the caller's stack frame.
+        int sz = ret_type->size;
+        retbuf_bp_off = -(codegen_ctx.adj_depth + sz);
+        codegen_ctx.adj_depth += sz;
+        ir_append(IR_ADJ, -sz, NULL);
+    }
     // Push the params on backwards, the offsets from the symbol table then work
-    int param_size = push_args_list(node->ch[0]);   // args list
+    int adj_before_args = codegen_ctx.adj_depth;
+    int param_size = push_args_list(node->ch[0]);   // user args (right-to-left)
+    if (struct_ret)
+    {
+        // Push hidden retbuf pointer as the implicit first argument (pushed last,
+        // so it occupies bp+FRAME_OVERHEAD in the callee's frame).
+        ir_append(IR_LEA, retbuf_bp_off, NULL);
+        ir_append(IR_PUSHW, 0, NULL);
+        param_size += WORD_SIZE;
+    }
     if (node->symbol->kind == SYM_STATIC_GLOBAL)
     {
         char mangled[80];
@@ -336,10 +515,20 @@ void gen_callfunction(Node *node)
     }
     else
         ir_append(IR_JL, 0, node->symbol->name);
-    // For the function postamble, we need to adjust the stack by the size of the
-    // push parameters
+    // Reclaim pushed args (and hidden ptr if struct_ret)
     ir_append(IR_ADJ, param_size, NULL);
-
+    // Free copy buffers allocated by push_struct_arg calls
+    int copybuf_sz = codegen_ctx.adj_depth - adj_before_args;
+    if (copybuf_sz > 0)
+    {
+        ir_append(IR_ADJ, copybuf_sz, NULL);
+        codegen_ctx.adj_depth -= copybuf_sz;
+    }
+    if (struct_ret)
+    {
+        // r0 = address of retbuf (still allocated on caller's stack)
+        ir_append(IR_LEA, retbuf_bp_off, NULL);
+    }
 }
 static const char *node_ident_str(Node *node)
 {
@@ -596,8 +785,9 @@ void gen_expr(Node *node)
         {
             // Value context: load or address of the variable.
             gen_varaddr(node);
-            // Don't fetch from address if array/function (name IS the address).
-            if (!istype_array(sym->type) && !istype_function(sym->type))
+            // Don't fetch from address if array/function/struct (name IS the address).
+            if (!istype_array(sym->type) && !istype_function(sym->type)
+                && sym->type->base != TB_STRUCT)
                 gen_ld(sym->type->size);
         }
     }
@@ -699,10 +889,34 @@ void gen_expr(Node *node)
     {
         Node *lhs = node->ch[0];
         Node *rhs = node->ch[1];
-        gen_addr(lhs);
-        ir_append(IR_PUSH,  0, NULL);
-        gen_expr(rhs);
-        gen_st(lhs->type->size);
+        if (lhs->type->base == TB_STRUCT)
+        {
+            // Struct assignment: copy field by field.
+            int adj_before = codegen_ctx.adj_depth;
+            gen_expr(rhs);                                            // r0 = rhs struct addr
+            ir_append(IR_PUSH, 0, NULL);
+            int src_slot = -(codegen_ctx.adj_depth + 4);             // slot for src ptr
+            gen_addr(lhs);                                            // r0 = lhs struct addr
+            ir_append(IR_PUSH, 0, NULL);
+            int dst_slot = -(codegen_ctx.adj_depth + 8);             // slot for dst ptr
+            gen_struct_copy(src_slot, dst_slot, lhs->type);
+            ir_append(IR_ADJ, 8, NULL);                               // free the two pushed slots
+            // Free any retbuf allocated by gen_expr(rhs)
+            int retbuf_sz = codegen_ctx.adj_depth - adj_before;
+            if (retbuf_sz > 0)
+            {
+                ir_append(IR_ADJ, retbuf_sz, NULL);
+                codegen_ctx.adj_depth -= retbuf_sz;
+            }
+            gen_addr(lhs);                                            // r0 = lhs addr (expression result)
+        }
+        else
+        {
+            gen_addr(lhs);
+            ir_append(IR_PUSH,  0, NULL);
+            gen_expr(rhs);
+            gen_st(lhs->type->size);
+        }
     }
     // ===== Compound assignment =====
     else if (node->kind == ND_COMPOUND_ASSIGN)
@@ -747,7 +961,8 @@ void gen_expr(Node *node)
     else if (node->kind == ND_MEMBER)
     {
         gen_addr(node);         // handles both . and ->
-        gen_ld(node->type->size);
+        if (node->type->base != TB_STRUCT)
+            gen_ld(node->type->size);
     }
     // ===== Ternary =====
     else if (node->kind == ND_TERNARY)
@@ -811,13 +1026,34 @@ void gen_expr(Node *node)
 void gen_returnstmt(Node *node)
 {
     Node *expr = node->ch[0];   // return expr (NULL if bare return)
-    if (expr)
+    Type *ret  = codegen_ctx.current_fn_ret_type;
+    if (expr && ret && ret->base == TB_STRUCT)
     {
-        // Must have an expression
+        // Struct return: copy src struct to caller's retbuf.
+        int adj_before = codegen_ctx.adj_depth;
+        gen_expr(expr);                              // r0 = src struct addr
+        ir_append(IR_PUSH, 0, NULL);
+        int src_slot = -(codegen_ctx.adj_depth + 4);
+        // Load the hidden retbuf ptr from bp+FRAME_OVERHEAD (callee's first param slot)
+        ir_append(IR_LEA, FRAME_OVERHEAD, NULL);
+        gen_ld(WORD_SIZE);                           // r0 = caller's retbuf addr
+        ir_append(IR_PUSH, 0, NULL);
+        int dst_slot = -(codegen_ctx.adj_depth + 8);
+        gen_struct_copy(src_slot, dst_slot, ret);
+        ir_append(IR_ADJ, 8, NULL);                  // free the two pushed slots
+        // Free any retbuf allocated by gen_expr(expr)
+        int retbuf_sz = codegen_ctx.adj_depth - adj_before;
+        if (retbuf_sz > 0)
+        {
+            ir_append(IR_ADJ, retbuf_sz, NULL);
+            codegen_ctx.adj_depth -= retbuf_sz;
+        }
+    }
+    else if (expr)
+    {
         gen_expr(expr);
     }
-    ir_append(IR_RET,   0, NULL);
-
+    ir_append(IR_RET, 0, NULL);
 }
 void gen_ifstmt(Node *node)
 {
@@ -868,7 +1104,10 @@ void gen_forstmt(Node *node)
     Node *body = node->ch[3];
     // If the init was a declaration, node->symtable holds the for-init scope.
     if (node->symtable)
+    {
+        codegen_ctx.adj_depth += node->symtable->size;
         ir_append(IR_ADJ, -node->symtable->size, NULL);
+    }
     if (init->kind == ND_DECLARATION)
         gen_decl(init);
     else if (init->kind != ND_EMPTY)
@@ -892,7 +1131,10 @@ void gen_forstmt(Node *node)
     ir_append(IR_LABEL, lbreak, NULL);
     codegen_ctx.loop_depth--;
     if (node->symtable)
+    {
         ir_append(IR_ADJ, node->symtable->size, NULL);
+        codegen_ctx.adj_depth -= node->symtable->size;
+    }
 }
 void gen_dowhilestmt(Node *node)
 {
@@ -927,7 +1169,15 @@ void gen_continuestmt(Node *node)
 }
 void gen_exprstmt(Node *node)
 {
+    int adj_before = codegen_ctx.adj_depth;
     gen_expr(node->ch[0]);   // expr
+    // If a struct-returning call left a retbuf on the stack, reclaim it.
+    int retbuf_sz = codegen_ctx.adj_depth - adj_before;
+    if (retbuf_sz > 0)
+    {
+        ir_append(IR_ADJ, retbuf_sz, NULL);
+        codegen_ctx.adj_depth -= retbuf_sz;
+    }
 }
 bool is_constexpr(Node *n)
 {
@@ -1224,6 +1474,26 @@ void gen_decl(Node *node)
                         ir_append(IR_SB,    0, NULL);
                     }
                 }
+                else if (n->symbol->type->base == TB_STRUCT)
+                {
+                    // Struct initializer from expression (e.g. struct P p = make(3, 7))
+                    int adj_before = codegen_ctx.adj_depth;
+                    gen_expr(init);                                   // r0 = src struct addr
+                    ir_append(IR_PUSH, 0, NULL);
+                    int src_slot = -(codegen_ctx.adj_depth + 4);
+                    gen_varaddr_from_ident(n, n->symbol->name);       // r0 = dst addr
+                    ir_append(IR_PUSH, 0, NULL);
+                    int dst_slot = -(codegen_ctx.adj_depth + 8);
+                    gen_struct_copy(src_slot, dst_slot, n->symbol->type);
+                    ir_append(IR_ADJ, 8, NULL);
+                    // Free any retbuf allocated by gen_expr(init)
+                    int retbuf_sz = codegen_ctx.adj_depth - adj_before;
+                    if (retbuf_sz > 0)
+                    {
+                        ir_append(IR_ADJ, retbuf_sz, NULL);
+                        codegen_ctx.adj_depth -= retbuf_sz;
+                    }
+                }
                 else
                 {
                     gen_varaddr_from_ident(n, n->symbol->name);
@@ -1299,6 +1569,7 @@ void gen_decl(Node *node)
 void gen_compstmt(Node *node)
 {
     // Make space on stack for this scope's locals
+    codegen_ctx.adj_depth += node->symtable->size;
     ir_append(IR_ADJ, -node->symtable->size, NULL);
     for (Node *n = node->ch[0]; n; n = n->next)   // stmts list
     {
@@ -1309,6 +1580,7 @@ void gen_compstmt(Node *node)
     }
     // Release the space back
     ir_append(IR_ADJ, node->symtable->size, NULL);
+    codegen_ctx.adj_depth -= node->symtable->size;
 }
 static int find_label_id(char *name)
 {
@@ -1358,6 +1630,7 @@ void gen_switchstmt(Node *node)
     codegen_ctx.break_labels[codegen_ctx.loop_depth] = lbreak;
     codegen_ctx.cont_labels[codegen_ctx.loop_depth]  = -1;
     codegen_ctx.loop_depth++;
+    codegen_ctx.adj_depth += body->symtable->size;
     ir_append(IR_ADJ, -body->symtable->size, NULL);
     for (Node *ch = body->ch[0]; ch; ch = ch->next)   // stmts list
     {
@@ -1371,6 +1644,7 @@ void gen_switchstmt(Node *node)
             gen_stmt(ch);
     }
     ir_append(IR_ADJ, body->symtable->size, NULL);
+    codegen_ctx.adj_depth -= body->symtable->size;
     codegen_ctx.loop_depth--;
     ir_append(IR_LABEL, lbreak, NULL);
 }
@@ -1413,6 +1687,8 @@ void gen_function(Node *node)
     codegen_ctx.label_table_size = 0;
     collect_labels(func_body);
     ir_append(IR_ENTER, 0, NULL);
+    codegen_ctx.adj_depth = 0;
+    codegen_ctx.current_fn_ret_type = fsym->type->u.fn.ret;
     gen_stmt(func_body);
     ir_append(IR_RET,   0, NULL);
 }

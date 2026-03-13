@@ -429,6 +429,7 @@ void make_basic_types();
 
 void reset_types_state(void);
 void finalize_local_offsets(void);
+void shift_param_offsets_for_struct_ret(Symbol_table *param_scope);
 void insert_extern_sym(const char *name, Type *type);
 void reset_parser(void);
 
@@ -590,6 +591,9 @@ typedef struct CodegenContext {
     // IR instruction list (built during gen_*, emitted by backend_emit_asm after gen_ir)
     IRInst *ir_head;
     IRInst *ir_tail;
+    // Struct-return ABI support
+    int   adj_depth;            // bytes allocated for local scopes via adj (updated by gen_compstmt/gen_forstmt)
+    Type *current_fn_ret_type;  // return type of function currently being generated
 } CodegenContext;
 
 // Global context instances (defined in respective .c files)

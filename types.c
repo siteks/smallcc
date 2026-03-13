@@ -903,7 +903,10 @@ static Symbol *insert_local_ident(Symbol_table *st, Type *type, const char *iden
     {
         n        = new_symbol(type, ident, st->param_offset);
         n->kind  = SYM_PARAM;
-        st->param_offset += type->size;
+        // Struct params are passed by pointer (hidden copy ABI): the slot size is WORD_SIZE,
+        // not the struct size. The callee dereferences the pointer transparently.
+        int slot_size = (type->base == TB_STRUCT) ? WORD_SIZE : type->size;
+        st->param_offset += slot_size;
     }
     else
     {
@@ -946,6 +949,24 @@ void finalize_local_offsets(void)
             if (s->ns == NS_IDENT && s->kind == SYM_LOCAL)
                 s->offset += go;
     }
+}
+
+// ---------------------------------------------------------------
+// shift_param_offsets_for_struct_ret
+// ---------------------------------------------------------------
+// When a function returns a struct, the hidden retbuf pointer occupies the
+// first parameter slot (bp+FRAME_OVERHEAD).  This function shifts all SYM_PARAM
+// symbols in the given scope up by WORD_SIZE to make room for that hidden slot.
+// Called from the parser immediately after a struct-returning function definition
+// is recognised.
+void shift_param_offsets_for_struct_ret(Symbol_table *param_scope)
+{
+    for (Symbol *s = param_scope->symbols; s; s = s->next)
+    {
+        if (s->ns == NS_IDENT && s->kind == SYM_PARAM)
+            s->offset += WORD_SIZE;
+    }
+    param_scope->param_offset += WORD_SIZE;
 }
 
 // ---------------------------------------------------------------

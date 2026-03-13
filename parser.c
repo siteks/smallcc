@@ -1154,6 +1154,14 @@ static Node *declaration(int depth)
             {
                 Node *node = make_decl_node(&ds, spec, decls.head);
                 add_types_and_symbols(node, ds, false, false);
+                // If the function returns a struct, shift all param offsets up by
+                // WORD_SIZE to make room for the hidden retbuf pointer at bp+FRAME_OVERHEAD.
+                if (node->type && istype_function(node->type)
+                    && node->type->u.fn.ret
+                    && node->type->u.fn.ret->base == TB_STRUCT)
+                {
+                    shift_param_offsets_for_struct_ret(type_ctx.last_symbol_table);
+                }
                 parser_ctx.current_function = node;
                 // This is the first compound statement of a
                 // function, so we need to use the scope
@@ -1841,6 +1849,9 @@ static void insert_coercions_step(Node *n)
     if (n->kind == ND_RETURNSTMT && n->ch[0])   // expr
     {
         Node *expr = n->ch[0];
+        // Struct returns are handled by gen_returnstmt field-by-field copy — no cast needed.
+        if (n->type && n->type->base == TB_STRUCT)
+            return;
         if (n->type != expr->type)
             insert_cast(n, 0, n->type);
     }
