@@ -1,4 +1,6 @@
 
+#include <stdlib.h>
+#include <string.h>
 #include "smallcc.h"
 
 
@@ -7,6 +9,54 @@ static FILE *asm_out = NULL;
 void set_asm_out(FILE *f)
 {
     asm_out = f ? f : stdout;
+}
+
+// ---------------------------------------------------------------------------
+// Annotation mode (-ann)
+// ---------------------------------------------------------------------------
+int flag_annotate = 0;
+
+static char       *ann_src  = NULL;   // strdup of the preprocessed source
+static const char **ann_lines = NULL; // ann_lines[i] points to start of line i+1
+static int          ann_nlines = 0;
+
+void set_ann_source(const char *src)
+{
+    free(ann_src);
+    free(ann_lines);
+    ann_src    = NULL;
+    ann_lines  = NULL;
+    ann_nlines = 0;
+    if (!src) return;
+
+    ann_src = strdup(src);
+    if (!ann_src) return;
+
+    // Count lines to allocate the index
+    int count = 1;
+    for (const char *p = ann_src; *p; p++)
+        if (*p == '\n') count++;
+
+    ann_lines = malloc(count * sizeof(char *));
+    if (!ann_lines) return;
+
+    ann_lines[ann_nlines++] = ann_src;
+    for (char *p = ann_src; *p; p++)
+        if (*p == '\n' && *(p + 1))
+            ann_lines[ann_nlines++] = p + 1;
+}
+
+// Emit the text of source line N (1-based) as an assembly comment.
+static void emit_src_comment(int line)
+{
+    if (line < 1 || line > ann_nlines) return;
+    const char *s = ann_lines[line - 1];
+    const char *e = s;
+    while (*e && *e != '\n') e++;
+    // trim leading whitespace
+    while (s < e && (*s == ' ' || *s == '\t')) s++;
+    if (s < e)
+        fprintf(asm_out, "; %.*s\n", (int)(e - s), s);
 }
 
 
@@ -59,8 +109,18 @@ static const char *ir_opname[] = {
 void backend_emit_asm(IRInst *ir)
 {
     if (!asm_out) asm_out = stdout;
+    int prev_line = 0;
+    int bb_idx    = 0;
     for (IRInst *p = ir; p; p = p->next)
     {
+        // Emit source-line comment when the line changes (skip structural nodes).
+        if (flag_annotate && p->line && p->line != prev_line &&
+            p->op != IR_BB_START && p->op != IR_NOP && p->op != IR_COMMENT)
+        {
+            emit_src_comment(p->line);
+            prev_line = p->line;
+        }
+
         switch (p->op)
         {
         case IR_LABEL:
@@ -72,6 +132,12 @@ void backend_emit_asm(IRInst *ir)
         case IR_COMMENT:
             fprintf(asm_out, ";%s\n", p->sym);
             break;
+        case IR_BB_START:
+            if (flag_annotate)
+                fprintf(asm_out, "; --- bb%d ---\n", bb_idx++);
+            break;
+        case IR_NOP:
+            break;  // no assembly emitted
         case IR_IMM:
             if (p->sym)
             {
@@ -80,9 +146,10 @@ void backend_emit_asm(IRInst *ir)
             else
             {
                 unsigned u = (unsigned)p->operand;
+                unsigned hi = (u >> 16) & 0xffff;
                 fprintf(asm_out, "    immw    0x%04x\n", u & 0xffff);
-                if (u > 0xffff)
-                    fprintf(asm_out, "    immwh   0x%04x\n", (u >> 16) & 0xffff);
+                if (hi)
+                    fprintf(asm_out, "    immwh   0x%04x\n", hi);
             }
             break;
         case IR_LEA:

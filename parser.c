@@ -1211,6 +1211,9 @@ static Node *stmt()
 {
     DBG_FUNC();
     Node *node = new_node(ND_STMT, 0, false);
+    // new_node uses last_line (the previously consumed token), but for statement
+    // annotation we want the line of the first token of this statement.
+    node->line = token_ctx.current->line;
     if (token_ctx.current->kind == TK_LBRACE)
     {
         node->ch[0] = comp_stmt(false);   // ND_STMT child
@@ -1860,5 +1863,118 @@ static void insert_coercions_step(Node *n)
 void insert_coercions(Node *root)
 {
     post_order_walk(root, insert_coercions_step);
+}
+
+// --- Pass 4: label_su (Sethi-Ullman numbering + commutative child reordering) ---
+// Computes, for each expression node, the minimum number of stack slots needed
+// to evaluate it. For commutative ops with pure children, swaps ch[0]/ch[1] so
+// the heavier subtree is evaluated first, reducing peak stack depth and enabling
+// the peephole constant-folder to fire more often.
+
+static bool is_commutative_op(Token_kind op)
+{
+    return op == TK_PLUS || op == TK_STAR || op == TK_AMPERSAND ||
+           op == TK_BITOR || op == TK_BITXOR || op == TK_EQ || op == TK_NE;
+}
+
+static bool is_pure_expr(Node *n)
+{
+    if (!n) return true;
+    switch (n->kind)
+    {
+    case ND_LITERAL:
+        return true;
+    case ND_IDENT:
+        return !n->u.ident.is_function;
+    case ND_UNARYOP:
+        if (n->u.unaryop.is_function) return false;
+        if (n->op_kind == TK_INC || n->op_kind == TK_DEC ||
+            n->op_kind == TK_POST_INC || n->op_kind == TK_POST_DEC)
+            return false;
+        return is_pure_expr(n->ch[0]);
+    case ND_MEMBER:
+        if (n->u.member.is_function) return false;
+        return is_pure_expr(n->ch[0]);
+    case ND_BINOP:
+        if (n->op_kind == TK_COMMA || n->op_kind == TK_LOGOR ||
+            n->op_kind == TK_LOGAND)
+            return false;
+        return is_pure_expr(n->ch[0]) && is_pure_expr(n->ch[1]);
+    case ND_CAST:
+        return is_pure_expr(n->ch[1]);
+    default:
+        return false;
+    }
+}
+
+static void label_su_step(Node *n)
+{
+    if (!n->is_expr) return;
+
+    switch (n->kind)
+    {
+    case ND_LITERAL:
+    case ND_IDENT:
+        n->su_label = 0;
+        return;
+
+    case ND_BINOP:
+    {
+        // Comma / short-circuit: no reordering
+        if (n->op_kind == TK_COMMA || n->op_kind == TK_LOGOR ||
+            n->op_kind == TK_LOGAND)
+        {
+            n->su_label = 0;
+            return;
+        }
+        int l = n->ch[0] ? n->ch[0]->su_label : 0;
+        int r = n->ch[1] ? n->ch[1]->su_label : 0;
+
+        if (is_commutative_op(n->op_kind) &&
+            is_pure_expr(n->ch[0]) && is_pure_expr(n->ch[1]) &&
+            r > l)
+        {
+            // Swap: evaluate heavier child first
+            Node *tmp = n->ch[0]; n->ch[0] = n->ch[1]; n->ch[1] = tmp;
+            int t = l; l = r; r = t;
+        }
+        if (is_commutative_op(n->op_kind))
+            n->su_label = (l == r) ? l + 1 : l;
+        else
+            n->su_label = (l > r + 1) ? l : r + 1;  // max(l, 1+r)
+        return;
+    }
+
+    case ND_UNARYOP:
+        n->su_label = n->ch[0] ? n->ch[0]->su_label : 0;
+        return;
+
+    case ND_CAST:
+        // ch[0] = type-decl node (not evaluated); ch[1] = expression
+        n->su_label = n->ch[1] ? n->ch[1]->su_label : 0;
+        return;
+
+    case ND_MEMBER:
+        n->su_label = n->ch[0] ? n->ch[0]->su_label : 0;
+        return;
+
+    case ND_TERNARY:
+    {
+        int a = n->ch[0] ? n->ch[0]->su_label : 0;
+        int b = n->ch[1] ? n->ch[1]->su_label : 0;
+        int c = n->ch[2] ? n->ch[2]->su_label : 0;
+        n->su_label = a > b ? (a > c ? a : c) : (b > c ? b : c);
+        return;
+    }
+
+    default:
+        n->su_label = 0;
+        return;
+    }
+}
+
+void label_su(Node *root)
+{
+    post_order_walk(root, label_su_step);
 }
 

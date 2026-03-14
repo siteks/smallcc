@@ -182,10 +182,11 @@ static int collect_needed_libs(char **user_files, int user_count,
 
 int main(int argc, char **argv)
 {
-    // Parse flags: -o outfile, -stats
+    // Parse flags: -o outfile, -stats, -O[N]
     FILE *out = stdout;
     int file_start = 1;
     bool show_stats = false;
+    int opt_level = 0;
 
     while (file_start < argc && argv[file_start][0] == '-')
     {
@@ -200,6 +201,17 @@ int main(int argc, char **argv)
             show_stats = true;
             file_start++;
         }
+        else if (strncmp(argv[file_start], "-O", 2) == 0)
+        {
+            const char *n = argv[file_start] + 2;
+            opt_level = (*n == '\0') ? 1 : atoi(n);
+            file_start++;
+        }
+        else if (strcmp(argv[file_start], "-ann") == 0)
+        {
+            flag_annotate = 1;
+            file_start++;
+        }
         else
         {
             fprintf(stderr, "smallcc: unknown option: %s\n", argv[file_start]);
@@ -209,7 +221,7 @@ int main(int argc, char **argv)
 
     if (argc <= file_start)
     {
-        fprintf(stderr, "Usage: smallcc [-o outfile] [-stats] <source.c> [source2.c ...]\n");
+        fprintf(stderr, "Usage: smallcc [-o outfile] [-stats] [-ann] <source.c> [source2.c ...]\n");
         return 1;
     }
 
@@ -274,6 +286,7 @@ int main(int argc, char **argv)
         resolve_symbols(node);
         derive_types(node);
         insert_coercions(node);
+        label_su(node);          // Sethi-Ullman: label + reorder commutative children
         finalize_local_offsets();
 #ifdef DEBUG_ENABLED
         print_tree(node, 0);
@@ -281,7 +294,11 @@ int main(int argc, char **argv)
         print_type_table();
 #endif
 
+        if (flag_annotate)
+            set_ann_source(source);
         gen_ir(node, tu);
+        mark_basic_blocks();
+        peephole(opt_level);
         backend_emit_asm(codegen_ctx.ir_head);
         harvest_globals();
         free(source);

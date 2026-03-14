@@ -357,6 +357,7 @@ struct Node
                                 // ND_STRUCT: the struct-member parsing scope.
     Symbol          *symbol;
     Type           *type;
+    int             su_label;   // Sethi-Ullman stack-depth label (set by label_su pass)
 };
 
 Node *program();
@@ -370,6 +371,8 @@ void for_each_child(Node *node, void (*fn)(Node *child, void *ctx), void *ctx);
 // ---------------------------------------------------------------
 
 void gen_ir(Node *node, int tu_index);
+void mark_basic_blocks(void);
+void peephole(int level);
 void reset_codegen(void);
 void gen_preamble(void);
 void gen_pop();
@@ -386,6 +389,7 @@ bool is_typequal(Token_kind tk);
 void resolve_symbols(Node *root);
 void derive_types(Node *root);
 void insert_coercions(Node *root);
+void label_su(Node *root);
 Node *new_node(Node_kind kind, char *val, bool is_expr);
 
 
@@ -506,12 +510,15 @@ typedef enum {
     IR_BYTE,
     IR_PUTCHAR,
     IR_COMMENT,
+    IR_BB_START,    // basic-block boundary marker (no assembly emitted; peephole barrier)
+    IR_NOP,         // deleted instruction (no assembly emitted; removed by compact_ir)
 } IROp;
 
 typedef struct IRInst {
     IROp          op;
     int           operand;
     const char   *sym;
+    int           line;     // source line number (0 = unknown); set during gen_ir
     struct IRInst *next;
 } IRInst;
 
@@ -624,6 +631,10 @@ extern CodegenContext codegen_ctx;
 
 void set_asm_out(FILE *f);
 void backend_emit_asm(IRInst *ir);
+// Annotation mode (-ann): call with the preprocessed source before backend_emit_asm.
+// Enables source-line and basic-block comments in the assembly output.
+extern int flag_annotate;
+void set_ann_source(const char *src);
 
 // Preprocessor
 void set_include_dir(const char *dir);

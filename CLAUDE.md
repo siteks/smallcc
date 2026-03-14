@@ -20,6 +20,7 @@ echo 'int main(){return 5+3;}' > t.c
 ./smallcc t.c > out.s && ./cpu3/sim.py out.s          # output to stdout
 ./smallcc -o out.s t.c && ./cpu3/sim.py out.s          # output to file
 ./smallcc -o out.s file1.c file2.c && ./cpu3/sim.py out.s  # multi-TU
+./smallcc -ann -O1 -o out.s t.c                        # annotated output with source comments
 ```
 
 Tests use `cpu3/sim.py` to execute generated assembly and check the value left in register `r0`. On test failure, verbose output is written to `error.log`. The test harness is in `test.sh`; individual suites are in `tests/`.
@@ -28,7 +29,7 @@ Tests use `cpu3/sim.py` to execute generated assembly and check the value left i
 
 ## Compiler Architecture
 
-C89 subset compiler. Input is one or more `.c` files; assembly is written to stdout or a file specified with `-o`. Usage: `smallcc [-o outfile] [-stats] <source.c> [source2.c ...]`.
+C89 subset compiler. Input is one or more `.c` files; assembly is written to stdout or a file specified with `-o`. Usage: `smallcc [-o outfile] [-stats] [-ann] [-O[N]] <source.c> [source2.c ...]`.
 
 ### Compilation Pipeline
 
@@ -54,8 +55,11 @@ Per-TU loop [smallcc.c]  (lib TUs first, then user TUs):
   resolve_symbols(root)     [parser.c]      Set ND_IDENT types via symbol table lookup
   derive_types(root)        [parser.c]      Propagate types bottom-up through the AST
   insert_coercions(root)    [parser.c]      Insert ND_CAST / stride-scale nodes
+  label_su(root)            [parser.c]      Sethi-Ullman labelling; reorder commutative children
   finalize_local_offsets()  [types.c]       Compute bp-relative offsets for all locals
   gen_ir(node, tu_index)    [codegen.c]     Walk AST; build flat IR instruction list
+  mark_basic_blocks()       [codegen.c]     Insert IR_BB_START sentinels between basic blocks
+  peephole(opt_level)       [optimise.c]    Constant folding, dead branches, store/reload elim
   backend_emit_asm(ir_head) [backend.c]     Walk IR list; emit assembly text
   harvest_globals()         [smallcc.c]     Mark non-static globals SYM_EXTERN for next TU
 ```
@@ -72,8 +76,9 @@ Every phase prints debug information to stderr. `-stats` prints per-TU and total
 | `tokeniser.c` | Lexer — produces a `Token` linked list |
 | `parser.c` | Recursive-descent parser — builds AST; `resolve_symbols`, `derive_types`, `insert_coercions` |
 | `types.c` | Type table, symbol table, struct layout, `add_types_and_symbols`, `reset_types_state`, `insert_extern_sym` |
-| `codegen.c` | AST walk; builds flat IR instruction list (`gen_ir`); `reset_codegen`; static label mangling |
-| `backend.c` | IR → assembly emission (`backend_emit_asm`); `set_asm_out`; retargeting point |
+| `codegen.c` | AST walk; builds flat IR instruction list (`gen_ir`); `reset_codegen`; static label mangling; `mark_basic_blocks` |
+| `optimise.c` | Peephole optimiser (`peephole`); rules 1–9; constant folding, dead branch elim, store/reload elim |
+| `backend.c` | IR → assembly emission (`backend_emit_asm`); `set_asm_out`; `-ann` annotation mode; retargeting point |
 | `lib/stdio.c` | `printf` (`%d %s %c %%`), `puts` — compiled as TU 0 automatically |
 | `lib/stdlib.c` | `abs` — compiled as TU 1 automatically |
 | `lib/string.c` | `strlen`, `strcmp`, `strcpy`, `strcat` — compiled as TU 2 automatically |

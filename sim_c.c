@@ -322,8 +322,9 @@ static void run_cpu(int verbose)
     uint32_t r0 = 0;
     uint16_t sp = 0, bp = 0, lr = 0, pc = 0;
     int H = 0;
+    long cycles = 0;
 
-    for (int step = 0; step < MAX_STEPS && !H; step++) {
+    for (int step = 0; step < MAX_STEPS && !H; step++, cycles++) {
         uint8_t op = read8(pc);
         uint16_t oldpc = pc;
         pc++;
@@ -410,8 +411,8 @@ static void run_cpu(int verbose)
         pc &= 0xffff;
     }
 
-    printf("r0:%08x sp:%04x bp:%04x lr:%04x pc:%04x H:%x\n",
-           r0, sp, bp, lr, pc, H);
+    printf("r0:%08x sp:%04x bp:%04x lr:%04x pc:%04x H:%x cycles:%ld\n",
+           r0, sp, bp, lr, pc, H, cycles);
 }
 
 /* ------------------------------------------------------------------ */

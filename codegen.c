@@ -51,12 +51,15 @@ void reset_codegen(void)
     // 'codegen_ctx.label_counter' is NOT reset — monotonically increasing across TUs.
 }
 
+static int current_codegen_line = 0;  // source line stamped onto each IR instruction
+
 static IRInst *ir_append(IROp op, int operand, const char *sym)
 {
     IRInst *inst = arena_alloc(sizeof(IRInst));
     inst->op      = op;
     inst->operand = operand;
     inst->sym     = sym;
+    inst->line    = current_codegen_line;
     inst->next    = NULL;
     if (codegen_ctx.ir_tail)
         codegen_ctx.ir_tail->next = inst;
@@ -64,6 +67,76 @@ static IRInst *ir_append(IROp op, int operand, const char *sym)
         codegen_ctx.ir_head = inst;
     codegen_ctx.ir_tail = inst;
     return inst;
+}
+
+// Insert IR_BB_START markers at every basic-block leader in the IR list.
+// A leader is:
+//   1. The first instruction in the list.
+//   2. Any instruction that immediately follows a terminator
+//      (unconditional/conditional branch or ret).
+//   3. Any IR_LABEL / IR_SYMLABEL instruction (potential jump target).
+//
+// IR_JL and IR_JLI are calls, not terminators: execution continues at
+// the instruction after the call, so they do not end a basic block.
+//
+// Consecutive IR_BB_START nodes are suppressed (only one is inserted
+// between any two non-marker instructions).
+void mark_basic_blocks(void)
+{
+    IRInst *head = codegen_ctx.ir_head;
+    if (!head)
+        return;
+
+    // Helper: is this op a basic-block terminator?
+#define IS_TERMINATOR(op) \
+    ((op) == IR_J || (op) == IR_JZ || (op) == IR_JNZ || (op) == IR_RET)
+
+    // Helper: does this op start a new BB regardless of what precedes it?
+#define IS_LABEL(op) \
+    ((op) == IR_LABEL || (op) == IR_SYMLABEL)
+
+    // --- Insert marker before the very first instruction (if not already a marker) ---
+    if (head->op != IR_BB_START)
+    {
+        IRInst *m = arena_alloc(sizeof(IRInst));
+        m->op   = IR_BB_START;
+        m->next = head;
+        codegen_ctx.ir_head = m;
+    }
+
+    // --- Walk the list and insert markers where needed ---
+    for (IRInst *p = codegen_ctx.ir_head; p && p->next; p = p->next)
+    {
+        IRInst *nxt = p->next;
+
+        // Skip if already a marker — nothing to insert after a marker.
+        if (p->op == IR_BB_START)
+            continue;
+
+        bool need_marker = IS_TERMINATOR(p->op) || IS_LABEL(nxt->op);
+
+        // Suppress if next is already a BB_START.
+        if (nxt->op == IR_BB_START)
+            need_marker = false;
+
+        if (need_marker)
+        {
+            IRInst *m = arena_alloc(sizeof(IRInst));
+            m->op   = IR_BB_START;
+            m->next = nxt;
+            p->next = m;
+            p = m;  // step over the fresh marker; loop increment moves to nxt
+        }
+    }
+
+    // Update ir_tail to reflect any appended nodes.
+    IRInst *last = codegen_ctx.ir_head;
+    while (last->next)
+        last = last->next;
+    codegen_ctx.ir_tail = last;
+
+#undef IS_TERMINATOR
+#undef IS_LABEL
 }
 
 static void collect_labels(Node *node);
@@ -1429,6 +1502,7 @@ void gen_initlist(Node *n, Symbol *s)
 
 void gen_decl(Node *node)
 {
+    if (node->line) current_codegen_line = node->line;
     if (node->u.declaration.sclass == SC_TYPEDEF) return;
     if (node->u.declaration.sclass == SC_EXTERN)  return;  // extern decl → no data emission
     // The symbol table has all the details needed for declarations.
@@ -1650,6 +1724,7 @@ void gen_switchstmt(Node *node)
 }
 void gen_stmt(Node *node)
 {
+    if (node->line) current_codegen_line = node->line;
     switch(node->kind)
     {
     case ND_EXPRSTMT:    gen_exprstmt(node);    return;
