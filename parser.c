@@ -171,6 +171,7 @@ static Node *struct_decl(DeclParseState *ds, int depth);
 static void enum_decl(DeclParseState *ds);
 static void parse_decl_specifiers(DeclParseState *ds);
 static Node *make_decl_node(DeclParseState *ds, Node *spec, Node *decls);
+static Node *cast_expr();
 
 
 
@@ -406,7 +407,7 @@ static Node *unary_expr()
         token_ctx.current = token_ctx.current->next;  // consume the operator token_ctx.current
         node = new_node(ND_UNARYOP, NULL, true);
         node->op_kind = k;
-        node->ch[0] = unary_expr();   // operand
+        node->ch[0] = cast_expr();    // operand (C grammar: unary-op takes cast-expr)
     }
     else if (token_ctx.current->kind == TK_IDENT
             || token_ctx.current->kind == TK_CONSTINT
@@ -707,7 +708,6 @@ static const Token_kind ops_logand[] = { TK_LOGAND, TK_INVALID };
 static const Token_kind ops_logor[]  = { TK_LOGOR, TK_INVALID };
 
 // Forward declarations needed for parse_binop sub_parser references
-static Node *cast_expr();
 static Node *add_expr();
 static Node *shift_expr();
 static Node *rel_expr();
