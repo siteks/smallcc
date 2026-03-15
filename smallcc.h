@@ -109,6 +109,8 @@ struct Token
 // Preprocessor
 // ---------------------------------------------------------------
 void  reset_preprocessor(void);
+void  pp_define(const char *name, const char *body);
+void  add_include_dir(const char *dir);
 char *preprocess(const char *src, const char *filename);
 
 // bool consume(char *op);

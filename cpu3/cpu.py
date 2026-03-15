@@ -164,18 +164,31 @@ def sext(b, w):
     # turn twos complement arb length to signed int
     return b if b < (1 << (w - 1)) else b - (1 << w)
 
+MMIO_BASE = 0xFF00
+
 class Mem:
     def __init__(self):
         self.mem    = np.full(65536, 0xff, np.ubyte)
         self.trace = ''
+        self.get_cycles = lambda: 0
+
+    def _mmio_read8(self, addr):
+        off = (addr - MMIO_BASE) & 0xffff
+        if off < 4:
+            return (self.get_cycles() >> (off * 8)) & 0xff
+        return 0
 
     def read8(self, addr, trace=True):
         addr &= 0xffff
+        if addr >= MMIO_BASE:
+            return self._mmio_read8(addr)
         self.trace += 'r8[%04x]=>%02x   ' % (addr, int(self.mem[addr])) if trace else ''
         return int(self.mem[addr])
 
     def read16(self, addr, trace=True):
         addr &= 0xffff
+        if addr >= MMIO_BASE:
+            return self._mmio_read8(addr) | (self._mmio_read8(addr + 1) << 8)
         d = int(self.mem[addr]) | (int(self.mem[addr + 1]) << 8)
         print(d, type(d))
         self.trace += 'r16[%04x]=>%04x ' % (addr, d) if trace else ''
@@ -183,6 +196,9 @@ class Mem:
 
     def read32(self, addr, trace=True):
         addr &= 0xffff
+        if addr >= MMIO_BASE:
+            return (self._mmio_read8(addr) | (self._mmio_read8(addr + 1) << 8) |
+                    (self._mmio_read8(addr + 2) << 16) | (self._mmio_read8(addr + 3) << 24))
         d = int(self.mem[addr]) | (int(self.mem[addr + 1]) << 8) | (int(self.mem[addr + 2]) << 16)| (int(self.mem[addr + 3]) << 24)
         self.trace += 'r32[%04x]=>%08x ' % (addr, d) if trace else ''
         return d
@@ -196,17 +212,23 @@ class Mem:
 
     def write8(self, addr, data):
         addr &= 0xffff
+        if addr >= MMIO_BASE:
+            return
         self.trace += 'w8[%04x]<=%02x   ' % (addr, data & 0xff)
         self.mem[addr] = data & 0xff
 
     def write16(self, addr, data):
         addr &= 0xffff
+        if addr >= MMIO_BASE:
+            return
         self.trace += 'w16[%04x]<=%04x ' % (addr, data & 0xffff)
         self.mem[addr] = data & 0xff
         self.mem[addr + 1] = (data >> 8) & 0xff
 
     def write32(self, addr, data):
         addr &= 0xffff
+        if addr >= MMIO_BASE:
+            return
         self.trace += 'w32[%04x]<=%08x ' % (addr, data & 0xffffffff)
         self.mem[addr] = data & 0xff
         self.mem[addr + 1] = (data >> 8) & 0xff
@@ -251,11 +273,14 @@ class CPU:
     def __init__(self, m):
         self.state  = State()
         self.mem    = m
+        self.cycles = 0
+        m.get_cycles = lambda: self.cycles
 
     def reset(self):
         self.state.reset()
 
     def step(self, trace=False):
+        self.cycles += 1
         s       = self.state
         # Read until we have an instruction.
         # Top two bits, size of data

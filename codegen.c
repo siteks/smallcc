@@ -1767,6 +1767,9 @@ void gen_function(Node *node)
     gen_stmt(func_body);
     ir_append(IR_RET,   0, NULL);
 }
+// Emitted once across all TUs, before the first global variable.
+static bool globals_start_emitted = false;
+
 void gen_ir(Node *node, int tu_index)
 {
 
@@ -1777,6 +1780,10 @@ void gen_ir(Node *node, int tu_index)
             gen_function(c);
     }
     // Pass 2: emit global variable declarations (data area)
+    if (!globals_start_emitted) {
+        ir_append(IR_SYMLABEL, 0, "_globals_start");
+        globals_start_emitted = true;
+    }
     for (Node *c = node->ch[0]; c; c = c->next)   // decls list
     {
         if (c->kind == ND_DECLARATION && !c->u.declaration.is_func_defn)

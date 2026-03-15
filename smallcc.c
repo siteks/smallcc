@@ -1,6 +1,9 @@
 
 #include "smallcc.h"
 #include <dirent.h>
+#ifdef __APPLE__
+#  include <mach-o/dyld.h>
+#endif
 
 // ---------------------------------------------------------------
 // Arena allocator
@@ -89,13 +92,33 @@ static void reset_tu(int tu)
 
 static void get_compiler_dir(const char *argv0, char *dir, size_t cap)
 {
-    strncpy(dir, argv0, cap - 1);
-    dir[cap - 1] = '\0';
-    char *slash = strrchr(dir, '/');
-    if (slash)
-        *slash = '\0';
-    else
+    char buf[4096];
+    bool resolved = false;
+
+#ifdef __APPLE__
+    uint32_t sz = sizeof(buf);
+    if (_NSGetExecutablePath(buf, &sz) == 0) resolved = true;
+#endif
+
+#ifdef __linux__
+    ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+    if (n > 0) { buf[n] = '\0'; resolved = true; }
+#endif
+
+    if (!resolved) {
+        /* Fallback: realpath on argv[0] — works for explicit paths, not bare names on PATH */
+        if (realpath(argv0, buf)) resolved = true;
+    }
+
+    if (resolved) {
+        char *slash = strrchr(buf, '/');
+        if (slash) *slash = '\0';
+        strncpy(dir, buf, cap - 1);
+        dir[cap - 1] = '\0';
+    } else {
         strncpy(dir, ".", cap - 1);
+        dir[cap - 1] = '\0';
+    }
 }
 
 static int compare_str(const void *a, const void *b)
@@ -182,11 +205,13 @@ static int collect_needed_libs(char **user_files, int user_count,
 
 int main(int argc, char **argv)
 {
-    // Parse flags: -o outfile, -stats, -O[N]
+    // Parse flags: -o outfile, -stats, -O[N], -DNAME[=VALUE]
     FILE *out = stdout;
     int file_start = 1;
     bool show_stats = false;
     int opt_level = 0;
+    const char *cmdline_defines[256];
+    int num_defines = 0;
 
     while (file_start < argc && argv[file_start][0] == '-')
     {
@@ -212,6 +237,24 @@ int main(int argc, char **argv)
             flag_annotate = 1;
             file_start++;
         }
+        else if (strncmp(argv[file_start], "-D", 2) == 0)
+        {
+            if (num_defines < 256)
+                cmdline_defines[num_defines++] = argv[file_start] + 2;
+            file_start++;
+        }
+        else if (strncmp(argv[file_start], "-I", 2) == 0)
+        {
+            const char *dir = argv[file_start] + 2;
+            if (*dir == '\0' && file_start + 1 < argc)
+            {
+                /* -I dir (space-separated) */
+                dir = argv[file_start + 1];
+                file_start++;
+            }
+            add_include_dir(dir);
+            file_start++;
+        }
         else
         {
             fprintf(stderr, "smallcc: unknown option: %s\n", argv[file_start]);
@@ -221,7 +264,7 @@ int main(int argc, char **argv)
 
     if (argc <= file_start)
     {
-        fprintf(stderr, "Usage: smallcc [-o outfile] [-stats] [-ann] <source.c> [source2.c ...]\n");
+        fprintf(stderr, "Usage: smallcc [-o outfile] [-stats] [-ann] [-DNAME[=VAL]] [-Idir] <source.c> [source2.c ...]\n");
         return 1;
     }
 
@@ -252,11 +295,21 @@ int main(int argc, char **argv)
     for (int i = 0; i < lib_count; i++)  all_files[i] = lib_files[i];
     for (int i = 0; i < user_count; i++) all_files[lib_count + i] = argv[file_start + i];
 
-    // Preamble emitted exactly once
-    fprintf(out, ".text=0\n");
-    fprintf(out, "    ssp     0x1000\n");
-    fprintf(out, "    jl      main\n");
-    fprintf(out, "    halt\n");
+    // Preamble: emit crt0.s if present, otherwise fall back to built-in default
+    char crt0_path[4096];
+    snprintf(crt0_path, sizeof(crt0_path), "%s/lib/crt0.s", compiler_dir);
+    FILE *crt0 = fopen(crt0_path, "r");
+    if (crt0) {
+        char buf[256];
+        while (fgets(buf, sizeof(buf), crt0))
+            fputs(buf, out);
+        fclose(crt0);
+    } else {
+        fprintf(out, ".text=0\n");
+        fprintf(out, "    ssp     0x1000\n");
+        fprintf(out, "    jl      main\n");
+        fprintf(out, "    halt\n");
+    }
 
     if (show_stats)
         fprintf(stderr, "%-4s  %-10s  %8s  %8s\n", "TU", "file", "arena_before", "arena_used");
@@ -266,7 +319,31 @@ int main(int argc, char **argv)
         size_t arena_before = arena.used;
 
         token_ctx.filename = all_files[tu];
-        char *raw    = read_file(all_files[tu]);
+        char *raw = read_file(all_files[tu]);
+
+        /* Apply -D command-line defines before preprocessing each TU.
+           reset_tu() -> reset_preprocessor() clears them, so re-add here. */
+        for (int d = 0; d < num_defines; d++)
+        {
+            const char *def = cmdline_defines[d];
+            const char *eq  = strchr(def, '=');
+            char name[64];
+            if (eq)
+            {
+                size_t nlen = (size_t)(eq - def);
+                if (nlen >= sizeof(name)) nlen = sizeof(name) - 1;
+                memcpy(name, def, nlen);
+                name[nlen] = '\0';
+                pp_define(name, eq + 1);
+            }
+            else
+            {
+                strncpy(name, def, sizeof(name) - 1);
+                name[sizeof(name) - 1] = '\0';
+                pp_define(name, "1");
+            }
+        }
+
         char *source = preprocess(raw, all_files[tu]);
 
         reset_tu(tu);

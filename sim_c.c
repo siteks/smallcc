@@ -19,12 +19,22 @@
 
 static uint8_t mem[65536];
 
-static void   write8 (uint16_t a, uint8_t  v) { mem[a] = v; }
-static void   write16(uint16_t a, uint16_t v) { mem[a]=(uint8_t)v; mem[(uint16_t)(a+1)]=(uint8_t)(v>>8); }
-static void   write32(uint16_t a, uint32_t v) { write16(a,(uint16_t)v); write16((uint16_t)(a+2),(uint16_t)(v>>16)); }
-static uint8_t  read8 (uint16_t a) { return mem[a]; }
-static uint16_t read16(uint16_t a) { return (uint16_t)mem[a] | ((uint16_t)mem[(uint16_t)(a+1)] << 8); }
-static uint32_t read32(uint16_t a) { return (uint32_t)read16(a) | ((uint32_t)read16((uint16_t)(a+2)) << 16); }
+#define MMIO_BASE 0xFF00u
+
+static uint32_t g_cycles = 0;
+
+static uint8_t mmio_read8(uint16_t a) {
+    uint32_t off = (uint16_t)(a - MMIO_BASE);
+    if (off < 4) return (uint8_t)(g_cycles >> (off * 8));
+    return 0;
+}
+
+static void   write8 (uint16_t a, uint8_t  v) { if (a >= MMIO_BASE) return; mem[a] = v; }
+static void   write16(uint16_t a, uint16_t v) { if (a >= MMIO_BASE) return; mem[a]=(uint8_t)v; mem[(uint16_t)(a+1)]=(uint8_t)(v>>8); }
+static void   write32(uint16_t a, uint32_t v) { if (a >= MMIO_BASE) return; write16(a,(uint16_t)v); write16((uint16_t)(a+2),(uint16_t)(v>>16)); }
+static uint8_t  read8 (uint16_t a) { if (a >= MMIO_BASE) return mmio_read8(a); return mem[a]; }
+static uint16_t read16(uint16_t a) { if (a >= MMIO_BASE) return (uint16_t)mmio_read8(a) | ((uint16_t)mmio_read8((uint16_t)(a+1))<<8); return (uint16_t)mem[a] | ((uint16_t)mem[(uint16_t)(a+1)] << 8); }
+static uint32_t read32(uint16_t a) { if (a >= MMIO_BASE) return (uint32_t)mmio_read8(a)|((uint32_t)mmio_read8((uint16_t)(a+1))<<8)|((uint32_t)mmio_read8((uint16_t)(a+2))<<16)|((uint32_t)mmio_read8((uint16_t)(a+3))<<24); return (uint32_t)read16(a) | ((uint32_t)read16((uint16_t)(a+2)) << 16); }
 
 /* ------------------------------------------------------------------ */
 /* Symbol table                                                         */
@@ -268,6 +278,12 @@ static void assemble(const char *src)
                 continue;
             }
 
+            /* clearmem: pseudo-instruction — no-op in simulator (memory is zero-initialised).
+               On physical hardware, replace with a real clear-memory loop in crt0.s. */
+            if (strcmp(mnem, "clearmem") == 0) {
+                continue;
+            }
+
             /* Regular instruction */
             const Instr *instr = find_instr(mnem);
             if (!instr) {
@@ -322,9 +338,9 @@ static void run_cpu(int verbose)
     uint32_t r0 = 0;
     uint16_t sp = 0, bp = 0, lr = 0, pc = 0;
     int H = 0;
-    long cycles = 0;
+    g_cycles = 0;
 
-    for (int step = 0; step < MAX_STEPS && !H; step++, cycles++) {
+    for (int step = 0; step < MAX_STEPS && !H; step++, g_cycles++) {
         uint8_t op = read8(pc);
         uint16_t oldpc = pc;
         pc++;
@@ -411,8 +427,8 @@ static void run_cpu(int verbose)
         pc &= 0xffff;
     }
 
-    printf("r0:%08x sp:%04x bp:%04x lr:%04x pc:%04x H:%x cycles:%ld\n",
-           r0, sp, bp, lr, pc, H, cycles);
+    printf("r0:%08x sp:%04x bp:%04x lr:%04x pc:%04x H:%x cycles:%u\n",
+           r0, sp, bp, lr, pc, H, g_cycles);
 }
 
 /* ------------------------------------------------------------------ */

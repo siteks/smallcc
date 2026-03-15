@@ -42,7 +42,7 @@ class Item:
 
 class Assembler(object):
     def __init__(self):
-        pass
+        self.clearmem_addr = None
 
     def assemble(self, code, showsymbols=False):
         # Take assembly in the form:
@@ -52,6 +52,7 @@ class Assembler(object):
         self.code = code
         self.symbols = {}
         self.assembly = []
+        self.clearmem_addr = None
 
         for passes in ['labels', 'assemble']:
             self.textaddr = 0
@@ -146,7 +147,14 @@ class Assembler(object):
                                             ';' if comment else '', comment)
 
                     if ins:
-                        if ins in G.directive:
+                        if ins == 'clearmem':
+                            # Pseudo-instruction: zero-length; records start address for makeimage.
+                            i.length = 0
+                            i.ins = []
+                            if passes == 'assemble' and op1 and op1 in self.symbols:
+                                self.clearmem_addr = self.symbols[op1].addr
+                            fmt = 99
+                        elif ins in G.directive:
                             if ins == 'allocb':
                                 i.length = val
                                 adr(adr() + val)
@@ -234,6 +242,11 @@ class Assembler(object):
 
 
     def makeimage(self, m):
+        # clearmem: zero the globals region before writing so uninitialized globals start at 0.
+        if self.clearmem_addr is not None:
+            max_addr = max((i.addr + i.length for i in self.assembly if i.length > 0),
+                           default=self.clearmem_addr)
+            m.mem[self.clearmem_addr:max_addr] = 0
         for i in self.assembly:
             m.write(i.addr, i.ins)
 

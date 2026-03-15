@@ -108,6 +108,24 @@ Float operands are 32-bit IEEE 754 single-precision values stored as raw bit pat
 
 **Indirect function call**: load the function pointer into r0, then `jli` (same save/jump semantics as `jl` but target is r0 not an immediate).
 
+## Memory Map
+
+The top 256 bytes of the 16-bit address space are reserved for memory-mapped I/O (MMIO). The stack grows down from `0x1000` and global data is placed after code, both well below `0xFF00`.
+
+| Address | Size | Register | Access |
+|---------|------|----------|--------|
+| `0xFF00` | 4 B  | Cycle counter | RO |
+| `0xFF04–0xFFFF` | — | Reserved | — |
+
+**Cycle counter (`0xFF00`):** 32-bit little-endian read-only register. Incremented once per instruction executed. Wraps at 2³²−1. Writes to the MMIO region are silently ignored.
+
+```c
+/* Read 32-bit cycle counter */
+unsigned long t = *(volatile unsigned long *)0xFF00;
+```
+
+Both `sim_c` and `cpu3/sim.py` implement this peripheral.
+
 ## Assembly Syntax
 
 ```
