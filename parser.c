@@ -1408,7 +1408,13 @@ static Node *stmt()
             node->ch[0] = expr();   // return expr
         expect(TK_SEMICOLON);
     }
-    else if (token_ctx.current->kind != TK_SEMICOLON)
+    else if (token_ctx.current->kind == TK_SEMICOLON)
+    {
+        /* null statement: consume the ';' and return an empty node */
+        expect(TK_SEMICOLON);
+        node->kind = ND_EMPTY;
+    }
+    else
     {
         node->kind = ND_EXPRSTMT;
         node->ch[0] = expr();   // expr
