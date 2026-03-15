@@ -1034,7 +1034,7 @@ void gen_expr(Node *node)
     else if (node->kind == ND_MEMBER)
     {
         gen_addr(node);         // handles both . and ->
-        if (node->type->base != TB_STRUCT)
+        if (node->type->base != TB_STRUCT && node->type->base != TB_ARRAY)
             gen_ld(node->type->size);
     }
     // ===== Ternary =====

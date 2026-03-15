@@ -475,7 +475,25 @@ static Node *unary_expr()
                         break;
                     }
                     if (!s)
-                        src_error(token_ctx.current->line, token_ctx.current->col, "No ident before left bracket");
+                    {
+                        /* Subscript on a member (or other expr whose type is not
+                           yet resolved at parse time).  Generate a pointer-style
+                           deref node; derive_types will resolve the element type
+                           and insert_coercions will insert the stride scaling. */
+                        expect(TK_LBRACKET);
+                        Node *e1  = node;
+                        Node *idx = expr();
+                        expect(TK_RBRACKET);
+                        Node *add_node   = new_node(ND_BINOP, NULL, true);
+                        add_node->op_kind = TK_PLUS;
+                        add_node->ch[0]  = e1;
+                        add_node->ch[1]  = idx;
+                        node             = new_node(ND_UNARYOP, NULL, true);
+                        node->op_kind    = TK_STAR;
+                        node->ch[0]      = add_node;
+                        // type left t_void; derive_types fills it via elem_type
+                        break;
+                    }
                     expect(token_ctx.current->kind);
                     Node *e1 = node;
                     // Walk type chain to current array depth
@@ -548,6 +566,10 @@ static Node *unary_expr()
                 // ch[1] = args list (set by TK_LPAREN handler if called)
                 node = n;
                 pex_node = n;
+                // After a member access, subscript tracking resets: any subsequent
+                // '[' applies to the member's type, not the original ident's type.
+                s = NULL;
+                array_depth = 0;
                 break;
             }
             case(TK_ARROW):
@@ -560,6 +582,9 @@ static Node *unary_expr()
                 // ch[1] = args list (set by TK_LPAREN handler if called)
                 node = n;
                 pex_node = n;
+                // After a member access, subscript tracking resets.
+                s = NULL;
+                array_depth = 0;
                 break;
             }
             case(TK_INC):
