@@ -898,7 +898,7 @@ void gen_expr(Node *node)
             else
             {
                 gen_expr(operand);
-                gen_ld(elem_type(node->type)->size);
+                gen_ld(node->type->size);
             }
             break;
         case TK_AMPERSAND:
