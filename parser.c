@@ -1356,6 +1356,17 @@ static Node *stmt()
             node->u.casestmt.value = (long long)s->offset;
             expect(TK_IDENT);
         }
+        else if (token_ctx.current->kind == TK_CHARACTER)
+        {
+            node->u.casestmt.value = (unsigned char)token_ctx.current->val[0];
+            expect(TK_CHARACTER);
+        }
+        else if (token_ctx.current->kind == TK_MINUS)
+        {
+            /* negative integer constant: -N */
+            expect(TK_MINUS);
+            node->u.casestmt.value = -(long long)expect_number();
+        }
         else
         {
             node->u.casestmt.value = (long long)expect_number();

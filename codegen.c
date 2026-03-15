@@ -386,8 +386,8 @@ static int push_args_list(Node *first_arg)
             gen_expr(arg);
             int s = arg->type ? arg->type->size : 0;
             if (s == 0) s = WORD_SIZE;  // function designator decays to pointer size
-            if (s == 4) ir_append(IR_PUSH, 0, NULL); else ir_append(IR_PUSHW, 0, NULL);
-            param_size += s;
+            if (s == 4) { ir_append(IR_PUSH, 0, NULL);  param_size += 4; }
+            else        { ir_append(IR_PUSHW, 0, NULL); param_size += WORD_SIZE; }
         }
     }
     return param_size;
