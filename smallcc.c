@@ -103,6 +103,7 @@ static void harvest_globals(void)
     {
         if (s->ns != NS_IDENT) continue;
         if (s->kind == SYM_STATIC_GLOBAL || s->kind == SYM_STATIC_LOCAL || s->kind == SYM_EXTERN || s->kind == SYM_BUILTIN) continue;
+        if (s->kind == SYM_ENUM_CONST) continue;  // enum consts have no cross-TU linkage; re-declared from headers each TU
         insert_extern_sym(s->name, s->type);
     }
 }
