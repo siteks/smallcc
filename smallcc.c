@@ -44,13 +44,40 @@ void error(const char *fmt, ...)
 
 void src_error(int line, int col, const char *fmt, ...)
 {
-    fprintf(stderr, "%s:%d:%d: error: ",
-            token_ctx.filename ? token_ctx.filename : "?", line, col);
+    /* Determine the best filename to report: prefer the current token's logical
+       filename, then the most recent linemarker filename, then the TU filename. */
+    const char *fname;
+    if (token_ctx.current && token_ctx.current->filename)
+        fname = token_ctx.current->filename;
+    else if (token_ctx.logical_filename)
+        fname = token_ctx.logical_filename;
+    else if (token_ctx.filename)
+        fname = token_ctx.filename;
+    else
+        fname = "?";
+
+    fprintf(stderr, "%s:%d:%d: error: ", fname, line, col);
     va_list ap;
     va_start(ap, fmt);
     vfprintf(stderr, fmt, ap);
     va_end(ap);
     fprintf(stderr, "\n");
+
+    /* Re-read the original source file to show the actual line + caret.
+       (token_ctx.user_input holds preprocessed text; line numbers there
+        do not match the original source after #include expansion.) */
+    FILE *f = fopen(fname, "r");
+    if (f) {
+        char buf[1024];
+        buf[0] = '\0';
+        for (int l = 1; l <= line; l++) {
+            if (!fgets(buf, sizeof(buf), f)) { buf[0] = '\0'; break; }
+        }
+        fclose(f);
+        buf[strcspn(buf, "\n")] = '\0';
+        fprintf(stderr, "    %s\n    %*s^\n", buf, col - 1, "");
+    }
+
     exit(1);
 }
 
@@ -209,6 +236,7 @@ int main(int argc, char **argv)
     FILE *out = stdout;
     int file_start = 1;
     bool show_stats = false;
+    bool preprocess_only = false;
     int opt_level = 0;
     const char *cmdline_defines[256];
     int num_defines = 0;
@@ -230,6 +258,11 @@ int main(int argc, char **argv)
         {
             const char *n = argv[file_start] + 2;
             opt_level = (*n == '\0') ? 1 : atoi(n);
+            file_start++;
+        }
+        else if (strcmp(argv[file_start], "-E") == 0)
+        {
+            preprocess_only = true;
             file_start++;
         }
         else if (strcmp(argv[file_start], "-ann") == 0)
@@ -264,7 +297,7 @@ int main(int argc, char **argv)
 
     if (argc <= file_start)
     {
-        fprintf(stderr, "Usage: smallcc [-o outfile] [-stats] [-ann] [-DNAME[=VAL]] [-Idir] <source.c> [source2.c ...]\n");
+        fprintf(stderr, "Usage: smallcc [-o outfile] [-E] [-stats] [-ann] [-DNAME[=VAL]] [-Idir] <source.c> [source2.c ...]\n");
         return 1;
     }
 
@@ -295,24 +328,26 @@ int main(int argc, char **argv)
     for (int i = 0; i < lib_count; i++)  all_files[i] = lib_files[i];
     for (int i = 0; i < user_count; i++) all_files[lib_count + i] = argv[file_start + i];
 
-    // Preamble: emit crt0.s if present, otherwise fall back to built-in default
-    char crt0_path[4096];
-    snprintf(crt0_path, sizeof(crt0_path), "%s/lib/crt0.s", compiler_dir);
-    FILE *crt0 = fopen(crt0_path, "r");
-    if (crt0) {
-        char buf[256];
-        while (fgets(buf, sizeof(buf), crt0))
-            fputs(buf, out);
-        fclose(crt0);
-    } else {
-        fprintf(out, ".text=0\n");
-        fprintf(out, "    ssp     0x1000\n");
-        fprintf(out, "    jl      main\n");
-        fprintf(out, "    halt\n");
-    }
+    if (!preprocess_only) {
+        // Preamble: emit crt0.s if present, otherwise fall back to built-in default
+        char crt0_path[4096];
+        snprintf(crt0_path, sizeof(crt0_path), "%s/lib/crt0.s", compiler_dir);
+        FILE *crt0 = fopen(crt0_path, "r");
+        if (crt0) {
+            char buf[256];
+            while (fgets(buf, sizeof(buf), crt0))
+                fputs(buf, out);
+            fclose(crt0);
+        } else {
+            fprintf(out, ".text=0\n");
+            fprintf(out, "    ssp     0x1000\n");
+            fprintf(out, "    jl      main\n");
+            fprintf(out, "    halt\n");
+        }
 
-    if (show_stats)
-        fprintf(stderr, "%-4s  %-10s  %8s  %8s\n", "TU", "file", "arena_before", "arena_used");
+        if (show_stats)
+            fprintf(stderr, "%-4s  %-10s  %8s  %8s\n", "TU", "file", "arena_before", "arena_used");
+    }
 
     for (int tu = 0; tu < tu_count; tu++)
     {
@@ -345,6 +380,20 @@ int main(int argc, char **argv)
         }
 
         char *source = preprocess(raw, all_files[tu]);
+
+        if (preprocess_only) {
+            /* Only emit preprocessed output for user files, not auto-included lib TUs */
+            if (tu >= lib_count) {
+                if (tu > lib_count)
+                    fprintf(out, "\n");
+                if (user_count > 1)
+                    fprintf(out, "# %s\n", all_files[tu]);
+                fputs(source, out);
+            }
+            free(source);
+            reset_preprocessor();
+            continue;
+        }
 
         reset_tu(tu);
         make_basic_types();

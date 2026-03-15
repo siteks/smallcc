@@ -425,6 +425,11 @@ static Node *unary_expr()
             node->symbol = find_symbol(node, node->u.ident.name, NS_IDENT);
         }
     }
+    else
+    {
+        src_error(token_ctx.current->line, token_ctx.current->col,
+                  "Expected expression, got '%s'", token_str(token_ctx.current->kind));
+    }
     // postfix-expr
     // Keep pointer to array or func ident, so we can reference later during fixup
     Symbol *s = node->symbol;
@@ -1062,6 +1067,16 @@ static Node *struct_decl(DeclParseState *ds, int depth)
             n = new_node(ND_STRUCT, 0, false);
             n->u.struct_spec.is_union = (ds->typespec & DS_UNION) != 0;
             n->ch[0] = new_node(ND_IDENT, new_anon_label(), false);   // tag
+        }
+        /* Pre-register the tag with an incomplete placeholder type BEFORE entering
+           the member scope so that self-references inside the body (e.g. "struct Foo *next")
+           can resolve the tag via scope-chain lookup. */
+        {
+            char   *tagname   = n->ch[0]->u.ident.name;
+            Symbol *early_tag = insert_tag(type_ctx.curr_scope_st, tagname);
+            if (early_tag->type == t_void)
+                early_tag->type = get_struct_type(early_tag, NULL,
+                                                  n->u.struct_spec.is_union);
         }
         expect(TK_LBRACE);
         n->symtable = enter_new_scope();

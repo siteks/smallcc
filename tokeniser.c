@@ -314,6 +314,8 @@ Token *tokenise(char *p)
     Token *cur  = &head;
 
     int cur_line = 1, cur_col = 1;
+    const char *cur_file = token_ctx.filename ? token_ctx.filename : "?";
+    token_ctx.logical_filename = cur_file;
 
     while (*p)
     {
@@ -323,6 +325,37 @@ Token *tokenise(char *p)
             else cur_col++;
             p++;
             continue;
+        }
+
+        // Linemarker: # <number> "filename"  (emitted by preprocessor, always at col 1)
+        if (*p == '#' && cur_col == 1)
+        {
+            const char *q = p + 1;
+            while (*q == ' ' || *q == '\t') q++;
+            if (isdigit((unsigned char)*q))
+            {
+                char *end;
+                int lm_line = (int)strtol(q, &end, 10);
+                q = end;
+                while (*q == ' ' || *q == '\t') q++;
+                if (*q == '"')
+                {
+                    q++;
+                    const char *fn_start = q;
+                    while (*q && *q != '"' && *q != '\n') q++;
+                    int fn_len = (int)(q - fn_start);
+                    char *fn = arena_alloc(fn_len + 1);
+                    memcpy(fn, fn_start, fn_len);
+                    fn[fn_len] = '\0';
+                    cur_file = fn;
+                    token_ctx.logical_filename = fn;
+                }
+                cur_line = lm_line;
+                // Skip to end of marker line (consuming the '\n' without incrementing cur_line)
+                while (*p && *p != '\n') p++;
+                if (*p == '\n') { p++; cur_col = 1; }
+                continue;
+            }
         }
 
         // Line comments: skip to end of line
@@ -355,8 +388,9 @@ Token *tokenise(char *p)
                 if (!strncmp(p, pt->str, pt->len))
                 {
                     cur = new_token(pt->kind, cur, p, pt->len);
-                    cur->line = cur_line;
-                    cur->col  = cur_col;
+                    cur->line     = cur_line;
+                    cur->col      = cur_col;
+                    cur->filename = cur_file;
                     cur_col += pt->len;
                     p += pt->len;
                     matched = true;
@@ -375,8 +409,9 @@ Token *tokenise(char *p)
             int l   = q - p;
             Token_kind tk = find_token(p, l);
             cur = new_token(tk, cur, p, l);
-            cur->line = tok_line;
-            cur->col  = tok_col;
+            cur->line     = tok_line;
+            cur->col      = tok_col;
+            cur->filename = cur_file;
             cur_col += l;
             p = q;
             continue;
@@ -416,8 +451,9 @@ Token *tokenise(char *p)
                 cur         = new_token(TK_CONSTINT, cur, p, q - p);
                 cur->ival   = ival;
             }
-            cur->line = tok_line;
-            cur->col  = tok_col;
+            cur->line     = tok_line;
+            cur->col      = tok_col;
+            cur->filename = cur_file;
             cur_col += (int)(q - p_start);
             p = q;
             continue;
@@ -431,8 +467,9 @@ Token *tokenise(char *p)
             if (p[1 + adv] != '\'')
                 src_error(tok_line, tok_col, "Unterminated character constant");
             cur = new_token(TK_CHARACTER, cur, &ch, 1);
-            cur->line = tok_line;
-            cur->col  = tok_col;
+            cur->line     = tok_line;
+            cur->col      = tok_col;
+            cur->filename = cur_file;
             int advance = 1 + adv + 1;
             cur_col += advance;
             p += advance;  // opening quote + char/escape + closing quote
@@ -477,8 +514,9 @@ Token *tokenise(char *p)
             free(buf);
             strtok->ival = len;
             strtok->loc  = start - token_ctx.user_input;
-            strtok->line = tok_line;
-            strtok->col  = tok_col;
+            strtok->line     = tok_line;
+            strtok->col      = tok_col;
+            strtok->filename = cur_file;
             cur->next = strtok;
             cur = strtok;
             continue;
@@ -487,8 +525,9 @@ Token *tokenise(char *p)
         src_error(cur_line, cur_col, "Unexpected input '%c'", *p);
     }
     Token *eof_tok = new_token(TK_EOF, cur, p, 0);
-    eof_tok->line = cur_line;
-    eof_tok->col  = cur_col;
+    eof_tok->line     = cur_line;
+    eof_tok->col      = cur_col;
+    eof_tok->filename = cur_file;
     return head.next;
 }
 

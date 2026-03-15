@@ -101,8 +101,9 @@ struct Token
     double      fval;
     long long   ival;
     int         loc;
-    int         line;   // 1-based line number in source
-    int         col;    // 1-based column number
+    int         line;           // 1-based logical line number (original source file)
+    int         col;            // 1-based column number
+    const char *filename;       // original source file for this token
 };
 
 // ---------------------------------------------------------------
@@ -571,6 +572,8 @@ typedef struct TokenContext {
     const char *filename;       // current source file (set per TU)
     int last_line;              // line of most recently consumed token
     int last_col;               // col  of most recently consumed token
+    // Logical (original) location — updated by tokeniser from linemarkers
+    const char *logical_filename; // most recent linemarker filename
 } TokenContext;
 
 typedef struct ParserContext {

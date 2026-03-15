@@ -42,6 +42,14 @@ static void buf_appends(Buf *b, const char *s)
     buf_append(b, s, strlen(s));
 }
 
+/* Emit a GCC-style linemarker: # <line> "<filename>"\n */
+static void buf_emit_linemarker(Buf *b, int line, const char *filename)
+{
+    char tmp[512];
+    snprintf(tmp, sizeof(tmp), "# %d \"%s\"\n", line, filename);
+    buf_appends(b, tmp);
+}
+
 /* ---- Macro table ---- */
 #define PP_MAX_MACROS  512
 #define PP_MAX_PARAMS   16
@@ -690,9 +698,14 @@ char *preprocess(const char *src, const char *filename)
     Buf        out  = {0};
     const char *p   = src;
     char        line[65536];
+    int         pp_lineno = 0;
+
+    /* Emit initial linemarker so the tokeniser knows which file this is */
+    buf_emit_linemarker(&out, 1, filename);
 
     while (*p)
     {
+        pp_lineno++;
         p = read_logical_line(p, line, sizeof(line));
 
         const char *lp = pp_skip_ws(line);
@@ -710,6 +723,9 @@ char *preprocess(const char *src, const char *filename)
             dir[dn] = '\0';
             lp = pp_skip_ws(lp);
 
+            bool need_resync = false;
+            bool is_include  = false;
+
             /* Conditional directives: always processed to maintain stack depth */
             if (strcmp(dir, "ifdef") == 0 || strcmp(dir, "ifndef") == 0)
             {
@@ -725,6 +741,7 @@ char *preprocess(const char *src, const char *filename)
                 pp_cond_emit [pp_cond_depth] = taken;
                 pp_cond_done [pp_cond_depth] = taken;
                 pp_cond_depth++;
+                need_resync = currently_emitting();
             }
             else if (strcmp(dir, "if") == 0)
             {
@@ -739,6 +756,7 @@ char *preprocess(const char *src, const char *filename)
                 pp_cond_emit [pp_cond_depth] = taken;
                 pp_cond_done [pp_cond_depth] = taken;
                 pp_cond_depth++;
+                need_resync = currently_emitting();
             }
             else if (strcmp(dir, "elif") == 0)
             {
@@ -752,6 +770,7 @@ char *preprocess(const char *src, const char *filename)
                 int taken = outer && !done && cond;
                 pp_cond_emit[pp_cond_depth - 1] = taken;
                 if (taken) pp_cond_done[pp_cond_depth - 1] = 1;
+                need_resync = currently_emitting();
             }
             else if (strcmp(dir, "else") == 0)
             {
@@ -760,12 +779,14 @@ char *preprocess(const char *src, const char *filename)
                 int outer = pp_cond_outer[pp_cond_depth - 1];
                 int done  = pp_cond_done [pp_cond_depth - 1];
                 pp_cond_emit[pp_cond_depth - 1] = outer && !done;
+                need_resync = currently_emitting();
             }
             else if (strcmp(dir, "endif") == 0)
             {
                 if (pp_cond_depth == 0)
                     error("preprocess: #endif without matching #ifdef");
                 pp_cond_depth--;
+                need_resync = currently_emitting();
             }
             /* Other directives: only processed when emitting */
             else if (currently_emitting())
@@ -835,6 +856,7 @@ char *preprocess(const char *src, const char *filename)
                 }
                 else if (strcmp(dir, "include") == 0)
                 {
+                    is_include = true;
                     char   inc_name[256];
                     size_t n = 0;
                     char  *resolved = NULL;
@@ -869,9 +891,18 @@ char *preprocess(const char *src, const char *filename)
                     free(expanded);
                     free(raw);
                     free(resolved);
+                    /* Resync to parent file after the included content */
+                    buf_emit_linemarker(&out, pp_lineno + 1, filename);
                 }
                 /* Unknown directives are silently ignored */
+
+                /* For non-include directives, resync so the tokeniser stays in step */
+                if (!is_include)
+                    need_resync = true;
             }
+
+            if (need_resync)
+                buf_emit_linemarker(&out, pp_lineno + 1, filename);
         }
         else if (currently_emitting())
         {

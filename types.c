@@ -519,8 +519,33 @@ static Type *generate_struct_type(Node *decl_node, DeclParseState ds, int depth)
         src_error(decl_node->line, decl_node->col, "Tag %s not found", tagname);
     }
 
-    if (tag->type == t_void)
+    /* A placeholder is a struct Type with members==NULL created by a forward
+       reference or self-reference before the full body was seen.  We detect
+       it as: tag->type is a TB_STRUCT/TB_UNION with no members yet. */
+    bool is_placeholder = (tag->type != t_void) &&
+                          (tag->type->base == TB_STRUCT) &&
+                          (tag->type->u.composite.members == NULL);
+
+    if (tag->type == t_void || is_placeholder)
     {
+        if (struct_node->ch[1] == NULL)
+        {
+            /* Reference to a tag that has no body yet — return/create placeholder */
+            if (tag->type == t_void)
+            {
+                Type *ph                 = arena_alloc(sizeof(Type));
+                ph->base                 = TB_STRUCT;
+                ph->u.composite.tag      = tag;
+                ph->u.composite.members  = NULL;
+                ph->u.composite.is_union = !!(ds.typespec & DS_UNION);
+                ph->size                 = 0;
+                ph->align                = 1;
+                append_type(ph);
+                tag->type                = ph;
+            }
+            return tag->type;
+        }
+
         // Build Field list from struct member declarations
         DBG_PRINT("%s defining struct %s\n", __func__, tagname);
         Field  *fields   = NULL;
@@ -576,6 +601,18 @@ static Type *generate_struct_type(Node *decl_node, DeclParseState ds, int depth)
             }
         }
 
+        if (is_placeholder)
+        {
+            /* Fill in the existing placeholder Type object in-place so that
+               any pointers already pointing to it (e.g. from self-referential
+               member types) automatically see the complete definition. */
+            Type *st                 = tag->type;
+            st->u.composite.members  = fields;
+            st->u.composite.is_union = !!(ds.typespec & DS_UNION);
+            calc_struct_layout(st);
+            return st;
+        }
+
         // Create struct Type entry
         Type *st                 = arena_alloc(sizeof(Type));
         st->base                 = TB_STRUCT;
@@ -618,8 +655,10 @@ void add_types_and_symbols(Node *node, DeclParseState ds, bool is_param, bool is
         {
             if (standalone)
             {
-                // Standalone incomplete struct (e.g. "struct foo;")
+                // Standalone incomplete struct (e.g. "struct B;")
                 DBG_PRINT("%s incomplete struct\n", __func__);
+                char   *tagname = spec->ch[0]->u.ident.name;
+                spec->symbol    = insert_tag(type_ctx.curr_scope_st, tagname);
                 Type *t = generate_struct_type(node, ds, 0);
                 if (spec->symbol)
                     spec->symbol->type = t;
@@ -628,7 +667,27 @@ void add_types_and_symbols(Node *node, DeclParseState ds, bool is_param, bool is
             else
             {
                 // "struct foo" as type specifier with a declarator
-                Symbol *s  = find_symbol(node, spec->ch[0]->u.ident.name, NS_TAG);   // tag name
+                char   *tagname = spec->ch[0]->u.ident.name;
+                Symbol *s       = find_symbol_st(node->st, tagname, NS_TAG);
+                if (!s)
+                {
+                    /* Forward reference: tag not yet declared.  Create a
+                       placeholder incomplete struct so the pointer type can
+                       be built; the real definition will fill it in later. */
+                    s = insert_tag(type_ctx.curr_scope_st, tagname);
+                    if (s->type == t_void)
+                    {
+                        Type *ph                 = arena_alloc(sizeof(Type));
+                        ph->base                 = TB_STRUCT;
+                        ph->u.composite.tag      = s;
+                        ph->u.composite.members  = NULL;
+                        ph->u.composite.is_union = !!(ds.typespec & DS_UNION);
+                        ph->size                 = 0;
+                        ph->align                = 1;
+                        append_type(ph);
+                        s->type                  = ph;
+                    }
+                }
                 node->type = s->type;
             }
         }
