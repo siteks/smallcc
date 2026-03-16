@@ -774,6 +774,9 @@ static void gen_arith_op(Token_kind op, bool is_float)
             case TK_LE:    ir_append(IR_FLE,   0, NULL);  return;
             case TK_GT:    ir_append(IR_FGT,   0, NULL);  return;
             case TK_GE:    ir_append(IR_FGE,   0, NULL);  return;
+            /* No feq/fne on CPU3 — bit-pattern equality is correct for non-NaN IEEE 754 */
+            case TK_EQ:    ir_append(IR_EQ,    0, NULL);  return;
+            case TK_NE:    ir_append(IR_NE,    0, NULL);  return;
             default: error("fp op_kind %d not handled in codegen", op);
         }
     }
