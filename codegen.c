@@ -1239,9 +1239,17 @@ void gen_breakstmt(Node *node)
 }
 void gen_continuestmt(Node *node)
 {
-    if (codegen_ctx.loop_depth == 0)
-        src_error(node->line, node->col, "continue outside loop");
-    ir_append(IR_J, codegen_ctx.cont_labels[codegen_ctx.loop_depth - 1], NULL);
+    /* Walk up the loop/switch stack to find the nearest true loop.
+       switch sets cont_labels[depth] = -1; only loops set a real label. */
+    for (int i = codegen_ctx.loop_depth - 1; i >= 0; i--)
+    {
+        if (codegen_ctx.cont_labels[i] >= 0)
+        {
+            ir_append(IR_J, codegen_ctx.cont_labels[i], NULL);
+            return;
+        }
+    }
+    src_error(node->line, node->col, "continue outside loop");
 }
 void gen_exprstmt(Node *node)
 {
