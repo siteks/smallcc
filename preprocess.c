@@ -894,6 +894,10 @@ char *preprocess(const char *src, const char *filename)
                     /* Resync to parent file after the included content */
                     buf_emit_linemarker(&out, pp_lineno + 1, filename);
                 }
+                else if (strcmp(dir, "error") == 0)
+                {
+                    error("%s:%d: #error %s", filename, pp_lineno, lp);
+                }
                 /* Unknown directives are silently ignored */
 
                 /* For non-include directives, resync so the tokeniser stays in step */
