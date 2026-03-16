@@ -385,6 +385,10 @@ Token *tokenise(char *p)
             bool matched = false;
             for (const PunctEntry *pt = punct_table; pt->str; pt++)
             {
+                /* Don't consume '.' as TK_DOT when followed by a digit —
+                   that's a leading-dot float literal like .03 or .5e2. */
+                if (pt->len == 1 && pt->str[0] == '.' && isdigit((unsigned char)p[1]))
+                    continue;
                 if (!strncmp(p, pt->str, pt->len))
                 {
                     cur = new_token(pt->kind, cur, p, pt->len);
@@ -417,7 +421,7 @@ Token *tokenise(char *p)
             continue;
         }
 
-        if (isdigit(*p))
+        if (isdigit(*p) || (*p == '.' && isdigit((unsigned char)p[1])))
         {
             // integers may be followed by u, l, or ul (any case)
             // floats may be followed by f, l
