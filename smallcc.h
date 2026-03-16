@@ -338,8 +338,8 @@ struct Node
         struct { int pointer_level; } declarator;
         // ND_PTYPE_LIST: variadic flag
         struct { bool is_variadic; } ptype_list;
-        // ND_DECLARATION: type specifier bitmask, storage class, func-defn flag
-        struct { Decl_spec typespec; StorageClass sclass; bool is_func_defn; } declaration;
+        // ND_DECLARATION: type specifier bitmask, storage class, func-defn flag, typedef type
+        struct { Decl_spec typespec; StorageClass sclass; bool is_func_defn; Type *typedef_type; } declaration;
         // ND_STRUCT: union-vs-struct flag
         struct { bool is_union; } struct_spec;
         // ND_LITERAL: integer/float/string value

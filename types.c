@@ -583,6 +583,10 @@ static Type *generate_struct_type(Node *decl_node, DeclParseState ds, int depth)
                         base             = (stag_sym && stag_sym->type) ? stag_sym->type : t_void;
                     }
                 }
+                else if (d->u.declaration.typespec & DS_TYPEDEF)
+                {
+                    base = d->u.declaration.typedef_type;
+                }
                 else
                 {
                     base = typespec_to_base(d->u.declaration.typespec);
@@ -642,8 +646,9 @@ void add_types_and_symbols(Node *node, DeclParseState ds, bool is_param, bool is
         src_error(node->line, node->col, "Node should be ND_DECLARATION");
 
     // Store ds fields into the node for later use by generate_struct_type
-    node->u.declaration.typespec = ds.typespec;
-    node->u.declaration.sclass   = ds.sclass;
+    node->u.declaration.typespec      = ds.typespec;
+    node->u.declaration.sclass        = ds.sclass;
+    node->u.declaration.typedef_type  = ds.typedef_type;
 
     // First pass: handle struct definitions and determine base type
     Node *spec                   = node->ch[0];   // spec

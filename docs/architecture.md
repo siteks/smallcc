@@ -228,7 +228,7 @@ struct Node {
         struct { int pointer_level; }                             declarator;  // ND_DECLARATOR
         struct { bool is_variadic; }                              ptype_list;  // ND_PTYPE_LIST
         struct { Decl_spec typespec; StorageClass sclass;
-                 bool is_func_defn; }                             declaration; // ND_DECLARATION
+                 bool is_func_defn; Type *typedef_type; }         declaration; // ND_DECLARATION
         struct { bool is_union; }                                 struct_spec; // ND_STRUCT
         struct { long long ival; double fval;
                  char *strval; int strval_len; }                  literal;     // ND_LITERAL
@@ -373,6 +373,8 @@ Type construction from AST nodes is done by two static helpers in `types.c`:
 `type_from_direct_decl(Node *dd, Type *base)` walks an `ND_DIRECT_DECL` node: applies array (`ND_ARRAY_DECL`) and function suffixes right-to-left (rightmost = innermost), then recurses for grouped inner declarators (e.g. `(*fp)`).
 
 `type2_from_decl_node(Node *node, DeclParseState ds)` is the public entry point (used by the parser for casts and `sizeof`). It determines the base type from `ds.typespec` (or `ds.typedef_type` when `DS_TYPEDEF` is set) and applies the first declarator child if present.
+
+`generate_struct_type` in `types.c` builds the `Field` list for a struct type by iterating the member `ND_DECLARATION` nodes stored in the AST. It reads the base type from `d->u.declaration.typespec`; when `DS_TYPEDEF` is set it uses `d->u.declaration.typedef_type` (the resolved `Type*` copied from `DeclParseState.typedef_type` during `add_types_and_symbols`). This `typedef_type` field is necessary because `typespec_to_base` has no way to recover a typedef's underlying type from the bitmask alone.
 
 ### Struct Layout
 
