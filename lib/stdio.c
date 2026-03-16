@@ -1,3 +1,32 @@
+/* ecvtbuf: convert double to ndigits significant decimal digits.
+   Returns buf. *decpt = decimal-point position (digits from left),
+   *sign = 1 if negative. Used by ee_printf for %e/%f formatting. */
+char *ecvtbuf(double value, int ndigits, int *decpt, int *sign, char *buf)
+{
+    int i, d;
+    if (value < 0.0) { *sign = 1; value = -value; } else { *sign = 0; }
+    if (value == 0.0) {
+        *decpt = 0;
+        for (i = 0; i < ndigits; i++) buf[i] = '0';
+        buf[ndigits] = '\0';
+        return buf;
+    }
+    /* Normalise to [1.0, 10.0) and count the decimal exponent */
+    *decpt = 1;
+    while (value >= 10.0) { value /= 10.0; (*decpt)++; }
+    while (value <   1.0) { value *= 10.0; (*decpt)--; }
+    /* Extract ndigits significant decimal digits */
+    for (i = 0; i < ndigits; i++) {
+        d = (int)value;
+        if (d < 0) d = 0;
+        if (d > 9) d = 9;
+        buf[i] = '0' + d;
+        value = (value - (double)d) * 10.0;
+    }
+    buf[ndigits] = '\0';
+    return buf;
+}
+
 static void _print_str(const char *s)
 {
     while (*s)
