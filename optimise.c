@@ -63,9 +63,11 @@ static bool is_foldable_binop(IROp op)
     {
     case IR_ADD: case IR_SUB: case IR_MUL:
     case IR_AND: case IR_OR:  case IR_XOR:
-    case IR_SHL: case IR_SHR:
+    case IR_SHL: case IR_SHR: case IR_SHRS:
     case IR_EQ:  case IR_NE:
     case IR_LT:  case IR_LE:  case IR_GT:  case IR_GE:
+    case IR_LTS: case IR_LES: case IR_GTS: case IR_GES:
+    case IR_DIVS: case IR_MODS:
         return true;
     default:
         return false;
@@ -78,21 +80,28 @@ static uint32_t fold_op(IROp op, uint32_t lhs, uint32_t rhs)
     int32_t sl = (int32_t)lhs, sr = (int32_t)rhs;
     switch (op)
     {
-    case IR_ADD: return lhs + rhs;
-    case IR_SUB: return lhs - rhs;
-    case IR_MUL: return (uint32_t)(sl * sr);
-    case IR_AND: return lhs & rhs;
-    case IR_OR:  return lhs | rhs;
-    case IR_XOR: return lhs ^ rhs;
-    case IR_SHL: return lhs << (rhs & 31);
-    case IR_SHR: return lhs >> (rhs & 31);  /* logical right shift */
-    case IR_EQ:  return (lhs == rhs) ? 1 : 0;
-    case IR_NE:  return (lhs != rhs) ? 1 : 0;
-    case IR_LT:  return (sl < sr)    ? 1 : 0;
-    case IR_LE:  return (sl <= sr)   ? 1 : 0;
-    case IR_GT:  return (sl > sr)    ? 1 : 0;
-    case IR_GE:  return (sl >= sr)   ? 1 : 0;
-    default:     return 0;
+    case IR_ADD:  return lhs + rhs;
+    case IR_SUB:  return lhs - rhs;
+    case IR_MUL:  return (uint32_t)(sl * sr);
+    case IR_AND:  return lhs & rhs;
+    case IR_OR:   return lhs | rhs;
+    case IR_XOR:  return lhs ^ rhs;
+    case IR_SHL:  return lhs << (rhs & 31);
+    case IR_SHR:  return lhs >> (rhs & 31);          /* logical right shift */
+    case IR_SHRS: return (uint32_t)(sl >> (rhs & 31)); /* arithmetic right shift */
+    case IR_EQ:   return (lhs == rhs) ? 1 : 0;
+    case IR_NE:   return (lhs != rhs) ? 1 : 0;
+    case IR_LT:   return (lhs < rhs)  ? 1 : 0;       /* unsigned */
+    case IR_LE:   return (lhs <= rhs) ? 1 : 0;
+    case IR_GT:   return (lhs > rhs)  ? 1 : 0;
+    case IR_GE:   return (lhs >= rhs) ? 1 : 0;
+    case IR_LTS:  return (sl < sr)    ? 1 : 0;       /* signed */
+    case IR_LES:  return (sl <= sr)   ? 1 : 0;
+    case IR_GTS:  return (sl > sr)    ? 1 : 0;
+    case IR_GES:  return (sl >= sr)   ? 1 : 0;
+    case IR_DIVS: return (uint32_t)(sr ? sl / sr : 0);
+    case IR_MODS: return (uint32_t)(sr ? sl % sr : 0);
+    default:      return 0;
     }
 }
 
@@ -243,6 +252,8 @@ static bool peephole_pass(int level)
                 case IR_AND: case IR_OR:  case IR_XOR: case IR_SHL: case IR_SHR:
                 case IR_EQ:  case IR_NE:  case IR_LT:  case IR_LE:
                 case IR_GT:  case IR_GE:
+                case IR_LTS: case IR_LES: case IR_GTS: case IR_GES:
+                case IR_DIVS: case IR_MODS: case IR_SHRS:
                 case IR_FADD: case IR_FSUB: case IR_FMUL: case IR_FDIV:
                 case IR_FLT:  case IR_FLE:  case IR_FGT:  case IR_FGE:
                     depth--;

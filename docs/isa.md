@@ -70,10 +70,19 @@ Three formats:
 | 0x27 | `fge` | r0 = (float(stack) >= float(r0)) ? 1 : 0; sp += 4 |
 | 0x28 | `itof` | r0 = float_bits(float(signed32(r0))) |
 | 0x29 | `ftoi` | r0 = int(float(r0)) truncated toward zero |
+| 0x2a | `lts` | r0 = (signed32(stack) < signed32(r0)) ? 1 : 0; sp += 4 |
+| 0x2b | `les` | r0 = (signed32(stack) <= signed32(r0)) ? 1 : 0; sp += 4 |
+| 0x2c | `gts` | r0 = (signed32(stack) > signed32(r0)) ? 1 : 0; sp += 4 |
+| 0x2d | `ges` | r0 = (signed32(stack) >= signed32(r0)) ? 1 : 0; sp += 4 |
+| 0x2e | `divs` | r0 = signed32(stack) / signed32(r0); sp += 4 (0 if divisor is 0) |
+| 0x2f | `mods` | r0 = signed32(stack) % signed32(r0); sp += 4 (0 if divisor is 0) |
+| 0x30 | `shrs` | r0 = signed32(stack) >> (r0 & 31); sp += 4 *(arithmetic shift)* |
 
 Float operands are 32-bit IEEE 754 single-precision values stored as raw bit patterns in r0 and on the stack. `float_bits(f)` means the IEEE 754 bit pattern of `f`. `float(x)` means interpret the bit pattern `x` as IEEE 754.
 
 **Stack-binary convention**: all `add`, `sub`, `mul`, `div`, `mod`, `shl`, `shr`, comparisons, and bitwise ops pop their left operand from the stack (`mem32[sp]`) and use r0 as right operand, writing the result to r0 and incrementing sp by 4.
+
+**Signed vs unsigned arithmetic**: `lt`/`le`/`gt`/`ge`, `div`, `mod`, and `shr` treat operands as **unsigned** 32-bit values. The `lts`/`les`/`gts`/`ges`, `divs`, `mods`, and `shrs` variants treat operands as **signed** 32-bit (two's complement) values. The compiler emits signed variants when the C operand type is a signed integer type (`char`, `short`, `int`, `long`); unsigned variants are used for pointer comparisons and unsigned integer types.
 
 **Store convention**: `sb`, `sw`, `sl` pop a 32-bit address from the stack and write r0 to that address.
 
@@ -101,6 +110,7 @@ Float operands are 32-bit IEEE 754 single-precision values stored as raw bit pat
 | 0x86 | `enter imm16` | mem32[sp-4] = lr; mem32[sp-8] = bp; bp = sp-8; sp -= imm16+8 |
 | 0x87 | `lea imm16` | r0 = bp + sign_extend(imm16) |
 | 0x88 | `ssp imm16` | sp = imm16 |
+| 0x89 | `adjw imm16` | sp += sign_extend(imm16) |
 
 **Loading a 32-bit constant**: use `immw` (lower 16 bits) followed by `immwh` (upper 16 bits). The compiler's `gen_imm(val)` emits this pair when `val > 0xffff`.
 

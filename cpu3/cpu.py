@@ -134,6 +134,13 @@ class G:
         'fge'   :   (0x27, 0),
         'itof'  :   (0x28, 0),
         'ftoi'  :   (0x29, 0),
+        'lts'   :   (0x2a, 0),
+        'les'   :   (0x2b, 0),
+        'gts'   :   (0x2c, 0),
+        'ges'   :   (0x2d, 0),
+        'divs'  :   (0x2e, 0),
+        'mods'  :   (0x2f, 0),
+        'shrs'  :   (0x30, 0),
         # Instructions with 8 bit operand
         'immb'  :   (0x40, 1),
         'adj'   :   (0x41, 1),
@@ -364,6 +371,40 @@ class CPU:
             s.r0 = f2b(float(iv))
         elif i == 'ftoi':
             s.r0 = int(b2f(s.r0)) & 0xffffffff
+        elif i == 'lts':
+            l = m.read32(s.sp); s.sp += 4
+            ls = l if l < 0x80000000 else l - 0x100000000
+            rs = s.r0 if s.r0 < 0x80000000 else s.r0 - 0x100000000
+            s.r0 = 1 if ls < rs else 0
+        elif i == 'les':
+            l = m.read32(s.sp); s.sp += 4
+            ls = l if l < 0x80000000 else l - 0x100000000
+            rs = s.r0 if s.r0 < 0x80000000 else s.r0 - 0x100000000
+            s.r0 = 1 if ls <= rs else 0
+        elif i == 'gts':
+            l = m.read32(s.sp); s.sp += 4
+            ls = l if l < 0x80000000 else l - 0x100000000
+            rs = s.r0 if s.r0 < 0x80000000 else s.r0 - 0x100000000
+            s.r0 = 1 if ls > rs else 0
+        elif i == 'ges':
+            l = m.read32(s.sp); s.sp += 4
+            ls = l if l < 0x80000000 else l - 0x100000000
+            rs = s.r0 if s.r0 < 0x80000000 else s.r0 - 0x100000000
+            s.r0 = 1 if ls >= rs else 0
+        elif i == 'divs':
+            l = m.read32(s.sp); s.sp += 4
+            ls = l if l < 0x80000000 else l - 0x100000000
+            rs = s.r0 if s.r0 < 0x80000000 else s.r0 - 0x100000000
+            s.r0 = (int(ls / rs) if rs != 0 else 0) & 0xffffffff
+        elif i == 'mods':
+            l = m.read32(s.sp); s.sp += 4
+            ls = l if l < 0x80000000 else l - 0x100000000
+            rs = s.r0 if s.r0 < 0x80000000 else s.r0 - 0x100000000
+            s.r0 = (ls % rs if rs != 0 else 0) & 0xffffffff
+        elif i == 'shrs':
+            l = m.read32(s.sp); s.sp += 4
+            ls = l if l < 0x80000000 else l - 0x100000000
+            s.r0 = (ls >> (s.r0 & 31)) & 0xffffffff
         elif    i == 'immb':    s.r0 = imm
         elif    i == 'adj':     s.sp += imm
 

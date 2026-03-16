@@ -142,11 +142,10 @@ static bool params_match(Param *a, Param *b)
     return a == NULL && b == NULL;
 }
 
-Type *get_function_type(Type *ret, Param *params, bool is_variadic, int num_params)
+Type *get_function_type(Type *ret, Param *params, bool is_variadic)
 {
     for (Type *p = type_ctx.type_list; p; p = p->next)
         if (p->base == TB_FUNCTION && p->u.fn.ret == ret && p->u.fn.is_variadic == is_variadic &&
-            p->u.fn.num_params == num_params &&
             params_match(p->u.fn.params, params))
             return p;
 
@@ -155,7 +154,6 @@ Type *get_function_type(Type *ret, Param *params, bool is_variadic, int num_para
     t->u.fn.ret          = ret;
     t->u.fn.params       = params;
     t->u.fn.is_variadic  = is_variadic;
-    t->u.fn.num_params   = num_params;
     t->size              = 2;
     t->align             = 2;
     append_type(t);
@@ -237,10 +235,7 @@ static Type *type_from_direct_decl(Node *dd, Type *base)
         else if (s->kind == ND_FUNC_DECL)
         {
             bool variadic = s->ch[0] && s->ch[0]->u.ptype_list.is_variadic;
-            int nparams = 0;
-            if (s->ch[0] && s->ch[0]->ch[0])
-                for (Node *pp = s->ch[0]->ch[0]; pp; pp = pp->next) nparams++;
-            t = get_function_type(t, NULL, variadic, nparams);
+            t = get_function_type(t, NULL, variadic);
         }
     }
 
@@ -444,7 +439,7 @@ void make_basic_types()
     // Builtin functions pre-declared in global scope
     Param *p = arena_alloc(sizeof(Param));
     p->type  = t_int;
-    insert_builtin("__putchar", get_function_type(t_int, p, false, 1));
+    insert_builtin("__putchar", get_function_type(t_int, p, false));
 
     // Register va_list as a typedef for int so the normal typedef path handles it.
     Symbol *va = arena_alloc(sizeof(Symbol));

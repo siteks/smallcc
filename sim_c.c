@@ -88,6 +88,8 @@ static const Instr itab[] = {
     {"fadd",0x20,0},{"fsub",0x21,0},{"fmul",0x22,0},{"fdiv",0x23,0},
     {"flt",0x24,0},{"fle",0x25,0},{"fgt",0x26,0},{"fge",0x27,0},
     {"itof",0x28,0},{"ftoi",0x29,0},
+    {"lts",0x2a,0},{"les",0x2b,0},{"gts",0x2c,0},{"ges",0x2d,0},
+    {"divs",0x2e,0},{"mods",0x2f,0},{"shrs",0x30,0},
     {"immb",0x40,1},{"adj",0x41,1},
     {"immw",0x80,2},{"immwh",0x81,2},{"j",0x82,2},{"jl",0x83,2},
     {"jz",0x84,2},{"jnz",0x85,2},{"enter",0x86,2},{"lea",0x87,2},
@@ -402,6 +404,13 @@ static void run_cpu(int verbose)
         case 0x27: /* fge  */    { float l=bits2float(read32(sp)); sp=(uint16_t)(sp+4); r0=(l>=bits2float(r0))?1:0; } break;
         case 0x28: /* itof */    { int32_t iv=(int32_t)r0; r0=float2bits((float)iv); } break;
         case 0x29: /* ftoi */    { float f=bits2float(r0); r0=(uint32_t)(int32_t)f; } break;
+        case 0x2a: /* lts  */    { int32_t l=(int32_t)read32(sp); sp=(uint16_t)(sp+4); r0=(l<(int32_t)r0)?1:0; } break;
+        case 0x2b: /* les  */    { int32_t l=(int32_t)read32(sp); sp=(uint16_t)(sp+4); r0=(l<=(int32_t)r0)?1:0; } break;
+        case 0x2c: /* gts  */    { int32_t l=(int32_t)read32(sp); sp=(uint16_t)(sp+4); r0=(l>(int32_t)r0)?1:0; } break;
+        case 0x2d: /* ges  */    { int32_t l=(int32_t)read32(sp); sp=(uint16_t)(sp+4); r0=(l>=(int32_t)r0)?1:0; } break;
+        case 0x2e: /* divs */    { int32_t l=(int32_t)read32(sp); sp=(uint16_t)(sp+4); r0=(uint32_t)(r0?(int32_t)l/(int32_t)r0:0); } break;
+        case 0x2f: /* mods */    { int32_t l=(int32_t)read32(sp); sp=(uint16_t)(sp+4); r0=(uint32_t)(r0?(int32_t)l%(int32_t)r0:0); } break;
+        case 0x30: /* shrs */    { int32_t l=(int32_t)read32(sp); sp=(uint16_t)(sp+4); r0=(uint32_t)(l>>(r0&31)); } break;
         case 0x40: /* immb */    r0 = (uint32_t)(int32_t)imm8; break;
         case 0x41: /* adj  */    sp = (uint16_t)(sp + imm8); break;
         case 0x80: /* immw */    r0 = imm16; break;

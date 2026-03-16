@@ -43,6 +43,8 @@ push                ; stack[sp] = lhs
 op                  ; r0 = stack[sp] op r0; sp += 4
 ```
 
+`gen_arith_op(op, is_float, is_signed)` selects the assembly instruction. For `<`, `<=`, `>`, `>=`, `/`, `%`, and `>>`, **signed** integer types (`char`, `short`, `int`, `long`) emit the signed variants (`lts`, `les`, `gts`, `ges`, `divs`, `mods`, `shrs`); unsigned types and pointers use the unsigned variants (`lt`, `le`, `gt`, `ge`, `div`, `mod`, `shr`). Floating-point operands use the `f`-prefixed instructions.
+
 **Assignment** (`ND_ASSIGN`):
 ```asm
 ; gen_addr(lhs) → r0 = address of lhs

@@ -246,7 +246,6 @@ struct Type
             Type    *ret;
             Param   *params;
             bool    is_variadic;
-            int     num_params;    // count of named parameters (0 when unknown)
         }       fn;
         struct
         {
@@ -413,6 +412,11 @@ static inline bool istype(Type *t, Type_base b) { return t && t->base == b; }
 #define istype_array(t)    istype(t, TB_ARRAY)
 #define istype_function(t) istype(t, TB_FUNCTION)
 
+static inline bool istype_signed(Type *t)
+{
+    return t && (t->base == TB_CHAR || t->base == TB_SHORT ||
+                 t->base == TB_INT  || t->base == TB_LONG);
+}
 static inline bool istype_fp(Type *t)
 {
     return t && (t->base == TB_FLOAT || t->base == TB_DOUBLE);
@@ -474,7 +478,7 @@ Type *find_typedef_type(char *name);
 Type *get_basic_type(Type_base base);
 Type *get_pointer_type(Type *pointee);
 Type *get_array_type(Type *elem, int count);
-Type *get_function_type(Type *ret, Param *params, bool is_variadic, int num_params);
+Type *get_function_type(Type *ret, Param *params, bool is_variadic);
 Type *get_struct_type(Symbol *tag, Field *members, bool is_union);
 Type *get_enum_type(Symbol *tag);
 Symbol *insert_tag(Symbol_table *st, char *ident);
@@ -507,6 +511,9 @@ typedef enum {
     IR_FADD, IR_FSUB, IR_FMUL, IR_FDIV,
     IR_ITOF, IR_FTOI,
     IR_EQ, IR_NE, IR_LT, IR_LE, IR_GT, IR_GE,
+    IR_LTS, IR_LES, IR_GTS, IR_GES,        // signed comparisons
+    IR_DIVS, IR_MODS,                       // signed div / mod
+    IR_SHRS,                                // arithmetic right shift
     IR_FLT, IR_FLE, IR_FGT, IR_FGE,
     IR_SHL, IR_SHR, IR_AND, IR_OR, IR_XOR,
     IR_ALIGN,

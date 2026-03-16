@@ -677,15 +677,38 @@ static char *pp_subst_defined(const char *text)
     return out.data;
 }
 
+/* Strip C block comments from a string; returns malloc'd result. */
+static char *pp_strip_block_comments(const char *text)
+{
+    Buf out = {0};
+    const char *p = text;
+    while (*p)
+    {
+        if (p[0] == '/' && p[1] == '*')
+        {
+            p += 2;
+            while (*p && !(p[0] == '*' && p[1] == '/')) p++;
+            if (*p) p += 2;
+            buf_appendc(&out, ' ');  /* replace comment with a space */
+        }
+        else
+            buf_appendc(&out, *p++);
+    }
+    buf_appendc(&out, '\0');
+    return out.data;
+}
+
 /* Macro-expand text then evaluate as a constant integer expression. */
 static long long pp_eval_if_expr(const char *text)
 {
     char *presubst = pp_subst_defined(text);  /* handle defined() first */
     char *expanded = pp_expand(presubst);
     free(presubst);
-    eval_p = expanded;
-    long long result = pp_eval_logor();
+    char *stripped = pp_strip_block_comments(expanded);
     free(expanded);
+    eval_p = stripped;
+    long long result = pp_eval_logor();
+    free(stripped);
     return result;
 }
 
