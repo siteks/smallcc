@@ -147,6 +147,7 @@ class G:
         'enter' :   (0x86, 2),
         'lea'   :   (0x87, 2),
         'ssp'   :   (0x88, 2),
+        'adjw'  :   (0x89, 2),
     }
 
     rptable = {v : k for k, v in ptable.items()}
@@ -375,6 +376,7 @@ class CPU:
         elif    i == 'enter':   m.write32(s.sp - 4, s.lr); m.write32(s.sp - 8, s.bp); s.bp = s.sp - 8; s.sp -= imm + 8
         elif    i == 'lea':     s.r0 = s.bp + imm
         elif    i == 'ssp':     s.sp = imm
+        elif    i == 'adjw':    s.sp += imm
 
 
         # clean up state

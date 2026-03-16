@@ -170,9 +170,14 @@ void backend_emit_asm(IRInst *ir)
         case IR_ENTER:
             fprintf(asm_out, "    enter   %d\n", p->operand);
             break;
-        case IR_ADJ:
-            fprintf(asm_out, "    adj     %d\n", p->operand);
+        case IR_ADJ: {
+            int v = p->operand;
+            if (v < -128 || v > 127)
+                fprintf(asm_out, "    adjw    %d\n", v);
+            else if (v != 0)
+                fprintf(asm_out, "    adj     %d\n", v);
             break;
+        }
         case IR_WORD:
             if (p->sym)
                 fprintf(asm_out, "    word    %s\n", p->sym);

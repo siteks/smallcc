@@ -18,8 +18,8 @@ assert 30 "int vmax(int n,...){va_list ap;int m;int i;int v;va_start(ap,n);m=va_
 # multiple vararg types (char promotion to int)
 assert 15 "int vadd3(int n,...){va_list ap;int s;int i;s=0;va_start(ap,n);for(i=0;i<n;i++)s+=va_arg(ap,int);va_end(ap);return s;} int main(){return vadd3(3,4,5,6);}"
 
-# putchar builtin (r0 holds char value after call since putchar is a no-modify opcode)
-assert 0 "int main(){putchar(65);return 0;}"
+assert 0 "#include <stdio.h>
+int main(){putchar(65);return 0;}"
 
 # post-increment: expression value is old
 assert 5 "int main(){int a=5; int b; b=a++; return b;}"

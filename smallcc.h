@@ -246,6 +246,7 @@ struct Type
             Type    *ret;
             Param   *params;
             bool    is_variadic;
+            int     num_params;    // count of named parameters (0 when unknown)
         }       fn;
         struct
         {
@@ -473,7 +474,7 @@ Type *find_typedef_type(char *name);
 Type *get_basic_type(Type_base base);
 Type *get_pointer_type(Type *pointee);
 Type *get_array_type(Type *elem, int count);
-Type *get_function_type(Type *ret, Param *params, bool is_variadic);
+Type *get_function_type(Type *ret, Param *params, bool is_variadic, int num_params);
 Type *get_struct_type(Symbol *tag, Field *members, bool is_union);
 Type *get_enum_type(Symbol *tag);
 Symbol *insert_tag(Symbol_table *st, char *ident);

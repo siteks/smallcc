@@ -1,3 +1,9 @@
+int putchar(int c)
+{
+    __putchar(c);
+    return c;
+}
+
 static void _print_str(const char *s)
 {
     while (*s)

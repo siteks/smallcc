@@ -91,7 +91,7 @@ static const Instr itab[] = {
     {"immb",0x40,1},{"adj",0x41,1},
     {"immw",0x80,2},{"immwh",0x81,2},{"j",0x82,2},{"jl",0x83,2},
     {"jz",0x84,2},{"jnz",0x85,2},{"enter",0x86,2},{"lea",0x87,2},
-    {"ssp",0x88,2},
+    {"ssp",0x88,2},{"adjw",0x89,2},
     {NULL,0,0}
 };
 
@@ -331,7 +331,7 @@ static uint32_t float2bits(float f)  { uint32_t b; memcpy(&b, &f, 4); return b; 
 /* CPU                                                                  */
 /* ------------------------------------------------------------------ */
 
-#define MAX_STEPS 10000000
+#define MAX_STEPS 100000000
 
 static void run_cpu(int verbose)
 {
@@ -413,6 +413,7 @@ static void run_cpu(int verbose)
         case 0x86: /* enter */   write32((uint16_t)(sp-4),lr); write32((uint16_t)(sp-8),bp); bp=(uint16_t)(sp-8); sp=(uint16_t)(sp-imm16-8); break;
         case 0x87: /* lea  */    r0 = (uint32_t)((int32_t)bp + (int32_t)(int16_t)imm16); break;
         case 0x88: /* ssp  */    sp = imm16; break;
+        case 0x89: /* adjw */    sp = (uint16_t)(sp + (int16_t)imm16); break;
         default:
             fprintf(stderr, "unknown opcode 0x%02x at pc=%04x\n", op, oldpc);
             H = 1;

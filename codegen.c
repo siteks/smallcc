@@ -331,7 +331,7 @@ static int push_struct_arg(Node *arg, int copybuf_lea);
 
 // Push function call args from a linked list (right-to-left onto stack).
 // Returns total bytes pushed (not counting copy buffer allocations, which are tracked via adj_depth).
-static int push_args_list(Node *first_arg)
+static int push_args_list(Node *first_arg, Type *fn_type)
 {
     // Collect args into a temporary array for right-to-left pushing
     Node *args[64];
@@ -341,6 +341,28 @@ static int push_args_list(Node *first_arg)
         if (n >= 64) error("Too many function arguments");
         args[n++] = a;
     }
+
+    // HACK: 4-byte variadic slot promotion — TO BE REVERTED once ee_printf is
+    // properly ported.
+    //
+    // The correct C89 ABI pushes each variadic arg at its natural size (after
+    // default argument promotions: char/short → int).  On this 16-bit target
+    // that means int args are 2-byte slots.  A conforming va_arg(ap, int)
+    // caller works fine with 2-byte slots.
+    //
+    // ee_printf (cpu3/ee_printf.c) was written for a 32-bit host where
+    // sizeof(int)==sizeof(long)==4; it unconditionally reads format args as
+    // va_arg(ap, long) (4 bytes).  With our natural 2-byte slots it reads
+    // garbage and goes haywire.
+    //
+    // The hack: promote all integer variadic slots to 4 bytes (sign-extending
+    // signed types) and advance va_arg by max(sizeof(T),4).  This matches the
+    // 32-bit convention ee_printf assumes.  The proper fix is to modify
+    // ee_printf to use va_arg(ap, int) for %d/%u/%x/%o and va_arg(ap, long)
+    // only for %ld/%lu etc., then revert this promotion and restore natural
+    // slot sizes.
+    bool is_variadic = fn_type && fn_type->base == TB_FUNCTION && fn_type->u.fn.is_variadic;
+    int num_named = is_variadic ? fn_type->u.fn.num_params : 0;
 
     // Phase 1 (right-to-left): allocate copy buffers for struct args via adj.
     //   This must happen before any pushw so that the param-pointer pushws are contiguous.
@@ -386,8 +408,29 @@ static int push_args_list(Node *first_arg)
             gen_expr(arg);
             int s = arg->type ? arg->type->size : 0;
             if (s == 0) s = WORD_SIZE;  // function designator decays to pointer size
-            if (s == 4) { ir_append(IR_PUSH, 0, NULL);  param_size += 4; }
-            else        { ir_append(IR_PUSHW, 0, NULL); param_size += WORD_SIZE; }
+            // HACK: see comment above — promote to 4-byte slot to match ee_printf's
+            // 32-bit assumptions.  Revert when ee_printf is properly ported.
+            bool variadic_slot = is_variadic && (i >= num_named) && (s < 4);
+            if (s == 4 || variadic_slot)
+            {
+                if (variadic_slot)
+                {
+                    // Sign-extend signed types so the 32-bit slot holds the correct
+                    // sign-extended value (important for negative int arguments).
+                    Type_base b = arg->type ? arg->type->base : TB_INT;
+                    if (b == TB_INT || b == TB_SHORT)  ir_append(IR_SXW, 0, NULL);
+                    else if (b == TB_CHAR)             ir_append(IR_SXB, 0, NULL);
+                    // Unsigned types (TB_UINT, TB_USHORT, TB_UCHAR, TB_POINTER) are
+                    // already zero-extended in r0 — no extra instruction needed.
+                }
+                ir_append(IR_PUSH, 0, NULL);
+                param_size += 4;
+            }
+            else
+            {
+                ir_append(IR_PUSHW, 0, NULL);
+                param_size += WORD_SIZE;
+            }
         }
     }
     return param_size;
@@ -473,7 +516,7 @@ static int push_struct_arg(Node *arg, int copybuf_lea)
 void gen_callfunction_via_ptr(Node *node)
 {
     // Check if function pointer returns a struct
-    Type *fn_type  = node->symbol->type->u.ptr.pointee;
+    Type *fn_type = node->symbol->type->u.ptr.pointee;
     Type *ret_type = fn_type->u.fn.ret;
     bool struct_ret = (ret_type && ret_type->base == TB_STRUCT);
     int retbuf_bp_off = 0;
@@ -485,7 +528,7 @@ void gen_callfunction_via_ptr(Node *node)
         ir_append(IR_ADJ, -sz, NULL);
     }
     int adj_before_args = codegen_ctx.adj_depth;
-    int param_size = push_args_list(node->ch[0]);   // user args (right-to-left)
+    int param_size = push_args_list(node->ch[0], fn_type);   // user args (right-to-left)
     if (struct_ret)
     {
         ir_append(IR_LEA, retbuf_bp_off, NULL);
@@ -524,7 +567,7 @@ void gen_callfunction_via_deref(Node *node)
         ir_append(IR_ADJ, -sz, NULL);
     }
     int adj_before_args = codegen_ctx.adj_depth;
-    int param_size = push_args_list(node->ch[1]);   // user args (right-to-left)
+    int param_size = push_args_list(node->ch[1], fn_type);   // user args (right-to-left)
     if (struct_ret)
     {
         ir_append(IR_LEA, retbuf_bp_off, NULL);
@@ -547,11 +590,11 @@ void gen_callfunction_via_deref(Node *node)
 
 void gen_callfunction(Node *node)
 {
-    // putchar(c) is a CPU builtin
+    // __putchar(c) is a CPU builtin
     if (node->symbol->kind == SYM_BUILTIN)
     {
         if (!node->ch[0] || node->ch[0]->next)
-            src_error(node->line, node->col, "putchar requires exactly 1 argument");
+            src_error(node->line, node->col, "__putchar requires exactly 1 argument");
         gen_expr(node->ch[0]);
         ir_append(IR_PUTCHAR, 0, NULL);
         return;
@@ -570,7 +613,7 @@ void gen_callfunction(Node *node)
     }
     // Push the params on backwards, the offsets from the symbol table then work
     int adj_before_args = codegen_ctx.adj_depth;
-    int param_size = push_args_list(node->ch[0]);   // user args (right-to-left)
+    int param_size = push_args_list(node->ch[0], node->symbol->type);   // user args (right-to-left)
     if (struct_ret)
     {
         // Push hidden retbuf pointer as the implicit first argument (pushed last,
@@ -1028,7 +1071,7 @@ void gen_expr(Node *node)
     else if (node->kind == ND_MEMBER && node->u.member.is_function)
     {
         // Call through a function-pointer struct member: s.fp(args) or s->fp(args)
-        int param_size = push_args_list(node->ch[1]);   // args list
+        int param_size = push_args_list(node->ch[1], NULL);   // args list (fn type not available here)
         gen_addr(node);
         gen_ld(WORD_SIZE);  // load function pointer (pointer-sized)
         ir_append(IR_JLI,   0, NULL);
@@ -1086,8 +1129,9 @@ void gen_expr(Node *node)
         gen_addr(ap_node);    // r0 = &ap
         gen_ld(WORD_SIZE);    // r0 = ap
         ir_append(IR_PUSH,  0, NULL);           // stack: [old_ap, &ap, ap]
-        ir_append(IR_IMM, s, NULL);           // r0 = s
-        ir_append(IR_ADD,   0, NULL);            // r0 = ap + s; stack: [old_ap, &ap]
+        int slot = s < 4 ? 4 : s;            // HACK: 4-byte minimum — see push_args_list comment; revert with ee_printf fix
+        ir_append(IR_IMM, slot, NULL);        // r0 = slot size
+        ir_append(IR_ADD,   0, NULL);            // r0 = ap + slot; stack: [old_ap, &ap]
         ir_append(IR_SW,    0, NULL);             // mem[&ap] = ap + s; stack: [old_ap]
         // Load vararg from old_ap
         ir_append(IR_POP,   0, NULL);            // r0 = old_ap; stack: []
