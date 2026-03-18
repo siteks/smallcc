@@ -664,6 +664,7 @@ static void assemble_cpu4(const char *src)
 /* ------------------------------------------------------------------ */
 
 #define MAX_STEPS 100000000
+static int g_max_steps = MAX_STEPS;
 
 static int32_t sx7 (int32_t v) { v &= 0x7f;  return (v >= 64)  ? v - 128  : v; }
 static int32_t sx10(int32_t v) { v &= 0x3ff; return (v >= 512) ? v - 1024 : v; }
@@ -684,7 +685,7 @@ static void run_cpu4(int verbose)
     struct { uint16_t pc; uint8_t op; uint32_t r0; uint16_t sp, bp; } trace[TRACE_N4];
     int trace_idx = 0;
 
-    for (int step = 0; step < MAX_STEPS && !H; step++, g_cycles++) {
+    for (int step = 0; step < g_max_steps && !H; step++, g_cycles++) {
         uint8_t  b0 = read8(pc);
         uint16_t oldpc = pc;
         pc++;
@@ -872,7 +873,7 @@ static void run_cpu(int verbose)
     int H = 0;
     g_cycles = 0;
 
-    for (int step = 0; step < MAX_STEPS && !H; step++, g_cycles++) {
+    for (int step = 0; step < g_max_steps && !H; step++, g_cycles++) {
         uint8_t op = read8(pc);
         uint16_t oldpc = pc;
         pc++;
@@ -1014,6 +1015,7 @@ int main(int argc, char **argv)
     int verbose = 0;
     int arch = 3;
     const char *filename = NULL;
+    int maxsteps_override = 0;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-v") == 0) verbose = 1;
@@ -1022,13 +1024,17 @@ int main(int argc, char **argv)
             if (strcmp(argv[i], "cpu4") == 0) arch = 4;
             else arch = 3;
         }
+        else if (strcmp(argv[i], "-maxsteps") == 0 && i+1 < argc) {
+            maxsteps_override = atoi(argv[++i]);
+        }
         else filename = argv[i];
     }
     if (!filename) {
-        fprintf(stderr, "usage: sim_c [-v] [-arch cpu3|cpu4] file.s\n");
+        fprintf(stderr, "usage: sim_c [-v] [-arch cpu3|cpu4] [-maxsteps N] file.s\n");
         return 1;
     }
 
+    if (maxsteps_override > 0) g_max_steps = maxsteps_override;
     char *src = read_file(filename);
     g_assembler_done = 0;
     if (arch == 4) {

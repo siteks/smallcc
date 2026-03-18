@@ -30,6 +30,58 @@ static int vs_depth;             /* current virtual stack depth */
 static int vsp;                  /* running sp - bp offset (starts at -frame_size) */
 
 /* ----------------------------------------------------------------
+ * Forward-branch vsp fixup table
+ *
+ * ssa.c processes the IR linearly, but the IR has control flow.
+ * When a conditional branch (JZ/JNZ) or unconditional jump (J) is
+ * processed, we record the current vsp for the target label.  When
+ * that label is later encountered in the linear scan, we restore vsp
+ * to the recorded value.  This prevents vsp from drifting due to
+ * scope-exit IR_ADJ instructions that belong to one branch arm
+ * "leaking" into the other arm.
+ *
+ * We only need to handle FORWARD branches (label seen after the
+ * jump instruction in the linear scan).  Backward branches go to
+ * labels already processed; recording their vsp is harmless because
+ * those labels won't be processed again.
+ *
+ * All paths to a well-formed label must reach it at the same scope
+ * depth, so the first recorded vsp for a label is used; subsequent
+ * recordings for the same label are ignored.
+ * ---------------------------------------------------------------- */
+#define LABEL_VID_MAX 2048
+
+static int  lvsp_base;                    /* label-ID of first label seen in this function */
+static int  lvsp_val[LABEL_VID_MAX];      /* recorded vsp for each label offset */
+static bool lvsp_set[LABEL_VID_MAX];      /* true if that entry is valid */
+
+static void lvsp_reset(void)
+{
+    lvsp_base = -1;
+    memset(lvsp_set, 0, sizeof(lvsp_set));
+}
+
+/* Record vsp for a jump target (only first recording wins). */
+static void lvsp_record(int label_id, int vsp_val)
+{
+    if (lvsp_base < 0) lvsp_base = label_id;
+    int idx = label_id - lvsp_base;
+    if (idx >= 0 && idx < LABEL_VID_MAX && !lvsp_set[idx]) {
+        lvsp_val[idx] = vsp_val;
+        lvsp_set[idx] = true;
+    }
+}
+
+/* Restore vsp from table when a label is reached (no-op if not recorded). */
+static void lvsp_apply(int label_id)
+{
+    if (lvsp_base < 0) return;
+    int idx = label_id - lvsp_base;
+    if (idx >= 0 && idx < LABEL_VID_MAX && lvsp_set[idx])
+        vsp = lvsp_val[idx];
+}
+
+/* ----------------------------------------------------------------
  * Post-call restore state
  *
  * When a call has outer expression temporaries in scratch registers
@@ -342,6 +394,34 @@ SSAInst *lift_to_ssa(IRInst *ir_head)
                 s = emit_op(SSA_CALLR);
             }
             s->line = p->line;
+
+            /* For 0-arg calls with spilled outer expression temps, restore
+             * immediately.  The normal deferred path waits for a post-call
+             * IR_ADJ +N (caller cleanup), but peephole deletes IR_ADJ 0
+             * before lift_to_ssa() runs, so that ADJ never arrives and
+             * vsp drifts permanently.  Detect this case and fix it now. */
+            if (arg_bytes == 0 && spill_count > 0) {
+                await_post_call_adj = 0;
+                for (int k = 0; k < spill_count; k++) {
+                    SSAInst *ld = emit_op(SSA_LOAD);
+                    ld->rd   = spill_reg[k];
+                    ld->rs1  = -2;
+                    ld->imm  = spill_off[k];
+                    ld->size = spill_sz[k];
+                    ld->line = p->line;
+                }
+                SSAInst *adj2 = emit_op(SSA_ADJ);
+                adj2->imm  = spill_total_bytes;
+                adj2->line = p->line;
+                vsp += spill_total_bytes;
+                for (int k = 0; k < spill_count; k++) {
+                    vs_reg[k]  = spill_reg[k];
+                    vs_size[k] = spill_sz[k];
+                }
+                vs_depth      = spill_count;
+                spill_count   = 0;
+                spill_total_bytes = 0;
+            }
             break;
         }
 
@@ -398,18 +478,21 @@ SSAInst *lift_to_ssa(IRInst *ir_head)
 
         /* ---- Control flow ---- */
         case IR_J:
+            lvsp_record(p->operand, vsp);
             s = emit_op(SSA_J);
             s->imm  = p->operand;
             s->line = p->line;
             break;
 
         case IR_JZ:
+            lvsp_record(p->operand, vsp);
             s = emit_op(SSA_JZ);
             s->imm  = p->operand;
             s->line = p->line;
             break;
 
         case IR_JNZ:
+            lvsp_record(p->operand, vsp);
             s = emit_op(SSA_JNZ);
             s->imm  = p->operand;
             s->line = p->line;
@@ -417,18 +500,25 @@ SSAInst *lift_to_ssa(IRInst *ir_head)
 
         /* ---- Labels ---- */
         case IR_LABEL:
+            /* Restore vsp to the value recorded when a branch to this
+             * label was processed.  This corrects drift caused by the
+             * linear scan traversing a scope-exit IR_ADJ that belongs
+             * to a sibling branch arm (e.g. the non-'%' arm of an
+             * if/else inside a while loop). */
+            lvsp_apply(p->operand);
             s = emit_op(SSA_LABEL);
             s->imm  = p->operand;
             s->line = p->line;
             break;
 
         case IR_SYMLABEL:
-            /* Function entry: reset virtual stack and spill state */
+            /* Function entry: reset virtual stack, spill state, and vsp table */
             vs_depth            = 0;
             vsp                 = 0;
             spill_count         = 0;
             spill_total_bytes   = 0;
             await_post_call_adj = 0;
+            lvsp_reset();
             s = emit_op(SSA_SYMLABEL);
             s->sym  = p->sym;
             s->line = p->line;
