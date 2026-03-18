@@ -219,22 +219,23 @@ static bool peephole_pass(int level)
         }
 
         /* ----------------------------------------------------------------
-         * Rule 9: store/reload elimination
+         * Rule 9: store/reload elimination (CPU3 only)
+         *
+         * This rule exploits the fact that after SW/SB/SL, r0 still holds
+         * the stored value (CPU3 stack-machine invariant).  On CPU4, values
+         * live in named registers and this invariant does not hold.
          *
          * Pattern: LEA N; PUSH; <expr>; SW;  LEA N; LW  → drop LEA N; LW
          *          IMM s; PUSH; <expr>; SW;  IMM s; LW  → drop IMM s; LW
          *          (and likewise for SB/LB and SL/LL)
-         *
-         * After any store instruction (SW/SB/SL) r0 still holds the value
-         * that was just written.  If the next instructions reload from the
-         * exact same address, they produce a value r0 already contains.
          *
          * Correctness guard: scan forward from the PUSH tracking expression
          * stack depth to confirm the store really consumes this address push
          * (depth reaches 0 at SW/SB/SL).  Abort at function calls (JL/JLI)
          * because they may clobber memory, and at BB boundaries.
          * ---------------------------------------------------------------- */
-        if ((p->op == IR_LEA || (p->op == IR_IMM && p->sym)) &&
+        if (g_target_arch == 3 &&
+            (p->op == IR_LEA || (p->op == IR_IMM && p->sym)) &&
             n1 && n1->op == IR_PUSH)
         {
             int depth = 1;

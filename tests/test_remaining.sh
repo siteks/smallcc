@@ -35,6 +35,13 @@ assert 4  "int main(){long x; return sizeof(x);}"
 # sizeof array
 assert 6  "int main(){int a[3]; return sizeof(a);}"
 
+# sizeof struct (tag name, not typedef) — was broken: type_name() didn't call struct_decl
+assert 4  "struct pt{int x;int y;}; int main(){return sizeof(struct pt);}"
+assert 2  "struct s{int v;}; int main(){return sizeof(struct s);}"
+assert 2  "struct s{int v;}; int f(){return sizeof(struct s);} int main(){return f();}"
+# sizeof struct used as array dimension
+assert 8  "struct pt{int x;int y;}; int g[sizeof(struct pt)]; int main(){return sizeof(g);}"
+
 # logical not !
 assert 1  "int main(){return !0;}"
 assert 0  "int main(){return !1;}"

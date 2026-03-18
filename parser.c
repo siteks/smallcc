@@ -641,7 +641,12 @@ static Node *type_name()
         return node;
     }
     parse_decl_specifiers(&ds);
-    if (ds.typespec & DS_ENUM)
+    Node *spec = NULL;
+    if (ds.typespec & (DS_STRUCT | DS_UNION))
+    {
+        spec = struct_decl(&ds, 0);
+    }
+    else if (ds.typespec & DS_ENUM)
     {
         enum_decl(&ds);
     }
@@ -650,7 +655,7 @@ static Node *type_name()
     {
         nl_append(&decls, declarator());
     }
-    Node *node = make_decl_node(&ds, NULL, decls.head);
+    Node *node = make_decl_node(&ds, spec, decls.head);
     node->type = type2_from_decl_node(node, ds);
     DBG_PRINT("%s type:%s\n", __func__, fulltype_str(node->type));
     return node;
@@ -1807,6 +1812,8 @@ static Type *unary_result_type(Node *n)
     return t;
 }
 
+static Node *derive_current_fn;   // forward-declared; definition after derive_types_step
+
 static void derive_types_step(Node *n)
 {
     DBG_PRINT("derive_types: %s\n", node_str(n));
@@ -1862,20 +1869,56 @@ static void derive_types_step(Node *n)
             if (n->type == t_void)  // preserve non-void types already set by parser (e.g. array subscripts)
                 n->type = t;
         }
+        // Function call expressions: type is the return type, not the function type.
+        // Codegen dispatches via symbol->type (not node->type), so this is safe.
+        if (n->kind == ND_IDENT && n->u.ident.is_function)
+        {
+            Type *ft = NULL;
+            if (istype_function(n->type))
+                ft = n->type;
+            else if (istype_ptr(n->type) && istype_function(n->type->u.ptr.pointee))
+                ft = n->type->u.ptr.pointee;
+            if (ft && ft->u.fn.ret && ft->u.fn.ret->base != TB_STRUCT)
+                n->type = ft->u.fn.ret;
+        }
+        if (n->kind == ND_UNARYOP && n->u.unaryop.is_function && istype_function(n->type))
+        {
+            if (n->type->u.fn.ret && n->type->u.fn.ret->base != TB_STRUCT)
+                n->type = n->type->u.fn.ret;
+        }
     }
     if (n->kind == ND_COMPOUND_ASSIGN)
         n->type = n->ch[0]->type;   // lhs
     if (n->kind == ND_RETURNSTMT && n->ch[0])   // expr
     {
-        n->type = parser_ctx.current_function->type->u.fn.ret;
+        if (derive_current_fn)
+            n->type = derive_current_fn->type->u.fn.ret;
+        else if (parser_ctx.current_function)
+            n->type = parser_ctx.current_function->type->u.fn.ret;
         DBG_PRINT("%s found return stmt with expr, type of func:%s:\n", __func__, fulltype_str(n->type));
     }
     DBG_PRINT("derive_types after: %s\n", node_str(n));
 }
 
+// derive_current_fn is forward-declared above derive_types_step
+
+static void derive_types_walk(Node *n);
+static void derive_types_walk_child(Node *child, void *ctx) { (void)ctx; derive_types_walk(child); }
+static void derive_types_walk(Node *n)
+{
+    if (!n) return;
+    Node *saved = derive_current_fn;
+    if (n->kind == ND_DECLARATION && n->u.declaration.is_func_defn)
+        derive_current_fn = n;
+    for_each_child(n, derive_types_walk_child, NULL);
+    derive_types_step(n);
+    derive_current_fn = saved;
+}
+
 void derive_types(Node *root)
 {
-    post_order_walk(root, derive_types_step);
+    derive_current_fn = NULL;
+    derive_types_walk(root);
 }
 
 // --- Pass 3: insert_coercions ---

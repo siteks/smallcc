@@ -4,7 +4,7 @@
 #include "smallcc.h"
 
 
-static FILE *asm_out = NULL;
+FILE *asm_out = NULL;
 
 void set_asm_out(FILE *f)
 {
@@ -17,8 +17,8 @@ void set_asm_out(FILE *f)
 int flag_annotate = 0;
 
 static char       *ann_src  = NULL;   // strdup of the preprocessed source
-static const char **ann_lines = NULL; // ann_lines[i] points to start of line i+1
-static int          ann_nlines = 0;
+const  char      **ann_lines  = NULL; // ann_lines[i] points to start of line i+1
+int                 ann_nlines = 0;
 
 void set_ann_source(const char *src)
 {

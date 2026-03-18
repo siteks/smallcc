@@ -639,14 +639,23 @@ extern CodegenContext codegen_ctx;
 #define current_global_tu (type_ctx.current_tu)
 
 // ---------------------------------------------------------------
+// Target architecture
+// ---------------------------------------------------------------
+// g_target_arch: 3 = cpu3 (default stack machine), 4 = cpu4 (RISC)
+extern int g_target_arch;
+
+// ---------------------------------------------------------------
 // Backend (IR → assembly)
 // ---------------------------------------------------------------
 
+extern FILE *asm_out;
 void set_asm_out(FILE *f);
 void backend_emit_asm(IRInst *ir);
 // Annotation mode (-ann): call with the preprocessed source before backend_emit_asm.
 // Enables source-line and basic-block comments in the assembly output.
-extern int flag_annotate;
+extern int          flag_annotate;
+extern const char **ann_lines;
+extern int          ann_nlines;
 void set_ann_source(const char *src);
 
 // Preprocessor

@@ -1,6 +1,10 @@
 
 #include "smallcc.h"
+#include "ssa.h"
 #include <dirent.h>
+
+/* Target architecture: 3 = cpu3 (default), 4 = cpu4 */
+int g_target_arch = 3;
 #ifdef __APPLE__
 #  include <mach-o/dyld.h>
 #endif
@@ -289,6 +293,17 @@ int main(int argc, char **argv)
             add_include_dir(dir);
             file_start++;
         }
+        else if (strcmp(argv[file_start], "-arch") == 0 && file_start + 1 < argc)
+        {
+            const char *a = argv[file_start + 1];
+            if (strcmp(a, "cpu4") == 0)      g_target_arch = 4;
+            else if (strcmp(a, "cpu3") == 0) g_target_arch = 3;
+            else {
+                fprintf(stderr, "smallcc: unknown arch: %s (use cpu3 or cpu4)\n", a);
+                return 1;
+            }
+            file_start += 2;
+        }
         else
         {
             fprintf(stderr, "smallcc: unknown option: %s\n", argv[file_start]);
@@ -298,7 +313,7 @@ int main(int argc, char **argv)
 
     if (argc <= file_start)
     {
-        fprintf(stderr, "Usage: smallcc [-o outfile] [-E] [-stats] [-ann] [-DNAME[=VAL]] [-Idir] <source.c> [source2.c ...]\n");
+        fprintf(stderr, "Usage: smallcc [-o outfile] [-E] [-stats] [-ann] [-arch cpu3|cpu4] [-DNAME[=VAL]] [-Idir] <source.c> [source2.c ...]\n");
         return 1;
     }
 
@@ -341,7 +356,7 @@ int main(int argc, char **argv)
             fclose(crt0);
         } else {
             fprintf(out, ".text=0\n");
-            fprintf(out, "    ssp     0x1000\n");
+            fprintf(out, "    ssp     0x8000\n");
             fprintf(out, "    jl      main\n");
             fprintf(out, "    halt\n");
         }
@@ -426,7 +441,14 @@ int main(int argc, char **argv)
         gen_ir(node, tu);
         mark_basic_blocks();
         peephole(opt_level);
-        backend_emit_asm(codegen_ctx.ir_head);
+        if (g_target_arch == 4) {
+            SSAInst *ssa = lift_to_ssa(codegen_ctx.ir_head);
+            ssa_peephole(ssa);
+            risc_backend_emit(ssa);
+            free_ssa(ssa);
+        } else {
+            backend_emit_asm(codegen_ctx.ir_head);
+        }
         harvest_globals();
         free(source);
 

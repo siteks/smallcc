@@ -1,7 +1,7 @@
 
 CFLAGS=-std=c11 -g
 
-smallcc: smallcc.c tokeniser.c parser.c types.c codegen.c backend.c preprocess.c optimise.c
+smallcc: smallcc.c tokeniser.c parser.c types.c codegen.c backend.c preprocess.c optimise.c ssa.c risc_backend.c
 sim_c: sim_c.c
 	$(CC) $(CFLAGS) -o sim_c sim_c.c -lm
 test_all: smallcc sim_c test_init test_ops test_logops test_func test_longs test_array test_struct test_loops test_goto test_struct_init test_floats test_compound test_remaining test_typedef test_strings test_enum test_variadic test_funcptr test_preprocess

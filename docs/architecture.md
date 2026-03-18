@@ -374,6 +374,8 @@ Type construction from AST nodes is done by two static helpers in `types.c`:
 
 `type2_from_decl_node(Node *node, DeclParseState ds)` is the public entry point (used by the parser for casts and `sizeof`). It determines the base type from `ds.typespec` (or `ds.typedef_type` when `DS_TYPEDEF` is set) and applies the first declarator child if present.
 
+**`sizeof(struct tag)` / cast to struct type**: `type_name()` in `parser.c` calls `struct_decl(&ds, 0)` after `parse_decl_specifiers` when `DS_STRUCT | DS_UNION` is set. This populates `node->ch[0]` with an `ND_STRUCT` node that carries the tag name. `type2_from_decl_node` then looks up the tag via `find_symbol_st(node->st, tagname, NS_TAG)` to obtain the already-defined struct `Type*`. Without the `struct_decl` call the tag name would be silently consumed by the declarator loop, and without the tag lookup the result would be `t_void` regardless.
+
 `generate_struct_type` in `types.c` builds the `Field` list for a struct type by iterating the member `ND_DECLARATION` nodes stored in the AST. It reads the base type from `d->u.declaration.typespec`; when `DS_TYPEDEF` is set it uses `d->u.declaration.typedef_type` (the resolved `Type*` copied from `DeclParseState.typedef_type` during `add_types_and_symbols`). This `typedef_type` field is necessary because `typespec_to_base` has no way to recover a typedef's underlying type from the bitmask alone.
 
 ### Struct Layout

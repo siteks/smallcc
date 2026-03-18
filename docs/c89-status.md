@@ -37,7 +37,7 @@ Preprocessor excluded. Features are assessed against ANSI C89/ISO C90.
 | Compound assignment `+= -= *= /= %= &= \|= ^= <<= >>=` | ✅ | `ND_COMPOUND_ASSIGN` node in codegen (not desugared); avoids double-evaluation of LHS (e.g. `a[i++] += 1`) |
 | Ternary `? :` | ✅ | ND_TERNARY node; right-associative via `cond_expr()` |
 | Comma operator `,` (in expressions) | ✅ | `expr()` loops on commas; function args use `assign_expr()` |
-| `sizeof` | ⚠️ | `sizeof(type-name)` and `sizeof(ident)` work; `sizeof` applied to any other expression (e.g. `sizeof(*p)`, `sizeof(a[0])`, `sizeof(s.x)`, `sizeof(a+b)`) is not supported |
+| `sizeof` | ⚠️ | `sizeof(type-name)` and `sizeof(ident)` work, including `sizeof(struct tag)` and `sizeof(enum tag)`; `sizeof` applied to any other expression (e.g. `sizeof(*p)`, `sizeof(a[0])`, `sizeof(s.x)`, `sizeof(a+b)`) is not supported |
 | Pre/post `++ --` | ✅ | |
 | Unary `+ - ~ !` | ✅ | |
 | Address-of `&` | ✅ | |
@@ -100,7 +100,7 @@ Preprocessor excluded. Features are assessed against ANSI C89/ISO C90.
 | Integer suffixes `u/U`, `l/L`, `ul/UL` | ✅ | |
 | Floating-point constants | ✅ | Parsed and emitted as IEEE 754 via `immw`/`immwh` pair |
 | Character constants (`'a'`, escape sequences) | ✅ | |
-| String literals (`"…"`) | ✅ | `TK_STRING` token; escape decoding; adjacent concatenation; `char*` type; deferred data emission in codegen pass 3; `char s[]`/`char s[N]` init; assembler extended to resolve labels in `word` directives |
+| String literals (`"…"`) | ✅ | `TK_STRING` token; escape decoding; adjacent concatenation; `char*` type; deferred data emission in codegen pass 3; `char s[]`/`char s[N]` init; assembler extended to resolve labels in `word` directives; global arrays of string-literal pointers (including cast wrappers like `(unsigned char*)"str"`) emit `word label` per element |
 
 ## Functions and Calling Convention
 
@@ -136,7 +136,7 @@ These behaviors are correct for the current 16-bit target (`sizeof(int) == sizeo
 
 ## Summary
 
-**Implemented and working**: basic scalar types, pointers, 1-D/N-D arrays, structs (including assignment, pass by value, and return by value via hidden-pointer ABI), unions, `float`/`double` (IEEE 754 arithmetic, comparisons, int↔float casts), `if`/`while`/`for`/`do-while`, `switch`/`case`/`default`, `break`, `continue`, `goto`, labeled statements, all arithmetic and bitwise operators including `%`, all comparison and logical operators, unary `+ - ~ ! &` and dereference `*`, pre/post-increment/decrement, struct/union member access (`.` and `->`), explicit casts, array subscripting, function definitions and calls (multi-arg, recursive), integer constants (decimal/hex/octal), floating-point constants, string literals, compound assignment (`+=` `-=` `*=` `/=` `%=` `&=` `|=` `^=` `<<=` `>>=`), ternary `?:`, comma operator, `sizeof(type)`/`sizeof(ident)`, `typedef` (scalar/pointer/struct aliases with lexical scoping), `enum` (tagged/anonymous, implicit/explicit/negative values, enum variables, enum constants in expressions and case labels), variadic functions (`va_list`/`va_start`/`va_arg`/`va_end`), function pointers (declare, assign, call via `fp(args)`, `(*fp)(args)`, `s.fp(args)`, `s->fp(args)`, pass as arguments and parameters), per-TU compilation with `static` internal linkage and cross-TU `extern` resolution, `static` local variables (persistent storage in data section, compile-time-constant initializers, independent between functions).
+**Implemented and working**: basic scalar types, pointers, 1-D/N-D arrays, structs (including assignment, pass by value, and return by value via hidden-pointer ABI), unions, `float`/`double` (IEEE 754 arithmetic, comparisons, int↔float casts), `if`/`while`/`for`/`do-while`, `switch`/`case`/`default`, `break`, `continue`, `goto`, labeled statements, all arithmetic and bitwise operators including `%`, all comparison and logical operators, unary `+ - ~ ! &` and dereference `*`, pre/post-increment/decrement, struct/union member access (`.` and `->`), explicit casts, array subscripting, function definitions and calls (multi-arg, recursive), integer constants (decimal/hex/octal), floating-point constants, string literals, compound assignment (`+=` `-=` `*=` `/=` `%=` `&=` `|=` `^=` `<<=` `>>=`), ternary `?:`, comma operator, `sizeof(type)`/`sizeof(ident)`/`sizeof(struct tag)`/`sizeof(enum tag)`, `typedef` (scalar/pointer/struct aliases with lexical scoping), `enum` (tagged/anonymous, implicit/explicit/negative values, enum variables, enum constants in expressions and case labels), variadic functions (`va_list`/`va_start`/`va_arg`/`va_end`), function pointers (declare, assign, call via `fp(args)`, `(*fp)(args)`, `s.fp(args)`, `s->fp(args)`, pass as arguments and parameters), per-TU compilation with `static` internal linkage and cross-TU `extern` resolution, `static` local variables (persistent storage in data section, compile-time-constant initializers, independent between functions), global arrays of pointer-to-string-literal (e.g. `char *names[] = {"a", "b"}` and with casts like `(unsigned char *)"str"`).
 
 **Partially working**: `const`/`volatile` (stored, not enforced), `auto`/`register` (parsed, ignored), integer promotions in function arguments (not applied at call sites; harmless on this target — see Target-Dependent Arithmetic Notes).
 

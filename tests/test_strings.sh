@@ -35,3 +35,12 @@ assert 104  "int main(){char s[]=\"hello\"; return s[0];}"
 
 # multiple strings in one function
 assert 1    "int main(){char *a=\"abc\"; char *b=\"def\"; return a[0]-96;}"
+
+# global array of char* pointers initialised with string literals — was broken: gen_initlist
+# emitted zeros for symbolic addresses; now correctly emits IR_WORD label per element
+assert 97   "char *words[3]={\"foo\",\"bar\",\"baz\"}; int main(){return words[1][1];}"
+assert 102  "char *words[3]={\"foo\",\"bar\",\"baz\"}; int main(){return words[0][0];}"
+assert 98   "char *words[3]={\"foo\",\"bar\",\"baz\"}; int main(){return words[2][0];}"
+
+# same pattern with casts — strips ND_CAST wrapper to find underlying string literal
+assert 120  "typedef unsigned char u8; static u8 *p[3]={(u8*)\"abc\",(u8*)\"xyz\",(u8*)\"123\"}; int main(){return p[1][0];}"

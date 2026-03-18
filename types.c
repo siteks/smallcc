@@ -208,6 +208,45 @@ static Type *type_from_declarator(Node *decl, Type *base)
     return type_from_direct_decl(decl->ch[0], t);   // direct_decl
 }
 
+// Evaluate a compile-time constant integer expression (for array size).
+// Returns the integer value, or 0 if not a constant expression.
+static long long eval_const_expr(Node *n)
+{
+    if (!n) return 0;
+    if (n->kind == ND_LITERAL) return n->u.literal.ival;
+    if (n->kind == ND_IDENT)
+    {
+        /* Enum constants and #define-expanded identifiers that resolve to an
+           integer constant in the current scope.  The symbol table is already
+           populated for enum constants by the time array-size expressions are
+           evaluated inside add_types_and_symbols(). */
+        Symbol *sym = n->st ? find_symbol_st(n->st, n->u.ident.name, NS_IDENT) : NULL;
+        if (sym && sym->kind == SYM_ENUM_CONST) return (long long)sym->offset;
+        return 0;
+    }
+    if (n->kind == ND_BINOP)
+    {
+        long long l = eval_const_expr(n->ch[0]);
+        long long r = eval_const_expr(n->ch[1]);
+        switch (n->op_kind)
+        {
+            case TK_PLUS:    return l + r;
+            case TK_MINUS:   return l - r;
+            case TK_STAR:    return l * r;
+            case TK_SLASH:   return r ? l / r : 0;
+            case TK_PERCENT: return r ? l % r : 0;
+            default: return 0;
+        }
+    }
+    if (n->kind == ND_UNARYOP)
+    {
+        long long v = eval_const_expr(n->ch[0]);
+        if (n->op_kind == TK_MINUS) return -v;
+        if (n->op_kind == TK_PLUS)  return  v;
+    }
+    return 0;
+}
+
 static Type *type_from_direct_decl(Node *dd, Type *base)
 {
     // ch[0]=name (ND_IDENT or ND_DECLARATOR for grouped inner declarators).
@@ -227,15 +266,31 @@ static Type *type_from_direct_decl(Node *dd, Type *base)
         Node *s = suf[i];
         if (s->kind == ND_ARRAY_DECL)
         {
-            int count = (s->ch[0] && s->ch[0]->kind == ND_LITERAL)   // size
-                            ? (int)s->ch[0]->u.literal.ival
-                            : 0;
+            int count = s->ch[0] ? (int)eval_const_expr(s->ch[0]) : 0;
             t         = get_array_type(t, count);
         }
         else if (s->kind == ND_FUNC_DECL)
         {
             bool variadic = s->ch[0] && s->ch[0]->u.ptype_list.is_variadic;
-            t = get_function_type(t, NULL, variadic);
+            // Build Param list from the ND_PTYPE_LIST.
+            // Each param is an ND_DECLARATION whose ->type was already set by
+            // add_types_and_symbols() during param_declaration() in the parser.
+            Param *params = NULL, **pp = &params;
+            if (s->ch[0] && s->ch[0]->ch[0])
+            {
+                for (Node *pd = s->ch[0]->ch[0]; pd; pd = pd->next)
+                {
+                    if (!pd->type || pd->type->base == TB_VOID)
+                        continue;   // skip (void) as single param
+                    Param *p = arena_alloc(sizeof(Param));
+                    p->type  = pd->type;
+                    p->name  = NULL;
+                    p->next  = NULL;
+                    *pp = p;
+                    pp = &p->next;
+                }
+            }
+            t = get_function_type(t, params, variadic);
         }
     }
 
@@ -299,7 +354,21 @@ Type *type2_from_decl_node(Node *node, DeclParseState ds)
     }
     else if (ds.typespec & (DS_STRUCT | DS_UNION))
     {
-        base = (node->type && node->type != t_void) ? node->type : t_void;
+        if (node->type && node->type != t_void)
+        {
+            base = node->type;
+        }
+        else if (node->ch[0] && node->ch[0]->kind == ND_STRUCT && node->ch[0]->ch[0])
+        {
+            /* sizeof(struct tag) or cast to struct type: look up the tag */
+            char   *tagname = node->ch[0]->ch[0]->u.ident.name;
+            Symbol *s       = find_symbol_st(node->st, tagname, NS_TAG);
+            base = (s && s->type && s->type != t_void) ? s->type : t_void;
+        }
+        else
+        {
+            base = t_void;
+        }
     }
     else if (ds.typespec & DS_ENUM)
     {
@@ -741,10 +810,24 @@ void add_types_and_symbols(Node *node, DeclParseState ds, bool is_param, bool is
         const char *ident = get_decl_ident(n);
         Type       *ty    = type_from_declarator(n, base);
         DBG_PRINT("%s declarator ident:'%s' type:%s\n", __func__, ident ? ident : "", fulltype_str(ty));
-        // char s[] = "hello" — fix up zero-size array from string literal init
-        if (ty->base == TB_ARRAY && ty->u.arr.count == 0 && n->ch[1] &&   // init
-            n->ch[1]->u.literal.strval)
-            ty = get_array_type(ty->u.arr.elem, n->ch[1]->u.literal.strval_len + 1);
+        // Fix up zero-size arrays when an initializer provides the count.
+        if (ty->base == TB_ARRAY && ty->u.arr.count == 0 && n->ch[1])
+        {
+            if (n->ch[1]->u.literal.strval)
+            {
+                // char s[] = "hello" — count from string literal
+                ty = get_array_type(ty->u.arr.elem, n->ch[1]->u.literal.strval_len + 1);
+            }
+            else if (n->ch[1]->kind == ND_INITLIST)
+            {
+                // T arr[] = { ... } — count elements in the initializer list
+                int count = 0;
+                for (Node *item = n->ch[1]->ch[0]; item; item = item->next)
+                    count++;
+                if (count > 0)
+                    ty = get_array_type(ty->u.arr.elem, count);
+            }
+        }
         if (first_decl)
         {
             node->type = ty;
@@ -967,9 +1050,13 @@ static Symbol *insert_local_ident(Symbol_table *st, Type *type, const char *iden
     {
         n        = new_symbol(type, ident, st->param_offset);
         n->kind  = SYM_PARAM;
-        // Struct params are passed by pointer (hidden copy ABI): the slot size is WORD_SIZE,
-        // not the struct size. The callee dereferences the pointer transparently.
-        int slot_size = (type->base == TB_STRUCT) ? WORD_SIZE : type->size;
+        // Slot size on the caller's stack: structs use WORD_SIZE (pointer), 4-byte types use 4,
+        // and everything smaller (char, short, int) uses WORD_SIZE because the caller always
+        // uses pushw (2 bytes) for any type smaller than 4 bytes.
+        int slot_size;
+        if (type->base == TB_STRUCT)    slot_size = WORD_SIZE;
+        else if (type->size >= 4)       slot_size = type->size;
+        else                            slot_size = WORD_SIZE;
         st->param_offset += slot_size;
     }
     else

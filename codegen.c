@@ -270,6 +270,21 @@ static void emit_float_bytes(double val)
     memcpy(bytes, &f, 4);
     gen_bytes(bytes, 4);
 }
+
+/* Emit integer data of size 2 or 4 bytes in little-endian order. */
+static void emit_int_data(long long val, int size)
+{
+    if (size == 4) {
+        char bytes[4];
+        bytes[0] = (char)( val        & 0xff);
+        bytes[1] = (char)((val >>  8) & 0xff);
+        bytes[2] = (char)((val >> 16) & 0xff);
+        bytes[3] = (char)((val >> 24) & 0xff);
+        gen_bytes(bytes, 4);
+    } else {
+        ir_append(IR_WORD, (int)(val & 0xffff), NULL);
+    }
+}
 void gen_imm_float(double val)
 {
     float f = (float)val;
@@ -338,8 +353,10 @@ void gen_fill(int offset, int size)
 static int push_struct_arg(Node *arg, int copybuf_lea);
 
 // Push function call args from a linked list (right-to-left onto stack).
+// params: declared parameter list (NULL for unknown/variadic); used to truncate args that
+//         are wider than their declared parameter type (e.g. ee_u32 arg → ee_s16 param).
 // Returns total bytes pushed (not counting copy buffer allocations, which are tracked via adj_depth).
-static int push_args_list(Node *first_arg)
+static int push_args_list(Node *first_arg, Param *params)
 {
     // Collect args into a temporary array for right-to-left pushing
     Node *args[64];
@@ -349,6 +366,12 @@ static int push_args_list(Node *first_arg)
         if (n >= 64) error("Too many function arguments");
         args[n++] = a;
     }
+
+    // Collect declared params into a parallel array (may be shorter than args for variadic fns)
+    Param *param_arr[64];
+    int np = 0;
+    for (Param *p = params; p && np < 64; p = p->next)
+        param_arr[np++] = p;
 
     // Phase 1 (right-to-left): allocate copy buffers for struct args via adj.
     //   This must happen before any pushw so that the param-pointer pushws are contiguous.
@@ -392,10 +415,40 @@ static int push_args_list(Node *first_arg)
         else
         {
             gen_expr(arg);
-            int s = arg->type ? arg->type->size : 0;
+            // For function call expressions, the value in r0 is the return value,
+            // not the function pointer — use return type size for push decision.
+            Type *push_type = arg->type;
+            if (push_type && istype_function(push_type))
+            {
+                bool is_call = (arg->kind == ND_IDENT   && arg->u.ident.is_function)   ||
+                               (arg->kind == ND_UNARYOP && arg->u.unaryop.is_function) ||
+                               (arg->kind == ND_MEMBER  && arg->u.member.is_function);
+                if (is_call && push_type->u.fn.ret)
+                    push_type = push_type->u.fn.ret;
+            }
+            int s = push_type ? push_type->size : 0;
             if (s == 0) s = WORD_SIZE;  // function designator decays to pointer size
-            if (s == 4) { ir_append(IR_PUSH,  0, NULL); param_size += 4; }
-            else        { ir_append(IR_PUSHW, 0, NULL); param_size += WORD_SIZE; }
+            int slot_size = (s == 4) ? 4 : WORD_SIZE;
+
+            // When we know the declared parameter type and the arg is wider than the
+            // param slot (e.g. ee_u32 passed to ee_s16), truncate to the param's slot size.
+            if (i < np && param_arr[i] && param_arr[i]->type &&
+                param_arr[i]->type->base != TB_STRUCT)
+            {
+                int ps = param_arr[i]->type->size;
+                int param_slot = (ps >= 4) ? 4 : WORD_SIZE;
+                if (slot_size == 4 && param_slot == WORD_SIZE)
+                {
+                    // Truncate 32-bit value to 16 bits: push; immw 0xffff; and
+                    ir_append(IR_PUSH, 0, NULL);
+                    ir_append(IR_IMM,  0xffff, NULL);
+                    ir_append(IR_AND,  0, NULL);
+                    slot_size = WORD_SIZE;
+                }
+            }
+
+            if (slot_size == 4) { ir_append(IR_PUSH,  0, NULL); param_size += 4; }
+            else                { ir_append(IR_PUSHW, 0, NULL); param_size += WORD_SIZE; }
         }
     }
     return param_size;
@@ -493,7 +546,7 @@ void gen_callfunction_via_ptr(Node *node)
         ir_append(IR_ADJ, -sz, NULL);
     }
     int adj_before_args = codegen_ctx.adj_depth;
-    int param_size = push_args_list(node->ch[0]);   // user args (right-to-left)
+    int param_size = push_args_list(node->ch[0], fn_type->u.fn.params);   // user args (right-to-left)
     if (struct_ret)
     {
         ir_append(IR_LEA, retbuf_bp_off, NULL);
@@ -532,7 +585,8 @@ void gen_callfunction_via_deref(Node *node)
         ir_append(IR_ADJ, -sz, NULL);
     }
     int adj_before_args = codegen_ctx.adj_depth;
-    int param_size = push_args_list(node->ch[1]);   // user args (right-to-left)
+    Param *deref_params = (fn_type && istype_function(fn_type)) ? fn_type->u.fn.params : NULL;
+    int param_size = push_args_list(node->ch[1], deref_params);   // user args (right-to-left)
     if (struct_ret)
     {
         ir_append(IR_LEA, retbuf_bp_off, NULL);
@@ -578,7 +632,7 @@ void gen_callfunction(Node *node)
     }
     // Push the params on backwards, the offsets from the symbol table then work
     int adj_before_args = codegen_ctx.adj_depth;
-    int param_size = push_args_list(node->ch[0]);   // user args (right-to-left)
+    int param_size = push_args_list(node->ch[0], node->symbol->type->u.fn.params);   // user args (right-to-left)
     if (struct_ret)
     {
         // Push hidden retbuf pointer as the implicit first argument (pushed last,
@@ -933,14 +987,18 @@ void gen_expr(Node *node)
         {
             int is_inc = (node->op_kind == TK_INC);
             int sz = operand->type ? operand->type->size : 2;
+            // For pointer types, stride = sizeof(*ptr); for scalars stride = 1
+            int stride = 1;
+            if (operand->type && (operand->type->base == TB_POINTER || operand->type->base == TB_ARRAY))
+                stride = elem_type(operand->type)->size;
             gen_addr(operand);
             ir_append(IR_PUSH,  0, NULL);         // stack: [&x]
             gen_expr(operand);
             ir_append(IR_PUSH,  0, NULL);         // stack: [&x, x]
-            ir_append(IR_IMM, 1, NULL);
-            if (is_inc) ir_append(IR_ADD,   0, NULL); else ir_append(IR_SUB,   0, NULL);  // r0 = x±1, stack: [&x]
+            ir_append(IR_IMM, stride, NULL);
+            if (is_inc) ir_append(IR_ADD,   0, NULL); else ir_append(IR_SUB,   0, NULL);  // r0 = x±stride, stack: [&x]
             gen_st(sz);
-            // r0 still holds x±1 (sw/sb/sl don't modify r0)
+            // r0 still holds x±stride (sw/sb/sl don't modify r0)
             break;
         }
         // Postfix increment/decrement: x++ / x--
@@ -951,16 +1009,20 @@ void gen_expr(Node *node)
         {
             int is_inc = (node->op_kind == TK_POST_INC);
             int sz = operand->type ? operand->type->size : 2;
+            // For pointer types, stride = sizeof(*ptr); for scalars stride = 1
+            int stride = 1;
+            if (operand->type && (operand->type->base == TB_POINTER || operand->type->base == TB_ARRAY))
+                stride = elem_type(operand->type)->size;
             gen_expr(operand);    // r0 = old_x
             ir_append(IR_PUSH,  0, NULL);         // stack: [old_x]
             gen_addr(operand);    // r0 = &x
             ir_append(IR_PUSH,  0, NULL);         // stack: [old_x, &x]
             gen_expr(operand);    // r0 = x (reload)
             ir_append(IR_PUSH,  0, NULL);         // stack: [old_x, &x, x]
-            ir_append(IR_IMM, 1, NULL);
-            if (is_inc) ir_append(IR_ADD,   0, NULL); else ir_append(IR_SUB,   0, NULL);  // r0 = x±1, stack: [old_x, &x]
+            ir_append(IR_IMM, stride, NULL);
+            if (is_inc) ir_append(IR_ADD,   0, NULL); else ir_append(IR_SUB,   0, NULL);  // r0 = x±stride, stack: [old_x, &x]
             gen_st(sz);
-            // stack: [old_x], r0 = x±1
+            // stack: [old_x], r0 = x±stride
             ir_append(IR_POP,   0, NULL);          // r0 = old_x, stack: []
             break;
         }
@@ -1036,7 +1098,7 @@ void gen_expr(Node *node)
     else if (node->kind == ND_MEMBER && node->u.member.is_function)
     {
         // Call through a function-pointer struct member: s.fp(args) or s->fp(args)
-        int param_size = push_args_list(node->ch[1]);   // args list
+        int param_size = push_args_list(node->ch[1], NULL);   // args list (fn-ptr member: param types unknown)
         gen_addr(node);
         gen_ld(WORD_SIZE);  // load function pointer (pointer-sized)
         ir_append(IR_JLI,   0, NULL);
@@ -1282,6 +1344,9 @@ bool is_constexpr(Node *n)
         return is_constexpr(n->ch[0]) && is_constexpr(n->ch[1]);
     if (n->kind == ND_UNARYOP)
         return is_constexpr(n->ch[0]);   // operand
+    // Cast of a constexpr is also a constexpr (e.g. (ee_u16)0xd4b0)
+    if (n->kind == ND_CAST)
+        return is_constexpr(n->ch[1]);   // ch[1] = expression being cast
     return false;
 }
 int count_constexpr(Node *n)
@@ -1397,6 +1462,8 @@ int int_constexpr(Node *n)
         return int_binop(n);
     if (n->kind == ND_IDENT && n->symbol && n->symbol->kind == SYM_ENUM_CONST)
         return n->symbol->offset;
+    if (n->kind == ND_CAST)
+        return int_constexpr(n->ch[1]);   // evaluate the expression being cast
     return (int)n->u.literal.ival;
 }
 
@@ -1508,15 +1575,55 @@ void gen_initlist(Node *n, Symbol *s)
             if (istype_fp(t))
                 emit_float_bytes(l->u.literal.fval);
             else
-                ir_append(IR_WORD, int_constexpr(l), NULL);
+                emit_int_data(int_constexpr(l), t->size);
         }
         else if (constexpr)
         {
-            char *data = arena_alloc(t->size);
-            gen_mem_inits(data, n, s, 0, 0, 0);
-            gen_bytes(data, t->size);
-        }
+            /* Check if any element is a string-literal pointer (symbolic address).
+               The byte-buffer approach can't hold label references, so emit each
+               element individually in that case. */
+            Type *elem_t = t;
+            while (elem_t->base == TB_ARRAY) elem_t = elem_t->u.arr.elem;
+            bool has_strlit_ptr = false;
+            if (istype_ptr(elem_t))
+            {
+                for (Node *item = n->ch[0]; item; item = item->next)
+                {
+                    Node *lit = item;
+                    while (lit->kind == ND_CAST) lit = lit->ch[1];
+                    if (lit->kind == ND_LITERAL && lit->u.literal.strval) { has_strlit_ptr = true; break; }
+                }
+            }
 
+            if (has_strlit_ptr)
+            {
+                /* Emit each element: string literal (or cast thereof) → word label;
+                   integer constexpr → word value */
+                for (Node *item = n->ch[0]; item; item = item->next)
+                {
+                    /* Strip casts to get to the underlying literal */
+                    Node *lit = item;
+                    while (lit->kind == ND_CAST) lit = lit->ch[1];
+                    if (lit->kind == ND_LITERAL && lit->u.literal.strval)
+                    {
+                        int sid = new_strlit(lit->u.literal.strval, lit->u.literal.strval_len);
+                        char buf[32];
+                        snprintf(buf, sizeof(buf), "_l%d", sid);
+                        ir_append(IR_WORD, 0, arena_strdup(buf));
+                    }
+                    else
+                    {
+                        emit_int_data(int_constexpr(item), elem_t->size);
+                    }
+                }
+            }
+            else
+            {
+                char *data = arena_alloc(t->size);
+                gen_mem_inits(data, n, s, 0, 0, 0);
+                gen_bytes(data, t->size);
+            }
+        }
     }
 }
 
@@ -1646,10 +1753,7 @@ void gen_decl(Node *node)
                         if (istype_fp(n->symbol->type))
                             emit_float_bytes(init->u.literal.fval);
                         else
-                        {
-                            int val = int_constexpr(init);
-                            ir_append(IR_WORD, val, NULL);
-                        }
+                            emit_int_data(int_constexpr(init), n->symbol->type->size);
                     }
                 }
                 else
@@ -1837,10 +1941,7 @@ void gen_ir(Node *node, int tu_index)
             else if (istype_fp(e->sym->type))
                 emit_float_bytes(init->u.literal.fval);
             else
-            {
-                int val = int_constexpr(init);
-                ir_append(IR_WORD, val, NULL);
-            }
+                emit_int_data(int_constexpr(init), e->sym->type->size);
         }
         else
             gen_zeros(e->sym->type->size);

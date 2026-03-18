@@ -173,7 +173,7 @@ Casts are no-ops when src and dst have the same size. Otherwise:
 
 **Scalars**: emits `word value` (or `long` for 4-byte integer types) in the data section. Float scalars emit 4 bytes of IEEE 754 representation via `gen_bytes`.
 
-**Arrays** (global): `gen_mem_inits()` recursively fills a `char data[]` byte buffer, then `gen_bytes()` emits one `byte` directive per byte.
+**Arrays** (global): `gen_mem_inits()` recursively fills a `char data[]` byte buffer, then `gen_bytes()` emits one `byte` directive per byte. **Exception — pointer arrays with string-literal initializers**: a byte buffer cannot hold symbolic label addresses, so `gen_initlist` detects this case (element type is a pointer, any initializer — after stripping `ND_CAST` wrappers — is a string literal) and emits `IR_WORD label` per element instead, where the label is assigned by `new_strlit` and the string data is emitted in pass 3.
 
 **Arrays** (local): `gen_fill(vaddr, size)` zeroes all bytes, then `gen_inits()` recursively emits `lea; push; immw; sw/sl` sequences for non-zero initializers.
 
