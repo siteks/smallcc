@@ -6,6 +6,10 @@ Each .c file may have magic // comments on its leading lines:
     // EXPECT_COMPILE_FAIL
     // EXPECT_STDOUT: hello
     // FILES: lib.c main.c   (multi-TU: all relative to the .c file's directory)
+
+Each test runs against both cpu3 (via sim_c) and cpu4 (via cpu4/sim.py),
+producing items named e.g. recursive_factorial[cpu3] and recursive_factorial[cpu4].
+EXPECT_COMPILE_FAIL tests are arch-independent and run as a single item.
 """
 
 import pytest
@@ -14,6 +18,9 @@ import re
 import os
 import tempfile
 from pathlib import Path
+
+ARCHES = ['cpu3', 'cpu4']
+CPU4_MAXSTEPS = 100_000   # generous limit for recursive/expensive tests
 
 
 def parse_meta(path):
@@ -39,18 +46,28 @@ def pytest_collect_file(parent, file_path):
 
 class CTestFile(pytest.File):
     def collect(self):
-        yield CTestItem.from_parent(self, name=self.path.stem, path=self.path)
+        meta = parse_meta(self.path)
+        if 'EXPECT_COMPILE_FAIL' in meta:
+            # Compile errors are arch-independent; run once
+            yield CTestItem.from_parent(self, name=self.path.stem,
+                                        path=self.path, arch='cpu3')
+        else:
+            for arch in ARCHES:
+                yield CTestItem.from_parent(self, name=arch,
+                                            path=self.path, arch=arch)
 
 
 class CTestItem(pytest.Item):
-    def __init__(self, *, path, **kw):
+    def __init__(self, *, path, arch, **kw):
         super().__init__(**kw)
         self.src_path = path
+        self.arch = arch
         self.meta = parse_meta(path)
 
     def runtest(self):
         meta = self.meta
         src_dir = self.src_path.parent
+        root = Path(__file__).parent.parent
 
         # Resolve file list
         if 'FILES' in meta:
@@ -58,17 +75,16 @@ class CTestItem(pytest.Item):
         else:
             files = [str(self.src_path)]
 
-        # Find project root (two levels up from tests/cases/)
-        root = Path(__file__).parent.parent
-
         with tempfile.TemporaryDirectory() as tmp:
             asm = os.path.join(tmp, 'out.s')
 
-            # Compile
-            proc = subprocess.run(
-                [str(root / 'smallcc'), '-o', asm] + files,
-                capture_output=True, text=True
-            )
+            # Compile (arch flag only for cpu4)
+            compile_cmd = [str(root / 'smallcc'), '-o', asm]
+            if self.arch == 'cpu4':
+                compile_cmd += ['-arch', 'cpu4']
+            compile_cmd += files
+
+            proc = subprocess.run(compile_cmd, capture_output=True, text=True)
 
             if 'EXPECT_COMPILE_FAIL' in meta:
                 assert proc.returncode != 0, \
@@ -78,11 +94,15 @@ class CTestItem(pytest.Item):
             assert proc.returncode == 0, \
                 f"compile failed (exit {proc.returncode}):\n{proc.stderr}"
 
-            # Simulate: putchar → stderr, state line → stdout
-            sim = subprocess.run(
-                [str(root / 'sim_c'), asm],
-                capture_output=True, text=True
-            )
+            # Simulate
+            # Both simulators: putchar → stderr, register state → stdout
+            if self.arch == 'cpu3':
+                sim_cmd = [str(root / 'sim_c'), asm]
+            else:
+                sim_cmd = ['python3', str(root / 'cpu4' / 'sim.py'),
+                           '--maxsteps', str(CPU4_MAXSTEPS), asm]
+
+            sim = subprocess.run(sim_cmd, capture_output=True, text=True)
 
             if 'EXPECT_R0' in meta:
                 m = re.search(r'r0:([0-9a-f]{8})', sim.stdout)
@@ -95,8 +115,6 @@ class CTestItem(pytest.Item):
                     f"r0={r0} (0x{r0 & 0xffffffff:08x}), expected {expected}"
 
             if 'EXPECT_STDOUT' in meta:
-                # putchar output goes to stderr
-                # Interpret escape sequences in the expected string
                 expected_out = meta['EXPECT_STDOUT'].replace('\\n', '\n').replace('\\t', '\t')
                 assert sim.stderr == expected_out, \
                     f"putchar output {sim.stderr!r}, expected {expected_out!r}"

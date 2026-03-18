@@ -45,9 +45,9 @@ if __name__ == "__main__":
     argparser = argparse.ArgumentParser('Dump AST')
     argparser.add_argument('filename', help='name of file to parse')
     argparser.add_argument('-v', '--verbose', action='store_true', help='verbose')
+    argparser.add_argument('--maxsteps', type=int, default=1000, help='max simulation steps')
     args = argparser.parse_args()
 
-    # print(args.verbose)
-    s = runfile(args.filename, verbose=args.verbose)
+    s = runfile(args.filename, maxsteps=args.maxsteps, verbose=args.verbose)
     print(s)
 

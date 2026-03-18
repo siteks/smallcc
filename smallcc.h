@@ -599,6 +599,7 @@ typedef struct CodegenContext {
     int loop_depth;             // current loop nesting level
     int break_labels[64];       // break target stack
     int cont_labels[64];        // continue target stack
+    int loop_adj[64];           // adj_depth at each loop/switch entry (for break/continue cleanup)
     // String literals
     StrLit strlits[MAX_STRLITS];
     int strlit_count;

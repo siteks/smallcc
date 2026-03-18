@@ -1232,6 +1232,7 @@ void gen_whilestmt(Node *node)
     int lbreak  = new_label();
     codegen_ctx.break_labels[codegen_ctx.loop_depth] = lbreak;
     codegen_ctx.cont_labels[codegen_ctx.loop_depth]  = lloop;
+    codegen_ctx.loop_adj[codegen_ctx.loop_depth]     = codegen_ctx.adj_depth;
     codegen_ctx.loop_depth++;
     ir_append(IR_LABEL, lloop, NULL);
     gen_expr(cond);
@@ -1264,6 +1265,7 @@ void gen_forstmt(Node *node)
     int lbreak = new_label();
     codegen_ctx.break_labels[codegen_ctx.loop_depth] = lbreak;
     codegen_ctx.cont_labels[codegen_ctx.loop_depth]  = lcont;
+    codegen_ctx.loop_adj[codegen_ctx.loop_depth]     = codegen_ctx.adj_depth;
     codegen_ctx.loop_depth++;
     ir_append(IR_LABEL, lloop, NULL);
     if (cond->kind != ND_EMPTY) {
@@ -1293,6 +1295,7 @@ void gen_dowhilestmt(Node *node)
     int lbreak = new_label();
     codegen_ctx.break_labels[codegen_ctx.loop_depth] = lbreak;
     codegen_ctx.cont_labels[codegen_ctx.loop_depth]  = lcont;
+    codegen_ctx.loop_adj[codegen_ctx.loop_depth]     = codegen_ctx.adj_depth;
     codegen_ctx.loop_depth++;
     ir_append(IR_LABEL, lloop, NULL);
     gen_stmt(body);
@@ -1306,7 +1309,10 @@ void gen_breakstmt(Node *node)
 {
     if (codegen_ctx.loop_depth == 0)
         src_error(node->line, node->col, "break outside loop or switch");
-    ir_append(IR_J, codegen_ctx.break_labels[codegen_ctx.loop_depth - 1], NULL);
+    int lev     = codegen_ctx.loop_depth - 1;
+    int cleanup = codegen_ctx.adj_depth - codegen_ctx.loop_adj[lev];
+    if (cleanup > 0) ir_append(IR_ADJ, cleanup, NULL);
+    ir_append(IR_J, codegen_ctx.break_labels[lev], NULL);
 }
 void gen_continuestmt(Node *node)
 {
@@ -1316,6 +1322,8 @@ void gen_continuestmt(Node *node)
     {
         if (codegen_ctx.cont_labels[i] >= 0)
         {
+            int cleanup = codegen_ctx.adj_depth - codegen_ctx.loop_adj[i];
+            if (cleanup > 0) ir_append(IR_ADJ, cleanup, NULL);
             ir_append(IR_J, codegen_ctx.cont_labels[i], NULL);
             return;
         }
@@ -1827,6 +1835,7 @@ void gen_switchstmt(Node *node)
     // Phase 2: emit body with case codegen_ctx.label_counter
     codegen_ctx.break_labels[codegen_ctx.loop_depth] = lbreak;
     codegen_ctx.cont_labels[codegen_ctx.loop_depth]  = -1;
+    codegen_ctx.loop_adj[codegen_ctx.loop_depth]     = codegen_ctx.adj_depth;
     codegen_ctx.loop_depth++;
     codegen_ctx.adj_depth += body->symtable->size;
     ir_append(IR_ADJ, -body->symtable->size, NULL);

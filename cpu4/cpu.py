@@ -409,7 +409,7 @@ class CPU:
         elif    i == 'itof':    iv = s.r[0] if s.r[0] < 0x80000000 else s.r[0] - 0x100000000; s.r[0] = f2b(float(iv))
         elif    i == 'ftoi':    s.r[0] = int(b2f(s.r[0])) & 0xffffffff
         elif    i == 'jlr':     s.pc, s.lr = s.r[0], s.pc
-        elif    i == 'putchar': sys.stdout.write(chr(s.r[0] & 0xff)); sys.stdout.flush()
+        elif    i == 'putchar': sys.stderr.write(chr(s.r[0] & 0xff)); sys.stderr.flush()
         # f1a
         elif    i == 'add':     s.r[dst] = s.r[src0] + s.r[src1]
         elif    i == 'sub':     s.r[dst] = s.r[src0] - s.r[src1]
