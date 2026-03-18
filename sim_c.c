@@ -1,9 +1,10 @@
 /*
- * sim_c.c — CPU3 assembler + simulator
+ * sim_c.c — CPU3/CPU4 assembler + simulator
  *
- * Usage:  ./sim_c [-v] file.s
+ * Usage:  ./sim_c [-v] [-arch cpu3|cpu4] file.s
  * Output: putchar to stderr; state line to stdout
- *         r0:XXXXXXXX sp:XXXX bp:XXXX lr:XXXX pc:XXXX H:X
+ *   cpu3:  r0:XXXXXXXX sp:XXXX bp:XXXX lr:XXXX pc:XXXX H:X cycles:N
+ *   cpu4:  r0:..r7:XXXXXXXX sp:XXXX bp:XXXX lr:XXXX pc:XXXX H:X cycles:N
  */
 
 #include <stdio.h>
@@ -29,9 +30,17 @@ static uint8_t mmio_read8(uint16_t a) {
     return 0;
 }
 
-static void   write8 (uint16_t a, uint8_t  v) { if (a >= MMIO_BASE) return; mem[a] = v; }
-static void   write16(uint16_t a, uint16_t v) { if (a >= MMIO_BASE) return; mem[a]=(uint8_t)v; mem[(uint16_t)(a+1)]=(uint8_t)(v>>8); }
-static void   write32(uint16_t a, uint32_t v) { if (a >= MMIO_BASE) return; write16(a,(uint16_t)v); write16((uint16_t)(a+2),(uint16_t)(v>>16)); }
+static uint16_t g_watch_pc = 0; /* set to pc of instruction being executed */
+static uint32_t g_watch_r0 = 0;
+static uint16_t g_watch_sp = 0, g_watch_bp = 0;
+/* Print writes to addresses < 0x5000 (code/data area, not stack) after assembler init */
+static int g_assembler_done = 0;
+static void write8_inner (uint16_t a, uint8_t  v) { if (a >= MMIO_BASE) return; if (g_assembler_done && a < 0x5000) fprintf(stderr, "  WRITE8 to %04x = %02x  at pc=%04x sp=%04x bp=%04x r0=%08x\n", a, v, g_watch_pc, g_watch_sp, g_watch_bp, g_watch_r0); mem[a] = v; }
+static void write16_inner(uint16_t a, uint16_t v) { if (a >= MMIO_BASE) return; if (g_assembler_done && a < 0x5000) fprintf(stderr, "  WRITE16 to %04x = %04x  at pc=%04x sp=%04x bp=%04x r0=%08x\n", a, v, g_watch_pc, g_watch_sp, g_watch_bp, g_watch_r0); mem[a]=(uint8_t)v; mem[(uint16_t)(a+1)]=(uint8_t)(v>>8); }
+static void write32_inner(uint16_t a, uint32_t v) { if (a >= MMIO_BASE) return; if (g_assembler_done && a < 0x5000) fprintf(stderr, "  WRITE32 to %04x = %08x  at pc=%04x sp=%04x bp=%04x r0=%08x\n", a, v, g_watch_pc, g_watch_sp, g_watch_bp, g_watch_r0); write16_inner(a,(uint16_t)v); write16_inner((uint16_t)(a+2),(uint16_t)(v>>16)); }
+#define write8  write8_inner
+#define write16 write16_inner
+#define write32 write32_inner
 static uint8_t  read8 (uint16_t a) { if (a >= MMIO_BASE) return mmio_read8(a); return mem[a]; }
 static uint16_t read16(uint16_t a) { if (a >= MMIO_BASE) return (uint16_t)mmio_read8(a) | ((uint16_t)mmio_read8((uint16_t)(a+1))<<8); return (uint16_t)mem[a] | ((uint16_t)mem[(uint16_t)(a+1)] << 8); }
 static uint32_t read32(uint16_t a) { if (a >= MMIO_BASE) return (uint32_t)mmio_read8(a)|((uint32_t)mmio_read8((uint16_t)(a+1))<<8)|((uint32_t)mmio_read8((uint16_t)(a+2))<<16)|((uint32_t)mmio_read8((uint16_t)(a+3))<<24); return (uint32_t)read16(a) | ((uint32_t)read16((uint16_t)(a+2)) << 16); }
@@ -102,6 +111,104 @@ static const Instr *find_instr(const char *n)
     for (int i = 0; itab[i].name; i++)
         if (strcmp(itab[i].name, n) == 0) return &itab[i];
     return NULL;
+}
+
+/* ------------------------------------------------------------------ */
+/* CPU4 instruction table                                               */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    const char *name;
+    uint8_t     first_byte;
+    int         extra;   /* extra bytes: 0, 1, or 2 */
+    int         subfmt;  /* 0=F0/F1a/F2/F3a, 1=F1b/F3b, 2=F3c */
+    int         subop;   /* F1b: subopcode in byte1[5:0] */
+} Instr4;
+
+static const Instr4 itab4[] = {
+    /* F0 — 1 byte, no operands */
+    {"halt",   0x00,0,0,0}, {"ret",    0x01,0,0,0},
+    {"itof",   0x02,0,0,0}, {"ftoi",   0x03,0,0,0},
+    {"jlr",    0x04,0,0,0}, {"putchar",0x1e,0,0,0},
+    /* F1a — 2 bytes, rd rx ry */
+    {"add",    0x40,1,0,0}, {"sub",    0x42,1,0,0},
+    {"mul",    0x44,1,0,0}, {"div",    0x46,1,0,0},
+    {"mod",    0x48,1,0,0}, {"shl",    0x4a,1,0,0},
+    {"shr",    0x4c,1,0,0}, {"lt",     0x4e,1,0,0},
+    {"gt",     0x50,1,0,0}, {"eq",     0x52,1,0,0},
+    {"ne",     0x54,1,0,0}, {"and",    0x56,1,0,0},
+    {"or",     0x58,1,0,0}, {"xor",    0x5a,1,0,0},
+    {"lts",    0x5c,1,0,0}, {"gts",    0x5e,1,0,0},
+    {"divs",   0x60,1,0,0}, {"mods",   0x62,1,0,0},
+    {"shrs",   0x64,1,0,0}, {"fadd",   0x66,1,0,0},
+    {"fsub",   0x68,1,0,0}, {"fmul",   0x6a,1,0,0},
+    {"fdiv",   0x6c,1,0,0}, {"flt",    0x6e,1,0,0},
+    {"fgt",    0x70,1,0,0},
+    /* F1b — 2 bytes, rd only; subop distinguishes the operation */
+    {"sxb",    0x7e,1,1,0x00}, {"sxw",   0x7e,1,1,0x01},
+    /* F2 — 2 bytes, rx imm7 (bp-relative; imm scaled by access width) */
+    {"lb",     0x80,1,0,0}, {"lw",     0x84,1,0,0},
+    {"ll",     0x88,1,0,0}, {"sb",     0x8c,1,0,0},
+    {"sw",     0x90,1,0,0}, {"sl",     0x94,1,0,0},
+    {"lbx",    0x98,1,0,0}, {"lwx",    0x9c,1,0,0},
+    {"addi",   0xa0,1,0,0},
+    /* F3a — 3 bytes, imm16 only */
+    {"j",      0xc0,2,0,0}, {"jl",     0xc1,2,0,0},
+    {"jz",     0xc2,2,0,0}, {"jnz",    0xc3,2,0,0},
+    {"enter",  0xc4,2,0,0}, {"ssp",    0xc5,2,0,0},
+    {"adjw",   0xc6,2,0,0},
+    /* F3b — 3 bytes, rx ry imm10 */
+    {"llb",    0xd0,2,1,0}, {"llw",    0xd1,2,1,0},
+    {"lll",    0xd2,2,1,0}, {"slb",    0xd3,2,1,0},
+    {"slw",    0xd4,2,1,0}, {"sll",    0xd5,2,1,0},
+    {"llbx",   0xd6,2,1,0}, {"llwx",   0xd7,2,1,0},
+    {"beq",    0xd8,2,1,0}, {"bne",    0xd9,2,1,0},
+    {"blt",    0xda,2,1,0}, {"bgt",    0xdb,2,1,0},
+    {"blts",   0xdc,2,1,0}, {"bgts",   0xdd,2,1,0},
+    {"addli",  0xde,2,1,0},
+    /* F3c — 3 bytes, rd imm16 */
+    {"immw",   0xe8,2,2,0}, {"immwh",  0xf0,2,2,0},
+    {"lea",    0xf8,2,2,0},
+    {NULL,0,0,0,0}
+};
+
+static const Instr4 *find_instr4(const char *n)
+{
+    for (int i = 0; itab4[i].name; i++)
+        if (strcmp(itab4[i].name, n) == 0) return &itab4[i];
+    return NULL;
+}
+
+static int is_branch4(const char *n)
+{
+    return !strcmp(n,"beq") || !strcmp(n,"bne") || !strcmp(n,"blt") ||
+           !strcmp(n,"bgt") || !strcmp(n,"blts") || !strcmp(n,"bgts");
+}
+
+static int parse_reg4(const char *s)
+{
+    if (s[0] == 'r' && s[1] >= '0' && s[1] <= '7' && s[2] == '\0')
+        return s[1] - '0';
+    return -1;
+}
+
+/* Split on commas and/or whitespace — for CPU4 operand lists. */
+static int tokenize4(const char *s, char toks[][MAX_NAME], int max)
+{
+    int n = 0;
+    const char *p = s;
+    while (*p && n < max) {
+        while (*p && (isspace((unsigned char)*p) || *p == ',')) p++;
+        if (!*p) break;
+        const char *start = p;
+        while (*p && !isspace((unsigned char)*p) && *p != ',') p++;
+        size_t len = (size_t)(p - start);
+        if (len >= MAX_NAME) len = MAX_NAME - 1;
+        strncpy(toks[n], start, len);
+        toks[n][len] = '\0';
+        n++;
+    }
+    return n;
 }
 
 /* ------------------------------------------------------------------ */
@@ -330,10 +437,431 @@ static float  bits2float(uint32_t b) { float f; memcpy(&f, &b, 4); return f; }
 static uint32_t float2bits(float f)  { uint32_t b; memcpy(&b, &f, 4); return b; }
 
 /* ------------------------------------------------------------------ */
-/* CPU                                                                  */
+/* CPU4 assembler                                                       */
+/* ------------------------------------------------------------------ */
+
+static void assemble_cpu4(const char *src)
+{
+    size_t srclen = strlen(src);
+    char *buf = malloc(srclen + 2);
+    if (!buf) { fprintf(stderr, "oom\n"); exit(1); }
+    memcpy(buf, src, srclen + 1);
+
+    for (int pass = 1; pass <= 2; pass++) {
+        int cur = 0;
+        char *p = buf;
+        while (*p) {
+            char *eol = strchr(p, '\n');
+            char line[512];
+            size_t linelen;
+            if (eol) {
+                linelen = (size_t)(eol - p);
+                if (linelen >= sizeof(line)) linelen = sizeof(line)-1;
+                strncpy(line, p, linelen);
+                line[linelen] = '\0';
+                p = eol + 1;
+            } else {
+                strncpy(line, p, sizeof(line)-1);
+                line[sizeof(line)-1] = '\0';
+                p += strlen(p);
+            }
+            strip_comment(line);
+            if (line[0] == '\0') continue;
+
+            char *lp = line;
+
+            /* Section directive */
+            if (lp[0] == '.') {
+                char *eq = strchr(lp, '=');
+                if (eq) cur = (int)strtol(eq+1, NULL, 0);
+                continue;
+            }
+
+            /* Label */
+            if (!isspace((unsigned char)lp[0])) {
+                char *colon = strchr(lp, ':');
+                if (colon) {
+                    char lname[MAX_NAME];
+                    size_t nlen = (size_t)(colon - lp);
+                    if (nlen >= MAX_NAME) nlen = MAX_NAME-1;
+                    strncpy(lname, lp, nlen);
+                    lname[nlen] = '\0';
+                    for (char *c = lname; *c; c++)
+                        if (isspace((unsigned char)*c)) { *c = '\0'; break; }
+                    if (pass == 1) add_sym(lname, (uint16_t)cur);
+                    lp = colon + 1;
+                    while (*lp && isspace((unsigned char)*lp)) lp++;
+                    if (*lp == '\0') continue;
+                }
+            } else {
+                while (*lp && isspace((unsigned char)*lp)) lp++;
+                if (*lp == '\0') continue;
+            }
+
+            /* Split mnemonic from operand string */
+            char mnem[MAX_NAME] = {0};
+            const char *mp = lp;
+            while (*mp && !isspace((unsigned char)*mp)) mp++;
+            size_t mlen = (size_t)(mp - lp);
+            if (mlen >= MAX_NAME) mlen = MAX_NAME-1;
+            strncpy(mnem, lp, mlen);
+            while (*mp && isspace((unsigned char)*mp)) mp++;
+
+            /* Tokenize comma-separated operands */
+            char ops[8][MAX_NAME];
+            int nops = tokenize4(mp, ops, 8);
+
+            /* Directives */
+            if (strcmp(mnem, "align") == 0) {
+                if (cur & 1) { if (pass == 2) write8((uint16_t)cur, 0); cur++; }
+                continue;
+            }
+            if (strcmp(mnem, "allocb") == 0) {
+                int n = (nops > 0) ? (int)strtol(ops[0], NULL, 0) : 0;
+                cur += n; continue;
+            }
+            if (strcmp(mnem, "allocw") == 0) {
+                int n = (nops > 0) ? (int)strtol(ops[0], NULL, 0) : 0;
+                if (cur & 1) cur++;
+                cur += n * 2; continue;
+            }
+            if (strcmp(mnem, "byte") == 0) {
+                for (int i = 0; i < nops; i++) {
+                    if (pass == 2) write8((uint16_t)cur, (uint8_t)parse_tok(ops[i], pass));
+                    cur++;
+                }
+                continue;
+            }
+            if (strcmp(mnem, "word") == 0) {
+                for (int i = 0; i < nops; i++) {
+                    if (pass == 2) write16((uint16_t)cur, (uint16_t)parse_tok(ops[i], pass));
+                    cur += 2;
+                }
+                continue;
+            }
+            if (strcmp(mnem, "long") == 0) {
+                for (int i = 0; i < nops; i++) {
+                    if (pass == 2) write32((uint16_t)cur, parse_tok(ops[i], pass));
+                    cur += 4;
+                }
+                continue;
+            }
+            if (strcmp(mnem, "clearmem") == 0) continue;
+
+            /* Pseudo-ops */
+            char real_mnem[MAX_NAME];
+            strncpy(real_mnem, mnem, MAX_NAME-1);
+            real_mnem[MAX_NAME-1] = '\0';
+            if (strcmp(mnem, "mov") == 0 && nops >= 2) {
+                /* mov rd, rx  →  or rd, rx, rx */
+                strcpy(real_mnem, "or");
+                strncpy(ops[2], ops[1], MAX_NAME-1);
+                nops = 3;
+            } else if (nops >= 3 && (strcmp(mnem,"ble")==0 || strcmp(mnem,"bge")==0 ||
+                                     strcmp(mnem,"bles")==0 || strcmp(mnem,"bges")==0)) {
+                /* swap rx,ry and pick opposite branch */
+                char tmp[MAX_NAME];
+                strncpy(tmp,    ops[0], MAX_NAME-1);
+                strncpy(ops[0], ops[1], MAX_NAME-1);
+                strncpy(ops[1], tmp,    MAX_NAME-1);
+                if      (strcmp(mnem,"ble") ==0) strcpy(real_mnem,"bgt");
+                else if (strcmp(mnem,"bge") ==0) strcpy(real_mnem,"blt");
+                else if (strcmp(mnem,"bles")==0) strcpy(real_mnem,"bgts");
+                else                             strcpy(real_mnem,"blts");
+            }
+
+            const Instr4 *instr = find_instr4(real_mnem);
+            if (!instr) {
+                fprintf(stderr, "cpu4 asm: unknown mnemonic: %s\n", real_mnem);
+                exit(1);
+            }
+
+            int instr_addr = cur;
+            int instr_len  = 1 + instr->extra;
+
+            if (instr->extra == 0) {
+                /* F0: opcode only */
+                if (pass == 2) write8((uint16_t)cur, instr->first_byte);
+                cur++;
+            } else if (instr->extra == 1 && instr->subfmt == 1) {
+                /* F1b: rd only */
+                int rd2 = (nops > 0) ? parse_reg4(ops[0]) : 0;
+                uint8_t b0 = instr->first_byte | (uint8_t)(rd2 >> 2);
+                uint8_t b1 = (uint8_t)(((rd2 & 3) << 6) | (instr->subop & 0x3f));
+                if (pass == 2) { write8((uint16_t)cur, b0); write8((uint16_t)(cur+1), b1); }
+                cur += 2;
+            } else if (instr->extra == 1 && (instr->first_byte & 0xc0) == 0x40) {
+                /* F1a: rd, rx, ry */
+                int rd2 = (nops > 0) ? parse_reg4(ops[0]) : 0;
+                int rx2 = (nops > 1) ? parse_reg4(ops[1]) : 0;
+                int ry2 = (nops > 2) ? parse_reg4(ops[2]) : 0;
+                uint8_t b0 = instr->first_byte | (uint8_t)(rd2 >> 2);
+                uint8_t b1 = (uint8_t)(((rd2 & 3) << 6) | (rx2 << 3) | ry2);
+                if (pass == 2) { write8((uint16_t)cur, b0); write8((uint16_t)(cur+1), b1); }
+                cur += 2;
+            } else if (instr->extra == 1 && (instr->first_byte & 0xc0) == 0x80) {
+                /* F2: rx, imm7 */
+                int rx2 = (nops > 0) ? parse_reg4(ops[0]) : 0;
+                int32_t imm7 = (nops > 1) ? (int32_t)strtol(ops[1], NULL, 0) : 0;
+                uint8_t b0 = instr->first_byte | (uint8_t)(rx2 >> 1);
+                uint8_t b1 = (uint8_t)(((rx2 & 1) << 7) | (imm7 & 0x7f));
+                if (pass == 2) { write8((uint16_t)cur, b0); write8((uint16_t)(cur+1), b1); }
+                cur += 2;
+            } else if (instr->extra == 2 && instr->subfmt == 0) {
+                /* F3a: imm16 only */
+                uint16_t imm16 = (nops > 0) ? (uint16_t)parse_tok(ops[0], pass) : 0;
+                if (pass == 2) {
+                    write8((uint16_t)cur,   instr->first_byte);
+                    write8((uint16_t)(cur+1), (uint8_t)(imm16 >> 8));
+                    write8((uint16_t)(cur+2), (uint8_t)(imm16 & 0xff));
+                }
+                cur += 3;
+            } else if (instr->extra == 2 && instr->subfmt == 1) {
+                /* F3b: rx, ry, imm10 */
+                int rx2 = (nops > 0) ? parse_reg4(ops[0]) : 0;
+                int ry2 = (nops > 1) ? parse_reg4(ops[1]) : 0;
+                int32_t imm10;
+                if (is_branch4(real_mnem)) {
+                    uint16_t tgt = (pass == 2 && nops > 2) ? (uint16_t)parse_tok(ops[2], pass) : 0;
+                    imm10 = (int32_t)tgt - (instr_addr + instr_len);
+                } else {
+                    imm10 = (nops > 2) ? (int32_t)strtol(ops[2], NULL, 0) : 0;
+                }
+                imm10 &= 0x3ff;
+                uint8_t b0 = instr->first_byte;
+                uint8_t b1 = (uint8_t)((rx2 << 5) | (ry2 << 2) | ((imm10 >> 8) & 3));
+                uint8_t b2 = (uint8_t)(imm10 & 0xff);
+                if (pass == 2) {
+                    write8((uint16_t)cur,   b0);
+                    write8((uint16_t)(cur+1), b1);
+                    write8((uint16_t)(cur+2), b2);
+                }
+                cur += 3;
+            } else if (instr->extra == 2 && instr->subfmt == 2) {
+                /* F3c: rd, imm16 */
+                int rd2 = (nops > 0) ? parse_reg4(ops[0]) : 0;
+                uint16_t imm16 = (nops > 1) ? (uint16_t)parse_tok(ops[1], pass) : 0;
+                uint8_t b0 = (instr->first_byte & 0xf8u) | (uint8_t)(rd2 & 7);
+                if (pass == 2) {
+                    write8((uint16_t)cur,   b0);
+                    write8((uint16_t)(cur+1), (uint8_t)(imm16 >> 8));
+                    write8((uint16_t)(cur+2), (uint8_t)(imm16 & 0xff));
+                }
+                cur += 3;
+            } else {
+                fprintf(stderr, "cpu4 asm: unhandled format for %s\n", real_mnem);
+                exit(1);
+            }
+        }
+    }
+    free(buf);
+}
+
+/* ------------------------------------------------------------------ */
+/* CPU4 sign-extension helpers                                          */
 /* ------------------------------------------------------------------ */
 
 #define MAX_STEPS 100000000
+
+static int32_t sx7 (int32_t v) { v &= 0x7f;  return (v >= 64)  ? v - 128  : v; }
+static int32_t sx10(int32_t v) { v &= 0x3ff; return (v >= 512) ? v - 1024 : v; }
+static int32_t sx16(int32_t v) { return (int32_t)(int16_t)(v & 0xffff); }
+
+/* ------------------------------------------------------------------ */
+/* CPU4 executor                                                        */
+/* ------------------------------------------------------------------ */
+
+static void run_cpu4(int verbose)
+{
+    uint32_t r[8] = {0};
+    uint16_t sp = 0, bp = 0, lr = 0, pc = 0;
+    int H = 0;
+    g_cycles = 0;
+
+    enum { TRACE_N4 = 32 };
+    struct { uint16_t pc; uint8_t op; uint32_t r0; uint16_t sp, bp; } trace[TRACE_N4];
+    int trace_idx = 0;
+
+    for (int step = 0; step < MAX_STEPS && !H; step++, g_cycles++) {
+        uint8_t  b0 = read8(pc);
+        uint16_t oldpc = pc;
+        pc++;
+
+        uint8_t  b1 = 0, b2 = 0;
+        int      rd = 0, rx = 0, ry = 0;
+        int32_t  imm = 0;
+        uint8_t  lookupop;
+        int      subop = 0;
+        uint8_t  fmt2 = b0 >> 6;
+
+        if (fmt2 == 0) {
+            /* F0: 1 byte */
+            lookupop = b0;
+        } else if (fmt2 == 1) {
+            /* F1a or F1b: 2 bytes */
+            b1 = read8(pc); pc++;
+            uint16_t ins16 = ((uint16_t)b0 << 8) | b1;
+            if ((b0 & 0xfe) == 0x7e) {
+                /* F1b */
+                lookupop = 0x7e;
+                rd       = (ins16 >> 6) & 0x7;
+                subop    = b1 & 0x3f;
+            } else {
+                /* F1a */
+                lookupop = b0 & 0xfe;
+                rd = (ins16 >> 6) & 0x7;
+                rx = (ins16 >> 3) & 0x7;
+                ry =  ins16       & 0x7;
+            }
+        } else if (fmt2 == 2) {
+            /* F2: 2 bytes, bp-relative */
+            b1 = read8(pc); pc++;
+            uint16_t ins16 = ((uint16_t)b0 << 8) | b1;
+            lookupop = b0 & 0xfc;
+            rd = rx  = (ins16 >> 7) & 0x7;
+            imm      =  ins16       & 0x7f;  /* raw 7-bit; scaled per instruction */
+        } else {
+            /* F3a / F3b / F3c: 3 bytes */
+            b1 = read8(pc); pc++;
+            b2 = read8(pc); pc++;
+            uint32_t ins24 = ((uint32_t)b0 << 16) | ((uint32_t)b1 << 8) | b2;
+            if ((b0 & 0xf0) == 0xc0) {
+                /* F3a */
+                lookupop = b0;
+                imm      = (int32_t)(uint32_t)(((uint16_t)b1 << 8) | b2);
+            } else if ((b0 & 0xf0) == 0xd0) {
+                /* F3b */
+                lookupop = b0;
+                rd = rx  = (ins24 >> 13) & 0x7;
+                ry       = (ins24 >> 10) & 0x7;
+                imm      = (int32_t)(ins24 & 0x3ff);
+            } else {
+                /* F3c (0xe0-0xff) */
+                lookupop = b0 & 0xf8;
+                rd       =  b0 & 0x7;
+                imm      = (int32_t)(uint32_t)(((uint16_t)b1 << 8) | b2);
+            }
+        }
+
+        g_watch_pc = oldpc; g_watch_r0 = r[0]; g_watch_sp = sp; g_watch_bp = bp;
+        trace[trace_idx].pc = oldpc; trace[trace_idx].op = b0;
+        trace[trace_idx].r0 = r[0]; trace[trace_idx].sp = sp; trace[trace_idx].bp = bp;
+        trace_idx = (trace_idx + 1) % TRACE_N4;
+
+        if (verbose) {
+            fprintf(stderr, "[%04x] op=%02x r0=%08x r1=%08x r2=%08x r3=%08x sp=%04x bp=%04x\n",
+                    oldpc, b0, r[0], r[1], r[2], r[3], sp, bp);
+        }
+
+        switch (lookupop) {
+        /* F0 */
+        case 0x00: H = 1; break;  /* halt */
+        case 0x01:                /* ret */
+            sp = bp;
+            bp = (uint16_t)read32(sp);
+            pc = (uint16_t)read32((uint16_t)(sp+4));
+            sp = (uint16_t)(sp + 8);
+            break;
+        case 0x02: { int32_t iv=(r[0]<0x80000000u)?(int32_t)r[0]:(int32_t)(r[0]-0x100000000ull); r[0]=float2bits((float)iv); } break; /* itof */
+        case 0x03: { float f=bits2float(r[0]); r[0]=(uint32_t)(int32_t)f; } break; /* ftoi */
+        case 0x04: { uint16_t t=pc; pc=(uint16_t)(r[0]&0xffff); lr=t; } break; /* jlr */
+        case 0x1e: fputc((int)(r[0]&0xff),stderr); fflush(stderr); break; /* putchar */
+        /* F1a */
+        case 0x40: r[rd]=r[rx]+r[ry]; break;  /* add */
+        case 0x42: r[rd]=r[rx]-r[ry]; break;  /* sub */
+        case 0x44: r[rd]=r[rx]*r[ry]; break;  /* mul */
+        case 0x46: r[rd]=r[ry]?r[rx]/r[ry]:0; break;  /* div */
+        case 0x48: r[rd]=r[ry]?r[rx]%r[ry]:0; break;  /* mod */
+        case 0x4a: r[rd]=r[rx]<<(r[ry]&31); break;    /* shl */
+        case 0x4c: r[rd]=r[rx]>>(r[ry]&31); break;    /* shr */
+        case 0x4e: r[rd]=(r[rx]<r[ry])?1:0; break;    /* lt  */
+        case 0x50: r[rd]=(r[rx]>r[ry])?1:0; break;    /* gt  */
+        case 0x52: r[rd]=(r[rx]==r[ry])?1:0; break;   /* eq  */
+        case 0x54: r[rd]=(r[rx]!=r[ry])?1:0; break;   /* ne  */
+        case 0x56: r[rd]=r[rx]&r[ry]; break;  /* and */
+        case 0x58: r[rd]=r[rx]|r[ry]; break;  /* or  */
+        case 0x5a: r[rd]=r[rx]^r[ry]; break;  /* xor */
+        case 0x5c: r[rd]=((int32_t)r[rx]<(int32_t)r[ry])?1:0; break; /* lts */
+        case 0x5e: r[rd]=((int32_t)r[rx]>(int32_t)r[ry])?1:0; break; /* gts */
+        case 0x60: r[rd]=(uint32_t)(r[ry]?(int32_t)r[rx]/(int32_t)r[ry]:0); break; /* divs */
+        case 0x62: r[rd]=(uint32_t)(r[ry]?(int32_t)r[rx]%(int32_t)r[ry]:0); break; /* mods */
+        case 0x64: r[rd]=(uint32_t)((int32_t)r[rx]>>(r[ry]&31)); break; /* shrs */
+        case 0x66: r[rd]=float2bits(bits2float(r[rx])+bits2float(r[ry])); break; /* fadd */
+        case 0x68: r[rd]=float2bits(bits2float(r[rx])-bits2float(r[ry])); break; /* fsub */
+        case 0x6a: r[rd]=float2bits(bits2float(r[rx])*bits2float(r[ry])); break; /* fmul */
+        case 0x6c: r[rd]=float2bits(bits2float(r[rx])/bits2float(r[ry])); break; /* fdiv */
+        case 0x6e: r[rd]=(bits2float(r[rx])<bits2float(r[ry]))?1:0; break; /* flt */
+        case 0x70: r[rd]=(bits2float(r[rx])>bits2float(r[ry]))?1:0; break; /* fgt */
+        /* F1b */
+        case 0x7e:
+            if      (subop==0x00) r[rd]=(uint32_t)(int32_t)(int8_t) (r[rd]&0xff);   /* sxb */
+            else if (subop==0x01) r[rd]=(uint32_t)(int32_t)(int16_t)(r[rd]&0xffff); /* sxw */
+            break;
+        /* F2 — bp-relative (imm is raw 7-bit; scaled by access size) */
+        case 0x80: r[rd]=read8 ((uint16_t)((int32_t)bp+sx7(imm)));     break; /* lb  */
+        case 0x84: r[rd]=read16((uint16_t)((int32_t)bp+sx7(imm)*2));   break; /* lw  */
+        case 0x88: r[rd]=read32((uint16_t)((int32_t)bp+sx7(imm)*4));   break; /* ll  */
+        case 0x8c: write8 ((uint16_t)((int32_t)bp+sx7(imm)),    (uint8_t) r[rx]); break; /* sb  */
+        case 0x90: write16((uint16_t)((int32_t)bp+sx7(imm)*2),  (uint16_t)r[rx]); break; /* sw  */
+        case 0x94: write32((uint16_t)((int32_t)bp+sx7(imm)*4),          r[rx]);   break; /* sl  */
+        case 0x98: r[rd]=(uint32_t)(int32_t)(int8_t) read8 ((uint16_t)((int32_t)bp+sx7(imm)));   break; /* lbx */
+        case 0x9c: r[rd]=(uint32_t)(int32_t)(int16_t)read16((uint16_t)((int32_t)bp+sx7(imm)*2)); break; /* lwx */
+        case 0xa0: r[rd]=r[rx]+(uint32_t)sx7(imm); break; /* addi */
+        /* F3a */
+        case 0xc0: pc=(uint16_t)imm; break;  /* j   */
+        case 0xc1: lr=pc; pc=(uint16_t)imm; break; /* jl  */
+        case 0xc2: if(!r[0]) pc=(uint16_t)imm; break; /* jz  */
+        case 0xc3: if( r[0]) pc=(uint16_t)imm; break; /* jnz */
+        case 0xc4:            /* enter */
+            write32((uint16_t)(sp-4),lr); write32((uint16_t)(sp-8),bp);
+            bp=(uint16_t)(sp-8); sp=(uint16_t)(sp-(uint16_t)imm-8);
+            break;
+        case 0xc5: sp=(uint16_t)imm; break;  /* ssp  */
+        case 0xc6: sp=(uint16_t)(sp+sx16(imm)); break; /* adjw */
+        /* F3b — register-relative */
+        case 0xd0: r[rx]=read8 ((uint16_t)((int32_t)r[ry]+sx10(imm)));     break; /* llb  */
+        case 0xd1: r[rx]=read16((uint16_t)((int32_t)r[ry]+sx10(imm)*2));   break; /* llw  */
+        case 0xd2: r[rx]=read32((uint16_t)((int32_t)r[ry]+sx10(imm)*4));   break; /* lll  */
+        case 0xd3: write8 ((uint16_t)((int32_t)r[ry]+sx10(imm)),    (uint8_t) r[rx]); break; /* slb  */
+        case 0xd4: write16((uint16_t)((int32_t)r[ry]+sx10(imm)*2),  (uint16_t)r[rx]); break; /* slw  */
+        case 0xd5: write32((uint16_t)((int32_t)r[ry]+sx10(imm)*4),          r[rx]);   break; /* sll  */
+        case 0xd6: r[rx]=(uint32_t)(int32_t)(int8_t) read8 ((uint16_t)((int32_t)r[ry]+sx10(imm)));   break; /* llbx */
+        case 0xd7: r[rx]=(uint32_t)(int32_t)(int16_t)read16((uint16_t)((int32_t)r[ry]+sx10(imm)*2)); break; /* llwx */
+        case 0xd8: if(r[rx]==r[ry]) pc=(uint16_t)(pc+sx10(imm)); break; /* beq  */
+        case 0xd9: if(r[rx]!=r[ry]) pc=(uint16_t)(pc+sx10(imm)); break; /* bne  */
+        case 0xda: if(r[rx]< r[ry]) pc=(uint16_t)(pc+sx10(imm)); break; /* blt  */
+        case 0xdb: if(r[rx]> r[ry]) pc=(uint16_t)(pc+sx10(imm)); break; /* bgt  */
+        case 0xdc: if((int32_t)r[rx]<(int32_t)r[ry]) pc=(uint16_t)(pc+sx10(imm)); break; /* blts */
+        case 0xdd: if((int32_t)r[rx]>(int32_t)r[ry]) pc=(uint16_t)(pc+sx10(imm)); break; /* bgts */
+        case 0xde: r[rx]=r[ry]+(uint32_t)sx10(imm); break; /* addli */
+        /* F3c */
+        case 0xe8: r[rd]=(uint32_t)(uint16_t)imm; break; /* immw  */
+        case 0xf0: r[rd]=(r[rd]&0xffff)|((uint32_t)(uint16_t)imm<<16); break; /* immwh */
+        case 0xf8: r[rd]=(uint32_t)((int32_t)bp+sx16(imm)); break; /* lea   */
+        default:
+            fprintf(stderr, "cpu4: unknown opcode 0x%02x at pc=%04x\n", b0, oldpc);
+            fprintf(stderr, "Last %d instructions:\n", TRACE_N4);
+            for (int _ti = 0; _ti < TRACE_N4; _ti++) {
+                int _idx = (trace_idx + _ti) % TRACE_N4;
+                fprintf(stderr, "  [%04x] op=%02x r0=%08x sp=%04x bp=%04x\n",
+                        trace[_idx].pc, trace[_idx].op, trace[_idx].r0,
+                        trace[_idx].sp, trace[_idx].bp);
+            }
+            H = 1;
+            break;
+        }
+
+        for (int i = 0; i < 8; i++) r[i] &= 0xffffffff;
+        sp &= 0xffff; bp &= 0xffff; lr &= 0xffff; pc &= 0xffff;
+    }
+
+    printf("r0:%08x r1:%08x r2:%08x r3:%08x r4:%08x r5:%08x r6:%08x r7:%08x sp:%04x bp:%04x lr:%04x pc:%04x H:%x cycles:%u\n",
+           r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], sp, bp, lr, pc, H, g_cycles);
+}
+
+/* ------------------------------------------------------------------ */
+/* CPU                                                                  */
+/* ------------------------------------------------------------------ */
 
 static void run_cpu(int verbose)
 {
@@ -356,10 +884,23 @@ static void run_cpu(int verbose)
             imm16 = read16(pc); pc += 2;
         }
 
+        g_watch_pc = oldpc;
+        g_watch_r0 = r0;
+        g_watch_sp = sp;
+        g_watch_bp = bp;
+
         if (verbose) {
             fprintf(stderr, "[%04x] op=%02x r0=%08x sp=%04x bp=%04x\n",
                     oldpc, op, r0, sp, bp);
         }
+
+        /* Ring buffer: record last 32 instructions for crash dumps */
+        enum { TRACE_N = 32 };
+        static struct { uint16_t pc; uint8_t op; uint32_t r0; uint16_t sp, bp; } trace[TRACE_N];
+        static int trace_idx = 0;
+        trace[trace_idx].pc = oldpc; trace[trace_idx].op = op;
+        trace[trace_idx].r0 = r0;   trace[trace_idx].sp = sp; trace[trace_idx].bp = bp;
+        trace_idx = (trace_idx + 1) % TRACE_N;
 
         switch (op) {
         case 0x00: /* halt */    H = 1; break;
@@ -425,6 +966,12 @@ static void run_cpu(int verbose)
         case 0x89: /* adjw */    sp = (uint16_t)(sp + (int16_t)imm16); break;
         default:
             fprintf(stderr, "unknown opcode 0x%02x at pc=%04x\n", op, oldpc);
+            fprintf(stderr, "Last %d instructions:\n", TRACE_N);
+            for (int _ti = 0; _ti < TRACE_N; _ti++) {
+                int _idx = (trace_idx + _ti) % TRACE_N;
+                fprintf(stderr, "  [%04x] op=%02x r0=%08x sp=%04x bp=%04x\n",
+                        trace[_idx].pc, trace[_idx].op, trace[_idx].r0, trace[_idx].sp, trace[_idx].bp);
+            }
             H = 1;
             break;
         }
@@ -463,20 +1010,35 @@ static char *read_file(const char *path)
 int main(int argc, char **argv)
 {
     int verbose = 0;
+    int arch = 3;
     const char *filename = NULL;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-v") == 0) verbose = 1;
+        else if (strcmp(argv[i], "-arch") == 0 && i+1 < argc) {
+            i++;
+            if (strcmp(argv[i], "cpu4") == 0) arch = 4;
+            else arch = 3;
+        }
         else filename = argv[i];
     }
     if (!filename) {
-        fprintf(stderr, "usage: sim_c [-v] file.s\n");
+        fprintf(stderr, "usage: sim_c [-v] [-arch cpu3|cpu4] file.s\n");
         return 1;
     }
 
     char *src = read_file(filename);
-    assemble(src);
-    free(src);
-    run_cpu(verbose);
+    g_assembler_done = 0;
+    if (arch == 4) {
+        assemble_cpu4(src);
+        free(src);
+        g_assembler_done = 1;
+        run_cpu4(verbose);
+    } else {
+        assemble(src);
+        free(src);
+        g_assembler_done = 1;
+        run_cpu(verbose);
+    }
     return 0;
 }
