@@ -33,11 +33,13 @@ static uint8_t mmio_read8(uint16_t a) {
 static uint16_t g_watch_pc = 0; /* set to pc of instruction being executed */
 static uint32_t g_watch_r0 = 0;
 static uint16_t g_watch_sp = 0, g_watch_bp = 0;
-/* Print writes to addresses < 0x5000 (code/data area, not stack) after assembler init */
-static int g_assembler_done = 0;
-static void write8_inner (uint16_t a, uint8_t  v) { if (a >= MMIO_BASE) return; if (g_assembler_done && a < 0x5000) fprintf(stderr, "  WRITE8 to %04x = %02x  at pc=%04x sp=%04x bp=%04x r0=%08x\n", a, v, g_watch_pc, g_watch_sp, g_watch_bp, g_watch_r0); mem[a] = v; }
-static void write16_inner(uint16_t a, uint16_t v) { if (a >= MMIO_BASE) return; if (g_assembler_done && a < 0x5000) fprintf(stderr, "  WRITE16 to %04x = %04x  at pc=%04x sp=%04x bp=%04x r0=%08x\n", a, v, g_watch_pc, g_watch_sp, g_watch_bp, g_watch_r0); mem[a]=(uint8_t)v; mem[(uint16_t)(a+1)]=(uint8_t)(v>>8); }
-static void write32_inner(uint16_t a, uint32_t v) { if (a >= MMIO_BASE) return; if (g_assembler_done && a < 0x5000) fprintf(stderr, "  WRITE32 to %04x = %08x  at pc=%04x sp=%04x bp=%04x r0=%08x\n", a, v, g_watch_pc, g_watch_sp, g_watch_bp, g_watch_r0); write16_inner(a,(uint16_t)v); write16_inner((uint16_t)(a+2),(uint16_t)(v>>16)); }
+/* Print writes below the code/data boundary after assembler init.
+   Threshold defaults to 0x5000; updated to _globals_start after assembly. */
+static int      g_assembler_done  = 0;
+static uint16_t g_write_threshold = 0x5000;
+static void write8_inner (uint16_t a, uint8_t  v) { if (a >= MMIO_BASE) return; if (g_assembler_done && a < g_write_threshold) fprintf(stderr, "  WRITE8 to %04x = %02x  at pc=%04x sp=%04x bp=%04x r0=%08x\n", a, v, g_watch_pc, g_watch_sp, g_watch_bp, g_watch_r0); mem[a] = v; }
+static void write16_inner(uint16_t a, uint16_t v) { if (a >= MMIO_BASE) return; if (g_assembler_done && a < g_write_threshold) fprintf(stderr, "  WRITE16 to %04x = %04x  at pc=%04x sp=%04x bp=%04x r0=%08x\n", a, v, g_watch_pc, g_watch_sp, g_watch_bp, g_watch_r0); mem[a]=(uint8_t)v; mem[(uint16_t)(a+1)]=(uint8_t)(v>>8); }
+static void write32_inner(uint16_t a, uint32_t v) { if (a >= MMIO_BASE) return; if (g_assembler_done && a < g_write_threshold) fprintf(stderr, "  WRITE32 to %04x = %08x  at pc=%04x sp=%04x bp=%04x r0=%08x\n", a, v, g_watch_pc, g_watch_sp, g_watch_bp, g_watch_r0); write16_inner(a,(uint16_t)v); write16_inner((uint16_t)(a+2),(uint16_t)(v>>16)); }
 #define write8  write8_inner
 #define write16 write16_inner
 #define write32 write32_inner
@@ -1032,11 +1034,13 @@ int main(int argc, char **argv)
     if (arch == 4) {
         assemble_cpu4(src);
         free(src);
+        { int i = find_sym("_globals_start"); if (i >= 0) g_write_threshold = syms[i].addr; }
         g_assembler_done = 1;
         run_cpu4(verbose);
     } else {
         assemble(src);
         free(src);
+        { int i = find_sym("_globals_start"); if (i >= 0) g_write_threshold = syms[i].addr; }
         g_assembler_done = 1;
         run_cpu(verbose);
     }
