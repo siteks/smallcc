@@ -345,10 +345,14 @@ int main(int argc, char **argv)
     for (int i = 0; i < user_count; i++) all_files[lib_count + i] = argv[file_start + i];
 
     if (!preprocess_only) {
-        // Preamble: emit crt0.s if present, otherwise fall back to built-in default
+        // Preamble: emit arch-specific crt0 if present, then plain crt0.s, else built-in default
         char crt0_path[4096];
-        snprintf(crt0_path, sizeof(crt0_path), "%s/lib/crt0.s", compiler_dir);
+        snprintf(crt0_path, sizeof(crt0_path), "%s/lib/crt0_cpu%d.s", compiler_dir, g_target_arch);
         FILE *crt0 = fopen(crt0_path, "r");
+        if (!crt0) {
+            snprintf(crt0_path, sizeof(crt0_path), "%s/lib/crt0.s", compiler_dir);
+            crt0 = fopen(crt0_path, "r");
+        }
         if (crt0) {
             char buf[256];
             while (fgets(buf, sizeof(buf), crt0))
