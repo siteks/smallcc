@@ -447,7 +447,8 @@ int main(int argc, char **argv)
         peephole(opt_level);
         if (g_target_arch == 4) {
             SSAInst *ssa = lift_to_ssa(codegen_ctx.ir_head);
-            ssa_peephole(ssa);    /* ssa_opt.c: optimize on virtual regs */
+            if (opt_level >= 2)
+                ssa_peephole(ssa);  /* ssa_opt.c: optimize on virtual regs */
             regalloc(ssa);        /* regalloc.c: virtual -> physical regs */
             risc_backend_emit(ssa);
             free_ssa(ssa);

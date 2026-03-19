@@ -473,6 +473,7 @@ static Node *unary_expr()
                         node->op_kind = TK_STAR;
                         node->type = elem;
                         node->ch[0] = add_node;   // operand
+                        pex_node = node;   // update so a following '(' marks this node as the call site
                         break;
                     }
                     if (!s)
@@ -493,6 +494,7 @@ static Node *unary_expr()
                         node->op_kind    = TK_STAR;
                         node->ch[0]      = add_node;
                         // type left t_void; derive_types fills it via elem_type
+                        pex_node = node;   // update so a following '(' marks this node as the call site
                         break;
                     }
                     expect(token_ctx.current->kind);
@@ -531,6 +533,7 @@ static Node *unary_expr()
                     add->ch[1] = mul;
                     outer_unary->ch[0] = add;   // operand
                     expect(TK_RBRACKET);
+                    pex_node = node;   // update so a following '(' marks this node as the call site
                     break;
                 }
             case(TK_LPAREN):

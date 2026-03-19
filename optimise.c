@@ -14,15 +14,18 @@
  *   3. Dead jump:       J/JZ/JNZ Lx; [BB_START]; LABEL Lx  →  kill branch
  *   4. Merge adj:       ADJ N; ADJ M  →  ADJ N+M  (when sum fits int8)
  *   5. Kill zero adj:   ADJ 0  →  kill
- *   9. Store/reload:    LEA N; PUSH; <expr>; SW; LEA N; LW  →  drop LEA+LW
- *                       IMM s; PUSH; <expr>; SW; IMM s; LW  →  drop IMM+LW
- *      (after any store r0 holds the stored value; reload from same addr is redundant)
- *
- * -O2 additional patterns:
  *   6. Mul-by-1:        PUSH; IMM 1; MUL  →  kill all three
  *   7. Mul-by-pow2:     PUSH; IMM 2^k; MUL  →  PUSH; IMM k; SHL
  *      (lets constant folding collapse it when the pushed value is also a constant)
  *   8. Zero add/sub:    PUSH; IMM 0; ADD/SUB  →  kill all three
+ *   9. Store/reload:    LEA N; PUSH; <expr>; SW; LEA N; LW  →  drop LEA+LW
+ *                       IMM s; PUSH; <expr>; SW; IMM s; LW  →  drop IMM+LW
+ *      (after any store r0 holds the stored value; reload from same addr is redundant)
+ *
+ * -O2: as -O1, plus SSA-level optimisations (CPU4 only):
+ *   B1. SSA_ADJ merge, B2. compare-branch fusion (beq/bne/blt/…),
+ *   B3/C1. LEA→STORE forwarding (F2 bp-relative stores),
+ *   C2. LOAD+MOV fusion, D4. add-immediate (inc/dec/addi/addli)
  *
  * The pass repeats (up to 20 times) until stable, then compacts out NOP nodes.
  */
@@ -300,9 +303,9 @@ static bool peephole_pass(int level)
         }
 
         /* ----------------------------------------------------------------
-         * -O2 and above rules
+         * Rules 6-8: strength reduction (active at -O1 and above)
          * ---------------------------------------------------------------- */
-        if (level >= 2)
+        if (level >= 1)
         {
             /* Rule 6: mul-by-1 — PUSH; IMM 1; MUL → no-op (r0 unchanged)
              *

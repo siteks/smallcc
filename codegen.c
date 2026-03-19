@@ -593,7 +593,12 @@ void gen_callfunction_via_deref(Node *node)
         ir_append(IR_PUSHW, 0, NULL);
         param_size += WORD_SIZE;
     }
-    gen_expr(node->ch[0]);                           // operand (function pointer expr)
+    gen_expr(node->ch[0]);                           // operand: function pointer value or address
+    // For (*fp)(args): gen_expr(ND_IDENT "fp") already loads the 2-byte fp value.
+    // For arr[i](args): ch[0] is ND_BINOP "+" (subscript address arithmetic), so gen_expr
+    // produces the address of the array slot — load the function pointer from there.
+    if (node->ch[0]->kind == ND_BINOP)
+        gen_ld(WORD_SIZE);
     ir_append(IR_JLI,   0, NULL);
     ir_append(IR_ADJ, param_size, NULL);
     // Free copy buffers allocated by push_struct_arg calls

@@ -388,7 +388,31 @@ SSAInst *lift_to_ssa(IRInst *ir_head)
                 if (q->op == IR_JL  || q->op == IR_JLI || q->op == IR_RET ||
                     q->op == IR_J   || q->op == IR_JZ  || q->op == IR_JNZ) break;
             }
+
+            /* For indirect calls (JLI), the function pointer lives in r0.
+             * flush_for_call_n spills outer expression temps to memory; the
+             * risc_backend fallback for out-of-F2-range stores uses 'lea r0, off'
+             * as a scratch address register, which clobbers r0.
+             * Guard: copy r0 to physical r4 (never assigned by the depth-based
+             * allocator) before flushing, then restore r0 from r4 afterward.
+             * r4 is caller-saved scratch, so this is safe across the call site. */
+            bool save_fp = (p->op == IR_JLI && vs_depth > 0);
+            if (save_fp) {
+                SSAInst *mv = emit_op(SSA_MOV);
+                mv->rd   = 4;              /* physical r4 */
+                mv->rs1  = VREG_START + 0; /* accumulator */
+                mv->line = p->line;
+            }
+
             flush_for_call_n(arg_bytes, p->line);
+
+            if (save_fp) {
+                SSAInst *mv = emit_op(SSA_MOV);
+                mv->rd   = VREG_START + 0; /* accumulator */
+                mv->rs1  = 4;              /* physical r4 */
+                mv->line = p->line;
+            }
+
             if (p->op == IR_JL) {
                 s = emit_op(SSA_CALL);
                 s->sym  = p->sym;
