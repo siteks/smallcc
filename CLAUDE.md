@@ -130,7 +130,8 @@ Every phase prints debug information to stderr. `-stats` prints per-TU and total
 
 ## Detailed Reference
 
-- @docs/architecture.md — tokeniser, parser (grammar, AST nodes, node struct), type system, per-TU compilation
-- @docs/codegen.md — stack frame, variable addressing, expression idioms, cast generation, initialization, three-pass structure
-- @docs/isa.md — CPU3 registers, full instruction set, assembly syntax
+- @docs/architecture.md — tokeniser, parser (grammar, AST nodes, node struct), type system, per-TU compilation, backend file overview
+- @docs/codegen.md — stack IR (`IRInst`/`IROp`), CPU3 backend (frame layout, expression idioms, cast gen, peephole), CPU4 backend (SSA IR `SSAInst`/`SSAOp`, lift, regalloc, RISC emit)
+- @docs/cpu3-isa.md — CPU3 registers, full instruction set, assembly syntax
+- @docs/cpu4-isa.md — CPU4 registers, full instruction set, assembly syntax (verified against `cpu4/cpu.py`)
 - @docs/c89-status.md — compliance tables, deliberate deviations, what's implemented/missing

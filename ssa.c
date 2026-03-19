@@ -1,16 +1,18 @@
 /* ssa.c — Stack IR → 3-address SSA lift for the CPU4 RISC backend.
  *
  * lift_to_ssa() walks the existing stack-based IRInst list and produces a
- * SSAInst list with explicit physical register assignments:
+ * SSAInst list with virtual register assignments (>= VREG_START):
  *
- *   r0           = accumulator (always holds the current value)
- *   r{depth+1}   = scratch register at virtual stack depth (r1, r2, r3, …)
+ *   VREG_START+0 = accumulator (physical r0 after regalloc)
+ *   VREG_START+{depth+1} = scratch at virtual stack depth (physical r1, r2, …)
  *
  * Key invariants:
- *   • IR_PUSH / IR_PUSHW → SSA_MOV r{depth+1}, r0  then depth++
- *   • IR_ADD etc.        → SSA_ALU r0, r{depth}, r0  then depth--
- *   • IR_LEA N + IR_LW   → SSA_LOAD r0, bp+N (collapsed to one F2 load)
+ *   • IR_PUSH / IR_PUSHW → SSA_MOV v{depth+1}, v0  then depth++
+ *   • IR_ADD etc.        → SSA_ALU v0, v{depth}, v0  then depth--
+ *   • IR_LEA N + IR_LW   → SSA_LOAD v0, bp+N (collapsed to one F2 load)
  *   • IR_JL              → flush virtual stack to memory first, then SSA_CALL
+ *
+ * regalloc() (regalloc.c) maps virtual → physical registers after this pass.
  */
 
 #include <stdio.h>
@@ -24,7 +26,7 @@
  * ---------------------------------------------------------------- */
 #define MAX_VDEPTH 8
 
-static int vs_reg[MAX_VDEPTH];   /* physical register holding each depth slot */
+static int vs_reg[MAX_VDEPTH];   /* virtual register holding each depth slot */
 static int vs_size[MAX_VDEPTH];  /* push size in bytes (2 or 4) per slot */
 static int vs_depth;             /* current virtual stack depth */
 static int vsp;                  /* running sp - bp offset (starts at -frame_size) */
@@ -246,7 +248,7 @@ SSAInst *lift_to_ssa(IRInst *ir_head)
         /* ---- Immediate loads ---- */
         case IR_IMM:
             s = emit_op(p->sym ? SSA_MOVSYM : SSA_MOVI);
-            s->rd   = 0;
+            s->rd   = VREG_START + 0;
             s->imm  = p->operand;
             s->sym  = p->sym;
             s->line = p->line;
@@ -265,7 +267,7 @@ SSAInst *lift_to_ssa(IRInst *ir_head)
                 if (sz)
                 {
                     s = emit_op(SSA_LOAD);
-                    s->rd   = 0;
+                    s->rd   = VREG_START + 0;
                     s->rs1  = -2;         /* -2 = bp-relative (F2) */
                     s->imm  = p->operand; /* byte offset from bp   */
                     s->size = sz;
@@ -274,9 +276,9 @@ SSAInst *lift_to_ssa(IRInst *ir_head)
                     break;
                 }
             }
-            /* Standalone LEA: compute bp-relative address into r0 */
+            /* Standalone LEA: compute bp-relative address into accumulator */
             s = emit_op(SSA_LEA);
-            s->rd   = 0;
+            s->rd   = VREG_START + 0;
             s->imm  = p->operand;
             s->line = p->line;
             break;
@@ -284,11 +286,11 @@ SSAInst *lift_to_ssa(IRInst *ir_head)
         /* ---- Loads (not collapsed by LEA peek) ---- */
         case IR_LW: case IR_LB: case IR_LL:
         {
-            /* Address is already in r0 (from a preceding LEA + possible other ops) */
+            /* Address is already in accumulator (from a preceding LEA + possible other ops) */
             int sz = (p->op == IR_LW) ? 2 : (p->op == IR_LB) ? 1 : 4;
             s = emit_op(SSA_LOAD);
-            s->rd   = 0;
-            s->rs1  = 0;   /* base = r0 (register-relative, imm=0) */
+            s->rd   = VREG_START + 0;
+            s->rs1  = VREG_START + 0;  /* base = accumulator (register-relative, imm=0) */
             s->imm  = 0;
             s->size = sz;
             s->line = p->line;
@@ -300,15 +302,15 @@ SSAInst *lift_to_ssa(IRInst *ir_head)
         case IR_PUSHW:
         {
             int sz  = (p->op == IR_PUSH) ? 4 : 2;
-            int reg = vs_depth + 1;
-            if (reg > 7)
+            int reg = VREG_START + vs_depth + 1;
+            if (reg > VREG_START + 7)
             {
                 fprintf(stderr, "ssa: virtual stack overflow at depth %d\n", vs_depth);
-                reg = 7;   /* clobber r7; SU labelling makes depth ≤ 3 in practice */
+                reg = VREG_START + 7;   /* clobber v15; SU labelling makes depth <= 3 in practice */
             }
             s = emit_op(SSA_MOV);
             s->rd   = reg;
-            s->rs1  = 0;       /* save r0 (current accumulator) */
+            s->rs1  = VREG_START + 0;  /* save accumulator */
             s->line = p->line;
             vs_reg[vs_depth]  = reg;
             vs_size[vs_depth] = sz;
@@ -322,28 +324,28 @@ SSAInst *lift_to_ssa(IRInst *ir_head)
             if (vs_depth > 0) {
                 vs_depth--;
                 s = emit_op(SSA_MOV);
-                s->rd   = 0;
+                s->rd   = VREG_START + 0;
                 s->rs1  = vs_reg[vs_depth];
                 s->line = p->line;
             }
             break;
 
-        /* ---- Stores: addr in scratch top, value in r0 ---- */
+        /* ---- Stores: addr in scratch top, value in accumulator ---- */
         case IR_SW: case IR_SB: case IR_SL:
             if (vs_depth > 0)
             {
                 int sz = (p->op == IR_SW) ? 2 : (p->op == IR_SB) ? 1 : 4;
                 vs_depth--;
                 s = emit_op(SSA_STORE);
-                s->rd   = vs_reg[vs_depth]; /* register holding the address */
-                s->rs1  = 0;                /* r0 = value to store */
-                s->imm  = 0;                /* no extra offset */
+                s->rd   = vs_reg[vs_depth];  /* register holding the address */
+                s->rs1  = VREG_START + 0;    /* accumulator = value to store */
+                s->imm  = 0;                 /* no extra offset */
                 s->size = sz;
                 s->line = p->line;
             }
             break;
 
-        /* ---- Binary ALU: r0 = scratch_top OP r0; pop ---- */
+        /* ---- Binary ALU: accum = scratch_top OP accum; pop ---- */
         case IR_ADD: case IR_SUB: case IR_MUL: case IR_DIV: case IR_MOD:
         case IR_AND: case IR_OR:  case IR_XOR: case IR_SHL: case IR_SHR:
         case IR_EQ:  case IR_NE:  case IR_LT:  case IR_LE:  case IR_GT:  case IR_GE:
@@ -356,9 +358,9 @@ SSAInst *lift_to_ssa(IRInst *ir_head)
                 vs_depth--;
                 s = emit_op(SSA_ALU);
                 s->alu_op = p->op;
-                s->rd     = 0;
-                s->rs1    = vs_reg[vs_depth]; /* left operand (was on stack) */
-                s->rs2    = 0;                /* right operand = r0 */
+                s->rd     = VREG_START + 0;
+                s->rs1    = vs_reg[vs_depth];  /* left operand (was on vstack) */
+                s->rs2    = VREG_START + 0;    /* right operand = accumulator */
                 s->line   = p->line;
             }
             break;
@@ -367,8 +369,8 @@ SSAInst *lift_to_ssa(IRInst *ir_head)
         case IR_SXB: case IR_SXW: case IR_ITOF: case IR_FTOI:
             s = emit_op(SSA_ALU1);
             s->alu_op = p->op;
-            s->rd     = 0;
-            s->rs1    = 0;
+            s->rd     = VREG_START + 0;
+            s->rs1    = VREG_START + 0;
             s->line   = p->line;
             break;
 
@@ -560,22 +562,6 @@ SSAInst *lift_to_ssa(IRInst *ir_head)
     }
 
     return ssa_head;
-}
-
-/* ----------------------------------------------------------------
- * ssa_peephole — copy propagation pass (in-place)
- *
- * Eliminates trivial identity moves: MOV r, r.
- * Future: add constant propagation, dead-code elimination.
- * ---------------------------------------------------------------- */
-void ssa_peephole(SSAInst *head)
-{
-    for (SSAInst *p = head; p; p = p->next)
-    {
-        /* Kill: mov rd, rs1 where rd == rs1 (identity move) */
-        if (p->op == SSA_MOV && p->rd == p->rs1 && p->rd >= 0)
-            p->op = (SSAOp)-1;  /* mark dead; risc_backend skips negative ops */
-    }
 }
 
 /* ----------------------------------------------------------------

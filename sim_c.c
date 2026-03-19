@@ -13,6 +13,7 @@
 #include <stdint.h>
 #include <ctype.h>
 #include <math.h>
+#include <stdbool.h>
 
 /* ------------------------------------------------------------------ */
 /* Memory                                                               */
@@ -23,6 +24,113 @@ static uint8_t mem[65536];
 #define MMIO_BASE 0xFF00u
 
 static uint32_t g_cycles = 0;
+
+/* ------------------------------------------------------------------ */
+/* Profiling                                                            */
+/* ------------------------------------------------------------------ */
+
+static int       g_profile   = 0;
+static uint32_t  prof_count[65536];   /* execution count per PC address */
+static int16_t   prof_lineno[65536];  /* addr -> source line index (-1 = none) */
+static char    **prof_lines  = NULL;  /* original source lines (strdup'd) */
+static int       prof_nlines = 0;
+
+static void prof_split_lines(const char *src)
+{
+    /* Count lines */
+    int n = 0;
+    const char *p = src;
+    while (*p) { if (*p++ == '\n') n++; }
+    if (src[0] != '\0') n++;  /* last line even without trailing newline */
+
+    prof_lines = malloc(((size_t)n + 1) * sizeof(char *));
+    if (!prof_lines) { fprintf(stderr, "oom\n"); exit(1); }
+    prof_nlines = 0;
+
+    p = src;
+    while (*p) {
+        const char *eol = strchr(p, '\n');
+        size_t len = eol ? (size_t)(eol - p) : strlen(p);
+        char *line = malloc(len + 1);
+        if (!line) { fprintf(stderr, "oom\n"); exit(1); }
+        memcpy(line, p, len);
+        line[len] = '\0';
+        if (len > 0 && line[len-1] == '\r') line[--len] = '\0';
+        prof_lines[prof_nlines++] = line;
+        if (!eol) break;
+        p = eol + 1;
+    }
+}
+
+typedef struct { uint32_t count; uint16_t addr; } ProfEntry;
+
+static int prof_entry_cmp(const void *a, const void *b)
+{
+    const ProfEntry *pa = (const ProfEntry *)a;
+    const ProfEntry *pb = (const ProfEntry *)b;
+    if (pb->count > pa->count) return  1;
+    if (pb->count < pa->count) return -1;
+    return 0;
+}
+
+static void print_profile(void)
+{
+    unsigned long long total = 0;
+    for (int i = 0; i < 65536; i++) total += prof_count[i];
+    fprintf(stderr, "\nProfile: %llu instructions executed\n\n", total);
+
+    /* --- Section A: top 40 hottest instructions --- */
+    ProfEntry *entries = malloc(65536 * sizeof(ProfEntry));
+    if (!entries) { fprintf(stderr, "oom\n"); return; }
+    int nentries = 0;
+    for (int i = 0; i < 65536; i++) {
+        if (prof_count[i] > 0) {
+            entries[nentries].count = prof_count[i];
+            entries[nentries].addr  = (uint16_t)i;
+            nentries++;
+        }
+    }
+    qsort(entries, (size_t)nentries, sizeof(ProfEntry), prof_entry_cmp);
+
+    fprintf(stderr, "Top 40 hot instructions:\n");
+    fprintf(stderr, "  %10s  %7s  %4s  %s\n", "count", "%total", "addr", "source");
+    int top = nentries < 40 ? nentries : 40;
+    for (int i = 0; i < top; i++) {
+        uint16_t    a   = entries[i].addr;
+        uint32_t    cnt = entries[i].count;
+        double      pct = total ? (100.0 * cnt / total) : 0.0;
+        int16_t     ln  = prof_lineno[a];
+        const char *src = (ln >= 0 && ln < prof_nlines) ? prof_lines[ln] : "";
+        while (*src == ' ' || *src == '\t') src++;
+        fprintf(stderr, "  %10u  %6.2f%%  %04x  %s\n", cnt, pct, (unsigned)a, src);
+    }
+    free(entries);
+
+    /* --- Section B: annotated listing --- */
+    /* Build lineno2addr: first address seen for each source line */
+    int *lineno2addr = malloc((size_t)prof_nlines * sizeof(int));
+    if (!lineno2addr) { fprintf(stderr, "oom\n"); return; }
+    for (int i = 0; i < prof_nlines; i++) lineno2addr[i] = -1;
+    for (int a = 0; a < 65536; a++) {
+        int16_t ln = prof_lineno[a];
+        if (ln >= 0 && ln < prof_nlines && lineno2addr[ln] == -1)
+            lineno2addr[ln] = a;
+    }
+
+    fprintf(stderr, "\nAnnotated listing:\n");
+    for (int ln = 0; ln < prof_nlines; ln++) {
+        int         a    = lineno2addr[ln];
+        const char *text = prof_lines[ln];
+        if (a >= 0 && prof_count[a] > 0) {
+            uint32_t cnt = prof_count[a];
+            double   pct = total ? (100.0 * cnt / total) : 0.0;
+            fprintf(stderr, "%10u %6.2f%%  %04x  |%s\n", cnt, pct, (unsigned)a, text);
+        } else {
+            fprintf(stderr, "                    |%s\n", text);
+        }
+    }
+    free(lineno2addr);
+}
 
 static uint8_t mmio_read8(uint16_t a) {
     uint32_t off = (uint16_t)(a - MMIO_BASE);
@@ -148,6 +256,7 @@ static const Instr4 itab4[] = {
     {"fgt",    0x70,1,0,0},
     /* F1b — 2 bytes, rd only; subop distinguishes the operation */
     {"sxb",    0x7e,1,1,0x00}, {"sxw",   0x7e,1,1,0x01},
+    {"inc",    0x7e,1,1,0x02}, {"dec",   0x7e,1,1,0x03},
     /* F2 — 2 bytes, rx imm7 (bp-relative; imm scaled by access width) */
     {"lb",     0x80,1,0,0}, {"lw",     0x84,1,0,0},
     {"ll",     0x88,1,0,0}, {"sb",     0x8c,1,0,0},
@@ -278,6 +387,7 @@ static void assemble(const char *src)
 
     for (int pass = 1; pass <= 2; pass++) {
         int cur = 0;  /* current byte address */
+        int lineno = 0;
 
         char *p = buf;
         while (*p) {
@@ -297,6 +407,7 @@ static void assemble(const char *src)
                 p += strlen(p);
             }
 
+            int cur_lineno = lineno++;
             strip_comment(line);
             if (line[0] == '\0') continue;
 
@@ -402,6 +513,8 @@ static void assemble(const char *src)
                 exit(1);
             }
 
+            if (pass == 2 && g_profile) prof_lineno[cur] = (int16_t)cur_lineno;
+
             if (instr->fmt == 0) {
                 if (pass == 2) write8((uint16_t)cur, instr->op);
                 cur++;
@@ -451,6 +564,7 @@ static void assemble_cpu4(const char *src)
 
     for (int pass = 1; pass <= 2; pass++) {
         int cur = 0;
+        int lineno = 0;
         char *p = buf;
         while (*p) {
             char *eol = strchr(p, '\n');
@@ -467,6 +581,7 @@ static void assemble_cpu4(const char *src)
                 line[sizeof(line)-1] = '\0';
                 p += strlen(p);
             }
+            int cur_lineno = lineno++;
             strip_comment(line);
             if (line[0] == '\0') continue;
 
@@ -578,6 +693,7 @@ static void assemble_cpu4(const char *src)
                 exit(1);
             }
 
+            if (pass == 2 && g_profile) prof_lineno[cur] = (int16_t)cur_lineno;
             int instr_addr = cur;
             int instr_len  = 1 + instr->extra;
 
@@ -689,6 +805,7 @@ static void run_cpu4(int verbose)
         uint8_t  b0 = read8(pc);
         uint16_t oldpc = pc;
         pc++;
+        if (g_profile) prof_count[oldpc]++;
 
         uint8_t  b1 = 0, b2 = 0;
         int      rd = 0, rx = 0, ry = 0;
@@ -799,6 +916,8 @@ static void run_cpu4(int verbose)
         case 0x7e:
             if      (subop==0x00) r[rd]=(uint32_t)(int32_t)(int8_t) (r[rd]&0xff);   /* sxb */
             else if (subop==0x01) r[rd]=(uint32_t)(int32_t)(int16_t)(r[rd]&0xffff); /* sxw */
+            else if (subop==0x02) r[rd]=(r[rd]+1)&0xffffffff;                        /* inc */
+            else if (subop==0x03) r[rd]=(r[rd]-1)&0xffffffff;                        /* dec */
             break;
         /* F2 — bp-relative (imm is raw 7-bit; scaled by access size) */
         case 0x80: r[rd]=read8 ((uint16_t)((int32_t)bp+sx7(imm)));     break; /* lb  */
@@ -877,6 +996,7 @@ static void run_cpu(int verbose)
         uint8_t op = read8(pc);
         uint16_t oldpc = pc;
         pc++;
+        if (g_profile) prof_count[oldpc]++;
 
         int8_t  imm8  = 0;
         uint16_t imm16 = 0;
@@ -1019,6 +1139,7 @@ int main(int argc, char **argv)
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-v") == 0) verbose = 1;
+        else if (strcmp(argv[i], "-profile") == 0) g_profile = 1;
         else if (strcmp(argv[i], "-arch") == 0 && i+1 < argc) {
             i++;
             if (strcmp(argv[i], "cpu4") == 0) arch = 4;
@@ -1030,25 +1151,30 @@ int main(int argc, char **argv)
         else filename = argv[i];
     }
     if (!filename) {
-        fprintf(stderr, "usage: sim_c [-v] [-arch cpu3|cpu4] [-maxsteps N] file.s\n");
+        fprintf(stderr, "usage: sim_c [-v] [-profile] [-arch cpu3|cpu4] [-maxsteps N] file.s\n");
         return 1;
     }
 
     if (maxsteps_override > 0) g_max_steps = maxsteps_override;
+    if (g_profile) memset(prof_lineno, 0xff, sizeof(prof_lineno));  /* -1 = no mapping */
     char *src = read_file(filename);
     g_assembler_done = 0;
     if (arch == 4) {
+        if (g_profile) prof_split_lines(src);
         assemble_cpu4(src);
         free(src);
         { int i = find_sym("_globals_start"); if (i >= 0) g_write_threshold = syms[i].addr; }
         g_assembler_done = 1;
         run_cpu4(verbose);
+        if (g_profile) print_profile();
     } else {
+        if (g_profile) prof_split_lines(src);
         assemble(src);
         free(src);
         { int i = find_sym("_globals_start"); if (i >= 0) g_write_threshold = syms[i].addr; }
         g_assembler_done = 1;
         run_cpu(verbose);
+        if (g_profile) print_profile();
     }
     return 0;
 }

@@ -177,6 +177,8 @@ class G:
         # this format escapes to give large space for single op no imm
         'sxb'   :   (0x7e, 1, 1, 0x00),
         'sxw'   :   (0x7e, 1, 1, 0x01),
+        'inc'   :   (0x7e, 1, 1, 0x02),
+        'dec'   :   (0x7e, 1, 1, 0x03),
         # format 2 - one op + imm7      10ooooxxxiiiiiii
         'lb'    :   (0x80, 1, 0, 0),
         'lw'    :   (0x84, 1, 0, 0),
@@ -439,6 +441,8 @@ class CPU:
         # f1b
         elif    i == 'sxb':     s.r[dst] = 0xffffff00 | s.r[src0] if s.r[src0] & 0x80 else 0xff & s.r[src0]
         elif    i == 'sxw':     s.r[dst] = 0xffff0000 | s.r[src0] if s.r[src0] & 0x8000 else 0xffff & s.r[src0]
+        elif    i == 'inc':     s.r[dst] = s.r[src0] + 1
+        elif    i == 'dec':     s.r[dst] = s.r[src0] - 1
         # f2
         elif    i == 'lb':      s.r[dst] = m.read8(s.bp + sext(imm, 7))
         elif    i == 'lw':      s.r[dst] = m.read16(s.bp + sext(imm<<1, 8))

@@ -1,55 +1,206 @@
-# Code Generator (`codegen.c`) and Backend (`backend.c`)
+# Code Generator, IR, and Backends
 
-`codegen.c` walks the annotated AST and builds a flat linked list of `IRInst` nodes. `backend.c` then walks that list and emits assembly text to the output file (stdout or `-o` target). This split makes `backend.c` the retargeting point: to support a new CPU, replace `backend_emit_asm` while keeping the IR unchanged.
-
-## Stack Frame Layout
+`codegen.c` walks the annotated AST and builds a flat linked list of `IRInst` (stack IR) nodes.
+From there the pipeline splits by target architecture:
 
 ```
-  bp+8 + 2*(n-1)   param n   (last param, 2-byte int/pointer)
+gen_ir()              [codegen.c]    AST → stack IR list
+mark_basic_blocks()   [codegen.c]    insert IR_BB_START sentinels
+peephole(opt_level)   [optimise.c]   constant fold, dead branch, adj merge, store/reload elim
+
+── CPU3 ──────────────────────────────────────────────────────────────────────
+backend_emit_asm()    [backend.c]    stack IR → CPU3 assembly
+
+── CPU4 ──────────────────────────────────────────────────────────────────────
+lift_to_ssa()         [ssa.c]        stack IR → SSA IR (virtual registers)
+ssa_peephole()        [ssa_opt.c]    identity-move elimination
+regalloc()            [regalloc.c]   virtual registers → physical r0–r7
+risc_backend_emit()   [risc_backend.c]  SSA IR → CPU4 assembly
+```
+
+The stack IR is identical for both targets; the split happens after `peephole`. `backend.c`
+and `risc_backend.c` are independent emitters that consume the same upstream IR.
+
+---
+
+## Stack IR
+
+### `IRInst` Struct
+
+```c
+typedef struct IRInst {
+    IROp          op;       // operation kind
+    int           operand;  // integer operand (imm, offset, label id, byte count)
+    const char   *sym;      // symbolic operand (label name, symbol name); NULL if unused
+    int           line;     // source line number (0 = unknown); set by ir_append()
+    struct IRInst *next;
+} IRInst;
+```
+
+`ir_append(op, operand, sym)` allocates a new node, stamps `current_codegen_line`, and appends
+it to `codegen_ctx.ir_head/ir_tail`.
+
+### `IROp` Enum
+
+| Group | Operations |
+|---|---|
+| Immediate load | `IR_IMM` — r0 = operand (or &sym when sym != NULL) |
+| Stack | `IR_PUSH`, `IR_PUSHW`, `IR_POP`, `IR_POPW` |
+| Arithmetic | `IR_ADD`, `IR_SUB`, `IR_MUL`, `IR_DIV`, `IR_MOD` |
+| Bitwise | `IR_SHL`, `IR_SHR`, `IR_AND`, `IR_OR`, `IR_XOR` |
+| Signed variants | `IR_DIVS`, `IR_MODS`, `IR_SHRS` |
+| Comparisons (unsigned) | `IR_EQ`, `IR_NE`, `IR_LT`, `IR_LE`, `IR_GT`, `IR_GE` |
+| Comparisons (signed) | `IR_LTS`, `IR_LES`, `IR_GTS`, `IR_GES` |
+| Float arithmetic | `IR_FADD`, `IR_FSUB`, `IR_FMUL`, `IR_FDIV` |
+| Float comparisons | `IR_FLT`, `IR_FLE`, `IR_FGT`, `IR_FGE` |
+| Float/int conversion | `IR_ITOF`, `IR_FTOI` |
+| Sign extension | `IR_SXB`, `IR_SXW` |
+| Memory load | `IR_LB`, `IR_LW`, `IR_LL` (byte / word / long) |
+| Memory store | `IR_SB`, `IR_SW`, `IR_SL` |
+| Address | `IR_LEA` — r0 = bp + operand |
+| Control flow | `IR_J`, `IR_JZ`, `IR_JNZ`, `IR_JL`, `IR_JLI`, `IR_RET` |
+| Frame | `IR_ENTER`, `IR_ADJ` |
+| Labels | `IR_LABEL` (numeric, operand = id), `IR_SYMLABEL` (sym = name) |
+| Data directives | `IR_WORD`, `IR_BYTE`, `IR_ALIGN` |
+| Special | `IR_PUTCHAR`, `IR_COMMENT`, `IR_BB_START`, `IR_NOP` |
+
+Binary ops (`IR_ADD` … `IR_GES`, `IR_FADD` … `IR_FGE`) follow the stack-binary convention:
+left operand is popped from the stack (`mem[sp]`), right operand is in r0, result written to r0,
+sp advanced by 4.
+
+---
+
+## IR Construction (`gen_ir`)
+
+`gen_ir(node, tu_index)` sets `current_tu` then makes four passes over the top-level declaration
+list for the current TU:
+
+1. **Pass 1** — function definitions (text area). Each function body emits `IR_SYMLABEL`,
+   `IR_ENTER`, per-scope `IR_ADJ` pairs, expression IR, and `IR_RET`. Local static variables
+   encountered here are collected for pass 2b.
+2. **Pass 2** — global variable declarations (data area). `extern` declarations and bare
+   function prototypes are skipped. Static globals use the mangled label `_s{tu_index}_{name}`.
+3. **Pass 2b** — local static variable data (`_ls{id}:` labels). `local_static_counter` is
+   monotonically increasing across TUs; label IDs are assigned at symbol-table build time.
+4. **Pass 3** — deferred string literal data (`_l{id}:` labels), each as a sequence of
+   `IR_BYTE` nodes followed by a null-terminator byte. Label IDs are monotonically increasing
+   across TUs.
+
+---
+
+## Basic-Block Markers (`mark_basic_blocks`)
+
+`mark_basic_blocks()` inserts `IR_BB_START` sentinel nodes immediately after `gen_ir` completes.
+These nodes emit no assembly; they exist solely to delimit basic blocks for the optimiser.
+
+A **basic-block leader** is:
+1. The very first instruction.
+2. Any instruction immediately following a terminator (`IR_J`, `IR_JZ`, `IR_JNZ`, `IR_RET`).
+3. Any `IR_LABEL` or `IR_SYMLABEL` (a potential jump target).
+
+`IR_JL` and `IR_JLI` are calls (not terminators) — execution continues at the next instruction.
+
+---
+
+## Stack-IR Peephole (`optimise.c`)
+
+Enabled by `-O<N>` (`-O` alone implies `-O1`). Called as `peephole(opt_level)` after
+`mark_basic_blocks`. `IR_BB_START` is a hard barrier — no pattern fires across it.
+`IR_NOP`/`IR_COMMENT` are transparent within a block. The pass repeats until stable (max 20
+iterations), then `compact_ir()` removes all `IR_NOP` nodes.
+
+### `-O1` Rules
+
+| # | Pattern | Replacement | Notes |
+|---|---|---|---|
+| 1 | `IMM K1; PUSH; IMM K2; binop` | `IMM (K1 op K2)` | Constant-fold arithmetic and comparisons |
+| 2 | `IMM K; SXB/SXW` | `IMM sext(K)` | Constant sign-extend |
+| 3 | `J/JZ/JNZ Lx` → `BB_START` → `LABEL Lx` | kill branch | Dead jump to immediately following label |
+| 4 | `ADJ N; ADJ M` | `ADJ N+M` (or delete if 0) | Merge adjacent stack adjustments |
+| 5 | `ADJ 0` | delete | Zero adjustment |
+| 9 | `LEA N; PUSH; <expr>; SW/SB/SL` + `LEA N; LW/LB/LL` | kill reload | Store/reload elim; gated on CPU3 only |
+
+Rule 1 covers: `add sub mul and or xor shl shr eq ne lt le gt ge`. Symbolic immediates are
+never folded. Rules 4+5 together collapse `adj -N`/`adj +N` pairs around empty scopes.
+
+### `-O2` Additional Rules
+
+| # | Pattern | Replacement | Notes |
+|---|---|---|---|
+| 6 | `PUSH; IMM 1; MUL` | delete | Multiply by 1 |
+| 7 | `PUSH; IMM 2^k; MUL` | `PUSH; IMM k; SHL` | Strength-reduce; Rule 1 then folds constant shifts |
+| 8 | `PUSH; IMM 0; ADD/SUB` | delete | Add/subtract zero |
+
+Rule 7 is particularly effective for array indexing: stride-scale multiplications (always a
+power of 2 since `sizeof(int) = 2`) convert to shifts, which constant-fold when the index is
+compile-time constant, collapsing the entire address computation to a single `IMM`.
+
+Rule 9 scans forward from the address push, tracking expression-stack depth across pushes, pops,
+and binary ops. When depth reaches 0 at a store, r0 still holds the stored value. If the
+immediately following instructions reload from the same address, they are killed. Aborts at
+`JL`/`JLI` (calls may clobber memory) and at BB boundaries. 64-instruction scan limit.
+
+---
+
+## CPU3 Backend (`backend.c`)
+
+`backend_emit_asm(ir_head)` walks the stack IR list and writes CPU3 assembly text. It is the
+sole difference between the two targets from the perspective of `smallcc.c`.
+
+### Stack Frame Layout
+
+```
+  bp+8 + 2*(n-1)   param n   (last param)
        ...
-  bp+8             param 0   (first param)   ← sp immediately before jl
+  bp+8             param 0   (first param)  ← sp immediately before jl
   bp+4             return address (lr)
-  bp+0             saved bp                  ← bp set here by enter
+  bp+0             saved bp                 ← bp set here by enter
   bp-2             local 0
   bp-4             local 1
        ...
-  bp-2k            local k                   ← sp after all adj in nested scopes
+  bp-2k            local k
 ```
 
-`enter word` executes: `mem[sp-4] = lr; mem[sp-8] = bp; bp = sp-8; sp -= word + 8`.
+`enter N`: `mem[sp-4]=lr; mem[sp-8]=bp; bp=sp-8; sp-=N+8`.
+`ret`: `sp=bp; bp=mem[sp]; pc=mem[sp+4]; sp+=8`.
 
-`ret` executes: `sp = bp; bp = mem[sp]; pc = mem[sp+4]; sp += 8`.
+Locals within a compound statement are allocated with `adj -size` on entry and reclaimed with
+`adj +size` on exit. Nested compound statements chain their adj pairs.
 
-Locals within a compound statement are allocated with `adj -size` on entry and reclaimed with `adj +size` on exit. Nested compound statements chain their adj pairs.
+### Variable Addressing
 
-## Variable Addressing
+`gen_varaddr_from_ident(node, name)` emits an address into r0:
 
-`gen_varaddr_from_ident(node, name)`:
-- **Global (non-static)**: `immw label_name` (symbolic address)
-- **Global (static)**: `immw _s{tu_index}_{name}` (mangled to be TU-private)
-- **Local static**: `immw _ls{id}` (persistent data-section label; `id` from `local_static_counter`)
-- **Parameter**: `lea positive_offset` (above bp)
-- **Local**: `lea -offset` (below bp)
+| Variable kind | IR emitted | Result in r0 |
+|---|---|---|
+| Global (non-static) | `IR_IMM sym=label_name` | symbolic address |
+| Global (static) | `IR_IMM sym=_s{tu}_{name}` | mangled label address |
+| Local static | `IR_IMM sym=_ls{id}` | persistent data-section label |
+| Parameter | `IR_LEA +offset` | bp + positive offset |
+| Local | `IR_LEA -offset` | bp - offset |
 
-After `gen_varaddr`, r0 holds the **address** of the variable. For non-array, non-pointer variables, `gen_ld(size)` is immediately called to load the value; arrays and pointers leave r0 as the address.
+For non-array, non-pointer variables, `gen_ld(size)` immediately follows with `IR_LB/LW/LL`
+to load the value. Arrays and pointers leave r0 as the address.
 
-## Expression Idioms
+### Expression Idioms
 
 **Binary operation** (`ND_BINOP`):
 ```asm
-; gen_expr(lhs) → r0 = lhs
-push                ; stack[sp] = lhs
-; gen_expr(rhs) → r0 = rhs
-op                  ; r0 = stack[sp] op r0; sp += 4
+; gen_expr(lhs) → r0 = lhs value
+push
+; gen_expr(rhs) → r0 = rhs value
+add/sub/mul/…       ; r0 = mem[sp] op r0; sp += 4
 ```
 
-`gen_arith_op(op, is_float, is_signed)` selects the assembly instruction. For `<`, `<=`, `>`, `>=`, `/`, `%`, and `>>`, **signed** integer types (`char`, `short`, `int`, `long`) emit the signed variants (`lts`, `les`, `gts`, `ges`, `divs`, `mods`, `shrs`); unsigned types and pointers use the unsigned variants (`lt`, `le`, `gt`, `ge`, `div`, `mod`, `shr`). Floating-point operands use the `f`-prefixed instructions.
+`gen_arith_op(op, is_float, is_signed)` selects the mnemonic. Signed integer types (`char`,
+`short`, `int`, `long`) use signed variants (`lts les gts ges divs mods shrs`); unsigned types
+and pointers use unsigned variants. Float operands use `f`-prefixed instructions.
 
 **Assignment** (`ND_ASSIGN`):
 ```asm
 ; gen_addr(lhs) → r0 = address of lhs
 push
-; gen_expr(rhs) → r0 = value
+; gen_expr(rhs) → r0 = value to store
 sb/sw/sl            ; mem[stack[sp]] = r0; sp += 4
 ```
 
@@ -63,64 +214,31 @@ lb/lw/ll            ; r0 = mem[r0]  (size from elem_type(node->type)->size)
 ```asm
 ; gen_addr(struct_expr) → r0 = struct base address
 push
-immw member_offset
+immw    member_offset
 add
 lb/lw/ll            ; load member value
 ```
 
-**Call through struct member function pointer** (`ND_MEMBER`, `is_function=true`; covers `s.fp(args)` and `s->fp(args)`):
+**Direct function call**:
 ```asm
-; push arguments right-to-left (children[2..])
-; gen_expr(arg[n-1]) → pushw/push
-; ...
-; gen_expr(arg[0]) → pushw/push
-; gen_addr(node) → r0 = address of fn-ptr field (struct_base + member_offset)
-lw                  ; load function pointer value (2 bytes)
-jli                 ; indirect call
-adj   param_total_bytes
+; push arguments right-to-left (last arg pushed first)
+jl      func_name
+adj     param_total_bytes   ; caller cleans up parameters
 ```
 
-**Direct function call** (`ND_IDENT` with `is_function=true` and function type):
-```asm
-; push arguments right-to-left (last arg first)
-; gen_expr(arg[n-1]) → pushw/push
-; ...
-; gen_expr(arg[0]) → pushw/push
-jl    func_name
-adj   param_total_bytes   ; caller cleans up parameters
-```
-Function designators used as values (e.g. `fp = myfunc`) emit only `immw func_name` (no call).
-
-**Indirect call through function pointer variable** (`fp(args)` where `fp` has `ptr(fn)` type):
+**Indirect call through function pointer variable** (`fp(args)`):
 ```asm
 ; push arguments right-to-left
-; gen_expr(arg[n-1]) → pushw/push
-; ...
-; gen_expr(arg[0]) → pushw/push
-lea   fp_offset     ; or immw fp for globals
-lw                  ; load function pointer value into r0
-jli                 ; indirect call: lr = pc; pc = r0
-adj   param_total_bytes
-```
-
-**Indirect call through dereferenced pointer** (`(*fp)(args)`):
-```asm
-; push arguments right-to-left (children[1..n-1])
-; gen_expr(children[0]) → r0 = function address (evaluating the pointer expr)
-jli
-adj   param_total_bytes
-```
-
-**`putchar(c)`** — special CPU builtin, handled directly in `gen_callfunction`:
-```asm
-; gen_expr(c) → r0
-putchar             ; opcode 0x1e; writes r0 & 0xff to stdout; does not modify r0
+lea     fp_offset           ; or immw fp for globals
+lw                          ; load function pointer into r0
+jli                         ; lr = pc; pc = r0
+adj     param_total_bytes
 ```
 
 **Logical OR** (`||`):
 ```asm
 ; gen_expr(lhs)
-jnz  L1         ; short-circuit: if lhs != 0, result is 1
+jnz  L1             ; short-circuit
 ; gen_expr(rhs)
 jnz  L1
 immw 0
@@ -129,33 +247,21 @@ L1: immw 1
 L2:
 ```
 
-**Logical AND** (`&&`):
-```asm
-; gen_expr(lhs)
-jz   L1         ; short-circuit: if lhs == 0, result is 0
-; gen_expr(rhs)
-jz   L1
-immw 1
-j    L2
-L1: immw 0
-L2:
-```
+**Logical AND** (`&&`) — symmetric with `jz` for false short-circuit.
 
-**Break/continue label stacks** (`codegen.c` file scope):
-```c
-static int break_labels[64];   // target label for break at each loop nesting depth
-static int cont_labels[64];    // target label for continue at each loop nesting depth
-static int loop_depth = 0;     // current nesting depth (incremented on loop entry)
-```
-`gen_whilestmt`, `gen_forstmt`, `gen_dowhilestmt`, and `gen_switchstmt` push their break/continue targets before generating the body and pop them after. `gen_breakstmt`/`gen_continuestmt` emit `j break_labels[loop_depth-1]` / `j cont_labels[loop_depth-1]`.
+**Break/continue**: `break_labels[64]` and `cont_labels[64]` stacks (indexed by `loop_depth`)
+store the target label for the enclosing loop or switch. `gen_breakstmt`/`gen_continuestmt`
+emit `IR_J break_labels[loop_depth-1]` / `IR_J cont_labels[loop_depth-1]`.
 
-**Switch dispatch** (`gen_switchstmt`): two-phase — phase 1 re-evaluates the selector expression for each `case` label, emitting `push; eq; jnz lcase` comparisons; phase 2 emits the compound-statement body verbatim, inserting `gen_label` at each `ND_CASESTMT`/`ND_DEFAULTSTMT` node.
+**Switch dispatch**: two-phase — phase 1 re-evaluates the selector for each case and emits
+`push; eq; jnz Lcase`; phase 2 emits the body, inserting `IR_LABEL` at each case/default node.
 
-**Goto/label resolution** (`gen_function`): before emitting a function body, `collect_labels()` walks the AST and calls `new_label()` for every `ND_LABELSTMT`, storing `(name, id)` pairs in `label_table[64]`. Both `gen_gotostmt` and `gen_labelstmt` look up the name in this table, so forward jumps resolve correctly.
+**Goto/label**: `collect_labels()` pre-scans the function body AST before codegen, assigning
+numeric IDs to all `ND_LABELSTMT` nodes. Both forward and backward `goto` then resolve by name.
 
-## Cast Generation (`gen_cast`)
+### Cast Generation (`gen_cast`)
 
-Casts are no-ops when src and dst have the same size. Otherwise:
+No-op when src and dst sizes match. Otherwise:
 
 | From → To | Instructions |
 |---|---|
@@ -164,215 +270,299 @@ Casts are no-ops when src and dst have the same size. Otherwise:
 | long/ulong → int (truncate) | `push; immw 0xffff; and` |
 | long/ulong → char (truncate) | `push; immw 0xff; and` |
 | int → char (truncate) | `push; immw 0xff; and` |
-| uchar/ushort → larger | zero-extend (no-op, top bits assumed 0) |
-| int/ptr → long (zero-extend) | `push; immw 0; push; …` (builds 32-bit) |
-| int-like → float/double | `sxb` or `sxw` (sign-extend to 32 bits) then `itof` |
-| float/double → int-like | `ftoi` then `push; immw mask; and` if size < 4 |
+| uchar/ushort → larger | zero-extend (no-op; top bits assumed 0) |
+| int/ptr → long (zero-extend) | `push; immw 0; push; …` (builds 32-bit pair) |
+| int-like → float/double | sign-extend to 32 bits (`sxb`/`sxw`), then `itof` |
+| float/double → int-like | `ftoi`, then `push; immw mask; and` if size < 4 |
 
-## Global Variable Initialization
+### Global Variable Initialization
 
-**Scalars**: emits `word value` (or `long` for 4-byte integer types) in the data section. Float scalars emit 4 bytes of IEEE 754 representation via `gen_bytes`.
+**Scalars**: emit `word value` (or `long` for 4-byte types) in the data section. Float scalars
+emit 4 bytes of IEEE 754 representation via `gen_bytes`.
 
-**Arrays** (global): `gen_mem_inits()` recursively fills a `char data[]` byte buffer, then `gen_bytes()` emits one `byte` directive per byte. **Exception — pointer arrays with string-literal initializers**: a byte buffer cannot hold symbolic label addresses, so `gen_initlist` detects this case (element type is a pointer, any initializer — after stripping `ND_CAST` wrappers — is a string literal) and emits `IR_WORD label` per element instead, where the label is assigned by `new_strlit` and the string data is emitted in pass 3.
+**Arrays** (global): `gen_mem_inits()` fills a byte buffer recursively, then `gen_bytes()` emits
+one `IR_BYTE` per byte. Exception — pointer arrays with string-literal initializers emit
+`IR_WORD label` per element (a byte buffer cannot hold symbolic addresses).
 
-**Arrays** (local): `gen_fill(vaddr, size)` zeroes all bytes, then `gen_inits()` recursively emits `lea; push; immw; sw/sl` sequences for non-zero initializers.
+**Arrays** (local): `gen_fill(vaddr, size)` zeroes all bytes, then `gen_inits()` emits
+`lea; push; immw; sw/sl` sequences for non-zero initializers.
 
-**Structs**: `gen_struct_inits` (local) and `gen_struct_mem_inits` (global) write each field; nested structs recurse. Partial initializers leave remaining fields zeroed.
+**Structs**: `gen_struct_inits` (local) and `gen_struct_mem_inits` (global) write each field;
+nested structs recurse. Partial initializers zero-fill the remainder.
 
-## Sethi-Ullman Numbering (`label_su`)
+### Sethi-Ullman Numbering (`label_su`)
 
-`label_su(root)` (`parser.c`) runs as an AST pass between `insert_coercions` and `gen_ir`. It assigns a stack-depth label to every expression node and, for commutative binary operators with pure operands, reorders children so the heavier subtree evaluates first.
-
-### Motivation
-
-On a single-accumulator stack machine, evaluating `a OP b` always follows:
-
-```
-gen_expr(lhs)   → r0 = lhs
-push            → save lhs to stack
-gen_expr(rhs)   → r0 = rhs
-op              → r0 = stack[sp] op r0; sp += 4
-```
-
-For commutative operators (`+ * & | ^ == !=`), either child can go first. Evaluating the heavier child first (the one that requires more stack slots) reduces peak stack depth and — critically — moves constant subtrees to the left where the `-O1` constant-folder can fire more often.
-
-### Label Rules
+Runs as an AST pass (in `parser.c`) between `insert_coercions` and `gen_ir`. Assigns a
+stack-depth label to every expression node; for commutative binary operators with pure operands,
+reorders children so the heavier subtree evaluates first. This reduces peak stack depth and moves
+constant subtrees left where Rule 1 constant-folds them.
 
 | Node kind | `su_label` |
 |---|---|
-| `ND_LITERAL`, `ND_IDENT` | `0` (load into r0, no stack) |
-| `ND_UNARYOP`, `ND_MEMBER`, `ND_CAST` | `su_label` of the single expression child |
-| `ND_TERNARY` | `max(cond, then, else)` |
-| `ND_BINOP` (commutative, after optional swap) | `l == r ? l+1 : max(l, r)` |
-| `ND_BINOP` (non-commutative) | `max(l, r+1)` |
-| Comma / `&&` / `\|\|` | `0` (evaluation order is semantically fixed) |
+| `ND_LITERAL`, `ND_IDENT` | 0 |
+| `ND_UNARYOP`, `ND_MEMBER`, `ND_CAST` | su_label of the single expression child |
+| `ND_TERNARY` | max(cond, then, else) |
+| `ND_BINOP` commutative (after optional swap) | l==r ? l+1 : max(l,r) |
+| `ND_BINOP` non-commutative | max(l, r+1) |
+| Comma / `&&` / `\|\|` | 0 (evaluation order is fixed) |
 
-**Swap condition**: if `su(right) > su(left)` and both children are `is_pure_expr`, swap `ch[0]` ↔ `ch[1]`. Purity is conservative: literals, non-call identifiers, non-mutating unary/binary ops, and casts qualify; assignments, calls, and `++`/`--` do not.
+Swap condition: if `su(right) > su(left)` and both children are pure (`is_pure_expr`), swap
+`ch[0]` ↔ `ch[1]`. Pure = literals, non-call identifiers, non-mutating ops, casts. Impure =
+assignments, calls, `++`/`--`.
 
-The pass uses the existing `post_order_walk` infrastructure so children are fully labelled before their parent is processed.
+### Annotation Mode (`-ann`)
 
-## IR Construction (`gen_ir`) and Emission (`backend_emit_asm`)
+Every `IRInst` carries a `line` field stamped by `ir_append()` from `current_codegen_line`.
+`backend_emit_asm` maintains `prev_line` and `bb_idx`; when `flag_annotate` is set it emits a
+`; source text` comment on the first instruction from each new source line, and `; --- bbN ---`
+at each `IR_BB_START`. `set_ann_source(src)` builds a line-pointer index into the preprocessed
+source text.
 
-`gen_ir(node, tu_index)` sets `current_tu` then makes three passes over the top-level declaration list for the current TU, appending `IRInst` nodes to `codegen_ctx.ir_head`:
+---
 
-1. **Pass 1**: append IR for function definitions (text area).
-2. **Pass 2**: append IR for global variable declarations (data area). `extern` declarations and bare function prototypes are skipped. Static globals use the mangled label `_s{tu_index}_{name}`.
-3. **Pass 2b**: append IR for local static variable data collected during pass 1 (`_ls{id}:` labels). `local_static_counter` is monotonically increasing across TUs; labels are assigned at symbol-table build time.
-4. **Pass 3**: append IR for deferred string literal data (`_l{id}:` labels), each as a sequence of `IR_BYTE` nodes followed by a null terminator. Label IDs are monotonically increasing across TUs.
+## CPU4 Backend
 
-After `gen_ir` returns, the caller invokes `backend_emit_asm(codegen_ctx.ir_head)` to walk the IR list and write assembly text. Two additional passes run between construction and emission:
+After `peephole`, the CPU4 path runs four additional passes before emitting assembly.
 
-```
-gen_ir(node, tu)          →  IR list (raw)
-mark_basic_blocks()       →  IR list + BB_START markers
-peephole(opt_level)       →  IR list, compacted   (only when -O1/-O2)
-backend_emit_asm(ir_head) →  assembly text
-```
+### SSA IR
 
-## Basic-Block Markers (`mark_basic_blocks`)
+#### `SSAInst` Struct
 
-`mark_basic_blocks()` (`codegen.c`) inserts `IR_BB_START` sentinel nodes into the IR list immediately after `gen_ir` completes. These nodes emit no assembly; they exist solely to delimit basic blocks for the optimiser.
-
-A **basic-block leader** is any instruction where a new basic block must begin:
-
-1. The very first instruction in the list.
-2. Any instruction that immediately follows a terminator (`IR_J`, `IR_JZ`, `IR_JNZ`, `IR_RET`).
-3. Any `IR_LABEL` or `IR_SYMLABEL` instruction (a potential jump target).
-
-`IR_JL` and `IR_JLI` are **calls**, not terminators — execution continues at the instruction after the call — so they do not end a basic block.
-
-`mark_basic_blocks` walks the list with a single pass, inserting an `IR_BB_START` node before each leader (suppressing duplicates). It updates `codegen_ctx.ir_tail` afterward.
-
-The result is a list whose structure looks like:
-
-```
-IR_BB_START
-IR_SYMLABEL "func"
-IR_ENTER  N
-...instructions...
-IR_JZ     L3
-IR_BB_START
-IR_LABEL  L3
-...instructions...
-IR_RET
-IR_BB_START
-...
+```c
+typedef struct SSAInst {
+    SSAOp       op;       // operation kind
+    IROp        alu_op;   // SSA_ALU/SSA_ALU1: original IR opcode (IR_ADD, IR_LTS, …)
+    int         rd;       // destination: VREG_START+ = virtual, 0–7 = physical, -1 = none, -2 = bp-relative
+    int         rs1;      // source 1 (same encoding as rd)
+    int         rs2;      // source 2 (same encoding as rd)
+    int         imm;      // immediate value, bp byte offset, or label id
+    int         size;     // 1/2/4 for SSA_LOAD/SSA_STORE
+    const char *sym;      // symbolic name: call target, label name
+    int         line;     // source line (carried from the originating IR node)
+    struct SSAInst *next;
+} SSAInst;
 ```
 
-`backend_emit_asm` skips `IR_BB_START` and `IR_NOP` nodes silently.
+#### Virtual Register Namespace
 
-## Peephole Optimiser (`optimise.c`)
+`VREG_START = 8`. Before register allocation all destinations use virtual registers:
 
-Enabled by the `-O<N>` compiler flag (`-O` alone implies `-O1`). Called as `peephole(opt_level)` after `mark_basic_blocks()`.
+| Value | Meaning |
+|---|---|
+| -2 | bp-relative addressing (not a register; used with SSA_LOAD/SSA_STORE) |
+| -1 | no destination |
+| 0–7 | physical register (only valid after `regalloc()`) |
+| 8 (VREG_START+0) | virtual accumulator → maps to r0 |
+| 9 (VREG_START+1) | virtual depth-1 temp → maps to r1 |
+| 10 (VREG_START+2) | virtual depth-2 temp → maps to r2 |
+| 11+ | additional depths → r3, r4, … |
 
-### Design
+#### `SSAOp` Enum
 
-`IR_BB_START` is a **hard barrier**: no pattern fires across it, so the optimiser never moves code between basic blocks. Within a block, `IR_NOP` (the deleted-instruction marker) and `IR_COMMENT` nodes are treated as **transparent**: the `next_inbb()` helper skips them when building a lookahead window, so intervening deletions from earlier rules do not prevent later rules from firing.
+| Op | Description |
+|---|---|
+| `SSA_MOVI` | rd = imm (integer constant) |
+| `SSA_MOVSYM` | rd = &sym (label address) |
+| `SSA_LEA` | rd = bp + imm (bp-relative address; no load) |
+| `SSA_MOV` | rd = rs1 (register copy) |
+| `SSA_LOAD` | rd = mem[rs1 + imm] (size bytes); rs1==-2 means bp-relative |
+| `SSA_STORE` | mem[rd + imm] = rs1 (size bytes); rd==-2 means bp-relative |
+| `SSA_ALU` | rd = rs1 alu_op rs2 (three-register; alu_op = IR_ADD, IR_LTS, IR_FADD, …) |
+| `SSA_ALU1` | rd = op(rs1) (single-register; alu_op = IR_SXB, IR_SXW, IR_ITOF, IR_FTOI) |
+| `SSA_ADJ` | sp += imm |
+| `SSA_ENTER` | enter N (frame setup) |
+| `SSA_RET` | ret |
+| `SSA_CALL` | jl sym (direct call) |
+| `SSA_CALLR` | jlr (indirect call through r0) |
+| `SSA_J` | unconditional jump to label imm |
+| `SSA_JZ` | jump to label imm if r0 == 0 |
+| `SSA_JNZ` | jump to label imm if r0 != 0 |
+| `SSA_LABEL` | numeric label (imm = id) |
+| `SSA_SYMLABEL` | symbolic label (sym = name) |
+| `SSA_WORD` | data word directive |
+| `SSA_BYTE` | data byte directive |
+| `SSA_ALIGN` | alignment directive |
+| `SSA_PUTCHAR` | putchar opcode (r0 implicit) |
+| `SSA_COMMENT` | annotation comment |
 
-The pass repeats until the IR stops changing (capped at 20 iterations), then `compact_ir()` relinks the list to physically remove all `IR_NOP` nodes and updates `ir_tail`.
+---
 
-### `-O1` Rules
+### Pass 1: `lift_to_ssa()` (`ssa.c`)
 
-| # | Pattern (same basic block) | Replacement | Notes |
-|---|---|---|---|
-| 1 | `IMM K1; PUSH; IMM K2; binop` | `IMM (K1 op K2)` | Constant-fold arithmetic and comparisons |
-| 2 | `IMM K; SXB` | `IMM sext8(K)` | Constant sign-extend byte |
-| 2 | `IMM K; SXW` | `IMM sext16(K)` | Constant sign-extend word |
-| 3 | `J/JZ/JNZ Lx` → `BB_START` → `LABEL Lx` | kill branch | Dead jump to immediately following label |
-| 4 | `ADJ N; ADJ M` | `ADJ N+M` (or delete if sum=0) | Merge adjacent stack adjustments |
-| 5 | `ADJ 0` | delete | Zero stack adjustment |
-| 9 | `LEA N; PUSH; …expr…; SW/SB/SL` followed by `LEA N; LW/LB/LL` | delete reload | Store/reload elimination: r0 still holds the stored value |
+Converts the flat stack IR list to SSA IR with virtual registers. The key insight is that the
+stack machine's expression stack maps cleanly to a small set of virtual registers.
 
-Rule 1 covers all foldable binary ops: `add sub mul and or xor shl shr eq ne lt le gt ge`. Symbolic immediates (label addresses) are never folded.
+#### Virtual Stack Model
 
-Rules 4 and 5 together collapse the paired `adj -N` / `adj +N` that surround empty or dead scopes (two passes: merge → zero → delete).
+```c
+static int vs_reg[MAX_VDEPTH];   // virtual register at each stack depth
+static int vs_size[MAX_VDEPTH];  // push size (2 or 4 bytes) per slot
+static int vs_depth;             // current expression stack depth
+static int vsp;                  // running (sp - bp) offset for scope adj tracking
+```
 
-Rule 3 handles both unconditional jumps and conditional branches whose target is the immediately following label (the branch is always taken to the same place as fall-through regardless of condition).
+`vs_reg[0]` is always `VREG_START+0` (the accumulator, maps to r0). When a `IR_PUSH` is
+processed, depth increments and `vs_reg[depth]` becomes `VREG_START+depth` (maps to r1, r2, …).
+`IR_POP` decrements depth. Sethi-Ullman labelling ensures depth never exceeds 3 for well-formed
+C expressions, so r0–r3 suffice.
 
-### `-O2` Additional Rules
+#### Stack IR → SSA Mapping
 
-| # | Pattern | Replacement | Notes |
-|---|---|---|---|
-| 6 | `PUSH; IMM 1; MUL` | delete all three | Multiply by 1 is identity |
-| 7 | `PUSH; IMM 2^k; MUL` | `PUSH; IMM k; SHL` | Strength-reduce power-of-2 multiply to shift; Rule 1 can then fold if the pushed value is also a constant |
-| 8 | `PUSH; IMM 0; ADD/SUB` | delete all three | Add/subtract zero is identity |
+| Stack IR pattern | SSA output | Notes |
+|---|---|---|
+| `IR_IMM` (integer) | `SSA_MOVI rd=v0, imm=K` | accumulator |
+| `IR_IMM` (symbolic) | `SSA_MOVSYM rd=v0, sym=S` | label address |
+| `IR_LEA N; IR_LW/LB/LL` | `SSA_LOAD rd=v0, rs1=-2, imm=N, size` | peephole: look ahead for load; bp-relative F2 path |
+| `IR_LW/LB/LL` (standalone) | `SSA_LOAD rd=v0, rs1=v0, imm=0, size` | register-relative (r0 is the address) |
+| `IR_SW/SB/SL` | `SSA_STORE rd=v{d-1}, rs1=v0, imm=0, size` | address in vs_reg[depth-1] |
+| `IR_LEA N; IR_SW/SB/SL` | `SSA_STORE rd=-2, rs1=v0, imm=N, size` | bp-relative store |
+| `IR_PUSH/PUSHW` | `SSA_MOV rd=v{d+1}, rs1=v0`; depth++ | save accumulator to next depth slot |
+| `IR_POP/POPW` | `SSA_MOV rd=v0, rs1=v{d}`; depth-- | restore accumulator |
+| `IR_ADD` (etc.) | `SSA_ALU rd=v0, rs1=v{d-1}, rs2=v0, alu_op=IR_ADD`; depth-- | pop left from stack slot |
+| `IR_SXB/SXW` | `SSA_ALU1 rd=v0, rs1=v0, alu_op=IR_SXB/SXW` | sign-extend accumulator |
+| `IR_ITOF/FTOI` | `SSA_ALU1 rd=v0, rs1=v0, alu_op=IR_ITOF/FTOI` | float conversion |
+| `IR_JL sym` | flush args + `SSA_CALL sym` | see call flushing below |
+| `IR_JLI` | flush args + `SSA_CALLR` | indirect call |
+| `IR_ENTER N` | `SSA_ENTER imm=N`; vsp = -N | frame setup; initialise vsp |
+| `IR_ADJ N` | `SSA_ADJ imm=N` (scope adj) or post-call arg cleanup (see below) | |
+| `IR_J/JZ/JNZ L` | `SSA_J/JZ/JNZ imm=L`; record vsp for forward-branch fixup | |
+| `IR_LABEL L` | `SSA_LABEL imm=L`; apply recorded vsp from branch | |
+| `IR_SYMLABEL S` | `SSA_SYMLABEL sym=S`; reset all state (function entry) | |
+| `IR_RET` | `SSA_RET` | |
 
-Rule 9 scans forward from the address push, tracking expression-stack depth across binary ops, pushes, and pops. When depth reaches 0 at a store (`SW/SB/SL`), r0 still holds the value just stored. If the immediately following instructions reload from the same address (matching `LEA N; LW/LB/LL` or `IMM sym; LW/LB/LL`), those two instructions are killed. The scan aborts at `JL`/`JLI` (calls may clobber memory) and at BB boundaries. A 64-instruction limit prevents O(n²) worst case.
+The lifter peeks one instruction ahead when it sees `IR_LEA`: if the next op is a load or
+store, it collapses the pair into a single `SSA_LOAD`/`SSA_STORE` with `rs1=-2` (bp-relative),
+enabling the F2 encode path in the backend.
 
-Rule 7 is particularly effective for array indexing: stride-scale multiplications (always a power of 2 on this target since `sizeof(int) = 2`) are converted to shifts, and when the array index is a compile-time constant the shift is immediately constant-folded by Rule 1, collapsing the entire address computation.
+#### Call Flushing (`flush_for_call_n`)
 
-### Example: constant array access
+Before every `IR_JL`/`IR_JLI`, argument registers and outer expression temporaries must be
+partitioned. The argument values pushed most recently occupy the bottom of the virtual stack;
+any temporaries from an enclosing expression sit above them.
 
-Source: `int a[5]; a[0]=10; a[1]=20; a[2]=30; return a[1]+a[2];`
+1. **Detect the boundary**: the call site knows the argument count (`n`); the bottom `n` virtual
+   stack slots are arguments; slots above are outer temporaries.
+2. **Spill outer temporaries** to memory at higher sp offsets with `SSA_STORE rd=-2, imm=vsp`.
+   Record the spill locations in `spill_reg[]`/`spill_off[]`/`spill_sz[]`.
+3. **Flush arguments** to the stack frame below the current sp with `SSA_STORE` and emit
+   `SSA_ADJ` to move sp to the new call frame boundary.
+4. **Post-call restore**: after the caller-side `IR_ADJ +N` (argument cleanup), reload the
+   spilled outer temporaries from their saved locations and emit a second `SSA_ADJ` to reclaim
+   the spill area.
 
-Unoptimised address computation for `a[1]`:
+This preserves r1–r3 across a call when there are outer expression temporaries, at the cost
+of a spill/reload per temporary.
+
+#### Forward-Branch vsp Fixup
+
+`adj` scope-exit instructions from one branch arm must not affect the `vsp` seen by the merge
+point at the target label. When a branch (`IR_J/JZ/JNZ`) is processed, the current `vsp` is
+recorded in a fixup table keyed by label id. When the target `IR_LABEL` is reached, `vsp` is
+restored from the table entry. This prevents scope-cleanup adjustments from one arm from
+corrupting the sp model in subsequent blocks.
+
+---
+
+### Pass 2: `ssa_peephole()` (`ssa_opt.c`)
+
+Single pass over the SSA list before register allocation. Currently:
+
+- **Identity-move elimination**: `SSA_MOV rd=A, rs1=A` (destination equals source) is marked
+  dead by setting `op = -1`. `risc_backend_emit` skips nodes with `op < 0`.
+
+The pass operates on virtual registers. Future passes (copy propagation, constant propagation,
+dead-code elimination, compare-branch fusion, LEA→STORE forwarding) slot in here.
+
+---
+
+### Pass 3: `regalloc()` (`regalloc.c`)
+
+Trivial depth-based mapping — no live-range analysis required:
+
+```c
+static int alloc_reg(int vreg) {
+    if (vreg < VREG_START) return vreg;   /* -2, -1, or already physical */
+    return vreg - VREG_START;             /* v8→r0, v9→r1, v10→r2, … */
+}
+```
+
+`regalloc()` walks the SSA list and rewrites every `rd`, `rs1`, `rs2` field through
+`alloc_reg()`. After this pass all virtual registers ≥ `VREG_START` become physical registers
+r0–r7. The `-2` bp-relative sentinel and `-1` no-destination sentinel are preserved unchanged.
+
+Correctness relies on the Sethi-Ullman guarantee that expression depth ≤ 3 (r0–r2 suffice for
+all typical C expressions). r3 handles the rare depth-3 case. r4–r7 are not currently assigned
+by the allocator (reserved for future use or callee-saved conventions).
+
+---
+
+### Pass 4: `risc_backend_emit()` (`risc_backend.c`)
+
+Walks the post-regalloc SSA list and emits CPU4 assembly text. Nodes with `op < 0` (killed by
+`ssa_peephole`) are skipped.
+
+#### Instruction Selection
+
+| SSAOp | Condition | CPU4 emission |
+|---|---|---|
+| `SSA_MOVI` | imm fits in 16 bits | `immw rd, imm` |
+| `SSA_MOVI` | imm > 0xffff | `immw rd, lo16; immwh rd, hi16` |
+| `SSA_MOVSYM` | — | `immw rd, sym` |
+| `SSA_LEA` | — | `lea rd, imm` (F3c; bp + signed 16-bit offset) |
+| `SSA_MOV` | rd != rs1 | `or rd, rs1, rs1` (F1a pseudo `mov`) |
+| `SSA_LOAD` | rs1 == -2, in F2 range | `lw/lb/ll rd, [bp+imm7]` (F2, 2 bytes) |
+| `SSA_LOAD` | rs1 == -2, out of F2 range | `lea scratch, imm; llw/llb/lll rd, [scratch+0]` |
+| `SSA_LOAD` | rs1 >= 0 | `llw/llb/lll rd, [rs1+imm]` (F3b, 3 bytes) |
+| `SSA_STORE` | rd == -2, in F2 range | `sw/sb/sl rs1, [bp+imm7]` (F2, 2 bytes) |
+| `SSA_STORE` | rd == -2, out of F2 range | `lea scratch, imm; slw/slb/sll rs1, [scratch+0]` |
+| `SSA_STORE` | rd >= 0 | `slw/slb/sll rs1, [rd+imm]` (F3b, 3 bytes) |
+| `SSA_ALU` | most ops | `add/sub/mul/… rd, rs1, rs2` (F1a, 2 bytes) |
+| `SSA_ALU` | `le`/`ge` | `gt/lt rd, rs2, rs1; immw tmp, 0; eq rd, rd, tmp` (3 instructions) |
+| `SSA_ALU` | `les`/`ges` | `gts/lts rd, rs2, rs1; immw tmp, 0; eq rd, rd, tmp` |
+| `SSA_ALU` | `fle`/`fge` | `fgt/flt rd, rs2, rs1; immw tmp, 0; eq rd, rd, tmp` |
+| `SSA_ALU1` | `sxb`/`sxw` | `sxb/sxw rd` (F1b, 2 bytes; in-place) |
+| `SSA_ALU1` | `itof`/`ftoi` | `itof`/`ftoi` (F0; r0 implicit) |
+| `SSA_ENTER` | — | `enter N` (F3a) |
+| `SSA_ADJ` | imm != 0 | `adjw imm` (F3a; always adjw, no 8-bit adj in CPU4) |
+| `SSA_RET` | — | `ret` (F0) |
+| `SSA_CALL` | — | `jl sym` (F3a) |
+| `SSA_CALLR` | — | `jlr` (F0; r0 holds target) |
+| `SSA_J/JZ/JNZ` | — | `j/jz/jnz _lN` (F3a) |
+| `SSA_LABEL` | — | `_lN:` |
+| `SSA_SYMLABEL` | — | `sym:` |
+| `SSA_WORD/BYTE/ALIGN` | — | `word`/`byte`/`align` directives |
+| `SSA_PUTCHAR` | — | `putchar` (F0) |
+
+#### F2 Range Checks
+
+F2 bp-relative instructions use a scaled 7-bit signed immediate:
+
+| Access size | Scale | F2 byte-offset range |
+|---|---|---|
+| byte (`lb`/`sb`/`lbx`) | ×1 | −64 … +63 bytes from bp |
+| word (`lw`/`sw`/`lwx`) | ×2 | −128 … +126 bytes from bp (even) |
+| long (`ll`/`sl`) | ×4 | −256 … +252 bytes from bp (mult of 4) |
+
+When a bp-relative access falls outside the F2 range, the backend falls back to
+`lea rd, imm` (F3c, 3 bytes) + `llw/slw rd, [rd+0]` (F3b, 3 bytes) = 6 bytes.
+
+#### `le`/`ge` Expansion
+
+The F1a instruction set omits `le`/`ge` (they are pseudo-ops implemented by operand-swap).
+For the compare-into-register case (where a 0/1 result is needed in a register rather than
+a direct branch), the backend expands `le rd, rs1, rs2` as:
+
 ```asm
-lea     -10          ; base of a
-push
-immw    0x0002       ; stride (sizeof int)
-push
-immw    0x0001       ; index
-mul                  ; 2 * 1
-add                  ; base + offset
+gt   rd, rs1, rs2    ; rd = (rs1 > rs2) ? 1 : 0
+immw tmp, 0
+eq   rd, rd, tmp     ; rd = (rd == 0) ? 1 : 0  — i.e. !(rs1 > rs2)
 ```
-After `-O2` (Rule 1 folds `immw 2; push; immw 1; mul` → `immw 2`; Rule 8 has no effect here since 2 ≠ 0):
-```asm
-lea     -10
-push
-immw    0x0002
-add
-```
-For `a[0]` the index is 0, so Rule 1 folds `2*0` → `immw 0`, and then Rule 8 eliminates `push; immw 0; add`, leaving only `lea -10` as the address.
 
-## Annotation Mode (`-ann`)
+When compare-branch fusion (optimisation B2) is implemented, `le`/`ge` followed by
+`jz`/`jnz` will collapse to a single F3b `bgt`/`blt` instruction instead.
 
-Passing `-ann` to the compiler enables inline source-code and basic-block comments in the assembly output. This is implemented across `codegen.c`, `backend.c`, and `smallcc.c`.
+#### Annotation
 
-### Source Line Tracking
-
-Every `IRInst` carries an `int line` field (0 = unknown). A static `current_codegen_line` in `codegen.c` is updated at the top of `gen_stmt()` and `gen_decl()` using `node->line`, which is set by the parser to the line of the first token of each statement or declaration. `ir_append()` stamps `current_codegen_line` onto every new instruction.
-
-**Statement line assignment**: `stmt()` sets `node->line = token_ctx.current->line` immediately after `new_node()`, using the not-yet-consumed token of the current statement (e.g. the `if` keyword) rather than the previously consumed token (e.g. `{` on the preceding line).
-
-### Assembly Output
-
-`backend_emit_asm` maintains `prev_line` (last emitted source line) and `bb_idx` (current BB counter). For each IR instruction:
-
-1. If `flag_annotate` is set, `p->line != 0`, and `p->line != prev_line`, and `p->op` is not `IR_BB_START`/`IR_NOP`/`IR_COMMENT`: emit the source line as a comment (`; trimmed source text`) and update `prev_line`.
-2. At `IR_BB_START` nodes: emit `; --- bbN ---` and increment `bb_idx`.
-
-`set_ann_source(src)` (called once per TU in `smallcc.c` before `gen_ir`) builds a line-pointer index: it `strdup`s the preprocessed source and indexes the start of each line into `ann_lines[]`. `emit_src_comment(line)` uses this index to print the trimmed content of line N.
-
-### Example output (`-ann -O1`)
-
-```asm
-; --- bb0 ---
-fact:
-    enter   0
-    adj     -2
-; if (n <= 1) return 1;
-    lea     2
-    lw
-    push
-    immw    0x0001
-    le
-    jz      _l4
-; --- bb1 ---
-    immw    0x0001
-    ret
-; --- bb2 ---
-_l4:
-; return n * fact(n - 1);
-    lea     2
-    lw
-    push
-    lea     2
-    lw
-    push
-    immw    0x0001
-    sub
-    jl      fact
-    adj     2
-    mul
-    ret
-```
+When `-ann` is set, `rb_emit_src_comment(line)` emits a `; source text` comment before the
+first instruction from each new source line, using the same `ann_lines[]` index built by
+`set_ann_source()` in `smallcc.c`. Comments are suppressed at label nodes.

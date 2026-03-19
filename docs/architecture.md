@@ -545,3 +545,61 @@ When `insert_ident()` sees `sclass == SC_EXTERN` at global scope it:
 When a real definition arrives for the same name (in the same or a later TU), `insert_ident()` finds the existing entry and upgrades it: sets `kind` to `SYM_GLOBAL`, updates the type, and allocates data offset.
 
 `gen_decl()` skips entire `extern` declarations (`sym->kind == SYM_EXTERN → return`) and bare function prototypes (`istype_function(sym->type) → continue`) so no spurious labels or data are emitted.
+
+---
+
+## Backend Files
+
+After `gen_ir` and `peephole`, the pipeline splits by target architecture. All backend files
+are independent of the parser and type system; they consume only `IRInst` lists and emit
+assembly text.
+
+### `codegen.c` — IR Generation
+
+Walks the annotated AST and builds the flat `IRInst` (stack IR) list. Also runs
+`mark_basic_blocks()` to insert `IR_BB_START` sentinels after IR construction. The IR is
+identical for both CPU3 and CPU4 targets.
+
+### `optimise.c` — Stack-IR Peephole
+
+Rules 1–9: constant folding, dead branch elimination, `adj` merging, multiply strength-reduction,
+and store/reload elimination. Runs on the stack IR before the target split. Rule 9 (store/reload
+elim) is currently gated on CPU3 only. See `docs/codegen.md` for rule details.
+
+### `backend.c` — CPU3 Emitter
+
+`backend_emit_asm(ir_head)` walks the stack IR list and writes CPU3 assembly text directly.
+One IR node → one or a few assembly instructions. Also owns the `-ann` source-comment
+infrastructure (`set_ann_source`, `emit_src_comment`).
+
+### `ssa.c` / `ssa.h` — Stack IR → SSA Lift (CPU4)
+
+`lift_to_ssa(ir_head)` converts the stack IR to a 3-address SSA-like IR (`SSAInst` list)
+with virtual registers. Models the stack machine's expression stack as a small set of virtual
+registers (`vs_reg[depth]`), peeks ahead to collapse `LEA+LOAD`/`LEA+STORE` pairs into
+bp-relative SSA ops, and handles call-site argument/temporary partitioning via
+`flush_for_call_n`. Maintains a forward-branch vsp fixup table so scope-exit adjustments
+from one branch arm do not corrupt the sp model at merge points.
+
+### `ssa_opt.c` — SSA-Level Peephole (CPU4)
+
+`ssa_peephole(head)` runs after `lift_to_ssa` and before register allocation. Currently
+eliminates identity moves (`SSA_MOV rd=A, rs1=A`). The natural location for future passes:
+compare-branch fusion, LEA→STORE forwarding, copy/constant propagation, DCE.
+
+### `regalloc.c` — Register Allocation (CPU4)
+
+`regalloc(head)` maps virtual registers to physical registers r0–r7. Current strategy is
+trivial depth-based: `VREG_START+depth → r{depth}`. Correctness is guaranteed by Sethi-Ullman
+labelling (expression depth ≤ 3). The allocator is isolated behind a single `alloc_reg(vreg)`
+function; replacing it with linear-scan or graph-colouring requires no changes to `ssa.c` or
+`risc_backend.c`.
+
+### `risc_backend.c` — CPU4 Emitter
+
+`risc_backend_emit(head)` walks the post-regalloc SSA list and emits CPU4 assembly text.
+Selects F2 bp-relative instructions when offsets are in range, falls back to F3b
+register-relative otherwise. Expands `le`/`ge`/`les`/`ges`/`fle`/`fge` into 3-instruction
+sequences (the CPU4 ISA omits these as direct encodings). Skips nodes marked dead by
+`ssa_peephole` (`op < 0`). Also supports `-ann` source comments via the shared `ann_lines[]`
+index.
