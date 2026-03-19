@@ -234,8 +234,7 @@ static bool peephole_pass(int level)
          * (depth reaches 0 at SW/SB/SL).  Abort at function calls (JL/JLI)
          * because they may clobber memory, and at BB boundaries.
          * ---------------------------------------------------------------- */
-        if (g_target_arch == 3 &&
-            (p->op == IR_LEA || (p->op == IR_IMM && p->sym)) &&
+        if ((p->op == IR_LEA || (p->op == IR_IMM && p->sym)) &&
             n1 && n1->op == IR_PUSH)
         {
             int depth = 1;

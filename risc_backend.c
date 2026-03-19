@@ -355,6 +355,62 @@ void risc_backend_emit(SSAInst *head)
             fprintf(asm_out, "    jnz     _l%d\n", p->imm);
             break;
 
+        case SSA_BRANCH:
+        {
+            /* Fused compare-branch (B2): emit a single F3b branch instruction.
+             * alu_op encodes the branch condition: IR_EQ→beq, IR_NE→bne,
+             * IR_LT→blt, IR_GT→bgt, IR_LTS→blts, IR_GTS→bgts. */
+            const char *mn;
+            switch (p->alu_op) {
+            case IR_EQ:  mn = "beq";  break;
+            case IR_NE:  mn = "bne";  break;
+            case IR_LT:  mn = "blt";  break;
+            case IR_GT:  mn = "bgt";  break;
+            case IR_LTS: mn = "blts"; break;
+            case IR_GTS: mn = "bgts"; break;
+            default:
+                fprintf(stderr, "risc_backend: unhandled BRANCH op %d\n",
+                        (int)p->alu_op);
+                mn = "beq";
+                break;
+            }
+            fprintf(asm_out, "    %-7s r%d, r%d, _l%d\n",
+                    mn, p->rs1, p->rs2, p->imm);
+            break;
+        }
+
+        case SSA_ALU_IMM:
+        {
+            /* Add-immediate (D4): rd = rs1 + K.
+             * Emit the most compact form available:
+             *   inc rd        (F1b, 2 bytes) when K=+1 and rd==rs1
+             *   dec rd        (F1b, 2 bytes) when K=-1 and rd==rs1
+             *   addi rd, K   (F2,  2 bytes) when |K|≤63 and rd==rs1
+             *   addli rd,rs1,K (F3b, 3 bytes) otherwise (|K|≤511)
+             * If K is outside addli range, fall back to immw + add. */
+            int rd  = p->rd;
+            int rs1 = p->rs1;
+            int K   = p->imm;
+            if (K == 1 && rd == rs1) {
+                fprintf(asm_out, "    inc     r%d\n", rd);
+            } else if (K == -1 && rd == rs1) {
+                fprintf(asm_out, "    dec     r%d\n", rd);
+            } else if (rd == rs1 && K >= -64 && K <= 63) {
+                fprintf(asm_out, "    addi    r%d, %d\n", rd, K);
+            } else if (K >= -512 && K <= 511) {
+                fprintf(asm_out, "    addli   r%d, r%d, %d\n", rd, rs1, K);
+            } else {
+                /* Fallback: load K into rd, then add rs1 */
+                unsigned u = (unsigned)K;
+                fprintf(asm_out, "    immw    r%d, 0x%04x\n", rd, u & 0xffff);
+                if (u >> 16)
+                    fprintf(asm_out, "    immwh   r%d, 0x%04x\n", rd,
+                            (u >> 16) & 0xffff);
+                fprintf(asm_out, "    add     r%d, r%d, r%d\n", rd, rs1, rd);
+            }
+            break;
+        }
+
         /* ---- Data section ---- */
         case SSA_WORD:
             if (p->sym)

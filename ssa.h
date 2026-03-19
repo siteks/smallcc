@@ -45,6 +45,8 @@ typedef enum {
     SSA_J,        /* j _lN                             */
     SSA_JZ,       /* jz _lN  (r0 == 0)                 */
     SSA_JNZ,      /* jnz _lN (r0 != 0)                 */
+    SSA_BRANCH,   /* beq/bne/blt/bgt/blts/bgts rs1,rs2,_lN (fused compare-branch, B2) */
+    SSA_ALU_IMM,  /* rd = rs1 + imm  (add-immediate, D4; inc/dec/addi/addli) */
     SSA_LABEL,    /* _lN:                              */
     SSA_SYMLABEL, /* sym:                              */
     SSA_WORD,     /* data word                         */
