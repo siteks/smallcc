@@ -46,6 +46,22 @@ Tests use `sim_c` (the C simulator) to execute generated assembly and check the 
 
 `cpu3/sim.py` (Python) is kept as a reference implementation and to support any legacy uses. It imports `cpu3/cpu.py` (instruction definitions, execution) and `cpu3/assembler.py` (two-pass assembler). The assembler picks up new instructions automatically from `cpu.py`'s `ptable`, so `cpu3/assembler.py` rarely needs changes.
 
+### CoreMark Benchmark
+
+CoreMark lives in `../coremark` (relative to this repo). To rebuild `coremark4.s` (CPU4):
+
+```bash
+cd ../coremark
+../smallcc/smallcc -Icpu3 -I. -arch cpu4 -ann \
+  -DFLAGS_STR=\""-O2 -DPERFORMANCE_RUN=1  "\" \
+  -DITERATIONS=8 -DPERFORMANCE_RUN=1 -O2 \
+  -o ./coremark4.s \
+  core_list_join.c core_main.c core_matrix.c core_state.c core_util.c cpu3/core_portme.c
+python3 ../smallcc/cpu4/sim.py coremark4.s
+```
+
+For CPU3: same command without `-arch cpu4`, output to `coremark.s`, run with `../smallcc/sim_c coremark.s`.
+
 ---
 
 ## Compiler Architecture

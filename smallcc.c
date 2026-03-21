@@ -449,6 +449,7 @@ int main(int argc, char **argv)
             SSAInst *ssa = lift_to_ssa(codegen_ctx.ir_head);
             if (opt_level >= 2)
                 ssa_peephole(ssa);  /* ssa_opt.c: optimize on virtual regs */
+            rb_prescan(ssa);      /* detect G1-pinned r6/r7 before regalloc */
             regalloc(ssa);        /* regalloc.c: virtual -> physical regs */
             risc_backend_emit(ssa);
             free_ssa(ssa);

@@ -78,6 +78,10 @@ void     ssa_peephole(SSAInst *head);
 /* Map virtual registers to physical registers (in-place). */
 void     regalloc(SSAInst *head);
 
+/* Pre-scan the SSA list BEFORE regalloc to detect G1-pinned r6/r7 usage.
+ * Must be called after ssa_peephole() but before regalloc(). */
+void     rb_prescan(SSAInst *head);
+
 /* Emit CPU4 assembly from SSA list. */
 void     risc_backend_emit(SSAInst *head);
 

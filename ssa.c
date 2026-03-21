@@ -272,6 +272,7 @@ SSAInst *lift_to_ssa(IRInst *ir_head)
                     s->imm  = p->operand; /* byte offset from bp   */
                     s->size = sz;
                     s->line = p->line;
+                    s->sym  = p->sym;     /* variable name for -ann annotation */
                     p = p->next;          /* consume the LW/LB/LL  */
                     break;
                 }

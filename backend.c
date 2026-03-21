@@ -1,4 +1,5 @@
 
+#include <ctype.h>
 #include <stdlib.h>
 #include <string.h>
 #include "smallcc.h"
@@ -32,18 +33,45 @@ void set_ann_source(const char *src)
     ann_src = strdup(src);
     if (!ann_src) return;
 
-    // Count lines to allocate the index
+    // Count physical lines to bound the allocation
     int count = 1;
     for (const char *p = ann_src; *p; p++)
         if (*p == '\n') count++;
 
-    ann_lines = malloc(count * sizeof(char *));
+    // allocate generously; logical line numbers can be at most count
+    ann_lines = calloc(count + 2, sizeof(char *));
     if (!ann_lines) return;
+    ann_nlines = count + 1;
 
-    ann_lines[ann_nlines++] = ann_src;
-    for (char *p = ann_src; *p; p++)
-        if (*p == '\n' && *(p + 1))
-            ann_lines[ann_nlines++] = p + 1;
+    // Walk the preprocessed source tracking logical line numbers via
+    // linemarker directives (same algorithm as the tokeniser).
+    // ann_lines[N-1] is set to the text of logical source line N.
+    int cur_line = 1;
+    char *p = ann_src;
+    while (*p) {
+        char *line_start = p;
+        // Linemarker: # <number> "filename" at start of line
+        if (*p == '#') {
+            const char *q = p + 1;
+            while (*q == ' ' || *q == '\t') q++;
+            if (isdigit((unsigned char)*q)) {
+                char *end;
+                int lm_line = (int)strtol(q, &end, 10);
+                cur_line = lm_line;
+                // skip to end of marker line
+                while (*p && *p != '\n') p++;
+                if (*p == '\n') p++;
+                // the next physical line is logical line cur_line
+                continue;
+            }
+        }
+        // Normal source line — record at logical cur_line
+        if (cur_line >= 1 && cur_line <= ann_nlines)
+            ann_lines[cur_line - 1] = line_start;
+        while (*p && *p != '\n') p++;
+        if (*p == '\n') p++;
+        cur_line++;
+    }
 }
 
 // Emit the text of source line N (1-based) as an assembly comment.

@@ -25,6 +25,17 @@
 static void rb_emit_src_comment(int line);
 
 /* ----------------------------------------------------------------
+ * E4 lookahead helpers
+ * ---------------------------------------------------------------- */
+static SSAInst *next_live_rb(SSAInst *p)
+{
+    for (p = p->next; p && (int)p->op < 0; p = p->next) {}
+    return p;
+}
+
+static void rb_mark_dead(SSAInst *p) { p->op = (SSAOp)-1; }
+
+/* ----------------------------------------------------------------
  * Helpers: F2 bp-relative address range check
  * ---------------------------------------------------------------- */
 
@@ -56,41 +67,68 @@ static int f2_long_ok(int byte_off)
 
 /* ----------------------------------------------------------------
  * Emit a bp-relative load (F2 if in range, else F3b via lea+llw)
+ * sign_ext: if non-zero, use sign-extending variants (lwx/lbx/llwx/llbx).
+ *           Ignored for size==4 (no sign-extending long load exists).
  * ---------------------------------------------------------------- */
-static void emit_bp_load(int rd, int byte_off, int size)
+static void emit_bp_load(int rd, int byte_off, int size, int sign_ext,
+                         const char *sym)
 {
+    const char *ann = (flag_annotate && sym) ? sym : NULL;
     if (size == 2 && f2_word_ok(byte_off)) {
-        fprintf(asm_out, "    lw      r%d, %d\n", rd, byte_off / 2);
+        fprintf(asm_out, "    %-7s r%d, %d", sign_ext ? "lwx" : "lw",
+                rd, byte_off / 2);
+        if (ann) fprintf(asm_out, "  ; %s", ann);
+        fputc('\n', asm_out);
     } else if (size == 1 && f2_byte_ok(byte_off)) {
-        fprintf(asm_out, "    lb      r%d, %d\n", rd, byte_off);
+        fprintf(asm_out, "    %-7s r%d, %d", sign_ext ? "lbx" : "lb",
+                rd, byte_off);
+        if (ann) fprintf(asm_out, "  ; %s", ann);
+        fputc('\n', asm_out);
     } else if (size == 4 && f2_long_ok(byte_off)) {
-        fprintf(asm_out, "    ll      r%d, %d\n", rd, byte_off / 4);
+        fprintf(asm_out, "    ll      r%d, %d", rd, byte_off / 4);
+        if (ann) fprintf(asm_out, "  ; %s", ann);
+        fputc('\n', asm_out);
     } else {
         /* Fallback: lea rd, byte_off; then load through rd */
         fprintf(asm_out, "    lea     r%d, %d\n", rd, byte_off);
-        if      (size == 2) fprintf(asm_out, "    llw     r%d, r%d, 0\n", rd, rd);
-        else if (size == 1) fprintf(asm_out, "    llb     r%d, r%d, 0\n", rd, rd);
-        else                fprintf(asm_out, "    lll     r%d, r%d, 0\n", rd, rd);
+        if      (size == 2)
+            fprintf(asm_out, "    %-7s r%d, r%d, 0", sign_ext ? "llwx" : "llw", rd, rd);
+        else if (size == 1)
+            fprintf(asm_out, "    %-7s r%d, r%d, 0", sign_ext ? "llbx" : "llb", rd, rd);
+        else
+            fprintf(asm_out, "    lll     r%d, r%d, 0", rd, rd);
+        if (ann) fprintf(asm_out, "  ; %s", ann);
+        fputc('\n', asm_out);
     }
 }
 
 /* ----------------------------------------------------------------
  * Emit a bp-relative store (F2 if in range, else F3b via lea+slw)
  * ---------------------------------------------------------------- */
-static void emit_bp_store(int val_reg, int byte_off, int size, int scratch)
+static void emit_bp_store(int val_reg, int byte_off, int size, int scratch,
+                          const char *sym)
 {
+    const char *ann = (flag_annotate && sym) ? sym : NULL;
     if (size == 2 && f2_word_ok(byte_off)) {
-        fprintf(asm_out, "    sw      r%d, %d\n", val_reg, byte_off / 2);
+        fprintf(asm_out, "    sw      r%d, %d", val_reg, byte_off / 2);
+        if (ann) fprintf(asm_out, "  ; %s", ann);
+        fputc('\n', asm_out);
     } else if (size == 1 && f2_byte_ok(byte_off)) {
-        fprintf(asm_out, "    sb      r%d, %d\n", val_reg, byte_off);
+        fprintf(asm_out, "    sb      r%d, %d", val_reg, byte_off);
+        if (ann) fprintf(asm_out, "  ; %s", ann);
+        fputc('\n', asm_out);
     } else if (size == 4 && f2_long_ok(byte_off)) {
-        fprintf(asm_out, "    sl      r%d, %d\n", val_reg, byte_off / 4);
+        fprintf(asm_out, "    sl      r%d, %d", val_reg, byte_off / 4);
+        if (ann) fprintf(asm_out, "  ; %s", ann);
+        fputc('\n', asm_out);
     } else {
         /* Fallback: lea scratch, byte_off; store via scratch */
         fprintf(asm_out, "    lea     r%d, %d\n", scratch, byte_off);
-        if      (size == 2) fprintf(asm_out, "    slw     r%d, r%d, 0\n", val_reg, scratch);
-        else if (size == 1) fprintf(asm_out, "    slb     r%d, r%d, 0\n", val_reg, scratch);
-        else                fprintf(asm_out, "    sll     r%d, r%d, 0\n", val_reg, scratch);
+        if      (size == 2) fprintf(asm_out, "    slw     r%d, r%d, 0", val_reg, scratch);
+        else if (size == 1) fprintf(asm_out, "    slb     r%d, r%d, 0", val_reg, scratch);
+        else                fprintf(asm_out, "    sll     r%d, r%d, 0", val_reg, scratch);
+        if (ann) fprintf(asm_out, "  ; %s", ann);
+        fputc('\n', asm_out);
     }
 }
 
@@ -144,13 +182,133 @@ static void rb_emit_src_comment(int line)
 }
 
 /* ----------------------------------------------------------------
+ * Pre-scan: detect r6/r7 usage per function in the SSA list.
+ *
+ * A function uses r6 (or r7) if any non-dead instruction has that physical
+ * register in rd, rs1, rs2, or as the value/address in SSA_LOAD/SSA_STORE.
+ * (After regalloc all registers are physical; r6/r7 are assigned by G1.)
+ *
+ * We build a per-function table keyed by the pointer to the SSA_SYMLABEL
+ * node that opens the function.  Returns 0/1 in use_r6/use_r7 for the
+ * function that contains node `at`.
+ *
+ * For simplicity we embed the scan result directly into two parallel arrays
+ * indexed by a small serial number assigned at each SSA_SYMLABEL+ENTER pair.
+ * ---------------------------------------------------------------- */
+#define MAX_FN_PRESCAN 512
+
+static SSAInst *fn_label_node[MAX_FN_PRESCAN];
+static int      fn_use_r6[MAX_FN_PRESCAN];
+static int      fn_use_r7[MAX_FN_PRESCAN];
+static int      fn_enter_n[MAX_FN_PRESCAN];    /* original enter N (before padding) */
+static int      fn_min_bp_off[MAX_FN_PRESCAN]; /* most negative bp-relative offset among locals */
+static int      fn_prescan_count = 0;
+
+static SSAInst *rb_next_live(SSAInst *p)
+{
+    for (p = p->next; p && (int)p->op < 0; p = p->next) {}
+    return p;
+}
+
+static int rb_is_fn_entry(SSAInst *sym_node)
+{
+    SSAInst *nx = rb_next_live(sym_node);
+    return nx && nx->op == SSA_ENTER;
+}
+
+/* rb_prescan — called BEFORE regalloc so that G1-pinned registers (set to
+ * physical 6/7 by ssa_peephole) are distinguishable from expression-depth
+ * registers (still virtual: VREG_START+6 / VREG_START+7).  The CHECK_REG
+ * macro fires only when a register value is a PHYSICAL register (< VREG_START),
+ * i.e. one explicitly assigned by the G1 pass.  Depth-slot registers that
+ * would later be mapped to r6/r7 by regalloc are NOT detected here, so they
+ * do not trigger unnecessary callee-save slots that would inflate the frame.
+ */
+void rb_prescan(SSAInst *head)
+{
+    fn_prescan_count = 0;
+
+    /* First pass: register all function entries */
+    for (SSAInst *p = head; p; p = p->next) {
+        if ((int)p->op < 0) continue;
+        if (p->op == SSA_SYMLABEL && rb_is_fn_entry(p)) {
+            if (fn_prescan_count >= MAX_FN_PRESCAN) break;
+            SSAInst *enter_node = rb_next_live(p);
+            fn_label_node[fn_prescan_count] = p;
+            fn_enter_n[fn_prescan_count]    = enter_node->imm;
+            fn_use_r6[fn_prescan_count]     = 0;
+            fn_use_r7[fn_prescan_count]     = 0;
+            fn_min_bp_off[fn_prescan_count] = 0; /* updated in second pass */
+            fn_prescan_count++;
+        }
+    }
+
+    /* Second pass: scan each function body for G1-pinned r6/r7 usage and
+     * the deepest bp-relative offset (needed for save-slot placement). */
+    int fi = -1;
+    for (SSAInst *p = head; p; p = p->next) {
+        if ((int)p->op < 0) continue;
+        if (p->op == SSA_SYMLABEL && rb_is_fn_entry(p)) {
+            fi++;
+            if (fi >= fn_prescan_count) break;
+            continue;
+        }
+        if (fi < 0) continue;
+
+        /* Only fire for PHYSICAL r6/r7 (< VREG_START), i.e. those set by
+         * the G1 pass.  Virtual depth registers (VREG_START+6, VREG_START+7)
+         * are not physical yet and must not trigger save-slot emission. */
+#define CHECK_REG(r) do { \
+    if ((r) >= 0 && (r) < VREG_START && (r) == 6) fn_use_r6[fi] = 1; \
+    if ((r) >= 0 && (r) < VREG_START && (r) == 7) fn_use_r7[fi] = 1; \
+} while (0)
+        CHECK_REG(p->rd);
+        CHECK_REG(p->rs1);
+        CHECK_REG(p->rs2);
+#undef CHECK_REG
+        /* Track the most negative bp-relative offset used by locals */
+        if (p->op == SSA_LOAD && p->rs1 == -2 && p->imm < fn_min_bp_off[fi])
+            fn_min_bp_off[fi] = p->imm;
+        if (p->op == SSA_STORE && p->rd == -2 && p->imm < fn_min_bp_off[fi])
+            fn_min_bp_off[fi] = p->imm;
+    }
+}
+
+/* Look up use_r6/use_r7/enter_n for the function identified by its
+ * SSA_SYMLABEL node. Returns 0 if not found. */
+static int rb_fn_index(SSAInst *label_node)
+{
+    for (int i = 0; i < fn_prescan_count; i++) {
+        if (fn_label_node[i] == label_node) return i;
+    }
+    return -1;
+}
+
+/* ----------------------------------------------------------------
  * risc_backend_emit — main emission pass
  * ---------------------------------------------------------------- */
 void risc_backend_emit(SSAInst *head)
 {
     if (!asm_out) asm_out = stdout;
 
+    /* rb_prescan() was already called by the caller (smallcc.c) before
+     * regalloc, so fn_use_r6/fn_use_r7/fn_min_bp_off are already populated. */
+
     int prev_line = 0;
+
+    /* Tracking state for callee-saved register save/restore */
+    int cur_fn_idx    = -1;  /* index into fn_prescan arrays for current function */
+    int cur_use_r6    = 0;
+    int cur_use_r7    = 0;
+    int cur_enter_n   = 0;   /* original enter N (before padding for saves) */
+    int cur_save_base = 0;   /* bp offset where r6 save slot starts (negative) */
+
+    /* When save slots expand enter N (by cur_flush_adj bytes), call-argument
+     * flush stores/loads (those with bp-relative imm < -cur_orig_n) must have
+     * their byte offset shifted down by the same amount, so that the lifter's
+     * vsp model remains consistent with the actual runtime sp. */
+    int cur_orig_n    = 0;   /* SSA enter N before any save-slot expansion */
+    int cur_flush_adj = 0;   /* bytes added to enter N for save slots */
 
     for (SSAInst *p = head; p; p = p->next)
     {
@@ -175,6 +333,20 @@ void risc_backend_emit(SSAInst *head)
 
         case SSA_SYMLABEL:
             fprintf(asm_out, "%s:\n", p->sym);
+            /* Track which function we're in for callee-saved reg handling */
+            if (rb_is_fn_entry(p)) {
+                cur_fn_idx = rb_fn_index(p);
+                if (cur_fn_idx >= 0) {
+                    cur_use_r6  = fn_use_r6[cur_fn_idx];
+                    cur_use_r7  = fn_use_r7[cur_fn_idx];
+                    cur_enter_n = fn_enter_n[cur_fn_idx];
+                } else {
+                    cur_use_r6 = cur_use_r7 = 0;
+                    cur_enter_n = 0;
+                }
+                cur_orig_n    = 0;
+                cur_flush_adj = 0;
+            }
             break;
 
         case SSA_COMMENT:
@@ -219,31 +391,54 @@ void risc_backend_emit(SSAInst *head)
 
         /* ---- Loads ---- */
         case SSA_LOAD:
+        {
+            /* E4: LOAD+SXW/SXB → sign-extending LOAD.
+             * If the next live node is an in-place sign-extend of the load
+             * result, absorb it and use lwx/lbx / llwx/llbx instead. */
+            SSAInst *nxt = next_live_rb(p);
+            int sign_ext = (nxt && nxt->op == SSA_ALU1
+                            && nxt->rd  == p->rd && nxt->rs1 == p->rd
+                            && ((nxt->alu_op == IR_SXW && p->size == 2) ||
+                                (nxt->alu_op == IR_SXB && p->size == 1)));
+            if (sign_ext) rb_mark_dead(nxt);
+
             if (p->rs1 == -2) {
-                /* bp-relative (F2) */
-                emit_bp_load(p->rd, p->imm, p->size);
+                /* bp-relative (F2).
+                 * If enter N was expanded for save slots (cur_flush_adj > 0),
+                 * call-arg flush loads (imm < -cur_orig_n) must be shifted down
+                 * by cur_flush_adj so they address below the expanded frame. */
+                int adj_imm = (cur_flush_adj > 0 && p->imm < -cur_orig_n)
+                              ? (p->imm - cur_flush_adj) : p->imm;
+                emit_bp_load(p->rd, adj_imm, p->size, sign_ext, p->sym);
             } else {
                 /* Register-relative (F3b): rd = mem[rs1 + imm * scale] */
                 int base = p->rs1;
                 int off  = p->imm;  /* byte offset → scale for F3b */
                 if (p->size == 2) {
                     int w = off / 2;
-                    fprintf(asm_out, "    llw     r%d, r%d, %d\n", p->rd, base, w);
+                    fprintf(asm_out, "    %-7s r%d, r%d, %d\n",
+                            sign_ext ? "llwx" : "llw", p->rd, base, w);
                 } else if (p->size == 1) {
-                    fprintf(asm_out, "    llb     r%d, r%d, %d\n", p->rd, base, off);
+                    fprintf(asm_out, "    %-7s r%d, r%d, %d\n",
+                            sign_ext ? "llbx" : "llb", p->rd, base, off);
                 } else {
                     int l = off / 4;
                     fprintf(asm_out, "    lll     r%d, r%d, %d\n", p->rd, base, l);
                 }
             }
             break;
+        }
 
         /* ---- Stores ---- */
         case SSA_STORE:
             if (p->rd == -2) {
-                /* bp-relative store (F2); use rd+1 as scratch if needed */
+                /* bp-relative store (F2); use rs1+1 as scratch if needed.
+                 * Same flush-adjustment as SSA_LOAD: shift call-arg flush stores
+                 * down by cur_flush_adj when enter N was expanded for save slots. */
                 int scratch = (p->rs1 == 0) ? 1 : 0;
-                emit_bp_store(p->rs1, p->imm, p->size, scratch);
+                int adj_imm = (cur_flush_adj > 0 && p->imm < -cur_orig_n)
+                              ? (p->imm - cur_flush_adj) : p->imm;
+                emit_bp_store(p->rs1, adj_imm, p->size, scratch, p->sym);
             } else {
                 /* Register-relative store (F3b):
                  * rd = base address register, rs1 = value register */
@@ -321,8 +516,47 @@ void risc_backend_emit(SSAInst *head)
 
         /* ---- Frame management ---- */
         case SSA_ENTER:
-            fprintf(asm_out, "    enter   %d\n", p->imm);
+        {
+            /* If this function uses r6 or r7, expand the frame to make room
+             * for the callee-saved register slots, placed just below bp:
+             *   bp - (orig_N + 4)          : r6 save slot (long, 4 bytes)
+             *   bp - (orig_N + 8)          : r7 save slot (long, 4 bytes)
+             * (Only the slots actually needed are allocated.)
+             */
+            int orig_N   = p->imm;
+            int min_off  = (cur_fn_idx >= 0) ? fn_min_bp_off[cur_fn_idx] : 0;
+            /* Also account for locals inside the enter allocation itself */
+            if (-orig_N < min_off) min_off = -orig_N;
+
+            /* Place r6 save slot at the first 4-byte-aligned offset strictly
+             * below min_off (so it cannot overlap any existing local).
+             * Two's-complement &~3 rounds toward -∞, which is what we want. */
+            int sv1 = min_off & ~3;
+            if (sv1 >= min_off) sv1 -= 4; /* ensure strictly below */
+            int sv2 = sv1 - 4;            /* r7 slot is 4 bytes lower */
+
+            /* The enter frame must cover the deepest save slot */
+            int needed_n = cur_use_r7 ? -sv2 : (cur_use_r6 ? -sv1 : orig_N);
+            int padded_n = (needed_n > orig_N) ? needed_n : orig_N;
+
+            cur_save_base = sv1;  /* bp-relative byte offset of r6 save slot */
+
+            /* Record the expansion so call-argument flush stores/loads
+             * (those below the original frame) can be emitted at adjusted
+             * offsets.  Without this, an expanded enter N shifts sp further
+             * from bp, but the lifter's bp-relative flush positions (computed
+             * for the original enter N) stay at the wrong addresses. */
+            cur_orig_n    = orig_N;
+            cur_flush_adj = padded_n - orig_N;
+
+            fprintf(asm_out, "    enter   %d\n", padded_n);
+            /* Emit callee-saved stores immediately after enter */
+            if (cur_use_r6)
+                emit_bp_store(6, cur_save_base, 4, 0, NULL);
+            if (cur_use_r7)
+                emit_bp_store(7, cur_save_base - 4, 4, 0, NULL);
             break;
+        }
 
         case SSA_ADJ:
             if (p->imm != 0)
@@ -330,6 +564,11 @@ void risc_backend_emit(SSAInst *head)
             break;
 
         case SSA_RET:
+            /* Restore callee-saved registers before returning */
+            if (cur_use_r6)
+                emit_bp_load(6, cur_save_base, 4, 0, NULL);
+            if (cur_use_r7)
+                emit_bp_load(7, cur_save_base - 4, 4, 0, NULL);
             fprintf(asm_out, "    ret\n");
             break;
 
@@ -357,25 +596,37 @@ void risc_backend_emit(SSAInst *head)
 
         case SSA_BRANCH:
         {
-            /* Fused compare-branch (B2): emit a single F3b branch instruction.
-             * alu_op encodes the branch condition: IR_EQ→beq, IR_NE→bne,
-             * IR_LT→blt, IR_GT→bgt, IR_LTS→blts, IR_GTS→bgts. */
-            const char *mn;
+            /* Fused compare-branch (B2): emit as F1a compare + F3a conditional jump.
+             * F3b branch instructions (beq/bne/blt/bgt) have only a ±511-byte
+             * PC-relative range; F3a jz/jnz use a 16-bit absolute address and
+             * can reach anywhere.  The cost is 5 bytes vs 3, but correctness
+             * is required for switch dispatch where case bodies can be far apart.
+             *
+             * Expansion table (alu_op → condition that TRIGGERS the branch):
+             *   IR_EQ  (branch if r1==r2): ne r0,r1,r2 ; jz  _lN  (jump when ne=0)
+             *   IR_NE  (branch if r1!=r2): eq r0,r1,r2 ; jz  _lN  (jump when eq=0)
+             *   IR_LT  (branch if r1<r2):  lt r0,r1,r2 ; jnz _lN
+             *   IR_GT  (branch if r1>r2):  gt r0,r1,r2 ; jnz _lN
+             *   IR_LTS (branch if r1<r2 signed): lts r0,r1,r2 ; jnz _lN
+             *   IR_GTS (branch if r1>r2 signed): gts r0,r1,r2 ; jnz _lN
+             */
+            const char *cmp_mn;
+            const char *jmp_mn;
             switch (p->alu_op) {
-            case IR_EQ:  mn = "beq";  break;
-            case IR_NE:  mn = "bne";  break;
-            case IR_LT:  mn = "blt";  break;
-            case IR_GT:  mn = "bgt";  break;
-            case IR_LTS: mn = "blts"; break;
-            case IR_GTS: mn = "bgts"; break;
+            case IR_EQ:  cmp_mn = "ne";   jmp_mn = "jz";  break;
+            case IR_NE:  cmp_mn = "eq";   jmp_mn = "jz";  break;
+            case IR_LT:  cmp_mn = "lt";   jmp_mn = "jnz"; break;
+            case IR_GT:  cmp_mn = "gt";   jmp_mn = "jnz"; break;
+            case IR_LTS: cmp_mn = "lts";  jmp_mn = "jnz"; break;
+            case IR_GTS: cmp_mn = "gts";  jmp_mn = "jnz"; break;
             default:
                 fprintf(stderr, "risc_backend: unhandled BRANCH op %d\n",
                         (int)p->alu_op);
-                mn = "beq";
+                cmp_mn = "ne"; jmp_mn = "jz";
                 break;
             }
-            fprintf(asm_out, "    %-7s r%d, r%d, _l%d\n",
-                    mn, p->rs1, p->rs2, p->imm);
+            fprintf(asm_out, "    %-7s r0, r%d, r%d\n", cmp_mn, p->rs1, p->rs2);
+            fprintf(asm_out, "    %-7s _l%d\n", jmp_mn, p->imm);
             break;
         }
 

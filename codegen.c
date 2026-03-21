@@ -204,8 +204,9 @@ void gen_bytes(char *data, int size)
     for (int i = 0; i < size; i++)
         ir_append(IR_BYTE, (unsigned char)data[i], NULL);
 }
-// Forward declaration needed by gen_logor_expr / gen_logand_expr below.
+// Forward declarations needed by mutual recursion and out-of-order use.
 void gen_expr(Node *node);
+static void gen_expr_discard(Node *node);
 
 // Short-circuit logical OR: if lhs != 0 result is 1 without evaluating rhs.
 // Self-contained — does not push or pop; r0 holds the result on exit.
@@ -316,14 +317,14 @@ void gen_varaddr_from_ident(Node *node, const char *name)
     else if (la.is_param)
     {
         Symbol *sym = find_symbol_st(node->st, name, NS_IDENT);
-        ir_append(IR_LEA, la.offset, NULL);
+        ir_append(IR_LEA, la.offset, name);
         // Struct params are passed by pointer (hidden copy ABI): dereference the pointer
         // to get the struct base address, making access transparent to all callers.
         if (sym && sym->type->base == TB_STRUCT)
             gen_ld(WORD_SIZE);
     }
     else
-        ir_append(IR_LEA, -la.offset, NULL);
+        ir_append(IR_LEA, -la.offset, name);
 }
 void gen_varaddr(Node *node)
 {
@@ -1256,10 +1257,13 @@ void gen_forstmt(Node *node)
     Node *inc  = node->ch[2];
     Node *body = node->ch[3];
     // If the init was a declaration, node->symtable holds the for-init scope.
+    // CPU4: round up to even to keep sp 2-byte aligned.
+    int for_init_sz = node->symtable ? node->symtable->size : 0;
+    if (g_target_arch == 4 && (for_init_sz & 1)) for_init_sz++;
     if (node->symtable)
     {
-        codegen_ctx.adj_depth += node->symtable->size;
-        ir_append(IR_ADJ, -node->symtable->size, NULL);
+        codegen_ctx.adj_depth += for_init_sz;
+        ir_append(IR_ADJ, -for_init_sz, NULL);
     }
     if (init->kind == ND_DECLARATION)
         gen_decl(init);
@@ -1280,14 +1284,14 @@ void gen_forstmt(Node *node)
     gen_stmt(body);
     ir_append(IR_LABEL, lcont, NULL);
     if (inc->kind != ND_EMPTY)
-        gen_expr(inc);
+        gen_expr_discard(inc);
     ir_append(IR_J, lloop, NULL);
     ir_append(IR_LABEL, lbreak, NULL);
     codegen_ctx.loop_depth--;
     if (node->symtable)
     {
-        ir_append(IR_ADJ, node->symtable->size, NULL);
-        codegen_ctx.adj_depth -= node->symtable->size;
+        ir_append(IR_ADJ, for_init_sz, NULL);
+        codegen_ctx.adj_depth -= for_init_sz;
     }
 }
 void gen_dowhilestmt(Node *node)
@@ -1335,10 +1339,42 @@ void gen_continuestmt(Node *node)
     }
     src_error(node->line, node->col, "continue outside loop");
 }
+/* Generate a post-increment/decrement as a pure side effect (result discarded).
+ * Equivalent to pre-increment: avoids saving/restoring the old value. */
+static void gen_postinc_stmt(Node *node)
+{
+    Node *operand = node->ch[0];
+    int sz = operand->type ? operand->type->size : 2;
+    int stride = 1;
+    if (operand->type && (operand->type->base == TB_POINTER ||
+                          operand->type->base == TB_ARRAY))
+        stride = elem_type(operand->type)->size;
+    gen_addr(operand);
+    ir_append(IR_PUSH, 0, NULL);
+    gen_expr(operand);
+    ir_append(IR_PUSH, 0, NULL);
+    ir_append(IR_IMM, stride, NULL);
+    if (node->op_kind == TK_POST_INC) ir_append(IR_ADD, 0, NULL);
+    else                               ir_append(IR_SUB, 0, NULL);
+    gen_st(sz);
+}
+
+/* Generate an expression whose result is discarded.
+ * For top-level post-increment/decrement, use pre-increment semantics to avoid
+ * the wasteful save/restore of the old value. */
+static void gen_expr_discard(Node *node)
+{
+    if (node->kind == ND_UNARYOP &&
+        (node->op_kind == TK_POST_INC || node->op_kind == TK_POST_DEC))
+        gen_postinc_stmt(node);
+    else
+        gen_expr(node);
+}
+
 void gen_exprstmt(Node *node)
 {
     int adj_before = codegen_ctx.adj_depth;
-    gen_expr(node->ch[0]);   // expr
+    gen_expr_discard(node->ch[0]);   // expr, result discarded
     // If a struct-returning call left a retbuf on the stack, reclaim it.
     int retbuf_sz = codegen_ctx.adj_depth - adj_before;
     if (retbuf_sz > 0)
@@ -1779,9 +1815,13 @@ void gen_decl(Node *node)
 }
 void gen_compstmt(Node *node)
 {
-    // Make space on stack for this scope's locals
-    codegen_ctx.adj_depth += node->symtable->size;
-    ir_append(IR_ADJ, -node->symtable->size, NULL);
+    // Make space on stack for this scope's locals.
+    // CPU4: round up to even so sp stays 2-byte aligned (F2 bp-relative instructions
+    // require bp to be even; odd adjw would make callee bp odd).
+    int sz = node->symtable->size;
+    if (g_target_arch == 4 && (sz & 1)) sz++;
+    codegen_ctx.adj_depth += sz;
+    ir_append(IR_ADJ, -sz, NULL);
     for (Node *n = node->ch[0]; n; n = n->next)   // stmts list
     {
         if (n->kind == ND_DECLARATION)
@@ -1790,8 +1830,8 @@ void gen_compstmt(Node *node)
             gen_stmt(n);
     }
     // Release the space back
-    ir_append(IR_ADJ, node->symtable->size, NULL);
-    codegen_ctx.adj_depth -= node->symtable->size;
+    ir_append(IR_ADJ, sz, NULL);
+    codegen_ctx.adj_depth -= sz;
 }
 static int find_label_id(char *name)
 {
@@ -1842,8 +1882,11 @@ void gen_switchstmt(Node *node)
     codegen_ctx.cont_labels[codegen_ctx.loop_depth]  = -1;
     codegen_ctx.loop_adj[codegen_ctx.loop_depth]     = codegen_ctx.adj_depth;
     codegen_ctx.loop_depth++;
-    codegen_ctx.adj_depth += body->symtable->size;
-    ir_append(IR_ADJ, -body->symtable->size, NULL);
+    // CPU4: round up to even to keep sp 2-byte aligned.
+    int sw_sz = body->symtable->size;
+    if (g_target_arch == 4 && (sw_sz & 1)) sw_sz++;
+    codegen_ctx.adj_depth += sw_sz;
+    ir_append(IR_ADJ, -sw_sz, NULL);
     for (Node *ch = body->ch[0]; ch; ch = ch->next)   // stmts list
     {
         if (ch->kind == ND_CASESTMT)
@@ -1855,8 +1898,8 @@ void gen_switchstmt(Node *node)
         else
             gen_stmt(ch);
     }
-    ir_append(IR_ADJ, body->symtable->size, NULL);
-    codegen_ctx.adj_depth -= body->symtable->size;
+    ir_append(IR_ADJ, sw_sz, NULL);
+    codegen_ctx.adj_depth -= sw_sz;
     codegen_ctx.loop_depth--;
     ir_append(IR_LABEL, lbreak, NULL);
 }

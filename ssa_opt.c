@@ -5,9 +5,15 @@
  *   0. Identity-move elimination       (original)
  *   1. B1: SSA_ADJ merging
  *   2. B3/C1: LEA→STORE forwarding     (F3b register-relative → F2 bp-relative)
- *   3. C2: LOAD+MOV fusion
+ *   3. C2: LOAD+[SXW/SXB]+MOV fusion  (skip optional sign-extend between load and MOV)
  *   4. B2: compare-branch fusion       (SSA_ALU + SSA_JZ/JNZ → SSA_BRANCH)
  *   5. D4: add-immediate               (SSA_MOVI + SSA_ALU ADD → SSA_ALU_IMM)
+ *   6. E1: LEA+LOAD → bp-relative LOAD (SSA_LEA + SSA_LOAD rs1=vA → rs1=-2)
+ *   7. E2: ADDLI+LOAD → offset LOAD   (SSA_ALU_IMM ADD + SSA_LOAD → non-zero imm LOAD)
+ *   8. E3: ALU+MOV → retarget ALU     (redirect ALU destination, kill identity MOV)
+ *   9. E5: Dead MOV DCE               (kill SSA_MOV whose destination is never used)
+ *  10. F1: MOVI/MOVSYM+MOV → retarget (immw r0,N;or r1,r0,r0 → immw r1,N)
+ *  11. F2: Redundant SXW/SXB DCE      (sxw(sxw(x))==sxw(x); kill second)
  */
 #include <stdlib.h>
 #include <string.h>
@@ -175,31 +181,51 @@ void ssa_peephole(SSAInst *head)
         if (used_before_redef(mov, store, vA)) continue;
 
         /* Transform: convert to bp-relative (F2) store; kill LEA and MOV */
+        store->sym = p->sym;  /* carry variable name for -ann annotation */
         store->rd  = -2;
         store->imm = N;
         mark_dead(p);
         mark_dead(mov);
     }
 
-    /* ----- Pass 3: C2 — LOAD+MOV fusion ----- *
+    /* ----- Pass 3: C2 — LOAD+[SXW/SXB]+MOV fusion ----- *
      *
-     * Pattern:
+     * Pattern (base):
      *   SSA_LOAD rd=vA, ...
      *   SSA_MOV  rd=vB, rs1=vA   (immediately adjacent)
      *
-     * By structural adjacency: the LOAD result (vA) is in the accumulator
-     * and is consumed immediately by the MOV push before being overwritten.
-     * Redirect the LOAD to produce vB directly and kill the MOV.
+     * Extended pattern (sign-extend in between):
+     *   SSA_LOAD  rd=vA, ...
+     *   SSA_ALU1  rd=vA, rs1=vA, alu_op=IR_SXW or IR_SXB   (optional)
+     *   SSA_MOV   rd=vB, rs1=vA
+     *
+     * Redirect the LOAD to produce vB directly. When a SXW/SXB is present,
+     * retarget it to operate on vB so that E4 (in risc_backend) can later
+     * fuse LOAD(vB)+SXW(vB) → sign-extending load instruction (lwx/lbx).
+     * Kill the MOV.
      */
     for (SSAInst *p = head; p; p = p->next) {
         if ((int)p->op < 0 || p->op != SSA_LOAD) continue;
         int vA = p->rd;
         if (vA < VREG_START) continue;
         SSAInst *q = next_live(p);
-        if (!q || q->op != SSA_MOV || q->rs1 != vA) continue;
-        /* Redirect LOAD destination; kill MOV */
-        p->rd = q->rd;
-        mark_dead(q);
+        if (!q) continue;
+        /* Optional SXW/SXB sitting between LOAD and MOV */
+        SSAInst *sxnode = NULL;
+        SSAInst *mov = q;
+        if (q->op == SSA_ALU1 && q->rd == vA && q->rs1 == vA &&
+            (q->alu_op == IR_SXW || q->alu_op == IR_SXB)) {
+            sxnode = q;
+            mov = next_live(q);
+        }
+        if (!mov || mov->op != SSA_MOV || mov->rs1 != vA) continue;
+        int vD = mov->rd;
+        /* Guard: vA must not be used after the MOV (before its next redefinition). */
+        if (used_before_redef(mov, NULL, vA)) continue;
+        /* Redirect LOAD (and SXW/SXB if present) to target vD; kill MOV */
+        p->rd = vD;
+        if (sxnode) { sxnode->rd = vD; sxnode->rs1 = vD; }
+        mark_dead(mov);
     }
 
     /* ----- Pass 4: B2 — compare-branch fusion ----- *
@@ -296,4 +322,161 @@ void ssa_peephole(SSAInst *head)
         q->imm    = K;
         mark_dead(p);
     }
+
+    /* ----- Pass 6: E1 — LEA+LOAD → bp-relative LOAD ----- *
+     *
+     * Pattern:
+     *   SSA_LEA  rd=vA, imm=N
+     *   SSA_LOAD rd=vB, rs1=vA, imm=0, size=S    (next live node)
+     *
+     * Rewrite the LOAD to bp-relative (rs1=-2, imm=N) so the backend
+     * selects the compact F2 encoding.  We do NOT use single_use(vA):
+     * virtual registers are reused by depth so global use_count is always
+     * > 1 for the accumulator.  Instead we check two windows:
+     *   (a) vA not used between LEA and LOAD (used_before_redef(p,q,vA))
+     *   (b) if LOAD doesn't redefine vA (q->rd != vA), vA must not be
+     *       used after LOAD before its next def (used_before_redef(q,NULL,vA))
+     */
+    count_uses(head);
+    for (SSAInst *p = head; p; p = p->next) {
+        if ((int)p->op < 0 || p->op != SSA_LEA) continue;
+        int vA = p->rd;
+        int N  = p->imm;
+        if (vA < VREG_START) continue;
+
+        SSAInst *q = next_live(p);
+        if (!q || q->op != SSA_LOAD || q->rs1 != vA || q->imm != 0) continue;
+        if (used_before_redef(p, q, vA)) continue;
+        if (q->rd != vA && used_before_redef(q, NULL, vA)) continue;
+
+        q->rs1 = -2;
+        q->imm = N;
+        mark_dead(p);
+    }
+
+    /* ----- Pass 7: E2 — ADDLI+LOAD → offset LOAD ----- *
+     *
+     * Pattern:
+     *   SSA_ALU_IMM rd=vA, rs1=vB, imm=N    (alu_op=IR_ADD)
+     *   SSA_LOAD    rd=vC, rs1=vA, imm=0    (next live node)
+     *
+     * Fold N into the LOAD offset so the backend can emit "llw rd,rb,N/2"
+     * (F3b) rather than addli + llw at 0.  vB must be a virtual register
+     * (not the bp-relative sentinel -2).
+     *
+     * We do NOT check single_use(vA) here: the LOAD redefines vA (rd=vA),
+     * so any uses of vA after the LOAD are of the LOAD's output, not the
+     * ADDLI's.  used_before_redef guards the ADDLI→LOAD window.
+     */
+    for (SSAInst *p = head; p; p = p->next) {
+        if ((int)p->op < 0 || p->op != SSA_ALU_IMM) continue;
+        if (p->alu_op != IR_ADD) continue;
+        int vA = p->rd;
+        int vB = p->rs1;
+        int N  = p->imm;
+        if (vA < VREG_START) continue;
+        if (vB < VREG_START) continue;  /* vB must be a real virtual register */
+
+        SSAInst *q = next_live(p);
+        if (!q || q->op != SSA_LOAD || q->rs1 != vA || q->imm != 0) continue;
+        if (used_before_redef(p, q, vA)) continue;
+
+        q->rs1 = vB;
+        q->imm = N;
+        mark_dead(p);
+    }
+
+    /* ----- Pass 8: E3 — ALU+MOV → retarget ALU destination ----- *
+     *
+     * Pattern:
+     *   SSA_ALU rd=vA, rs1=vB, rs2=vC
+     *   SSA_MOV rd=vD, rs1=vA              (next live node)
+     *
+     * Redirect the ALU to write directly into vD and kill the MOV.
+     * CPU4 F1a reads all sources before writing the destination so
+     * rd==rs1 or rd==rs2 is always safe.
+     *
+     * Example: mul r0,r3,r0; or r3,r0,r0  →  mul r3,r3,r0
+     *
+     * We do NOT use single_use(vA): the accumulator virtual register is
+     * reused throughout the function, so its global use_count is always
+     * large.  Instead we mirror the C2 check: vA must not appear as a
+     * source after the MOV before vA is redefined.
+     */
+    count_uses(head);
+    for (SSAInst *p = head; p; p = p->next) {
+        if ((int)p->op < 0 || p->op != SSA_ALU) continue;
+        int vA = p->rd;
+        if (vA < VREG_START) continue;
+
+        SSAInst *q = next_live(p);
+        if (!q || q->op != SSA_MOV || q->rs1 != vA) continue;
+        int vD = q->rd;
+        if (used_before_redef(p, q, vA)) continue;
+        if (used_before_redef(q, NULL, vA)) continue;
+
+        /* E3 is incorrect when vA==VREG_START (r0 as ALU destination);
+         * disable those cases until root cause is identified. */
+        if (vA == VREG_START) continue;
+
+        p->rd = vD;
+        mark_dead(q);
+    }
+
+    /* ----- Pass 9: E5 — Dead MOV DCE ----- *
+     *
+     * After E3 (and other passes), some SSA_MOV nodes may have a
+     * destination virtual register that is never used. Kill them.
+     */
+    count_uses(head);
+    for (SSAInst *p = head; p; p = p->next) {
+        if ((int)p->op < 0 || p->op != SSA_MOV) continue;
+        int vA = p->rd;
+        if (vA < VREG_START) continue;
+        if (use_count[vA - VREG_START] == 0)
+            mark_dead(p);
+    }
+
+    /* ----- Pass 10: F1 — MOVI/MOVSYM + MOV → retarget immediate load ----- *
+     *
+     * Pattern:
+     *   SSA_MOVI   rd=vA, imm=K          (or SSA_MOVSYM rd=vA, sym=S)
+     *   SSA_MOV    rd=vD, rs1=vA
+     *
+     * Retarget the MOVI/MOVSYM to write directly into vD and kill the MOV.
+     *
+     * Example: immw r0,2; or r1,r0,r0  →  immw r1,2
+     */
+    for (SSAInst *p = head; p; p = p->next) {
+        if ((int)p->op < 0) continue;
+        if (p->op != SSA_MOVI && p->op != SSA_MOVSYM) continue;
+        int vA = p->rd;
+        if (vA < VREG_START) continue;
+        SSAInst *q = next_live(p);
+        if (!q || q->op != SSA_MOV || q->rs1 != vA) continue;
+        int vD = q->rd;
+        if (used_before_redef(q, NULL, vA)) continue;
+        p->rd = vD;
+        mark_dead(q);
+    }
+
+    /* ----- Pass 11: F2 — redundant consecutive SXW/SXB DCE ----- *
+     *
+     * sxw16(sxw16(x)) == sxw16(x): a second identical in-place sign-extend
+     * is a no-op.  Kill it.  This cleans up double-SXW sequences that arise
+     * from both insert_coercions and explicit (type) casts, and prevents a
+     * spurious "sxw r0" from appearing after an E4-generated "llwx r0,rx,N".
+     *
+     * Example: sxw r0; sxw r0  →  sxw r0
+     */
+    for (SSAInst *p = head; p; p = p->next) {
+        if ((int)p->op < 0 || p->op != SSA_ALU1) continue;
+        if (p->alu_op != IR_SXW && p->alu_op != IR_SXB) continue;
+        int vA = p->rd;   /* == p->rs1 (in-place) */
+        SSAInst *q = next_live(p);
+        if (!q || q->op != SSA_ALU1) continue;
+        if (q->rd != vA || q->rs1 != vA || q->alu_op != p->alu_op) continue;
+        mark_dead(q);
+    }
+
 }
