@@ -453,7 +453,6 @@ int main(int argc, char **argv)
             IR3Inst *ir3 = braun_ssa(blocks, n_blocks, codegen_ctx.ir_head);
             linscan_regalloc(ir3);
             SSAInst *ssa = ir3_lower(ir3);
-            rb_prescan(ssa);
             risc_backend_emit(ssa);
             free_ssa(ssa);
             free_ir3(ir3);
