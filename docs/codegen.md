@@ -329,13 +329,17 @@ ir3_lower) before reaching the unchanged `risc_backend_emit`.
 Stack IR (codegen.c, unchanged)
     ↓  peephole(opt_level)      [optimise.c]    — unchanged
     ↓  braun_ssa()              [braun.c]        stack IR → IR3Inst (fresh vregs)
-    ↓  linscan_regalloc()       [linscan.c]      vregs → physical r0–r7 (in-place)
+    ↓  linscan_regalloc()       [linscan.c]      vregs → physical r0–r6 (r7 = spill scratch)
     ↓  ir3_lower()              [ir3_lower.c]    IR3Inst → SSAInst
     ↓  risc_backend_emit()      [risc_backend.c] SSAInst → CPU4 assembly (unchanged)
 ```
 
-**Removed from old pipeline:** `lift_to_ssa` (`ssa.c`), `ssa_peephole` (`ssa_opt.c`, now
-a no-op stub), `rb_prescan`, depth-indexed `regalloc` (`regalloc.c`).
+**Removed from old pipeline:** `lift_to_ssa` (`ssa.c`), `ssa_peephole` (`ssa_opt.c`),
+`rb_prescan` (callee-save pre-scan), depth-indexed `regalloc` (`regalloc.c`).
+
+**ABI:** All-caller-save.  r0–r7 are all caller-saved.  No callee-save infrastructure.
+r7 is reserved as the spill scratch register; r0 is the accumulator; r1–r6 are available
+for allocation.
 
 ### IR3: the intermediate representation
 
@@ -499,8 +503,8 @@ Standard Poletto/Sarkar (1999) linear-scan allocator. Runs per function (between
 
 #### Physical register pool
 
-`r1`–`r7` are available for allocation. `r0` is **not** in the pool — it is permanently
-reserved for `IR3_VREG_ACCUM` and is handled by a final rewrite pass (see below).
+`r1`–`r6` are available for allocation. `r0` is permanently reserved for `IR3_VREG_ACCUM`.
+`r7` is reserved as the spill scratch register. Both are handled by a final rewrite pass.
 
 #### Live intervals
 
@@ -515,9 +519,18 @@ reserved for `IR3_VREG_ACCUM` and is handled by a final rewrite pass (see below)
 1. Sort intervals by `start`.
 2. For each interval, expire all active intervals whose `end < current.start` and return
    their registers to the pool.
-3. `pool_alloc()` returns the next available physical register (r1 first, then r2, …, r7).
+3. `pool_alloc()` returns the next available physical register (r1 first, then r2, …, r6).
 4. If the pool is empty, spill the longest-lived active interval: steal its register for the
    current interval; record a bp-relative spill slot for the displaced interval.
+
+#### Spill insertion (Phase 5)
+
+After register rewriting, if any vregs were spilled:
+- Insert `IR3_LOAD rd=r7, rs1=BP, imm=spill_off` before each USE of a spilled vreg.
+- Insert `IR3_STORE rd=BP, rs1=r7, imm=spill_off` after each DEF of a spilled vreg.
+- Expand the function's `IR3_ENTER` to cover the spill area.
+- Shift call-arg flush offsets (bp-relative offsets below the original ENTER) down by
+  the expansion amount to preserve correct argument placement.
 
 #### ACCUM rewrite
 

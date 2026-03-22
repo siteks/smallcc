@@ -182,125 +182,13 @@ static void rb_emit_src_comment(int line)
 }
 
 /* ----------------------------------------------------------------
- * Pre-scan: detect r6/r7 usage per function in the SSA list.
- *
- * A function uses r6 (or r7) if any non-dead instruction has that physical
- * register in rd, rs1, rs2, or as the value/address in SSA_LOAD/SSA_STORE.
- * (After linscan_regalloc all registers are physical.)
- *
- * We build a per-function table keyed by the pointer to the SSA_SYMLABEL
- * node that opens the function.  Returns 0/1 in use_r6/use_r7 for the
- * function that contains node `at`.
- *
- * For simplicity we embed the scan result directly into two parallel arrays
- * indexed by a small serial number assigned at each SSA_SYMLABEL+ENTER pair.
- * ---------------------------------------------------------------- */
-#define MAX_FN_PRESCAN 512
-
-static SSAInst *fn_label_node[MAX_FN_PRESCAN];
-static int      fn_use_r6[MAX_FN_PRESCAN];
-static int      fn_use_r7[MAX_FN_PRESCAN];
-static int      fn_enter_n[MAX_FN_PRESCAN];    /* original enter N (before padding) */
-static int      fn_min_bp_off[MAX_FN_PRESCAN]; /* most negative bp-relative offset among locals */
-static int      fn_prescan_count = 0;
-
-static SSAInst *rb_next_live(SSAInst *p)
-{
-    for (p = p->next; p && (int)p->op < 0; p = p->next) {}
-    return p;
-}
-
-static int rb_is_fn_entry(SSAInst *sym_node)
-{
-    SSAInst *nx = rb_next_live(sym_node);
-    return nx && nx->op == SSA_ENTER;
-}
-
-/* rb_prescan — called BEFORE risc_backend_emit() to detect which functions
- * use callee-saved registers r6/r7 and the deepest bp-relative offset.
- * All registers are physical at this point (post linscan_regalloc).
- */
-void rb_prescan(SSAInst *head)
-{
-    fn_prescan_count = 0;
-
-    /* First pass: register all function entries */
-    for (SSAInst *p = head; p; p = p->next) {
-        if ((int)p->op < 0) continue;
-        if (p->op == SSA_SYMLABEL && rb_is_fn_entry(p)) {
-            if (fn_prescan_count >= MAX_FN_PRESCAN) break;
-            SSAInst *enter_node = rb_next_live(p);
-            fn_label_node[fn_prescan_count] = p;
-            fn_enter_n[fn_prescan_count]    = enter_node->imm;
-            fn_use_r6[fn_prescan_count]     = 0;
-            fn_use_r7[fn_prescan_count]     = 0;
-            fn_min_bp_off[fn_prescan_count] = 0; /* updated in second pass */
-            fn_prescan_count++;
-        }
-    }
-
-    /* Second pass: scan each function body for r6/r7 usage and
-     * the deepest bp-relative offset (needed for save-slot placement). */
-    int fi = -1;
-    for (SSAInst *p = head; p; p = p->next) {
-        if ((int)p->op < 0) continue;
-        if (p->op == SSA_SYMLABEL && rb_is_fn_entry(p)) {
-            fi++;
-            if (fi >= fn_prescan_count) break;
-            continue;
-        }
-        if (fi < 0) continue;
-
-#define CHECK_REG(r) do { \
-    if ((r) == 6) fn_use_r6[fi] = 1; \
-    if ((r) == 7) fn_use_r7[fi] = 1; \
-} while (0)
-        CHECK_REG(p->rd);
-        CHECK_REG(p->rs1);
-        CHECK_REG(p->rs2);
-#undef CHECK_REG
-        /* Track the most negative bp-relative offset used by locals */
-        if (p->op == SSA_LOAD && p->rs1 == -2 && p->imm < fn_min_bp_off[fi])
-            fn_min_bp_off[fi] = p->imm;
-        if (p->op == SSA_STORE && p->rd == -2 && p->imm < fn_min_bp_off[fi])
-            fn_min_bp_off[fi] = p->imm;
-    }
-}
-
-/* Look up use_r6/use_r7/enter_n for the function identified by its
- * SSA_SYMLABEL node. Returns 0 if not found. */
-static int rb_fn_index(SSAInst *label_node)
-{
-    for (int i = 0; i < fn_prescan_count; i++) {
-        if (fn_label_node[i] == label_node) return i;
-    }
-    return -1;
-}
-
-/* ----------------------------------------------------------------
  * risc_backend_emit — main emission pass
  * ---------------------------------------------------------------- */
 void risc_backend_emit(SSAInst *head)
 {
     if (!asm_out) asm_out = stdout;
 
-    /* rb_prescan() populates fn_use_r6/fn_use_r7/fn_min_bp_off. */
-
     int prev_line = 0;
-
-    /* Tracking state for callee-saved register save/restore */
-    int cur_fn_idx    = -1;  /* index into fn_prescan arrays for current function */
-    int cur_use_r6    = 0;
-    int cur_use_r7    = 0;
-    int cur_enter_n   = 0;   /* original enter N (before padding for saves) */
-    int cur_save_base = 0;   /* bp offset where r6 save slot starts (negative) */
-
-    /* When save slots expand enter N (by cur_flush_adj bytes), call-argument
-     * flush stores/loads (those with bp-relative imm < -cur_orig_n) must have
-     * their byte offset shifted down by the same amount, so that the lifter's
-     * vsp model remains consistent with the actual runtime sp. */
-    int cur_orig_n    = 0;   /* SSA enter N before any save-slot expansion */
-    int cur_flush_adj = 0;   /* bytes added to enter N for save slots */
 
     for (SSAInst *p = head; p; p = p->next)
     {
@@ -325,20 +213,6 @@ void risc_backend_emit(SSAInst *head)
 
         case SSA_SYMLABEL:
             fprintf(asm_out, "%s:\n", p->sym);
-            /* Track which function we're in for callee-saved reg handling */
-            if (rb_is_fn_entry(p)) {
-                cur_fn_idx = rb_fn_index(p);
-                if (cur_fn_idx >= 0) {
-                    cur_use_r6  = fn_use_r6[cur_fn_idx];
-                    cur_use_r7  = fn_use_r7[cur_fn_idx];
-                    cur_enter_n = fn_enter_n[cur_fn_idx];
-                } else {
-                    cur_use_r6 = cur_use_r7 = 0;
-                    cur_enter_n = 0;
-                }
-                cur_orig_n    = 0;
-                cur_flush_adj = 0;
-            }
             break;
 
         case SSA_COMMENT:
@@ -395,13 +269,8 @@ void risc_backend_emit(SSAInst *head)
             if (sign_ext) rb_mark_dead(nxt);
 
             if (p->rs1 == -2) {
-                /* bp-relative (F2).
-                 * If enter N was expanded for save slots (cur_flush_adj > 0),
-                 * call-arg flush loads (imm < -cur_orig_n) must be shifted down
-                 * by cur_flush_adj so they address below the expanded frame. */
-                int adj_imm = (cur_flush_adj > 0 && p->imm < -cur_orig_n)
-                              ? (p->imm - cur_flush_adj) : p->imm;
-                emit_bp_load(p->rd, adj_imm, p->size, sign_ext, p->sym);
+                /* bp-relative (F2) */
+                emit_bp_load(p->rd, p->imm, p->size, sign_ext, p->sym);
             } else {
                 /* Register-relative (F3b): rd = mem[rs1 + imm * scale] */
                 int base = p->rs1;
@@ -424,13 +293,9 @@ void risc_backend_emit(SSAInst *head)
         /* ---- Stores ---- */
         case SSA_STORE:
             if (p->rd == -2) {
-                /* bp-relative store (F2); use rs1+1 as scratch if needed.
-                 * Same flush-adjustment as SSA_LOAD: shift call-arg flush stores
-                 * down by cur_flush_adj when enter N was expanded for save slots. */
+                /* bp-relative store (F2); use rs1+1 as scratch if needed. */
                 int scratch = (p->rs1 == 0) ? 1 : 0;
-                int adj_imm = (cur_flush_adj > 0 && p->imm < -cur_orig_n)
-                              ? (p->imm - cur_flush_adj) : p->imm;
-                emit_bp_store(p->rs1, adj_imm, p->size, scratch, p->sym);
+                emit_bp_store(p->rs1, p->imm, p->size, scratch, p->sym);
             } else {
                 /* Register-relative store (F3b):
                  * rd = base address register, rs1 = value register */
@@ -507,47 +372,8 @@ void risc_backend_emit(SSAInst *head)
 
         /* ---- Frame management ---- */
         case SSA_ENTER:
-        {
-            /* If this function uses r6 or r7, expand the frame to make room
-             * for the callee-saved register slots, placed just below bp:
-             *   bp - (orig_N + 4)          : r6 save slot (long, 4 bytes)
-             *   bp - (orig_N + 8)          : r7 save slot (long, 4 bytes)
-             * (Only the slots actually needed are allocated.)
-             */
-            int orig_N   = p->imm;
-            int min_off  = (cur_fn_idx >= 0) ? fn_min_bp_off[cur_fn_idx] : 0;
-            /* Also account for locals inside the enter allocation itself */
-            if (-orig_N < min_off) min_off = -orig_N;
-
-            /* Place r6 save slot at the first 4-byte-aligned offset strictly
-             * below min_off (so it cannot overlap any existing local).
-             * Two's-complement &~3 rounds toward -∞, which is what we want. */
-            int sv1 = min_off & ~3;
-            if (sv1 >= min_off) sv1 -= 4; /* ensure strictly below */
-            int sv2 = sv1 - 4;            /* r7 slot is 4 bytes lower */
-
-            /* The enter frame must cover the deepest save slot */
-            int needed_n = cur_use_r7 ? -sv2 : (cur_use_r6 ? -sv1 : orig_N);
-            int padded_n = (needed_n > orig_N) ? needed_n : orig_N;
-
-            cur_save_base = sv1;  /* bp-relative byte offset of r6 save slot */
-
-            /* Record the expansion so call-argument flush stores/loads
-             * (those below the original frame) can be emitted at adjusted
-             * offsets.  Without this, an expanded enter N shifts sp further
-             * from bp, but the lifter's bp-relative flush positions (computed
-             * for the original enter N) stay at the wrong addresses. */
-            cur_orig_n    = orig_N;
-            cur_flush_adj = padded_n - orig_N;
-
-            fprintf(asm_out, "    enter   %d\n", padded_n);
-            /* Emit callee-saved stores immediately after enter */
-            if (cur_use_r6)
-                emit_bp_store(6, cur_save_base, 4, 0, NULL);
-            if (cur_use_r7)
-                emit_bp_store(7, cur_save_base - 4, 4, 0, NULL);
+            fprintf(asm_out, "    enter   %d\n", p->imm);
             break;
-        }
 
         case SSA_ADJ:
             if (p->imm != 0)
@@ -555,11 +381,6 @@ void risc_backend_emit(SSAInst *head)
             break;
 
         case SSA_RET:
-            /* Restore callee-saved registers before returning */
-            if (cur_use_r6)
-                emit_bp_load(6, cur_save_base, 4, 0, NULL);
-            if (cur_use_r7)
-                emit_bp_load(7, cur_save_base - 4, 4, 0, NULL);
             fprintf(asm_out, "    ret\n");
             break;
 

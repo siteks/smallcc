@@ -605,12 +605,21 @@ static void translate_bb(BB *bb, int bb_id)
             break;
 
         case IR_LEA: {
-            /* Promotion is disabled: all variables (locals and parameters) are
-             * accessed through memory.  Promoting variables to SSA registers
-             * requires loop-aware linscan to extend live ranges across back edges
-             * and enough registers for all simultaneously-live SSA values.  Until
-             * linscan handles this, all scalar accesses use bp-relative F2 loads
-             * and stores (2 bytes, 1 instruction on CPU4). */
+            /* Promotion: scalars that are not address-taken can be promoted
+             * to SSA registers.  The ir_promote_sentinel tag is set by
+             * gen_varaddr_from_ident() in codegen.c for eligible locals.
+             * With linear-scan + spilling, promoted variables that exceed
+             * register pressure are automatically spilled to stack slots.
+             *
+             * Currently disabled: enabling causes 7 test failures in
+             * variadic, coremark, and stdlib tests.  The promotion logic
+             * in braun.c likely needs fixes for:
+             *  - va_arg interaction (promoted va_list variables)
+             *  - phi deconstruction across loop back-edges
+             *  - promotion of variables modified inside loops
+             * Enable with: is_promo = (p->sym == ir_promote_sentinel);
+             * Future work: add heuristics to promote only profitable
+             * variables (loop counters, frequently-read scalars). */
             bool is_promo = false;
 
             /* Peek: if next instruction is a load, collapse to bp-relative load */

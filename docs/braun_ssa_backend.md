@@ -37,10 +37,10 @@ Stack IR (IRInst list)
 | `ir3.h` | 123 | IR3 data structures: `IR3Inst`, `IR3Op`, `BB`, vreg encoding constants |
 | `ir3.c` | 168 | Infrastructure: fresh-vreg counter, CFG builder (`build_cfg`), `free_ir3` |
 | `braun.c` | 1255 | Braun SSA construction: virtual stack model, phi insertion/elimination, phi deconstruction |
-| `linscan.c` | 298 | Poletto/Sarkar linear-scan register allocator |
+| `linscan.c` | ~520 | Poletto/Sarkar linear-scan register allocator with spill support |
 | `ir3_lower.c` | 220 | Lower IR3Inst to SSAInst for the existing RISC backend |
 | `ssa.h` | 72 | SSAInst/SSAOp definitions consumed by `risc_backend.c` |
-| `risc_backend.c` | ~600 | CPU4 assembly emission (unchanged from the stack-IR era) |
+| `risc_backend.c` | ~500 | CPU4 assembly emission (simplified: no callee-save infrastructure) |
 
 ---
 
@@ -300,20 +300,20 @@ the sp model at merge points.
 Standard Poletto/Sarkar (1999) linear-scan allocator.  Runs independently per function
 (between `IR3_SYMLABEL` boundaries).  Rewrites `rd`/`rs1`/`rs2` in the IR3 list in-place.
 
-### Physical Register Pool
+### Physical Register Pool and ABI
 
-`r1`–`r7` are available for allocation.  `r0` is permanently reserved for `IR3_VREG_ACCUM`
-and handled by a final rewrite pass.
+**ABI**: All-caller-save.  r0–r7 are all caller-saved.  `braun_ssa`'s call flushing
+guarantees no vreg live range spans a call instruction, so no callee-save/restore
+infrastructure is needed.
+
+`r1`–`r6` are available for allocation.  `r0` is permanently reserved for `IR3_VREG_ACCUM`
+(handled by a final rewrite pass).  `r7` is reserved as the spill scratch register — used
+to shuttle values between spill slots and instructions when a vreg cannot be assigned a
+physical register.
 
 The pool is initialized as a stack with r1 allocated first (lowest-numbered registers
-preferred).  Pool exhaustion triggers spilling, though in practice Sethi-Ullman labelling
-keeps expression depth ≤ 3, so at most r1–r3 are needed for expression temporaries.
-
-**Note on r6/r7**: These registers are architecturally callee-saved, but the current
-pipeline treats all registers as caller-saved.  `braun_ssa`'s call flushing guarantees no
-vreg live range spans a call instruction, so r6/r7 never hold values across calls and do
-not require callee-save/restore.  The `rb_prescan` / callee-save infrastructure in
-`risc_backend.c` is not used.
+preferred).  For expression temporaries (no promotion), Sethi-Ullman labelling keeps depth
+≤ 3, so at most r1–r3 are needed.
 
 ### Algorithm
 
@@ -340,12 +340,31 @@ rewrites `IR3_VREG_ACCUM` (100) → physical register 0.
 
 ### Spilling
 
-Spilling is a fallback that should never fire with correct Sethi-Ullman labelling.  If it
-does, a diagnostic is printed to stderr (`linscan: spilling vreg N`).  Spill slots are
-allocated by bump-allocating negative bp-relative offsets below the function's frame.
-**The spill code path (inserting IR3_LOAD/IR3_STORE around spilled uses) is not fully
-implemented** — the allocator records spill slots but does not insert reload/spill
-instructions.  This is acceptable because SU guarantees prevent spilling in practice.
+When the register pool is exhausted, the longest-lived active interval is spilled to a
+bp-relative stack slot.  A diagnostic is printed to stderr (`linscan: spilling vreg N to
+[bp-M]`).
+
+**Spill slot placement**: Spill slots are bump-allocated below the function's deepest
+existing frame usage.  The allocator scans all bp-relative LOAD/STORE/LEA offsets and all
+cumulative ADJ adjustments to find the most negative bp offset in use, then places spill
+slots strictly below that.
+
+**Phase 5 — Spill insertion**: After register rewriting, the allocator walks the IR3 list
+and inserts:
+- `IR3_LOAD rd=r7, rs1=BP, imm=spill_off` (reload) before each USE of a spilled vreg
+- `IR3_STORE rd=BP, rs1=r7, imm=spill_off` (spill) after each DEF of a spilled vreg
+
+r7 serves as the scratch register for all spill traffic.
+
+**Frame expansion**: The function's `IR3_ENTER` node is expanded to cover the spill area.
+Since braun.c's call-arg flush offsets are computed relative to the original ENTER frame,
+any bp-relative offset strictly below `-original_enter_N` (i.e., flush positions below the
+original frame) is shifted down by the expansion amount.  This preserves the invariant that
+flush stores land right at sp at call time.
+
+Without promotion, spilling should never fire (SU guarantees depth ≤ 3, and 6 allocatable
+registers are more than sufficient).  With promotion enabled, spilling handles the overflow
+from promoted variables whose live ranges exceed register pressure.
 
 ---
 
@@ -406,36 +425,37 @@ over a pre-built CFG.  This is a good fit because:
    a separate phi-pruning pass.
 3. The algorithm naturally handles the virtual-stack-to-register translation in one pass.
 
+### ABI: All-Caller-Save
+
+The CPU4 ABI is all-caller-save: r0–r7 are all caller-saved with no callee-saved registers.
+This is safe because `braun_ssa`'s `flush_for_call_n` ensures every expression temporary is
+spilled to memory before a call and reloaded into a **fresh vreg** afterward.  No vreg's
+live range ever spans a call instruction, so no register needs to survive a call.
+
+r7 is reserved as the spill scratch register (not available for allocation).  r0 is reserved
+for the accumulator (ACCUM).  r1–r6 are available for general allocation.
+
 ### Why is Promotion Disabled?
 
 Promoting variables to SSA registers eliminates loads/stores but extends live ranges.
 A variable live across a loop back-edge creates a live range that spans the entire loop
-body.  With only 7 allocable registers (r1–r7) and deeply-nested code (switch/state
-machines in CoreMark), promotion can easily cause register pressure to exceed capacity,
-triggering spilling.
+body.  With only 6 allocable registers (r1–r6), promotion can cause register pressure to
+exceed capacity, triggering spilling.
 
-The current linscan implementation does not insert spill/reload instructions (it only
-records spill slots).  More fundamentally, the F2 bp-relative load/store instructions
-(`lw r, [bp+imm7]`: 2 bytes, 1 cycle) make memory access cheap enough that no-promotion
-is competitive with promotion for typical code patterns on this target.
+The spill mechanism is now fully implemented (r7 as scratch, frame expansion with flush
+offset adjustment).  However, enabling promotion currently causes 7 test failures in
+variadic, coremark, and stdlib tests — likely due to bugs in the promotion logic itself
+(va_arg interaction, phi deconstruction across loop back-edges, or modification of
+promoted variables inside loops).
 
-Promotion can be re-enabled by setting `is_promo = true` in `translate_bb` once linscan
-gains loop-aware live-range extension and proper spill code insertion.
+The F2 bp-relative load/store instructions (`lw r, [bp+imm7]`: 2 bytes, 1 cycle) make
+memory access cheap enough that no-promotion is competitive with promotion for typical
+code patterns on this target.
 
-### Why No Callee-Save for r6/r7?
-
-The CPU4 ABI designates r6/r7 as callee-saved, but the current pipeline does not use the
-`rb_prescan` callee-save mechanism in `risc_backend.c`.  This is safe because:
-
-- `braun_ssa`'s `flush_for_call_n` ensures every expression temporary is spilled to memory
-  before a call and reloaded into a **fresh vreg** afterward.
-- No vreg's live range ever spans a call instruction.
-- Therefore linscan never assigns a register that must survive across a call.
-- r6/r7 are effectively caller-saved in practice, even though the architecture says otherwise.
-
-If a future optimisation (e.g., promotion across calls, loop induction variables in
-registers) requires values to survive calls in r6/r7, the callee-save mechanism will need
-to be re-enabled and adapted to work with the IR3/linscan frame model.
+Promotion can be re-enabled by setting `is_promo = (p->sym == ir_promote_sentinel)` in
+`translate_bb` in `braun.c` once the promotion bugs are fixed.  Future work should also
+add heuristics to promote only profitable variables (loop counters, frequently-read
+scalars) rather than all eligible scalars, to avoid unnecessary register pressure.
 
 ### Two-Level IR (IR3 → SSA)
 

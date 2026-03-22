@@ -9,16 +9,17 @@ A custom 32-bit RISC-like machine with a dense variable-width encoding. Simulate
 |---|---|---|
 | `r0`–`r7` | 32-bit | General-purpose; r0 is the return value and implicit operand for some F0/F3a ops |
 | `r0` | 32-bit | Accumulator and function return value |
-| `r1`–`r5` | 32-bit | Scratch (caller-saved) |
-| `r6`–`r7` | 32-bit | Preserved (callee-saved; loop induction variables) |
+| `r1`–`r6` | 32-bit | Scratch (caller-saved) |
+| `r7` | 32-bit | Scratch (caller-saved); reserved as spill scratch by the register allocator |
 | `bp` | 16-bit | Frame pointer |
 | `sp` | 16-bit | Stack pointer (grows downward) |
 | `lr` | 16-bit | Link register (return address) |
 | `pc` | 16-bit | Program counter |
 | `H` | 1-bit | Halt flag |
 
-Any function that uses `r6`/`r7` must save and restore them in its prologue/epilogue.
-`r0`–`r5` may be clobbered by any call.
+All registers r0–r7 are caller-saved — any call may clobber all of them. The compiler's
+call flushing mechanism ensures all live values are saved to memory before calls and
+restored afterward.
 
 Memory is 65536 bytes. Data is little-endian. The stack starts at `sp = 0x1000` (set by `ssp`).
 

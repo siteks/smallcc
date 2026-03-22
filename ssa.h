@@ -8,10 +8,13 @@
  * Produced by ir3_lower() from the post-regalloc IR3Inst list.
  * All registers are physical (0-7) at this point:
  *   r0           = accumulator / return value
- *   r1-r5        = scratch (caller-saved)
- *   r6-r7        = callee-saved
+ *   r1-r7        = scratch (caller-saved)
  *   -1           = no destination
  *   -2           = bp-relative addressing (LOAD/STORE only)
+ *
+ * ABI: all-caller-save.  No callee-saved registers.  braun.c's call
+ * flushing ensures no vreg live range spans a call, so r0-r7 are all
+ * effectively caller-saved without needing save/restore in prologues.
  */
 
 typedef enum {
@@ -58,10 +61,6 @@ typedef struct SSAInst {
     int         line;   /* source line for annotation */
     struct SSAInst *next;
 } SSAInst;
-
-/* Pre-scan the SSA list to detect r6/r7 usage and deepest bp-relative offset
- * per function.  Must be called before risc_backend_emit(). */
-void     rb_prescan(SSAInst *head);
 
 /* Emit CPU4 assembly from SSA list. */
 void     risc_backend_emit(SSAInst *head);
