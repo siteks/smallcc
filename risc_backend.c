@@ -1,6 +1,6 @@
 /* risc_backend.c — SSA → CPU4 assembly emitter.
  *
- * Walks the SSAInst list produced by lift_to_ssa() and emits CPU4 assembly
+ * Walks the SSAInst list produced by ir3_lower() and emits CPU4 assembly
  * text to the output file (set by set_asm_out()).
  *
  * Instruction selection:
@@ -186,7 +186,7 @@ static void rb_emit_src_comment(int line)
  *
  * A function uses r6 (or r7) if any non-dead instruction has that physical
  * register in rd, rs1, rs2, or as the value/address in SSA_LOAD/SSA_STORE.
- * (After regalloc all registers are physical; r6/r7 are assigned by G1.)
+ * (After linscan_regalloc all registers are physical.)
  *
  * We build a per-function table keyed by the pointer to the SSA_SYMLABEL
  * node that opens the function.  Returns 0/1 in use_r6/use_r7 for the
@@ -216,13 +216,9 @@ static int rb_is_fn_entry(SSAInst *sym_node)
     return nx && nx->op == SSA_ENTER;
 }
 
-/* rb_prescan — called BEFORE regalloc so that G1-pinned registers (set to
- * physical 6/7 by ssa_peephole) are distinguishable from expression-depth
- * registers (still virtual: VREG_START+6 / VREG_START+7).  The CHECK_REG
- * macro fires only when a register value is a PHYSICAL register (< VREG_START),
- * i.e. one explicitly assigned by the G1 pass.  Depth-slot registers that
- * would later be mapped to r6/r7 by regalloc are NOT detected here, so they
- * do not trigger unnecessary callee-save slots that would inflate the frame.
+/* rb_prescan — called BEFORE risc_backend_emit() to detect which functions
+ * use callee-saved registers r6/r7 and the deepest bp-relative offset.
+ * All registers are physical at this point (post linscan_regalloc).
  */
 void rb_prescan(SSAInst *head)
 {
@@ -243,7 +239,7 @@ void rb_prescan(SSAInst *head)
         }
     }
 
-    /* Second pass: scan each function body for G1-pinned r6/r7 usage and
+    /* Second pass: scan each function body for r6/r7 usage and
      * the deepest bp-relative offset (needed for save-slot placement). */
     int fi = -1;
     for (SSAInst *p = head; p; p = p->next) {
@@ -255,12 +251,9 @@ void rb_prescan(SSAInst *head)
         }
         if (fi < 0) continue;
 
-        /* Only fire for PHYSICAL r6/r7 (< VREG_START), i.e. those set by
-         * the G1 pass.  Virtual depth registers (VREG_START+6, VREG_START+7)
-         * are not physical yet and must not trigger save-slot emission. */
 #define CHECK_REG(r) do { \
-    if ((r) >= 0 && (r) < VREG_START && (r) == 6) fn_use_r6[fi] = 1; \
-    if ((r) >= 0 && (r) < VREG_START && (r) == 7) fn_use_r7[fi] = 1; \
+    if ((r) == 6) fn_use_r6[fi] = 1; \
+    if ((r) == 7) fn_use_r7[fi] = 1; \
 } while (0)
         CHECK_REG(p->rd);
         CHECK_REG(p->rs1);
@@ -291,8 +284,7 @@ void risc_backend_emit(SSAInst *head)
 {
     if (!asm_out) asm_out = stdout;
 
-    /* rb_prescan() was already called by the caller (smallcc.c) before
-     * regalloc, so fn_use_r6/fn_use_r7/fn_min_bp_off are already populated. */
+    /* rb_prescan() populates fn_use_r6/fn_use_r7/fn_min_bp_off. */
 
     int prev_line = 0;
 
@@ -312,7 +304,7 @@ void risc_backend_emit(SSAInst *head)
 
     for (SSAInst *p = head; p; p = p->next)
     {
-        /* Skip dead nodes (marked by ssa_peephole) */
+        /* Skip dead nodes */
         if ((int)p->op < 0) continue;
 
         /* Source annotation */
@@ -470,8 +462,7 @@ void risc_backend_emit(SSAInst *head)
                 fprintf(asm_out, "    %-7s r%d, r%d, r%d\n", mn, rd, rs1, rs2);
             } else {
                 /* Needs 3-instruction expansion (le/ge/les/ges/fle/fge).
-                 * rs1 is now free (virtual stack was popped before lift_to_ssa
-                 * generates this node), so we reuse it as a 0-constant reg.
+                 * rs1 is free, so we reuse it as a 0-constant reg.
                  *
                  *   le  a, b  = NOT(a > b):  gt rd,rs1,rs2; immw rs1,0; eq rd,rd,rs1
                  *   ge  a, b  = NOT(a < b):  lt rd,rs1,rs2; immw rs1,0; eq rd,rd,rs1

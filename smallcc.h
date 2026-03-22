@@ -298,6 +298,7 @@ struct Symbol
     SymbolKind kind;
     Namespace  ns;          // NS_IDENT | NS_TAG | NS_TYPEDEF
     int     tu_index;       // TU that defined a static (SYM_STATIC_GLOBAL / SYM_STATIC_LOCAL)
+    bool    address_taken;  // true if &sym appears anywhere in the function (set by mark_address_taken)
     Symbol  *next;
 };
 

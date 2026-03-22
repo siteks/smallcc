@@ -3,25 +3,15 @@
 
 #include "smallcc.h"
 
-/* Virtual register namespace:
- *   VREG_START+0 = v8  → accumulator          (physical r0 after regalloc)
- *   VREG_START+1 = v9  → depth-1 scratch      (physical r1)
- *   VREG_START+2 = v10 → depth-2 scratch      (physical r2)
- *   ...
- *   -2 = bp-relative addressing (not a register)
- *   -1 = no destination
- *   0..7 = physical registers (only after regalloc())
- */
-#define VREG_START 8   /* virtual regs >= VREG_START; physical regs 0-7 */
-
-/* 3-address SSA-like IR for the CPU4 RISC backend.
- * Produced by lift_to_ssa() from the stack-based IR.
- * lift_to_ssa() emits virtual registers (>= VREG_START).
- * regalloc() maps them to physical registers (0-7).
+/* SSAInst — the final IR consumed by risc_backend_emit() (CPU4 assembly).
+ *
+ * Produced by ir3_lower() from the post-regalloc IR3Inst list.
+ * All registers are physical (0-7) at this point:
  *   r0           = accumulator / return value
- *   r1-r3        = expression scratch (caller-saved; depth 1-3)
- *   r4-r5        = extra scratch (overflow; shouldn't be needed with SU labelling)
- *   r6-r7        = callee-saved (not yet used by the allocator)
+ *   r1-r5        = scratch (caller-saved)
+ *   r6-r7        = callee-saved
+ *   -1           = no destination
+ *   -2           = bp-relative addressing (LOAD/STORE only)
  */
 
 typedef enum {
@@ -45,8 +35,8 @@ typedef enum {
     SSA_J,        /* j _lN                             */
     SSA_JZ,       /* jz _lN  (r0 == 0)                 */
     SSA_JNZ,      /* jnz _lN (r0 != 0)                 */
-    SSA_BRANCH,   /* beq/bne/blt/bgt/blts/bgts rs1,rs2,_lN (fused compare-branch, B2) */
-    SSA_ALU_IMM,  /* rd = rs1 + imm  (add-immediate, D4; inc/dec/addi/addli) */
+    SSA_BRANCH,   /* beq/bne/blt/bgt/blts/bgts rs1,rs2,_lN (fused compare-branch) */
+    SSA_ALU_IMM,  /* rd = rs1 + imm  (add-immediate; inc/dec/addi/addli) */
     SSA_LABEL,    /* _lN:                              */
     SSA_SYMLABEL, /* sym:                              */
     SSA_WORD,     /* data word                         */
@@ -59,7 +49,7 @@ typedef enum {
 typedef struct SSAInst {
     SSAOp       op;
     IROp        alu_op; /* SSA_ALU/SSA_ALU1: original IR opcode */
-    int         rd;     /* VREG_START+ = virtual (pre-regalloc), 0-7 = physical (post), -1=none, -2=bp-rel */
+    int         rd;     /* 0-7 = physical, -1=none, -2=bp-rel */
     int         rs1;    /* same encoding as rd */
     int         rs2;    /* same encoding as rd */
     int         imm;    /* immediate, byte offset from bp, or label id */
@@ -69,17 +59,8 @@ typedef struct SSAInst {
     struct SSAInst *next;
 } SSAInst;
 
-/* Convert stack IR to 3-address SSA with virtual register assignment. */
-SSAInst *lift_to_ssa(IRInst *ir_head);
-
-/* Simple copy-propagation pass over SSA list (in-place, on virtual regs). */
-void     ssa_peephole(SSAInst *head);
-
-/* Map virtual registers to physical registers (in-place). */
-void     regalloc(SSAInst *head);
-
-/* Pre-scan the SSA list BEFORE regalloc to detect G1-pinned r6/r7 usage.
- * Must be called after ssa_peephole() but before regalloc(). */
+/* Pre-scan the SSA list to detect r6/r7 usage and deepest bp-relative offset
+ * per function.  Must be called before risc_backend_emit(). */
 void     rb_prescan(SSAInst *head);
 
 /* Emit CPU4 assembly from SSA list. */

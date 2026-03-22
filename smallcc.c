@@ -1,6 +1,7 @@
 
 #include "smallcc.h"
 #include "ssa.h"
+#include "ir3.h"
 #include <dirent.h>
 
 /* Target architecture: 3 = cpu3 (default), 4 = cpu4 */
@@ -446,13 +447,17 @@ int main(int argc, char **argv)
         mark_basic_blocks();
         peephole(opt_level);
         if (g_target_arch == 4) {
-            SSAInst *ssa = lift_to_ssa(codegen_ctx.ir_head);
-            if (opt_level >= 2)
-                ssa_peephole(ssa);  /* ssa_opt.c: optimize on virtual regs */
-            rb_prescan(ssa);      /* detect G1-pinned r6/r7 before regalloc */
-            regalloc(ssa);        /* regalloc.c: virtual -> physical regs */
+            ir3_reset();
+            int n_blocks;
+            BB *blocks = build_cfg(codegen_ctx.ir_head, &n_blocks);
+            IR3Inst *ir3 = braun_ssa(blocks, n_blocks, codegen_ctx.ir_head);
+            linscan_regalloc(ir3);
+            SSAInst *ssa = ir3_lower(ir3);
+            rb_prescan(ssa);
             risc_backend_emit(ssa);
             free_ssa(ssa);
+            free_ir3(ir3);
+            free_cfg(blocks, n_blocks);
         } else {
             backend_emit_asm(codegen_ctx.ir_head);
         }

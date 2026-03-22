@@ -1,6 +1,13 @@
 
 #include "smallcc.h"
+#include "ir3.h"
 
+/* Sentinel sym pointer for promotable-variable IR_LEA instructions.
+ * braun_ssa() identifies promotable LEAs by pointer identity:
+ *   p->sym == ir_promote_sentinel  → promotable scalar local / param
+ *   p->sym == NULL                 → structural LEA (array fill, copy buffer)
+ *   p->sym = other non-NULL ptr    → address-taken or aggregate variable */
+const char ir_promote_sentinel[] = "";
 
 // Codegen context instance
 CodegenContext codegen_ctx;
@@ -314,17 +321,29 @@ void gen_varaddr_from_ident(Node *node, const char *name)
         else
             ir_append(IR_IMM, 0, name);
     }
-    else if (la.is_param)
+    else
     {
         Symbol *sym = find_symbol_st(node->st, name, NS_IDENT);
-        ir_append(IR_LEA, la.offset, name);
-        // Struct params are passed by pointer (hidden copy ABI): dereference the pointer
-        // to get the struct base address, making access transparent to all callers.
-        if (sym && sym->type->base == TB_STRUCT)
-            gen_ld(WORD_SIZE);
+        /* A scalar local/param is promotable if its address never escapes.
+         * Aggregates and function types are never promoted. */
+        bool scalar = sym &&
+                      !istype_array(sym->type) &&
+                      sym->type->base != TB_STRUCT &&
+                      sym->type->base != TB_FUNCTION;
+        bool promote = scalar && sym && !sym->address_taken;
+        const char *lea_sym = promote ? ir_promote_sentinel : name;
+
+        if (la.is_param)
+        {
+            ir_append(IR_LEA, la.offset, lea_sym);
+            // Struct params are passed by pointer (hidden copy ABI): dereference the pointer
+            // to get the struct base address, making access transparent to all callers.
+            if (sym && sym->type->base == TB_STRUCT)
+                gen_ld(WORD_SIZE);
+        }
+        else
+            ir_append(IR_LEA, -la.offset, lea_sym);
     }
-    else
-        ir_append(IR_LEA, -la.offset, name);
 }
 void gen_varaddr(Node *node)
 {
@@ -1927,6 +1946,27 @@ void gen_stmt(Node *node)
     default:;
     }
 }
+/* Pre-scan the function AST to mark every local/param symbol whose address
+ * is taken with '&'.  Called once per function before gen_ir runs.
+ * Walks ch[0..3] and ->next recursively, stripping implicit ND_CAST nodes
+ * that insert_coercions may have placed around the & operand. */
+static void mark_address_taken(Node *n)
+{
+    if (!n) return;
+    if (n->kind == ND_UNARYOP && n->op_kind == TK_AMPERSAND) {
+        Node *op = n->ch[0];
+        /* Strip implicit casts inserted by insert_coercions */
+        while (op && op->kind == ND_CAST) op = op->ch[1];
+        if (op && op->kind == ND_IDENT && op->symbol) {
+            Symbol *s = op->symbol;
+            if (s->kind == SYM_LOCAL || s->kind == SYM_PARAM)
+                s->address_taken = true;
+        }
+    }
+    for (int i = 0; i < 4; i++) mark_address_taken(n->ch[i]);
+    mark_address_taken(n->next);
+}
+
 void gen_function(Node *node)
 {
     Node *first_decl = node->ch[1];   // decls list head
@@ -1942,6 +1982,7 @@ void gen_function(Node *node)
         ir_append(IR_SYMLABEL, 0, fsym->name);
     codegen_ctx.label_table_size = 0;
     collect_labels(func_body);
+    mark_address_taken(func_body);
     ir_append(IR_ENTER, 0, NULL);
     codegen_ctx.adj_depth = 0;
     codegen_ctx.current_fn_ret_type = fsym->type->u.fn.ret;
