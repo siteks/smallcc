@@ -451,6 +451,7 @@ int main(int argc, char **argv)
             int n_blocks;
             BB *blocks = build_cfg(codegen_ctx.ir_head, &n_blocks);
             IR3Inst *ir3 = braun_ssa(blocks, n_blocks, codegen_ctx.ir_head);
+            ir3_optimize(ir3, opt_level);
             linscan_regalloc(ir3);
             SSAInst *ssa = ir3_lower(ir3);
             risc_backend_emit(ssa);

@@ -335,13 +335,14 @@ source text.
 
 ## CPU4 Backend
 
-After `peephole`, the CPU4 path runs three additional passes (braun_ssa, linscan_regalloc,
-ir3_lower) before reaching the unchanged `risc_backend_emit`.
+After `peephole`, the CPU4 path runs four additional passes (braun_ssa, ir3_optimize,
+linscan_regalloc, ir3_lower) before reaching the unchanged `risc_backend_emit`.
 
 ```
 Stack IR (codegen.c, unchanged)
     ↓  peephole(opt_level)      [optimise.c]    — unchanged
     ↓  braun_ssa()              [braun.c]        stack IR → IR3Inst (fresh vregs)
+    ↓  ir3_optimize()           [ir3_opt.c]      copy prop, const prop/fold, DCE, le/ge expand
     ↓  linscan_regalloc()       [linscan.c]      vregs → physical r0–r6 (r7 = spill scratch)
     ↓  ir3_lower()              [ir3_lower.c]    IR3Inst → SSAInst
     ↓  risc_backend_emit()      [risc_backend.c] SSAInst → CPU4 assembly (unchanged)
@@ -541,6 +542,52 @@ Same mechanism as the old `lift_to_ssa`: when a branch (`IR_J/JZ/JNZ`) is emitte
 current `vsp` is recorded in a table keyed by label id. When the target `IR_LABEL` is
 processed, `vsp` is restored from the table. This prevents scope-exit `adj` instructions
 from one branch arm from corrupting the sp model seen by the merge point.
+
+---
+
+### Pass 1b: `ir3_optimize()` (`ir3_opt.c`)
+
+IR3-level optimizations gated on `opt_level >= 1`. Three passes run per function
+(delimited by `IR3_SYMLABEL` with `IR3_ENTER`), iterated up to 4 times until stable:
+
+1. **Copy propagation** — local (per BB). Tracks `copy_of[vreg]` chains for fresh vregs
+   and a shadow `accum_copy` for ACCUM so that copies flowing through ACCUM (the dominant
+   pattern from `braun_ssa`: `MOV ACCUM, v101; MOV v102, ACCUM` → `copy_of[v102] = v101`)
+   propagate correctly. Replaces `rs1`/`rs2` with root sources, also propagates into
+   `IR3_STORE`'s `rd` (which is a read, not a definition). Reset at BB boundaries; calls
+   do not reset fresh-vreg maps (see `braun_ssa` call flushing). CALL/CALLR invalidate
+   ACCUM tracking (return value overwrites r0).
+
+2. **Constant propagation and folding** — local (per BB). Tracks `cval[vreg]` for fresh
+   vregs and `accum_cval` for ACCUM. Rewrites `MOV X ← Y` to `CONST X, val` when Y has a
+   known constant. Folds `IR3_ALU` when both operands are constant (`ir3_fold`). Simplifies
+   identity operations: `x+0 → MOV`, `x*0 → CONST 0`, `x*1 → MOV`, etc. Folds `IR3_ALU1`
+   sign-extensions of known constants.
+
+3. **Dead code elimination** — per function (global use count). Two scans: count uses of
+   each fresh vreg through `rs1`, `rs2`, and `IR3_STORE`'s `rd`; then kill instructions
+   with `rd > 100`, `use_count == 0`, and side-effect-free ops. Dead ACCUM store elimination:
+   if ACCUM is written by a side-effect-free op and the next instruction also writes ACCUM
+   without reading it, the first write is dead.
+
+After the per-function optimization loop, a whole-program **le/ge expansion** pass rewrites
+`IR3_ALU` nodes with `alu_op` in {`IR_LE`, `IR_GE`, `IR_LES`, `IR_GES`, `IR_FLE`, `IR_FGE`}
+into a 3-instruction sequence:
+
+```
+ALU rd, rs1, rs2, IR_GT        (inverse comparison)
+CONST v_zero, 0                (fresh vreg)
+ALU rd, rd, v_zero, IR_EQ      (negate result)
+```
+
+This ensures the zero-constant temp gets a proper fresh vreg so `linscan_regalloc` allocates
+it correctly, avoiding the register-clobber conflict that would occur if `risc_backend`'s
+inline expansion reused `rs1` as the temp (copy propagation can extend `rs1`'s live range
+past the comparison).
+
+**`IR3_STORE` semantics note**: `IR3_STORE`'s `rd` field holds the base address register
+(a read, not a definition). All three passes treat it accordingly: copy prop propagates
+into it, const prop does not invalidate it, and DCE counts it as a use.
 
 ---
 

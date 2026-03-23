@@ -110,6 +110,11 @@ void free_cfg(BB *blocks, int n_blocks);
  * blocks / n_blocks may be NULL / 0 — they are ignored in this version. */
 IR3Inst *braun_ssa(BB *blocks, int n_blocks, IRInst *ir_head);
 
+/* IR3-level optimizations: copy prop, constant prop/fold, DCE.
+ * Runs after braun_ssa() and before linscan_regalloc().
+ * opt_level: 0 = skip, >= 1 = run all passes. */
+void ir3_optimize(IR3Inst *head, int opt_level);
+
 /* Linear-scan register allocator: rewrites virtual vregs (>= IR3_VREG_BASE)
  * to physical registers 0-7 in place.  Also rewrites IR3_VREG_ACCUM → 0. */
 void linscan_regalloc(IR3Inst *head);
