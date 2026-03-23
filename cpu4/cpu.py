@@ -156,14 +156,14 @@ class G:
         'shl'   :   (0x4a, 1, 0, 0),
         'shr'   :   (0x4c, 1, 0, 0),
         'lt'    :   (0x4e, 1, 0, 0),
-        'gt'    :   (0x50, 1, 0, 0),
+        'le'    :   (0x50, 1, 0, 0),
         'eq'    :   (0x52, 1, 0, 0),
         'ne'    :   (0x54, 1, 0, 0),
         'and'   :   (0x56, 1, 0, 0),
         'or'    :   (0x58, 1, 0, 0),
         'xor'   :   (0x5a, 1, 0, 0),
         'lts'   :   (0x5c, 1, 0, 0),
-        'gts'   :   (0x5e, 1, 0, 0),
+        'les'   :   (0x5e, 1, 0, 0),
         'divs'  :   (0x60, 1, 0, 0),
         'mods'  :   (0x62, 1, 0, 0),
         'shrs'  :   (0x64, 1, 0, 0),
@@ -172,7 +172,7 @@ class G:
         'fmul'  :   (0x6a, 1, 0, 0),
         'fdiv'  :   (0x6c, 1, 0, 0),
         'flt'   :   (0x6e, 1, 0, 0),
-        'fgt'   :   (0x70, 1, 0, 0),
+        'fle'   :   (0x70, 1, 0, 0),
         # format 1b - one op, 16 bits   0111111dddoooooo
         # this format escapes to give large space for single op no imm
         'sxb'   :   (0x7e, 1, 1, 0x00),
@@ -209,9 +209,9 @@ class G:
         'beq'   :   (0xd8, 2, 1, 0),
         'bne'   :   (0xd9, 2, 1, 0),
         'blt'   :   (0xda, 2, 1, 0),
-        'bgt'   :   (0xdb, 2, 1, 0),
+        'ble'   :   (0xdb, 2, 1, 0),
         'blts'  :   (0xdc, 2, 1, 0),
-        'bgts'  :   (0xdd, 2, 1, 0),
+        'bles'  :   (0xdd, 2, 1, 0),
         'addli' :   (0xde, 2, 1, 0),
         # format 3c - one op + imm16    111ooxxxiiiiiiiiiiiiiiii
         'immw'  :   (0xe8, 2, 2, 0),
@@ -421,14 +421,14 @@ class CPU:
         elif    i == 'shl':     s.r[dst] = s.r[src0] << s.r[src1]
         elif    i == 'shr':     s.r[dst] = s.r[src0] >> s.r[src1]
         elif    i == 'lt':      s.r[dst] = s.r[src0] < s.r[src1]
-        elif    i == 'gt':      s.r[dst] = s.r[src0] > s.r[src1]
+        elif    i == 'le':      s.r[dst] = s.r[src0] <= s.r[src1]
         elif    i == 'eq':      s.r[dst] = s.r[src0] == s.r[src1]
         elif    i == 'ne':      s.r[dst] = s.r[src0] != s.r[src1]
         elif    i == 'and':     s.r[dst] = s.r[src0] & s.r[src1]
         elif    i == 'or':      s.r[dst] = s.r[src0] | s.r[src1]
         elif    i == 'xor':     s.r[dst] = s.r[src0] ^ s.r[src1]
         elif    i == 'lts':     s.r[dst] = 1 if sext(s.r[src0], 32) < sext(s.r[src1], 32) else 0
-        elif    i == 'gts':     s.r[dst] = 1 if sext(s.r[src0], 32) > sext(s.r[src1], 32) else 0
+        elif    i == 'les':     s.r[dst] = 1 if sext(s.r[src0], 32) <= sext(s.r[src1], 32) else 0
         elif    i == 'divs':    s.r[dst] = int(sext(s.r[src0], 32) / sext(s.r[src1], 32)) if s.r[src1] != 0 else 0
         elif    i == 'mods':    s.r[dst] = sext(s.r[src0], 32) % sext(s.r[src1], 32) if s.r[src1] != 0 else 0
         elif    i == 'shrs':    s.r[dst] = sext(s.r[src0], 32) >> (s.r[src1] & 31)
@@ -437,7 +437,7 @@ class CPU:
         elif    i == 'fmul':    s.r[dst] = f2b(b2f(s.r[src0]) * b2f(s.r[src1]))
         elif    i == 'fdiv':    s.r[dst] = f2b(b2f(s.r[src0]) / b2f(s.r[src1]))
         elif    i == 'flt':     s.r[dst] = 1 if b2f(s.r[src0]) < b2f(s.r[src1]) else 0
-        elif    i == 'fgt':     s.r[dst] = 1 if b2f(s.r[src0]) > b2f(s.r[src1]) else 0
+        elif    i == 'fle':     s.r[dst] = 1 if b2f(s.r[src0]) <= b2f(s.r[src1]) else 0
         # f1b
         elif    i == 'sxb':     s.r[dst] = 0xffffff00 | s.r[src0] if s.r[src0] & 0x80 else 0xff & s.r[src0]
         elif    i == 'sxw':     s.r[dst] = 0xffff0000 | s.r[src0] if s.r[src0] & 0x8000 else 0xffff & s.r[src0]
@@ -473,9 +473,9 @@ class CPU:
         elif    i == 'beq':     s.pc = s.pc + sext(imm, 10) if s.r[src0] == s.r[src1] else s.pc
         elif    i == 'bne':     s.pc = s.pc + sext(imm, 10) if s.r[src0] != s.r[src1] else s.pc
         elif    i == 'blt':     s.pc = s.pc + sext(imm, 10) if s.r[src0] < s.r[src1] else s.pc
-        elif    i == 'bgt':     s.pc = s.pc + sext(imm, 10) if s.r[src0] > s.r[src1] else s.pc
+        elif    i == 'ble':     s.pc = s.pc + sext(imm, 10) if s.r[src0] <= s.r[src1] else s.pc
         elif    i == 'blts':    s.pc = s.pc + sext(imm, 10) if sext(s.r[src0], 32) < sext(s.r[src1], 32) else s.pc
-        elif    i == 'bgts':    s.pc = s.pc + sext(imm, 10) if sext(s.r[src0], 32) > sext(s.r[src1], 32) else s.pc
+        elif    i == 'bles':    s.pc = s.pc + sext(imm, 10) if sext(s.r[src0], 32) <= sext(s.r[src1], 32) else s.pc
         elif    i == 'addli':   s.r[dst] = s.r[src1] + sext(imm, 10)
         # f3c
         elif    i == 'immw':    s.r[dst] = imm

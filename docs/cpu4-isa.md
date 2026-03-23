@@ -75,14 +75,14 @@ Result written to `rd`; `rx` and `ry` are read-only. Opcode `11111` (0x7e) is th
 | 0x4a | `shl rd, rx, ry` | rd = rx << ry |
 | 0x4c | `shr rd, rx, ry` | rd = rx >> ry (logical) |
 | 0x4e | `lt rd, rx, ry` | rd = (rx < ry) ? 1 : 0 (unsigned) |
-| 0x50 | `gt rd, rx, ry` | rd = (rx > ry) ? 1 : 0 (unsigned) |
+| 0x50 | `le rd, rx, ry` | rd = (rx <= ry) ? 1 : 0 (unsigned) |
 | 0x52 | `eq rd, rx, ry` | rd = (rx == ry) ? 1 : 0 |
 | 0x54 | `ne rd, rx, ry` | rd = (rx != ry) ? 1 : 0 |
 | 0x56 | `and rd, rx, ry` | rd = rx & ry |
 | 0x58 | `or rd, rx, ry` | rd = rx \| ry |
 | 0x5a | `xor rd, rx, ry` | rd = rx ^ ry |
 | 0x5c | `lts rd, rx, ry` | rd = (signed(rx) < signed(ry)) ? 1 : 0 |
-| 0x5e | `gts rd, rx, ry` | rd = (signed(rx) > signed(ry)) ? 1 : 0 |
+| 0x5e | `les rd, rx, ry` | rd = (signed(rx) <= signed(ry)) ? 1 : 0 |
 | 0x60 | `divs rd, rx, ry` | rd = signed(rx) / signed(ry) (0 if ry == 0) |
 | 0x62 | `mods rd, rx, ry` | rd = signed(rx) % signed(ry) (0 if ry == 0) |
 | 0x64 | `shrs rd, rx, ry` | rd = signed(rx) >> (ry & 31) (arithmetic) |
@@ -91,7 +91,7 @@ Result written to `rd`; `rx` and `ry` are read-only. Opcode `11111` (0x7e) is th
 | 0x6a | `fmul rd, rx, ry` | rd = float_bits(float(rx) × float(ry)) |
 | 0x6c | `fdiv rd, rx, ry` | rd = float_bits(float(rx) / float(ry)) |
 | 0x6e | `flt rd, rx, ry` | rd = (float(rx) < float(ry)) ? 1 : 0 |
-| 0x70 | `fgt rd, rx, ry` | rd = (float(rx) > float(ry)) ? 1 : 0 |
+| 0x70 | `fle rd, rx, ry` | rd = (float(rx) <= float(ry)) ? 1 : 0 |
 
 *(6 slots available: 0x72, 0x74, 0x76, 0x78, 0x7a, 0x7c.)*
 
@@ -105,16 +105,17 @@ deviations on this target).
 
 | Pseudo-op | Expands to |
 |---|---|
-| `le rd, rx, ry` | `gt rd, ry, rx` |
-| `ge rd, rx, ry` | `lt rd, ry, rx` |
-| `les rd, rx, ry` | `gts rd, ry, rx` |
-| `ges rd, rx, ry` | `lts rd, ry, rx` |
-| `fle rd, rx, ry` | `fgt rd, ry, rx` |
-| `fge rd, rx, ry` | `flt rd, ry, rx` |
+| `gt rd, rx, ry` | `lt rd, ry, rx` |
+| `ge rd, rx, ry` | `le rd, ry, rx` |
+| `gts rd, rx, ry` | `lts rd, ry, rx` |
+| `ges rd, rx, ry` | `les rd, ry, rx` |
+| `fgt rd, rx, ry` | `flt rd, ry, rx` |
+| `fge rd, rx, ry` | `fle rd, ry, rx` |
 | `mov rd, rx` | `or rd, rx, rx` |
 
-`le`/`ge`/`les`/`ges` have no separate encoding — they are implemented by swapping operands
-and using the opposite comparison direction, which is the standard 3-address RISC approach.
+The ISA has `lt` and `le` (plus signed/float variants) as native instructions. All four
+comparison directions are single instructions via operand swapping: `gt rd, rx, ry` becomes
+`lt rd, ry, rx`, and `ge rd, rx, ry` becomes `le rd, ry, rx`.
 `mov rd, rx` is the pseudo-op `or rd, rx, rx`; no dedicated encoding is needed.
 
 ---
@@ -220,9 +221,9 @@ Memory accesses are register-relative (ry is the base; rx is source/destination)
 | 0xd8 | `beq rx, ry, imm10` | if rx == ry: pc += sext10(imm10) |
 | 0xd9 | `bne rx, ry, imm10` | if rx != ry: pc += sext10(imm10) |
 | 0xda | `blt rx, ry, imm10` | if rx < ry (unsigned): pc += sext10(imm10) |
-| 0xdb | `bgt rx, ry, imm10` | if rx > ry (unsigned): pc += sext10(imm10) |
+| 0xdb | `ble rx, ry, imm10` | if rx <= ry (unsigned): pc += sext10(imm10) |
 | 0xdc | `blts rx, ry, imm10` | if signed(rx) < signed(ry): pc += sext10(imm10) |
-| 0xdd | `bgts rx, ry, imm10` | if signed(rx) > signed(ry): pc += sext10(imm10) |
+| 0xdd | `bles rx, ry, imm10` | if signed(rx) <= signed(ry): pc += sext10(imm10) |
 | 0xde | `addli rx, ry, imm10` | rx = ry + sext10(imm10) (separate source and destination) |
 
 *(1 slot available: 0xdf.)*
@@ -239,10 +240,10 @@ separate destination register and a wider 10-bit immediate.
 
 | Pseudo-op | Expands to |
 |---|---|
-| `ble rx, ry, imm10` | `bgt ry, rx, imm10` |
-| `bge rx, ry, imm10` | `blt ry, rx, imm10` |
-| `bles rx, ry, imm10` | `bgts ry, rx, imm10` |
-| `bges rx, ry, imm10` | `blts ry, rx, imm10` |
+| `bgt rx, ry, imm10` | `blt ry, rx, imm10` |
+| `bge rx, ry, imm10` | `ble ry, rx, imm10` |
+| `bgts rx, ry, imm10` | `blts ry, rx, imm10` |
+| `bges rx, ry, imm10` | `bles ry, rx, imm10` |
 
 ---
 

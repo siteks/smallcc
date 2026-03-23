@@ -6,14 +6,16 @@
  *   2. Constant prop/fold — folds ALU ops with known-constant operands
  *   3. Dead code elimination — removes defs with zero uses
  *
- * After the per-function passes, a whole-program pass expands le/ge/les/ges/
- * fle/fge ALU ops into 3-instruction sequences with fresh vregs, so that
- * linscan can allocate the temp register correctly (risc_backend's expansion
- * assumes rs1 is dead after the ALU, which copy propagation can violate).
- *
  * ACCUM (vreg 100) tracking: copy_propagate tracks a shadow "accum_copy"
  * so that copies flowing through ACCUM can propagate to fresh vregs.
  * const_prop_fold tracks "accum_cval" similarly for constants.
+ *
+ * CALL/CALLR invalidate ACCUM tracking (return value overwrites r0) and
+ * also reset fresh vreg copy/const maps.  While IR3 vregs are virtual,
+ * propagation across calls can extend non-promoted vreg live ranges past
+ * call sites where call_spill_insert cannot save/restore them (no stack
+ * slot metadata).  Promoted vregs that genuinely span calls are handled
+ * by call_spill_insert (STORE/LOAD around calls).
  */
 
 #include <stdlib.h>
@@ -52,9 +54,8 @@ static bool is_side_effect_free(IR3Op op)
 }
 
 /* Is this instruction a basic-block boundary for local propagation?
- * Labels and terminators reset per-BB tracking.  CALL/CALLR do NOT
- * reset fresh-vreg maps because flush_for_call_n ensures no fresh
- * vreg's live range spans a call. */
+ * Labels and terminators reset per-BB tracking.  CALL/CALLR are handled
+ * inline in each pass (reset ACCUM + fresh vreg maps). */
 static bool is_bb_leader_or_term(IR3Op op)
 {
     switch (op) {
@@ -203,9 +204,16 @@ static bool copy_propagate(IR3Inst *start, IR3Inst *end)
         if (p->rd == IR3_VREG_ACCUM)
             accum_copy = -1;
 
-        /* CALL/CALLR clobber ACCUM (return value) */
-        if (p->op == IR3_CALL || p->op == IR3_CALLR)
+        /* CALL/CALLR clobber ACCUM (return value overwrites r0).
+         * Also reset fresh vreg copy maps — while IR3 vregs are virtual,
+         * copy propagation across calls can extend non-promoted vreg live
+         * ranges past call sites, causing them to need spill slots that
+         * call_spill_insert cannot provide (no promo_vreg_info entry).
+         * Promoted vregs that span calls are handled by call_spill_insert. */
+        if (p->op == IR3_CALL || p->op == IR3_CALLR) {
             accum_copy = -1;
+            memset(copy_of, -1, sizeof(copy_of));
+        }
 
         /* Invalidate fresh vreg if redefined (STORE reads rd, doesn't define it) */
         if (p->op != IR3_STORE && is_fresh(p->rd) && vidx_ok(p->rd))
@@ -452,9 +460,13 @@ skip_alu1:
         if (p->op != IR3_STORE && p->rd == IR3_VREG_ACCUM)
             accum_cval_valid = false;
 
-        /* CALL/CALLR clobber ACCUM (return value) */
-        if (p->op == IR3_CALL || p->op == IR3_CALLR)
+        /* CALL/CALLR clobber ACCUM and reset fresh vreg const maps
+         * (same rationale as copy_propagate — prevent non-promoted vregs
+         * from appearing live across calls). */
+        if (p->op == IR3_CALL || p->op == IR3_CALLR) {
             accum_cval_valid = false;
+            memset(cval_valid, 0, sizeof(cval_valid));
+        }
     }
 
     return changed;
@@ -563,61 +575,6 @@ static bool dce(IR3Inst *start, IR3Inst *end)
  * vreg gets a proper register allocation.  risc_backend's expansion
  * (which reuses rs1 as the temp) remains as a fallback for -O0.
  * ---------------------------------------------------------------- */
-static IROp le_ge_inverse(IROp op)
-{
-    switch (op) {
-    case IR_LE:  return IR_GT;
-    case IR_GE:  return IR_LT;
-    case IR_LES: return IR_GTS;
-    case IR_GES: return IR_LTS;
-    case IR_FLE: return IR_FGT;
-    case IR_FGE: return IR_FLT;
-    default:     return (IROp)0;
-    }
-}
-
-static void expand_le_ge(IR3Inst *head)
-{
-    for (IR3Inst *p = head; p; p = p->next) {
-        if (p->op != IR3_ALU) continue;
-        IROp inv = le_ge_inverse(p->alu_op);
-        if (!inv) continue;
-
-        int v_zero = ir3_new_vreg();
-
-        /* Allocate the two new instructions */
-        IR3Inst *const_node = calloc(1, sizeof(IR3Inst));
-        IR3Inst *eq_node    = calloc(1, sizeof(IR3Inst));
-
-        /* Rewrite p: inverse comparison */
-        p->alu_op = inv;
-
-        /* CONST v_zero, 0 */
-        const_node->op  = IR3_CONST;
-        const_node->rd  = v_zero;
-        const_node->rs1 = IR3_VREG_NONE;
-        const_node->rs2 = IR3_VREG_NONE;
-        const_node->imm = 0;
-        const_node->line = p->line;
-
-        /* ALU rd, rd, v_zero, IR_EQ */
-        eq_node->op     = IR3_ALU;
-        eq_node->alu_op = IR_EQ;
-        eq_node->rd     = p->rd;
-        eq_node->rs1    = p->rd;
-        eq_node->rs2    = v_zero;
-        eq_node->line   = p->line;
-
-        /* Splice in: p → const_node → eq_node → p->next */
-        eq_node->next    = p->next;
-        const_node->next = eq_node;
-        p->next          = const_node;
-
-        /* Skip past the two new nodes */
-        p = eq_node;
-    }
-}
-
 /* Remove IR3_COMMENT nodes with no sym (dead instruction stubs). */
 static void compact_ir3(IR3Inst *head)
 {
@@ -670,9 +627,6 @@ void ir3_optimize(IR3Inst *head, int opt_level)
 
         p = func_end;
     }
-
-    /* Expand le/ge after all optimizations (before linscan) */
-    expand_le_ge(head);
 
     compact_ir3(head);
 }

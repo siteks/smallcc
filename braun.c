@@ -119,13 +119,20 @@ static int spill_total_bytes;
 static int await_post_call_adj;
 
 /* ================================================================
+ * Promoted-variable vreg metadata (exported for call_spill_insert)
+ * ================================================================ */
+PromoVregInfo promo_vreg_info[MAX_PROMO_VREG_INFO];
+int n_promo_vreg_info;
+static const char *current_func_sym;  /* current function name for promo_vreg_info tagging */
+static bool func_can_promote;        /* true if promotion is enabled for current function */
+
+/* ================================================================
  * Output IR3 list
  * ================================================================ */
 static IR3Inst  *ir3_head;
 static IR3Inst **ir3_tail;
 static IR3Inst  *ir3_last;   /* last emitted node */
 static IR3Inst  *func_ir3_start; /* first IR3 node of current function */
-static bool      func_has_calls; /* true if current function has IR_JL/JLI */
 
 static IR3Inst *new_ir3(IR3Op op)
 {
@@ -280,11 +287,14 @@ static void restore_outer_temps(int line)
 /* Per-block current definition: block_def[bb_id][slot] = vreg or IR3_VREG_NONE */
 static int block_def[MAX_BLOCKS][PROMOTE_SLOTS];
 
-/* Function-level set of promoted slots ever written (for call save/restore) */
-static bool promo_ever_written[PROMOTE_SLOTS];
+/* (promo_ever_written removed — call save/restore now in call_spill.c) */
 
 /* Phi node lookup: phi_node_map[vreg - IR3_VREG_BASE] = IR3Inst* or NULL */
 static IR3Inst *phi_node_map[PHI_MAP_SIZE];
+
+/* Phi forwarding table: when a phi vreg V is simplified to W,
+ * phi_fwd[V - IR3_VREG_BASE] = W.  0 means "no forwarding". */
+static int phi_fwd[PHI_MAP_SIZE];
 
 /* Where to insert new phis at the head of each block */
 static IR3Inst *phi_insert_point[MAX_BLOCKS];
@@ -333,61 +343,13 @@ static void sealBlock(int bb_id);
 static void writeVariable(int bb_id, int var_slot, int vreg)
 {
     block_def[bb_id][var_slot] = vreg;
-    promo_ever_written[var_slot] = true;
-}
-
-/* ================================================================
- * Save/restore promoted variables across calls.
- *
- * All registers are caller-saved.  Promoted variables live in vregs
- * which get physical registers via linscan.  Before a call, write
- * every live promoted variable back to its stack slot; after the
- * call, reload into fresh vregs so linscan never sees a live range
- * that spans a call instruction.
- * ================================================================ */
-#define MAX_PROMO_SAVE 64
-
-static struct { int slot; int offset; int size; } promo_save[MAX_PROMO_SAVE];
-static int n_promo_save;
-
-static void save_promoted_before_call(int bb_id, int line)
-{
-    n_promo_save = 0;
-    for (int s = 0; s < PROMOTE_SLOTS; s++) {
-        if (!promo_ever_written[s]) continue;
-        if (promo_slot_size[s] == 0) continue;
-        /* Ensure block_def is populated for this slot via readVariable */
-        int vreg = readVariable(bb_id, s);
-        if (vreg == IR3_VREG_NONE) continue;
-        int offset = s - PROMOTE_BASE;
-        IR3Inst *st = emit_ir3(IR3_STORE);
-        st->rd   = IR3_VREG_BP;
-        st->rs1  = vreg;
-        st->imm  = offset;
-        st->size = promo_slot_size[s];
-        st->line = line;
-        if (n_promo_save < MAX_PROMO_SAVE) {
-            promo_save[n_promo_save].slot   = s;
-            promo_save[n_promo_save].offset = offset;
-            promo_save[n_promo_save].size   = promo_slot_size[s];
-            n_promo_save++;
-        }
+    /* Record vreg→slot mapping for call_spill_insert */
+    if (vreg > IR3_VREG_ACCUM && n_promo_vreg_info < MAX_PROMO_VREG_INFO) {
+        promo_vreg_info[n_promo_vreg_info++] = (PromoVregInfo){
+            vreg, var_slot - PROMOTE_BASE, promo_slot_size[var_slot],
+            current_func_sym
+        };
     }
-}
-
-static void reload_promoted_after_call(int bb_id, int line)
-{
-    for (int k = 0; k < n_promo_save; k++) {
-        int fresh = ir3_new_vreg();
-        IR3Inst *ld = emit_ir3(IR3_LOAD);
-        ld->rd   = fresh;
-        ld->rs1  = IR3_VREG_BP;
-        ld->imm  = promo_save[k].offset;
-        ld->size = promo_save[k].size;
-        ld->line = line;
-        writeVariable(bb_id, promo_save[k].slot, fresh);
-    }
-    n_promo_save = 0;
 }
 
 /* Set phi_insert_point[bb_id] = node and flush any pending phis for this block.
@@ -456,10 +418,29 @@ static IR3Inst *emit_phi_at(int bb_id, int phi_vreg)
 }
 
 /* Try to remove a trivial phi (all non-self ops are the same value). */
+/* Chase the phi forwarding chain to find the final resolved vreg.
+ * If vreg V was simplified to W, and W was simplified to X, resolve(V) = X. */
+static int resolve_phi_vreg(int vreg)
+{
+    for (int depth = 0; depth < 64; depth++) {
+        int idx = vreg - IR3_VREG_BASE;
+        if ((unsigned)idx >= PHI_MAP_SIZE) return vreg;
+        int fwd = phi_fwd[idx];
+        if (fwd == 0 || fwd == vreg) return vreg;
+        vreg = fwd;
+    }
+    return vreg;  /* safety: chain too long */
+}
+
 static int tryRemoveTrivialPhi(int phi_vreg)
 {
     int idx = phi_vreg - IR3_VREG_BASE;
     if ((unsigned)idx >= PHI_MAP_SIZE) return phi_vreg;
+
+    /* If this phi was already simplified, chase the forwarding chain */
+    if (phi_fwd[idx] != 0 && phi_fwd[idx] != phi_vreg)
+        return resolve_phi_vreg(phi_vreg);
+
     IR3Inst *phi = phi_node_map[idx];
     if (!phi || phi->op != IR3_PHI) return phi_vreg;
 
@@ -506,10 +487,11 @@ static int tryRemoveTrivialPhi(int phi_vreg)
         if (p->rd  == phi_vreg) p->rd  = unique;
     }
 
-    /* Mark phi dead */
+    /* Mark phi dead and record forwarding */
     phi->op = IR3_MOV;
     phi->rd = IR3_VREG_NONE;  /* linscan will skip rd=NONE */
     phi->rs1 = unique;
+    phi_fwd[idx] = unique;
     phi_node_map[idx] = NULL;
 
     /* Recursively try to simplify phis that used phi_vreg (now updated to unique) */
@@ -581,8 +563,23 @@ static int readVariableRecursive(int bb_id, int var_slot)
 static int readVariable(int bb_id, int var_slot)
 {
     int v = block_def[bb_id][var_slot];
-    if (v != IR3_VREG_NONE) return v;
-    return readVariableRecursive(bb_id, var_slot);
+    if (v != IR3_VREG_NONE) {
+        /* Chase forwarding chain in case this vreg was a simplified phi */
+        int resolved = resolve_phi_vreg(v);
+        if (resolved != v) {
+            block_def[bb_id][var_slot] = resolved;  /* update in place */
+            v = resolved;
+        }
+        return v;
+    }
+    v = readVariableRecursive(bb_id, var_slot);
+    /* Chase forwarding chain for the recursive result too */
+    int resolved = resolve_phi_vreg(v);
+    if (resolved != v) {
+        block_def[bb_id][var_slot] = resolved;
+        v = resolved;
+    }
+    return v;
 }
 
 static void sealBlock(int bb_id)
@@ -618,6 +615,7 @@ static void reset_braun_state(void)
 {
     memset(block_def, -1, sizeof(block_def));  /* -1 = IR3_VREG_NONE */
     memset(phi_node_map, 0, sizeof(phi_node_map));
+    memset(phi_fwd, 0, sizeof(phi_fwd));
     memset(phi_insert_point, 0, sizeof(phi_insert_point));
     memset(pending_phis, 0, sizeof(pending_phis));
     memset(block_last_ir3, 0, sizeof(block_last_ir3));
@@ -625,7 +623,6 @@ static void reset_braun_state(void)
     memset(preds_done, 0, sizeof(preds_done));
     memset(vreg_lea_offset, 0, sizeof(vreg_lea_offset));
     memset(promo_slot_size, 0, sizeof(promo_slot_size));
-    memset(promo_ever_written, 0, sizeof(promo_ever_written));
     current_bb_id = 0;
     cur_n_blocks = 0;
     cur_blocks = NULL;
@@ -710,7 +707,7 @@ static void translate_bb(BB *bb, int bb_id)
              *
              * Future work: add heuristics to promote only profitable
              * variables (loop counters, frequently-read scalars). */
-            bool is_promo = (!func_has_calls && p->sym == ir_promote_sentinel);
+            bool is_promo = (func_can_promote && p->sym == ir_promote_sentinel);
 
             /* Peek: if next instruction is a load, collapse to bp-relative load */
             int peek_sz = 0;
@@ -1252,11 +1249,15 @@ static void process_function(IRInst *sym_node)
     /* Reset per-function state */
     vs_depth = 0; vsp = 0;
     spill_count = 0; spill_total_bytes = 0; await_post_call_adj = 0;
+    /* NOTE: do NOT reset n_promo_vreg_info here — it accumulates across
+     * all functions so call_spill_insert (which runs after braun_ssa
+     * finishes) can look up any vreg from any function. */
     lvsp_reset();
     reset_braun_state();
     ir3_reset();  /* reset vreg counter per function */
 
     /* Emit the function's SYMLABEL */
+    current_func_sym = sym_node->sym;
     IR3Inst *symlabel_ir3 = emit_ir3(IR3_SYMLABEL);
     symlabel_ir3->sym  = sym_node->sym;
     symlabel_ir3->line = sym_node->line;
@@ -1281,6 +1282,38 @@ static void process_function(IRInst *sym_node)
     cur_blocks = blocks;
     cur_n_blocks = n_blocks;
 
+    /* Promotion gating for non-leaf functions.
+     *
+     * Promoting all scalars in a function with many calls and many locals
+     * creates long-lived vregs that saturate the register file.  linscan
+     * spills the excess, expanding the ENTER frame.  For large functions
+     * (e.g. CoreMark main with a 2000-byte local array) this can overflow
+     * the stack.
+     *
+     * Leaf functions: promote unconditionally (no call-spanning issues).
+     * Non-leaf functions: promote up to MAX_PROMO_NONLEAF distinct variables.
+     * call_spill_insert handles save/restore around calls for promoted vars.
+     */
+    #define MAX_PROMO_NONLEAF 4
+    bool func_has_calls_scan = false;
+    int n_promo_vars = 0;
+    int promo_offsets[64];
+    for (IRInst *p = sym_node->next;
+         p && p->op != IR_SYMLABEL; p = p->next) {
+        if (p->op == IR_JL || p->op == IR_JLI)
+            func_has_calls_scan = true;
+        if (p->op == IR_LEA && p->sym == ir_promote_sentinel) {
+            bool dup = false;
+            for (int i = 0; i < n_promo_vars; i++) {
+                if (promo_offsets[i] == p->operand) { dup = true; break; }
+            }
+            if (!dup && n_promo_vars < 64)
+                promo_offsets[n_promo_vars++] = p->operand;
+        }
+    }
+    func_can_promote = !func_has_calls_scan
+                       || n_promo_vars <= MAX_PROMO_NONLEAF;
+
     /* Pre-seed promoted parameters in the entry block.
      *
      * Parameters get their initial values from the caller via the stack frame,
@@ -1296,18 +1329,10 @@ static void process_function(IRInst *sym_node)
      * (parameters).  For each unique parameter, pre-allocate a vreg and call
      * writeVariable; the actual IR3_LOAD is deferred to the IR_ENTER handler
      * (because bp must be set up before bp-relative loads). */
-    /* Scan for calls — promotion is disabled in functions with calls
-     * (all-caller-save ABI means every promoted variable must be saved
-     * and restored around each call, which negates the benefit). */
-    func_has_calls = false;
-    for (IRInst *p = sym_node->next; p && p->op != IR_SYMLABEL; p = p->next) {
-        if (p->op == IR_JL || p->op == IR_JLI) { func_has_calls = true; break; }
-    }
-
     n_param_seeds = 0;
-    for (IRInst *p = sym_node->next; p && p->op != IR_SYMLABEL; p = p->next) {
-        if (func_has_calls) break;  /* skip param seeding if calls present */
-        if (p->op == IR_LEA && p->sym == ir_promote_sentinel
+    for (IRInst *p = sym_node->next;
+         p && p->op != IR_SYMLABEL; p = p->next) {
+        if (func_can_promote && p->op == IR_LEA && p->sym == ir_promote_sentinel
             && p->operand > 0)  /* positive offset = parameter */
         {
             /* Determine load size from the following instruction */
@@ -1417,6 +1442,7 @@ IR3Inst *braun_ssa(BB *blocks_ignored, int n_blocks_ignored, IRInst *ir_head)
     spill_count = 0;
     spill_total_bytes = 0;
     await_post_call_adj = 0;
+    n_promo_vreg_info = 0;  /* reset once for all functions */
     lvsp_reset();
     reset_braun_state();
 

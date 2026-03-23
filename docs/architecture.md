@@ -580,7 +580,8 @@ registers. Uses the Braun et al. (2013) SSA construction algorithm with
 the stack machine's expression stack as a virtual register stack, peeks ahead to collapse
 `LEA+LOAD`/`LEA+STORE` pairs into bp-relative IR3 ops, and handles call-site
 argument/temporary partitioning via `flush_for_call_n`. SSA promotion of scalar locals is
-enabled for leaf functions only.
+enabled for leaf functions unconditionally and for non-leaf functions with ≤4 promotable
+variables (with call save/restore to split live ranges at call sites).
 
 ### `ir3.c` / `ir3.h` — IR3 Infrastructure (CPU4)
 

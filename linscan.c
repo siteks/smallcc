@@ -159,7 +159,10 @@ static int rewrite_reg(int reg)
     int idx = reg - IR3_VREG_BASE;
     if (idx < 0 || idx >= MAX_INTERVALS) return reg;
     int k = vreg_map[idx];
-    if (k == -1) return reg;
+    if (k == -1) {
+        fprintf(stderr, "linscan: vreg %d has no interval (unmapped)\n", reg);
+        return reg;
+    }
     if (intervals[k].phys >= 0) return intervals[k].phys;
     /* Spilled: use r7 as scratch.  Phase 5 will insert the actual
      * spill loads/stores around this instruction. */
@@ -425,12 +428,18 @@ static void alloc_function(IR3Inst *func_head, IR3Inst *func_end,
     }
 
     for (IR3Inst *p = func_head; p != func_end; p = p->next) {
+        int old_rd = p->rd, old_rs1 = p->rs1, old_rs2 = p->rs2;
         if (p->rd  != IR3_VREG_NONE && p->rd  != IR3_VREG_BP)
             p->rd  = rewrite_reg(p->rd);
         if (p->rs1 != IR3_VREG_NONE && p->rs1 != IR3_VREG_BP)
             p->rs1 = rewrite_reg(p->rs1);
         if (p->rs2 != IR3_VREG_NONE && p->rs2 != IR3_VREG_BP)
             p->rs2 = rewrite_reg(p->rs2);
+        /* Debug: check for unrewritten vregs */
+        if ((p->rd >= IR3_VREG_BASE+1) || (p->rs1 >= IR3_VREG_BASE+1) || (p->rs2 >= IR3_VREG_BASE+1))
+            fprintf(stderr, "linscan: unrewritten vreg in op=%d rd=%d(was %d) rs1=%d(was %d) rs2=%d(was %d) sym=%s\n",
+                    p->op, p->rd, old_rd, p->rs1, old_rs1, p->rs2, old_rs2,
+                    p->sym ? p->sym : "");
     }
 
     /* --- Phase 5a: expand ENTER and shift flush offsets BEFORE spill

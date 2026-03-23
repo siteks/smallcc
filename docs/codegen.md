@@ -13,6 +13,8 @@ backend_emit_asm()    [backend.c]    stack IR → CPU3 assembly
 
 ── CPU4 ──────────────────────────────────────────────────────────────────────
 braun_ssa()           [braun.c]       stack IR → IR3Inst (fresh vregs)
+ir3_optimize()        [ir3_opt.c]     copy prop, const prop/fold, DCE
+call_spill_insert()   [call_spill.c]  STORE/LOAD around calls for live promoted vregs
 linscan_regalloc()    [linscan.c]     vregs → physical r0–r7 (linear-scan)
 ir3_lower()           [ir3_lower.c]   IR3Inst → SSAInst
 risc_backend_emit()   [risc_backend.c]  SSAInst → CPU4 assembly
@@ -335,14 +337,16 @@ source text.
 
 ## CPU4 Backend
 
-After `peephole`, the CPU4 path runs four additional passes (braun_ssa, ir3_optimize,
-linscan_regalloc, ir3_lower) before reaching the unchanged `risc_backend_emit`.
+After `peephole`, the CPU4 path runs five additional passes (braun_ssa, ir3_optimize,
+call_spill_insert, linscan_regalloc, ir3_lower) before reaching the unchanged
+`risc_backend_emit`.
 
 ```
 Stack IR (codegen.c, unchanged)
     ↓  peephole(opt_level)      [optimise.c]    — unchanged
     ↓  braun_ssa()              [braun.c]        stack IR → IR3Inst (fresh vregs)
-    ↓  ir3_optimize()           [ir3_opt.c]      copy prop, const prop/fold, DCE, le/ge expand
+    ↓  ir3_optimize()           [ir3_opt.c]      copy prop, const prop/fold, DCE
+    ↓  call_spill_insert()      [call_spill.c]   STORE/LOAD for vregs live across calls
     ↓  linscan_regalloc()       [linscan.c]      vregs → physical r0–r6 (r7 = spill scratch)
     ↓  ir3_lower()              [ir3_lower.c]    IR3Inst → SSAInst
     ↓  risc_backend_emit()      [risc_backend.c] SSAInst → CPU4 assembly (unchanged)
@@ -421,18 +425,27 @@ Converts the flat stack-IR list to IR3Inst with fresh virtual registers. Uses th
 (2013) SSA construction algorithm with `readVariable`/`writeVariable`/`readVariableRecursive`
 to place phi nodes on demand.
 
-**SSA promotion** is enabled for **leaf functions only** (functions that contain no `IR_JL` or
-`IR_JLI` instructions). Scalar locals and parameters whose address never escapes (tagged with
-`ir_promote_sentinel` in `codegen.c`) are promoted from memory to SSA virtual registers. The
+**SSA promotion** promotes scalar locals and parameters whose address never escapes (tagged
+with `ir_promote_sentinel` in `codegen.c`) from memory to SSA virtual registers. The
 Braun algorithm handles phi placement at control-flow merge points, and trivial phis (all
 operands identical) are eliminated. Phi deconstruction inserts parallel copies at predecessor
 block tails.
 
-Promotion is restricted to leaf functions because all registers are caller-saved — a call
-would require saving and restoring every live promoted variable. For non-leaf functions, all
-locals and parameters go through `IR3_LEA + IR3_LOAD / IR3_STORE` as before. The F2
-bp-relative load/store instructions (`lw r, [bp+imm7]`, 2 bytes, 1 cycle) make memory access
-cheap enough that no-promotion is competitive with promotion for typical non-leaf code.
+Promotion is enabled for all leaf functions (no `IR_JL`/`IR_JLI`) unconditionally, and for
+non-leaf functions with at most `MAX_PROMO_NONLEAF` (4) distinct promotable variables.
+For non-leaf promoted functions, `call_spill_insert()` (a separate pass after
+`ir3_optimize`) inserts STORE/LOAD pairs around call sites for promoted vregs that are
+actually live across each call, using the vreg's original stack slot. This is more efficient
+than saving all promoted variables at every call — only live-across-call vregs incur
+save/restore overhead.
+
+The 4-variable limit avoids spill-register exhaustion: with only one spill scratch register
+(r7), linscan cannot handle multiple simultaneously-spilled promoted vregs at the same
+program point (all reloads write r7, clobbering each other). Promoting more variables than
+the register pool (6) guarantees spills, and even at the pool boundary, expression
+temporaries still need registers. Functions exceeding the limit use the unpromoted
+`IR3_LEA + IR3_LOAD / IR3_STORE` path, which is efficient via F2 bp-relative instructions
+(2 bytes, 1 cycle).
 
 #### Promoted variable handling
 
@@ -454,9 +467,19 @@ after `IR3_ENTER` and registered via `writeVariable` in block 0. This ensures
 even for empty blocks (no instructions), ensuring phi copy insertion works correctly for
 fall-through predecessors.
 
-**Call save/restore** (non-leaf functions with promoted variables — currently gated off but
-infrastructure exists): `save_promoted_for_call` / `restore_promoted_after_call` would spill
-promoted variables to their stack slots before calls and reload into fresh vregs afterward.
+**Phi forwarding**: When `tryRemoveTrivialPhi` simplifies a phi vreg V to another vreg W,
+it records the mapping in a forwarding table (`phi_fwd[V] = W`). `readVariable` applies
+`resolve_phi_vreg()` to chase forwarding chains in both the cached-definition and
+`readVariableRecursive` paths, ensuring that simplified phi vregs are never emitted in IR3
+instructions. Without this, a multi-step simplification chain (V→W→X) could leave stale
+vreg references that survive to assembly as unrewritten virtual registers.
+
+**Vreg→slot metadata export**: `writeVariable()` records a mapping from each promoted vreg
+to its bp-relative offset and size in the `promo_vreg_info[]` table (defined in `braun.c`,
+declared in `ir3.h`). Each entry also stores the function name (`func_sym`) to disambiguate
+vregs across functions (vreg IDs restart at 101 per function via `ir3_reset`). This table
+is consumed by `call_spill_insert()` to determine which stack slot to save/restore for
+each live-across-call vreg.
 
 #### Virtual stack model
 
@@ -570,24 +593,53 @@ IR3-level optimizations gated on `opt_level >= 1`. Three passes run per function
    if ACCUM is written by a side-effect-free op and the next instruction also writes ACCUM
    without reading it, the first write is dead.
 
-After the per-function optimization loop, a whole-program **le/ge expansion** pass rewrites
-`IR3_ALU` nodes with `alu_op` in {`IR_LE`, `IR_GE`, `IR_LES`, `IR_GES`, `IR_FLE`, `IR_FGE`}
-into a 3-instruction sequence:
-
-```
-ALU rd, rs1, rs2, IR_GT        (inverse comparison)
-CONST v_zero, 0                (fresh vreg)
-ALU rd, rd, v_zero, IR_EQ      (negate result)
-```
-
-This ensures the zero-constant temp gets a proper fresh vreg so `linscan_regalloc` allocates
-it correctly, avoiding the register-clobber conflict that would occur if `risc_backend`'s
-inline expansion reused `rs1` as the temp (copy propagation can extend `rs1`'s live range
-past the comparison).
-
 **`IR3_STORE` semantics note**: `IR3_STORE`'s `rd` field holds the base address register
 (a read, not a definition). All three passes treat it accordingly: copy prop propagates
 into it, const prop does not invalidate it, and DCE counts it as a use.
+
+---
+
+### Pass 1c: `call_spill_insert()` (`call_spill.c`)
+
+Inserts STORE/LOAD pairs around call sites for promoted vregs that are live across each
+call. Runs after `ir3_optimize()` and before `linscan_regalloc()`. Uses the
+`promo_vreg_info[]` table (populated by `writeVariable` in `braun.c`) to find each vreg's
+bp-relative save slot and size.
+
+**Design: same-vreg reload.** For each vreg V live across a call:
+```
+IR3_STORE [bp+offset], V    ; before the call
+IR3_LOAD  V, [bp+offset]    ; after the call
+```
+linscan allocates V a physical register for its entire interval. The STORE saves the value
+before the call clobbers registers; the LOAD restores it afterward.
+
+Advantages over a fresh-vreg reload approach:
+- No vreg renaming or substitution needed
+- No additional phi insertion needed at merge points
+- No back-edge copy insertion needed
+- linscan sees longer intervals but fewer total vregs
+
+**Algorithm (per function):**
+
+1. Scan for `IR3_CALL`/`IR3_CALLR`. If none, skip function.
+2. Number instructions sequentially (serial 0, 1, 2, …).
+3. Compute live intervals for all fresh vregs (same as linscan Phase 1: `record_def`/
+   `record_use`).
+4. **Back-edge extension**: find `J`/`JZ`/`JNZ` to lower-serial labels, extend overlapping
+   intervals to the back-edge. Iterate up to 4 times until stable (handles nested loops).
+5. For each call at serial S, find all vregs with `start <= S && end > S` (live across call).
+   For each such vreg V:
+   - Look up V in `promo_vreg_info[]` → get `bp_offset`, `size`
+   - Insert `IR3_STORE rd=BP, rs1=V, imm=bp_offset, size` before the call
+   - Insert `IR3_LOAD rd=V, rs1=BP, imm=bp_offset, size` after the call
+   - Vregs without promo info (e.g. expression temps) are skipped with a warning — they
+     should not appear live across calls because `flush_for_call_n` handles them
+
+**bp_offset deduplication**: Back-edge live-range extension can make multiple SSA vregs for
+the same promoted variable (same `bp_offset`) appear simultaneously live at a call site.
+The pass deduplicates by `bp_offset`, keeping only the vreg with the latest definition
+(highest interval start), since that is the most recent SSA definition of the variable.
 
 ---
 
@@ -651,7 +703,7 @@ nodes as well as inside function bodies.
 
 ---
 
-### Pass 3: `ir3_lower()` (`ir3_lower.c`)
+### Pass 2b: `ir3_lower()` (`ir3_lower.c`)
 
 Near-1:1 translation from `IR3Inst` (physical registers in `rd`/`rs1`/`rs2`) to `SSAInst`
 for `risc_backend_emit`. One `IR3Inst` → one `SSAInst` in all cases. Zero-imm `IR3_ADJ`
@@ -683,7 +735,7 @@ nodes are dropped.
 
 ---
 
-### Pass 4: `risc_backend_emit()` (`risc_backend.c`) — unchanged
+### Pass 3: `risc_backend_emit()` (`risc_backend.c`) — unchanged
 
 Walks the post-lower `SSAInst` list and emits CPU4 assembly text.
 
@@ -720,9 +772,7 @@ typedef struct SSAInst {
 | `SSA_STORE` | rd == -2, out of F2 range | `lea scratch, imm; slw/slb/sll rs1, [scratch+0]` |
 | `SSA_STORE` | rd >= 0 | `slw/slb/sll rs1, [rd+imm]` (F3b, 3 bytes) |
 | `SSA_ALU` | most ops | `add/sub/mul/… rd, rs1, rs2` (F1a, 2 bytes) |
-| `SSA_ALU` | `le`/`ge` | `gt/lt rd, rs2, rs1; immw tmp, 0; eq rd, rd, tmp` (3 insns) |
-| `SSA_ALU` | `les`/`ges` | `gts/lts rd, rs2, rs1; immw tmp, 0; eq rd, rd, tmp` |
-| `SSA_ALU` | `fle`/`fge` | `fgt/flt rd, rs2, rs1; immw tmp, 0; eq rd, rd, tmp` |
+| `SSA_ALU` | `le`/`ge`/`les`/`ges`/`fle`/`fge` | assembler pseudo-ops (operand swap, single insn) |
 | `SSA_ALU1` | `sxb`/`sxw` | `sxb/sxw rd` (F1b, 2 bytes; in-place) |
 | `SSA_ALU1` | `itof`/`ftoi` | `itof`/`ftoi` (F0; r0 implicit) |
 | `SSA_ENTER` | — | `enter N` (F3a) |
@@ -747,17 +797,6 @@ F2 bp-relative instructions use a scaled 7-bit signed immediate:
 | long (`ll`/`sl`) | ×4 | −256 … +252 bytes from bp (multiples of 4) |
 
 Outside F2 range: `lea rd, imm` (F3c, 3 bytes) + `llw/slw rd, [rd+0]` (F3b, 3 bytes) = 6 bytes.
-
-#### `le`/`ge` expansion
-
-`le`/`ge` and their signed and float variants have no direct F1a encoding. When a 0/1
-comparison result is needed in a register, the backend expands `le rd, rs1, rs2` as:
-
-```asm
-gt   rd, rs1, rs2    ; rd = (rs1 > rs2) ? 1 : 0
-immw tmp, 0
-eq   rd, rd, tmp     ; rd = (rd == 0) ? 1 : 0  ≡  !(rs1 > rs2)
-```
 
 #### Annotation (`-ann`)
 

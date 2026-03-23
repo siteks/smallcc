@@ -245,15 +245,15 @@ static const Instr4 itab4[] = {
     {"mul",    0x44,1,0,0}, {"div",    0x46,1,0,0},
     {"mod",    0x48,1,0,0}, {"shl",    0x4a,1,0,0},
     {"shr",    0x4c,1,0,0}, {"lt",     0x4e,1,0,0},
-    {"gt",     0x50,1,0,0}, {"eq",     0x52,1,0,0},
+    {"le",     0x50,1,0,0}, {"eq",     0x52,1,0,0},
     {"ne",     0x54,1,0,0}, {"and",    0x56,1,0,0},
     {"or",     0x58,1,0,0}, {"xor",    0x5a,1,0,0},
-    {"lts",    0x5c,1,0,0}, {"gts",    0x5e,1,0,0},
+    {"lts",    0x5c,1,0,0}, {"les",    0x5e,1,0,0},
     {"divs",   0x60,1,0,0}, {"mods",   0x62,1,0,0},
     {"shrs",   0x64,1,0,0}, {"fadd",   0x66,1,0,0},
     {"fsub",   0x68,1,0,0}, {"fmul",   0x6a,1,0,0},
     {"fdiv",   0x6c,1,0,0}, {"flt",    0x6e,1,0,0},
-    {"fgt",    0x70,1,0,0},
+    {"fle",    0x70,1,0,0},
     /* F1b — 2 bytes, rd only; subop distinguishes the operation */
     {"sxb",    0x7e,1,1,0x00}, {"sxw",   0x7e,1,1,0x01},
     {"inc",    0x7e,1,1,0x02}, {"dec",   0x7e,1,1,0x03},
@@ -274,8 +274,8 @@ static const Instr4 itab4[] = {
     {"slw",    0xd4,2,1,0}, {"sll",    0xd5,2,1,0},
     {"llbx",   0xd6,2,1,0}, {"llwx",   0xd7,2,1,0},
     {"beq",    0xd8,2,1,0}, {"bne",    0xd9,2,1,0},
-    {"blt",    0xda,2,1,0}, {"bgt",    0xdb,2,1,0},
-    {"blts",   0xdc,2,1,0}, {"bgts",   0xdd,2,1,0},
+    {"blt",    0xda,2,1,0}, {"ble",    0xdb,2,1,0},
+    {"blts",   0xdc,2,1,0}, {"bles",   0xdd,2,1,0},
     {"addli",  0xde,2,1,0},
     /* F3c — 3 bytes, rd imm16 */
     {"immw",   0xe8,2,2,0}, {"immwh",  0xf0,2,2,0},
@@ -293,7 +293,7 @@ static const Instr4 *find_instr4(const char *n)
 static int is_branch4(const char *n)
 {
     return !strcmp(n,"beq") || !strcmp(n,"bne") || !strcmp(n,"blt") ||
-           !strcmp(n,"bgt") || !strcmp(n,"blts") || !strcmp(n,"bgts");
+           !strcmp(n,"ble") || !strcmp(n,"blts") || !strcmp(n,"bles");
 }
 
 static int parse_reg4(const char *s)
@@ -674,17 +674,31 @@ static void assemble_cpu4(const char *src)
                 strcpy(real_mnem, "or");
                 strncpy(ops[2], ops[1], MAX_NAME-1);
                 nops = 3;
-            } else if (nops >= 3 && (strcmp(mnem,"ble")==0 || strcmp(mnem,"bge")==0 ||
-                                     strcmp(mnem,"bles")==0 || strcmp(mnem,"bges")==0)) {
-                /* swap rx,ry and pick opposite branch */
+            } else if (nops >= 3 && (strcmp(mnem,"gt")==0 || strcmp(mnem,"ge")==0 ||
+                                     strcmp(mnem,"gts")==0 || strcmp(mnem,"ges")==0 ||
+                                     strcmp(mnem,"fgt")==0 || strcmp(mnem,"fge")==0)) {
+                /* F1a: swap rx,ry (ops[1],ops[2]) and pick opposite comparison */
+                char tmp[MAX_NAME];
+                strncpy(tmp,    ops[1], MAX_NAME-1);
+                strncpy(ops[1], ops[2], MAX_NAME-1);
+                strncpy(ops[2], tmp,    MAX_NAME-1);
+                if      (strcmp(mnem,"gt") ==0) strcpy(real_mnem,"lt");
+                else if (strcmp(mnem,"ge") ==0) strcpy(real_mnem,"le");
+                else if (strcmp(mnem,"gts")==0) strcpy(real_mnem,"lts");
+                else if (strcmp(mnem,"ges")==0) strcpy(real_mnem,"les");
+                else if (strcmp(mnem,"fgt")==0) strcpy(real_mnem,"flt");
+                else                            strcpy(real_mnem,"fle");
+            } else if (nops >= 3 && (strcmp(mnem,"bgt")==0 || strcmp(mnem,"bge")==0 ||
+                                     strcmp(mnem,"bgts")==0 || strcmp(mnem,"bges")==0)) {
+                /* F3b: swap rx,ry (ops[0],ops[1]) and pick opposite branch */
                 char tmp[MAX_NAME];
                 strncpy(tmp,    ops[0], MAX_NAME-1);
                 strncpy(ops[0], ops[1], MAX_NAME-1);
                 strncpy(ops[1], tmp,    MAX_NAME-1);
-                if      (strcmp(mnem,"ble") ==0) strcpy(real_mnem,"bgt");
-                else if (strcmp(mnem,"bge") ==0) strcpy(real_mnem,"blt");
-                else if (strcmp(mnem,"bles")==0) strcpy(real_mnem,"bgts");
-                else                             strcpy(real_mnem,"blts");
+                if      (strcmp(mnem,"bgt") ==0) strcpy(real_mnem,"blt");
+                else if (strcmp(mnem,"bge") ==0) strcpy(real_mnem,"ble");
+                else if (strcmp(mnem,"bgts")==0) strcpy(real_mnem,"blts");
+                else                              strcpy(real_mnem,"bles");
             }
 
             const Instr4 *instr = find_instr4(real_mnem);
@@ -895,14 +909,14 @@ static void run_cpu4(int verbose)
         case 0x4a: r[rd]=r[rx]<<(r[ry]&31); break;    /* shl */
         case 0x4c: r[rd]=r[rx]>>(r[ry]&31); break;    /* shr */
         case 0x4e: r[rd]=(r[rx]<r[ry])?1:0; break;    /* lt  */
-        case 0x50: r[rd]=(r[rx]>r[ry])?1:0; break;    /* gt  */
+        case 0x50: r[rd]=(r[rx]<=r[ry])?1:0; break;    /* le  */
         case 0x52: r[rd]=(r[rx]==r[ry])?1:0; break;   /* eq  */
         case 0x54: r[rd]=(r[rx]!=r[ry])?1:0; break;   /* ne  */
         case 0x56: r[rd]=r[rx]&r[ry]; break;  /* and */
         case 0x58: r[rd]=r[rx]|r[ry]; break;  /* or  */
         case 0x5a: r[rd]=r[rx]^r[ry]; break;  /* xor */
         case 0x5c: r[rd]=((int32_t)r[rx]<(int32_t)r[ry])?1:0; break; /* lts */
-        case 0x5e: r[rd]=((int32_t)r[rx]>(int32_t)r[ry])?1:0; break; /* gts */
+        case 0x5e: r[rd]=((int32_t)r[rx]<=(int32_t)r[ry])?1:0; break; /* les */
         case 0x60: r[rd]=(uint32_t)(r[ry]?(int32_t)r[rx]/(int32_t)r[ry]:0); break; /* divs */
         case 0x62: r[rd]=(uint32_t)(r[ry]?(int32_t)r[rx]%(int32_t)r[ry]:0); break; /* mods */
         case 0x64: r[rd]=(uint32_t)((int32_t)r[rx]>>(r[ry]&31)); break; /* shrs */
@@ -911,7 +925,7 @@ static void run_cpu4(int verbose)
         case 0x6a: r[rd]=float2bits(bits2float(r[rx])*bits2float(r[ry])); break; /* fmul */
         case 0x6c: r[rd]=float2bits(bits2float(r[rx])/bits2float(r[ry])); break; /* fdiv */
         case 0x6e: r[rd]=(bits2float(r[rx])<bits2float(r[ry]))?1:0; break; /* flt */
-        case 0x70: r[rd]=(bits2float(r[rx])>bits2float(r[ry]))?1:0; break; /* fgt */
+        case 0x70: r[rd]=(bits2float(r[rx])<=bits2float(r[ry]))?1:0; break; /* fle */
         /* F1b */
         case 0x7e:
             if      (subop==0x00) r[rd]=(uint32_t)(int32_t)(int8_t) (r[rd]&0xff);   /* sxb */
@@ -952,9 +966,9 @@ static void run_cpu4(int verbose)
         case 0xd8: if(r[rx]==r[ry]) pc=(uint16_t)(pc+sx10(imm)); break; /* beq  */
         case 0xd9: if(r[rx]!=r[ry]) pc=(uint16_t)(pc+sx10(imm)); break; /* bne  */
         case 0xda: if(r[rx]< r[ry]) pc=(uint16_t)(pc+sx10(imm)); break; /* blt  */
-        case 0xdb: if(r[rx]> r[ry]) pc=(uint16_t)(pc+sx10(imm)); break; /* bgt  */
+        case 0xdb: if(r[rx]<=r[ry]) pc=(uint16_t)(pc+sx10(imm)); break; /* ble  */
         case 0xdc: if((int32_t)r[rx]<(int32_t)r[ry]) pc=(uint16_t)(pc+sx10(imm)); break; /* blts */
-        case 0xdd: if((int32_t)r[rx]>(int32_t)r[ry]) pc=(uint16_t)(pc+sx10(imm)); break; /* bgts */
+        case 0xdd: if((int32_t)r[rx]<=(int32_t)r[ry]) pc=(uint16_t)(pc+sx10(imm)); break; /* bles */
         case 0xde: r[rx]=r[ry]+(uint32_t)sx10(imm); break; /* addli */
         /* F3c */
         case 0xe8: r[rd]=(uint32_t)(uint16_t)imm; break; /* immw  */

@@ -8,7 +8,7 @@
  *   SSA_LOAD  rs1>=0             → F3b llw/llb/lll rx, ry, 0
  *   SSA_STORE rd==-2             → F2  sw/sb/sl  rx, imm7
  *   SSA_STORE rd>=0              → F3b slw/slb/sll rx, ry, 0
- *   SSA_ALU   (le/ge/les/ges/…)  → 3-instruction expansion (no direct encoding)
+ *   SSA_ALU   (le/ge/les/ges/…)  → assembler pseudo-ops (operand swap, single insn)
  *   SSA_ALU1  itof/ftoi          → F0  itof / ftoi (r0 implicit)
  *   SSA_ALU1  sxb/sxw            → F1b sxb/sxw rd
  *   SSA_MOVI  32-bit const       → immw rd, lo + immwh rd, hi
@@ -149,11 +149,15 @@ static const char *alu_mnemonic(IROp op)
     case IR_NE:   return "ne";
     case IR_LT:   return "lt";
     case IR_GT:   return "gt";
+    case IR_LE:   return "le";
+    case IR_GE:   return "ge";
     case IR_AND:  return "and";
     case IR_OR:   return "or";
     case IR_XOR:  return "xor";
     case IR_LTS:  return "lts";
     case IR_GTS:  return "gts";
+    case IR_LES:  return "les";
+    case IR_GES:  return "ges";
     case IR_DIVS: return "divs";
     case IR_MODS: return "mods";
     case IR_SHRS: return "shrs";
@@ -163,7 +167,9 @@ static const char *alu_mnemonic(IROp op)
     case IR_FDIV: return "fdiv";
     case IR_FLT:  return "flt";
     case IR_FGT:  return "fgt";
-    default:      return NULL;   /* le/ge/les/ges/fle/fge need expansion */
+    case IR_FLE:  return "fle";
+    case IR_FGE:  return "fge";
+    default:      return NULL;
     }
 }
 
@@ -323,36 +329,11 @@ void risc_backend_emit(SSAInst *head)
             const char *mn = alu_mnemonic(p->alu_op);
 
             if (mn) {
-                /* Direct instruction: rd = rs1 op rs2 */
+                /* Direct instruction: rd = rs1 op rs2
+                 * le/ge and variants are assembler pseudo-ops (operand swap). */
                 fprintf(asm_out, "    %-7s r%d, r%d, r%d\n", mn, rd, rs1, rs2);
             } else {
-                /* Needs 3-instruction expansion (le/ge/les/ges/fle/fge).
-                 * rs1 is free, so we reuse it as a 0-constant reg.
-                 *
-                 *   le  a, b  = NOT(a > b):  gt rd,rs1,rs2; immw rs1,0; eq rd,rd,rs1
-                 *   ge  a, b  = NOT(a < b):  lt rd,rs1,rs2; immw rs1,0; eq rd,rd,rs1
-                 *   les a, b  = NOT(a gts b):gts rd,rs1,rs2; immw rs1,0; eq rd,rd,rs1
-                 *   ges a, b  = NOT(a lts b):lts rd,rs1,rs2; immw rs1,0; eq rd,rd,rs1
-                 *   fle a, b  = NOT(a fgt b):fgt rd,rs1,rs2; immw rs1,0; eq rd,rd,rs1
-                 *   fge a, b  = NOT(a flt b):flt rd,rs1,rs2; immw rs1,0; eq rd,rd,rs1
-                 */
-                const char *inv;
-                switch (p->alu_op) {
-                case IR_LE:  inv = "gt";  break;
-                case IR_GE:  inv = "lt";  break;
-                case IR_LES: inv = "gts"; break;
-                case IR_GES: inv = "lts"; break;
-                case IR_FLE: inv = "fgt"; break;
-                case IR_FGE: inv = "flt"; break;
-                default:
-                    fprintf(stderr, "risc_backend: unhandled ALU op %d\n", (int)p->alu_op);
-                    inv = "add";
-                    break;
-                }
-                /* Use rs1 as scratch for the 0 constant (rs1 is freed by pop) */
-                fprintf(asm_out, "    %-7s r%d, r%d, r%d\n", inv, rd, rs1, rs2);
-                fprintf(asm_out, "    immw    r%d, 0\n", rs1);
-                fprintf(asm_out, "    eq      r%d, r%d, r%d\n", rd, rd, rs1);
+                fprintf(stderr, "risc_backend: unhandled ALU op %d\n", (int)p->alu_op);
             }
             break;
         }
