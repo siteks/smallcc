@@ -268,8 +268,16 @@ static void alloc_function(IR3Inst *func_head, IR3Inst *func_end,
     if (spill_next_off >= min_bp_off)
         spill_next_off -= 4;  /* ensure strictly below */
 
+    /* Build label_id → serial mapping for back-edge detection. */
+    #define MAX_LABELS 1024
+    int label_serial[MAX_LABELS];
+    memset(label_serial, -1, sizeof(label_serial));
+
     int serial = 0;
     for (IR3Inst *p = func_head; p != func_end; p = p->next, serial++) {
+        /* Record label positions. */
+        if (p->op == IR3_LABEL && p->imm >= 0 && p->imm < MAX_LABELS)
+            label_serial[p->imm] = serial;
         /* Definition */
         if (p->rd != IR3_VREG_NONE && p->rd != IR3_VREG_BP)
             record_def(p->rd, serial);
@@ -281,6 +289,55 @@ static void alloc_function(IR3Inst *func_head, IR3Inst *func_end,
     }
 
     if (n_intervals == 0) return;   /* no virtual regs in this function */
+
+    /* --- Phase 1b: extend intervals across loop back-edges ---
+     *
+     * A back-edge is a J/JZ/JNZ whose target label has a lower serial number
+     * than the jump itself.  Any vreg whose interval overlaps the loop body
+     * [header_serial, back_edge_serial] must have its end extended to at least
+     * the back-edge serial, because the vreg will be needed again on the next
+     * loop iteration.  Iterate until stable (handles nested loops). */
+    {
+        /* Collect back-edges: (header_serial, jump_serial) pairs. */
+        #define MAX_BACK_EDGES 64
+        struct { int header; int jump; } back_edges[MAX_BACK_EDGES];
+        int n_back_edges = 0;
+
+        serial = 0;
+        for (IR3Inst *p = func_head; p != func_end; p = p->next, serial++) {
+            if ((p->op == IR3_J || p->op == IR3_JZ || p->op == IR3_JNZ)
+                && p->imm >= 0 && p->imm < MAX_LABELS
+                && label_serial[p->imm] >= 0
+                && label_serial[p->imm] < serial)
+            {
+                if (n_back_edges < MAX_BACK_EDGES) {
+                    back_edges[n_back_edges].header = label_serial[p->imm];
+                    back_edges[n_back_edges].jump   = serial;
+                    n_back_edges++;
+                }
+            }
+        }
+
+        /* Extend intervals.  Repeat until no changes (handles nested loops
+         * where extending one interval opens up another). */
+        for (int iter = 0; iter < 4 && n_back_edges > 0; iter++) {
+            int changed = 0;
+            for (int bi = 0; bi < n_back_edges; bi++) {
+                int hdr = back_edges[bi].header;
+                int jmp = back_edges[bi].jump;
+                for (int i = 0; i < n_intervals; i++) {
+                    /* If interval is live at loop header (starts <= header
+                     * and ends >= header), extend to back-edge. */
+                    if (intervals[i].start <= hdr && intervals[i].end >= hdr
+                        && intervals[i].end < jmp) {
+                        intervals[i].end = jmp;
+                        changed = 1;
+                    }
+                }
+            }
+            if (!changed) break;
+        }
+    }
 
     /* --- Phase 2: sort intervals by start --- */
     qsort(intervals, n_intervals, sizeof(Interval), cmp_by_start);
@@ -376,7 +433,36 @@ static void alloc_function(IR3Inst *func_head, IR3Inst *func_end,
             p->rs2 = rewrite_reg(p->rs2);
     }
 
-    /* --- Phase 5: insert spill stores and reload loads --- */
+    /* --- Phase 5a: expand ENTER and shift flush offsets BEFORE spill
+     * insertion, so that spill stores/loads (which already have correct
+     * bp-relative offsets from alloc_spill_slot) are not double-shifted. */
+    if (n_spills > 0 && enter_node) {
+        int orig_N = enter_node->imm;
+        int total_frame = -spill_next_off;
+        total_frame = (total_frame + 3) & ~3;  /* align up */
+        int expansion = total_frame - orig_N;
+
+        if (expansion > 0) {
+            enter_node->imm = total_frame;
+
+            /* Shift flush offsets: any bp-relative offset < -orig_N
+             * was a call-site flush and must move down by expansion.
+             * This runs on the pre-spill IR3, so only braun.c's flush
+             * stores are affected — spill stores are added in Phase 5b. */
+            for (IR3Inst *p = func_head; p != func_end; p = p->next) {
+                if (p->op == IR3_LOAD && p->rs1 == IR3_VREG_BP
+                    && p->imm < -orig_N)
+                    p->imm -= expansion;
+                if (p->op == IR3_STORE && p->rd == IR3_VREG_BP
+                    && p->imm < -orig_N)
+                    p->imm -= expansion;
+                if (p->op == IR3_LEA && p->imm < -orig_N)
+                    p->imm -= expansion;
+            }
+        }
+    }
+
+    /* --- Phase 5b: insert spill stores and reload loads --- */
     if (n_spills > 0) {
         int s = 0;
         IR3Inst *prev = NULL;
@@ -443,44 +529,6 @@ static void alloc_function(IR3Inst *func_head, IR3Inst *func_end,
         free(orig_rd);
         free(orig_rs1);
         free(orig_rs2);
-
-        /* Expand the ENTER frame to cover spill slots and adjust
-         * call-arg flush offsets.
-         *
-         * braun.c's call flushing places arg/temp stores at bp-relative
-         * positions computed from the virtual stack pointer (vsp), which
-         * assumes the original ENTER N.  When we expand ENTER to cover
-         * spill slots, sp starts lower, but the flush positions must
-         * shift down by the same amount so they remain right at sp
-         * at call time.
-         *
-         * Rule: any bp-relative offset in a LOAD/STORE/LEA that is
-         * strictly below -original_enter_N (i.e., was computed by
-         * braun.c's flush mechanism to be below the original frame)
-         * must be shifted down by the expansion amount. */
-        if (enter_node) {
-            int orig_N = enter_node->imm;
-            int total_frame = -spill_next_off;
-            total_frame = (total_frame + 3) & ~3;  /* align up */
-            int expansion = total_frame - orig_N;
-
-            if (expansion > 0) {
-                enter_node->imm = total_frame;
-
-                /* Shift flush offsets: any bp-relative offset < -orig_N
-                 * was a call-site flush and must move down by expansion. */
-                for (IR3Inst *p = func_head; p != func_end; p = p->next) {
-                    if (p->op == IR3_LOAD && p->rs1 == IR3_VREG_BP
-                        && p->imm < -orig_N)
-                        p->imm -= expansion;
-                    if (p->op == IR3_STORE && p->rd == IR3_VREG_BP
-                        && p->imm < -orig_N)
-                        p->imm -= expansion;
-                    if (p->op == IR3_LEA && p->imm < -orig_N)
-                        p->imm -= expansion;
-                }
-            }
-        }
     }
 }
 

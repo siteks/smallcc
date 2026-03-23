@@ -226,6 +226,13 @@ jl      func_name
 adj     param_total_bytes   ; caller cleans up parameters
 ```
 
+**Argument slot widening** (`push_args_list`): when a function's declared parameter type is
+wider than the argument's natural slot size (e.g. passing an `int` to an `unsigned long`
+parameter), the caller inserts `IR_SXW` (for signed types) to widen the value to 4 bytes
+before pushing. Conversely, when the arg is wider than the param (e.g. `long` to `int`), the
+caller truncates with `push; immw 0xffff; and`. This ensures the callee's `IR_LL`/`IR_LW`
+loads see correctly-sized values.
+
 **Indirect call through function pointer variable** (`fp(args)`):
 ```asm
 ; push arguments right-to-left
@@ -287,8 +294,14 @@ one `IR_BYTE` per byte. Exception — pointer arrays with string-literal initial
 **Arrays** (local): `gen_fill(vaddr, size)` zeroes all bytes, then `gen_inits()` emits
 `lea; push; immw; sw/sl` sequences for non-zero initializers.
 
-**Structs**: `gen_struct_inits` (local) and `gen_struct_mem_inits` (global) write each field;
-nested structs recurse. Partial initializers zero-fill the remainder.
+**Structs** (local): `gen_struct_inits` writes each field with `lea; push; immw; sw/sl`.
+
+**Structs** (global): `gen_struct_mem_inits` fills a byte buffer, then `gen_bytes` emits one
+`IR_BYTE` per byte. Exception — when a struct contains pointer fields initialized with
+address-of-global expressions (e.g. `struct node n2 = {&n3, 20}`), `collect_sym_fields`
+detects the symbolic fields and emits the struct byte-by-byte with `IR_WORD label` at each
+symbolic field offset. This is analogous to the pointer-array string-literal handling.
+Nested structs are handled recursively. Partial initializers zero-fill the remainder.
 
 ### Sethi-Ullman Numbering (`label_su`)
 
@@ -403,14 +416,46 @@ based on actual live ranges rather than expression depth.
 
 ### Pass 1: `braun_ssa()` (`braun.c`)
 
-Converts the flat stack-IR list to IR3Inst with fresh virtual registers. No phi nodes and no
-local promotion — all locals and parameters go through `IR3_LEA + IR3_LOAD / IR3_STORE`.
-Promotion of scalar variables to SSA registers (local to a basic block or across phi copies)
-is disabled: promoting variables across loop back-edges would require loop-aware live-range
-extension in linscan, and with 7 available caller-saved registers, deeply-nested switch/state
-machine code would trigger register spilling.  The F2 bp-relative load/store instructions
-(`lw r, [bp+imm7]`, 2 bytes, 1 cycle) make memory access cheap enough that no-promotion is
-competitive with promotion for typical code patterns.
+Converts the flat stack-IR list to IR3Inst with fresh virtual registers. Uses the Braun et al.
+(2013) SSA construction algorithm with `readVariable`/`writeVariable`/`readVariableRecursive`
+to place phi nodes on demand.
+
+**SSA promotion** is enabled for **leaf functions only** (functions that contain no `IR_JL` or
+`IR_JLI` instructions). Scalar locals and parameters whose address never escapes (tagged with
+`ir_promote_sentinel` in `codegen.c`) are promoted from memory to SSA virtual registers. The
+Braun algorithm handles phi placement at control-flow merge points, and trivial phis (all
+operands identical) are eliminated. Phi deconstruction inserts parallel copies at predecessor
+block tails.
+
+Promotion is restricted to leaf functions because all registers are caller-saved — a call
+would require saving and restoring every live promoted variable. For non-leaf functions, all
+locals and parameters go through `IR3_LEA + IR3_LOAD / IR3_STORE` as before. The F2
+bp-relative load/store instructions (`lw r, [bp+imm7]`, 2 bytes, 1 cycle) make memory access
+cheap enough that no-promotion is competitive with promotion for typical non-leaf code.
+
+#### Promoted variable handling
+
+Promoted variables use a slot index (`bp_offset + PROMOTE_BASE`) into per-function tables:
+
+- `writeVariable(bb_id, slot, vreg)` records the SSA definition.
+- `readVariable(bb_id, slot)` returns the current vreg, or calls `readVariableRecursive` to
+  search predecessor blocks and insert phi nodes.
+- Promoted `IR_LEA` is suppressed (no IR3 emitted); the offset is tracked in
+  `local_accum_offset`.
+- Promoted `IR_LEA + IR_LOAD` reads the SSA value directly via `readVariable`.
+- Promoted `PUSH + STORE` writes via `writeVariable` (no IR3 store emitted).
+
+**Parameter pre-seeding**: promoted parameters are loaded from their stack slots immediately
+after `IR3_ENTER` and registered via `writeVariable` in block 0. This ensures
+`readVariableRecursive` always finds a definition when tracing back to the entry block.
+
+**Empty predecessor blocks**: `block_last_ir3[bb_id]` is set at the end of `translate_bb`
+even for empty blocks (no instructions), ensuring phi copy insertion works correctly for
+fall-through predecessors.
+
+**Call save/restore** (non-leaf functions with promoted variables — currently gated off but
+infrastructure exists): `save_promoted_for_call` / `restore_promoted_after_call` would spill
+promoted variables to their stack slots before calls and reload into fresh vregs afterward.
 
 #### Virtual stack model
 
@@ -433,8 +478,8 @@ into a fresh vreg; `IR_POP` restores a previously saved vreg to the accumulator.
 |---|---|---|
 | `IR_IMM K` (integer) | `IR3_CONST rd=ACCUM, imm=K` | |
 | `IR_IMM S` (symbolic) | `IR3_CONST rd=ACCUM, sym=S` | |
-| `IR_LEA N; IR_LW/LB/LL` | `IR3_LOAD rd=ACCUM, rs1=BP, imm=N, size` | peek-ahead collapses pair |
-| `IR_LEA N` (standalone) | `IR3_LEA rd=ACCUM, imm=N` | non-promotable local address |
+| `IR_LEA N; IR_LW/LB/LL` | `IR3_LOAD rd=ACCUM, rs1=BP, imm=N, size` | peek-ahead collapses pair; promoted → `readVariable` (no IR3) |
+| `IR_LEA N` (standalone) | `IR3_LEA rd=ACCUM, imm=N` | non-promotable local address; promoted → suppressed |
 | `IR_LW/LB/LL` | `IR3_LOAD rd=ACCUM, rs1=ACCUM, imm=0, size` | reg-relative deref |
 | `IR_SW/SB/SL` | `IR3_STORE rd=vs_reg[top], rs1=ACCUM, imm=0, size` | addr from vstack |
 | `IR_PUSH/PUSHW` | `IR3_MOV rd=fresh, rs1=ACCUM`; push fresh onto vstack | |
@@ -476,12 +521,15 @@ registers without any call-clobber awareness.
 1. **Detect the arg boundary**: scan ahead for the post-call `IR_ADJ +N` to determine
    `arg_bytes`; bottom `n_args` vstack slots are args.
 2. **Spill outer temps** to memory (`IR3_STORE rd=BP, rs1=vs_reg[k], imm=vsp+k*sz`),
-   preceded by `IR3_ADJ -outer_bytes` to allocate the spill area.
+   preceded by `IR3_ADJ -outer_bytes` to allocate the spill area. Promoted dummy slots
+   (tracked via `vlo_get`) are skipped — they have no memory footprint.
 3. **Flush args** to the machine stack (`IR3_STORE` per arg) with `IR3_ADJ -arg_bytes`.
 4. **Emit the call** (`IR3_CALL` or `IR3_CALLR`).
 5. **Post-call restore** (triggered by the arg-cleanup `IR3_ADJ +arg_bytes`): reload each
    spilled temp into a **fresh vreg** via `IR3_LOAD`, update the vstack, then emit
-   `IR3_ADJ +outer_bytes` to free the spill area.
+   `IR3_ADJ +outer_bytes` to free the spill area. Promoted dummy slots are restored by
+   re-reading the SSA variable (`readVariable`) into a fresh vreg rather than loading from
+   memory.
 
 For indirect calls, the function pointer lives in ACCUM and must survive `flush_for_call_n`.
 It is saved to a fresh vreg before the flush and moved back to ACCUM immediately before
@@ -514,6 +562,15 @@ Standard Poletto/Sarkar (1999) linear-scan allocator. Runs per function (between
 3. For each vreg, `interval.start = serial of first definition`, `interval.end = serial of
    last use`.
 
+#### Back-edge live-range extension (Phase 1b)
+
+After computing initial intervals, a second pass extends live ranges across loop back-edges.
+A back-edge is a `J`/`JZ`/`JNZ` whose target label has a lower serial number than the jump.
+Any vreg whose interval overlaps the loop body `[header_serial, back_edge_serial]` has its
+`end` extended to at least `back_edge_serial`. This iterates until stable (handles nested
+loops). Without this, promoted variables used in loops would appear dead before the back-edge
+and get their register reused.
+
 #### Scan
 
 1. Sort intervals by `start`.
@@ -523,14 +580,21 @@ Standard Poletto/Sarkar (1999) linear-scan allocator. Runs per function (between
 4. If the pool is empty, spill the longest-lived active interval: steal its register for the
    current interval; record a bp-relative spill slot for the displaced interval.
 
-#### Spill insertion (Phase 5)
+#### Frame expansion and flush-offset shifting (Phase 5a)
 
-After register rewriting, if any vregs were spilled:
+When spills exist, the ENTER frame must be expanded to cover the spill area. This is done
+**before** spill insertion to avoid double-shifting spill offsets. All bp-relative offsets
+below the original ENTER boundary (call-arg flush stores/loads and LEAs emitted by
+`flush_for_call_n`) are shifted down by the expansion amount.
+
+#### Spill insertion (Phase 5b)
+
+After frame expansion, spill stores and loads are inserted:
 - Insert `IR3_LOAD rd=r7, rs1=BP, imm=spill_off` before each USE of a spilled vreg.
 - Insert `IR3_STORE rd=BP, rs1=r7, imm=spill_off` after each DEF of a spilled vreg.
-- Expand the function's `IR3_ENTER` to cover the spill area.
-- Shift call-arg flush offsets (bp-relative offsets below the original ENTER) down by
-  the expansion amount to preserve correct argument placement.
+
+The spill offsets are allocated by `alloc_spill_slot` below the ENTER boundary and are
+already correct relative to bp — they are not shifted by Phase 5a.
 
 #### ACCUM rewrite
 

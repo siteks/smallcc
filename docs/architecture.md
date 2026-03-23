@@ -572,28 +572,34 @@ elim) is currently gated on CPU3 only. See `docs/codegen.md` for rule details.
 One IR node → one or a few assembly instructions. Also owns the `-ann` source-comment
 infrastructure (`set_ann_source`, `emit_src_comment`).
 
-### `ssa.c` / `ssa.h` — Stack IR → SSA Lift (CPU4)
+### `braun.c` — Stack IR → IR3 (Braun SSA Construction, CPU4)
 
-`lift_to_ssa(ir_head)` converts the stack IR to a 3-address SSA-like IR (`SSAInst` list)
-with virtual registers. Models the stack machine's expression stack as a small set of virtual
-registers (`vs_reg[depth]`), peeks ahead to collapse `LEA+LOAD`/`LEA+STORE` pairs into
-bp-relative SSA ops, and handles call-site argument/temporary partitioning via
-`flush_for_call_n`. Maintains a forward-branch vsp fixup table so scope-exit adjustments
-from one branch arm do not corrupt the sp model at merge points.
+`braun_ssa(ir_head)` converts the stack IR to a 3-address `IR3Inst` list with fresh virtual
+registers. Uses the Braun et al. (2013) SSA construction algorithm with
+`readVariable`/`writeVariable`/`readVariableRecursive` to place phi nodes on demand. Models
+the stack machine's expression stack as a virtual register stack, peeks ahead to collapse
+`LEA+LOAD`/`LEA+STORE` pairs into bp-relative IR3 ops, and handles call-site
+argument/temporary partitioning via `flush_for_call_n`. SSA promotion of scalar locals is
+enabled for leaf functions only.
 
-### `ssa_opt.c` — SSA-Level Peephole (CPU4)
+### `ir3.c` / `ir3.h` — IR3 Infrastructure (CPU4)
 
-`ssa_peephole(head)` runs after `lift_to_ssa` and before register allocation. Currently
-eliminates identity moves (`SSA_MOV rd=A, rs1=A`). The natural location for future passes:
-compare-branch fusion, LEA→STORE forwarding, copy/constant propagation, DCE.
+Defines the `IR3Inst` struct and `IR3Op` enum. `build_cfg()` constructs a basic-block CFG
+from the stack IR for the Braun SSA algorithm. `ir3_new_vreg()` allocates fresh virtual
+register IDs.
 
-### `regalloc.c` — Register Allocation (CPU4)
+### `linscan.c` — Linear-Scan Register Allocation (CPU4)
 
-`regalloc(head)` maps virtual registers to physical registers r0–r7. Current strategy is
-trivial depth-based: `VREG_START+depth → r{depth}`. Correctness is guaranteed by Sethi-Ullman
-labelling (expression depth ≤ 3). The allocator is isolated behind a single `alloc_reg(vreg)`
-function; replacing it with linear-scan or graph-colouring requires no changes to `ssa.c` or
-`risc_backend.c`.
+`linscan_regalloc(head)` implements the Poletto/Sarkar (1999) linear-scan algorithm. Runs
+per function, computing live intervals with back-edge extension for loops. Maps virtual
+registers to physical r1–r6 (r0 reserved for accumulator, r7 for spill scratch). Handles
+spilling with Phase 5a (frame expansion + flush-offset shifting) and Phase 5b (spill
+store/load insertion).
+
+### `ir3_lower.c` — IR3 → SSA Lowering (CPU4)
+
+`ir3_lower(head)` performs near-1:1 translation from post-regalloc `IR3Inst` (physical
+registers in `rd`/`rs1`/`rs2`) to `SSAInst` for `risc_backend_emit`.
 
 ### `risc_backend.c` — CPU4 Emitter
 

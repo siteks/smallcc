@@ -5,12 +5,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Build & Test
 
 ```bash
-make smallcc           # Build the compiler
-make test_all       # Run all test suites
-make test_struct    # Run a specific suite (also: test_init, test_ops, test_logops, test_func,
-                    # test_longs, test_array, test_loops, test_goto, test_struct_init,
-                    # test_floats, test_compound, test_remaining, test_typedef, test_strings,
-                    # test_enum, test_variadic, test_funcptr)
+make smallcc        # Build the compiler
+make test           # Run all pytest test cases (quiet)
+make test_v         # Run all pytest test cases (verbose)
+make test_p         # Run pytest cases in parallel (requires pytest-xdist)
 make clean          # Remove binaries and temp files
 ```
 
@@ -116,7 +114,12 @@ Every phase prints debug information to stderr. `-stats` prints per-TU and total
 | `codegen.c` | AST walk; builds flat IR instruction list (`gen_ir`); `reset_codegen`; static label mangling; `mark_basic_blocks` |
 | `optimise.c` | Peephole optimiser (`peephole`); rules 1–9; constant folding, dead branch elim, store/reload elim |
 | `backend.c` | IR → assembly emission (`backend_emit_asm`); `set_asm_out`; `-ann` annotation mode; retargeting point |
-| `sim_c.c` | Primary simulator — self-contained C assembler + CPU3 executor; `make sim_c` |
+| `braun.c` | Braun SSA construction — stack IR → `IR3Inst` with fresh vregs; phi placement; SSA promotion (leaf functions) |
+| `ir3.c` / `ir3.h` | IR3 infrastructure — `IR3Inst`/`IR3Op` definitions; `build_cfg`; `ir3_new_vreg` |
+| `linscan.c` | Linear-scan register allocation (Poletto/Sarkar) — vregs → physical r0–r6; spilling via r7 |
+| `ir3_lower.c` | IR3 → SSA lowering — near-1:1 `IR3Inst` → `SSAInst` for `risc_backend_emit` |
+| `risc_backend.c` | CPU4 emitter — `SSAInst` → CPU4 assembly; F2 bp-relative selection; `le`/`ge` expansion |
+| `sim_c.c` | Primary simulator — self-contained C assembler + CPU3/CPU4 executor; `make sim_c` |
 | `cpu3/cpu.py` | Python CPU3 definition: `ptable` (opcode/format map) + execution handler |
 | `cpu3/assembler.py` | Python two-pass assembler; reads `ptable` from `cpu.py` — no changes needed for new instructions |
 | `cpu3/sim.py` | Python simulator (reference / legacy); imports `cpu.py` and `assembler.py` |
@@ -147,7 +150,7 @@ Every phase prints debug information to stderr. `-stats` prints per-TU and total
 ## Detailed Reference
 
 - @docs/architecture.md — tokeniser, parser (grammar, AST nodes, node struct), type system, per-TU compilation, backend file overview
-- @docs/codegen.md — stack IR (`IRInst`/`IROp`), CPU3 backend (frame layout, expression idioms, cast gen, peephole), CPU4 backend (SSA IR `SSAInst`/`SSAOp`, lift, regalloc, RISC emit)
+- @docs/codegen.md — stack IR (`IRInst`/`IROp`), CPU3 backend (frame layout, expression idioms, cast gen, peephole), CPU4 backend (Braun SSA, IR3, linear-scan regalloc, RISC emit)
 - @docs/cpu3-isa.md — CPU3 registers, full instruction set, assembly syntax
 - @docs/cpu4-isa.md — CPU4 registers, full instruction set, assembly syntax (verified against `cpu4/cpu.py`)
 - @docs/c89-status.md — compliance tables, deliberate deviations, what's implemented/missing

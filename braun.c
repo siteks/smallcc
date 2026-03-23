@@ -42,6 +42,9 @@ static bool promote_slot(int offset)
     return (unsigned)idx < PROMOTE_SLOTS;
 }
 
+/* Size (1/2/4) of each promoted slot, set on first access */
+static int promo_slot_size[PROMOTE_SLOTS];
+
 /* accum_offset: if non-zero, ACCUM holds the ADDRESS of the var at this bp-offset.
  * Cleared by ACCUM-modifying ops; preserved through PUSH. */
 static int accum_offset;
@@ -98,10 +101,19 @@ static void lvsp_apply(int label_id)
 }
 
 /* ================================================================
+ * Promoted parameter pre-seeding (deferred until after ENTER)
+ * ================================================================ */
+#define MAX_PARAM_SEEDS 32
+static struct { int offset; int size; int vreg; } param_seeds[MAX_PARAM_SEEDS];
+static int n_param_seeds;
+
+/* ================================================================
  * Post-call restore state (spill outer expression temps across calls)
  * ================================================================ */
 static int spill_off[MAX_VDEPTH];
 static int spill_sz[MAX_VDEPTH];
+static int spill_vreg[MAX_VDEPTH];   /* original vreg (for promo dummies) */
+static int spill_is_promo[MAX_VDEPTH]; /* 1 = promoted-address dummy, skip spill/reload */
 static int spill_count;
 static int spill_total_bytes;
 static int await_post_call_adj;
@@ -112,6 +124,8 @@ static int await_post_call_adj;
 static IR3Inst  *ir3_head;
 static IR3Inst **ir3_tail;
 static IR3Inst  *ir3_last;   /* last emitted node */
+static IR3Inst  *func_ir3_start; /* first IR3 node of current function */
+static bool      func_has_calls; /* true if current function has IR_JL/JLI */
 
 static IR3Inst *new_ir3(IR3Op op)
 {
@@ -167,25 +181,37 @@ static void flush_for_call_n(int arg_bytes, int line)
 
     if (first_arg > 0) {
         int outer_bytes = 0;
-        for (int k = 0; k < first_arg; k++) outer_bytes += vs_size[k];
+        for (int k = 0; k < first_arg; k++) {
+            if (vlo_get(vs_reg[k]) != 0) continue; /* promo dummy: no memory needed */
+            outer_bytes += vs_size[k];
+        }
 
-        IR3Inst *adj = emit_ir3(IR3_ADJ);
-        adj->imm  = -outer_bytes;
-        adj->line = line;
-        vsp -= outer_bytes;
+        if (outer_bytes > 0) {
+            IR3Inst *adj = emit_ir3(IR3_ADJ);
+            adj->imm  = -outer_bytes;
+            adj->line = line;
+            vsp -= outer_bytes;
+        }
 
         int boff = vsp;
         for (int k = 0; k < first_arg; k++) {
-            IR3Inst *st = emit_ir3(IR3_STORE);
-            st->rd   = IR3_VREG_BP;
-            st->rs1  = vs_reg[k];
-            st->imm  = boff;
-            st->size = vs_size[k];
-            st->line = line;
-            spill_off[spill_count] = boff;
+            int is_promo_dummy = (vlo_get(vs_reg[k]) != 0);
+            spill_is_promo[spill_count] = is_promo_dummy;
+            spill_vreg[spill_count]     = vs_reg[k];
+            if (!is_promo_dummy) {
+                IR3Inst *st = emit_ir3(IR3_STORE);
+                st->rd   = IR3_VREG_BP;
+                st->rs1  = vs_reg[k];
+                st->imm  = boff;
+                st->size = vs_size[k];
+                st->line = line;
+                spill_off[spill_count] = boff;
+                boff += vs_size[k];
+            } else {
+                spill_off[spill_count] = 0; /* unused */
+            }
             spill_sz [spill_count] = vs_size[k];
             spill_count++;
-            boff += vs_size[k];
         }
         spill_total_bytes   = outer_bytes;
         await_post_call_adj = 1;
@@ -216,20 +242,29 @@ static void restore_outer_temps(int line)
 {
     if (spill_count == 0) return;
     for (int k = 0; k < spill_count; k++) {
-        int fresh = ir3_new_vreg();
-        IR3Inst *ld = emit_ir3(IR3_LOAD);
-        ld->rd   = fresh;
-        ld->rs1  = IR3_VREG_BP;
-        ld->imm  = spill_off[k];
-        ld->size = spill_sz[k];
-        ld->line = line;
-        vs_reg[k]  = fresh;
-        vs_size[k] = spill_sz[k];
+        if (spill_is_promo[k]) {
+            /* Promoted-address dummy: no memory spill happened.
+             * Preserve the original vreg and its vlo mapping. */
+            vs_reg[k]  = spill_vreg[k];
+            vs_size[k] = spill_sz[k];
+        } else {
+            int fresh = ir3_new_vreg();
+            IR3Inst *ld = emit_ir3(IR3_LOAD);
+            ld->rd   = fresh;
+            ld->rs1  = IR3_VREG_BP;
+            ld->imm  = spill_off[k];
+            ld->size = spill_sz[k];
+            ld->line = line;
+            vs_reg[k]  = fresh;
+            vs_size[k] = spill_sz[k];
+        }
     }
-    IR3Inst *adj2 = emit_ir3(IR3_ADJ);
-    adj2->imm  = spill_total_bytes;
-    adj2->line = line;
-    vsp += spill_total_bytes;
+    if (spill_total_bytes > 0) {
+        IR3Inst *adj2 = emit_ir3(IR3_ADJ);
+        adj2->imm  = spill_total_bytes;
+        adj2->line = line;
+        vsp += spill_total_bytes;
+    }
 
     vs_depth          = spill_count;
     spill_count       = 0;
@@ -244,6 +279,9 @@ static void restore_outer_temps(int line)
 
 /* Per-block current definition: block_def[bb_id][slot] = vreg or IR3_VREG_NONE */
 static int block_def[MAX_BLOCKS][PROMOTE_SLOTS];
+
+/* Function-level set of promoted slots ever written (for call save/restore) */
+static bool promo_ever_written[PROMOTE_SLOTS];
 
 /* Phi node lookup: phi_node_map[vreg - IR3_VREG_BASE] = IR3Inst* or NULL */
 static IR3Inst *phi_node_map[PHI_MAP_SIZE];
@@ -295,6 +333,61 @@ static void sealBlock(int bb_id);
 static void writeVariable(int bb_id, int var_slot, int vreg)
 {
     block_def[bb_id][var_slot] = vreg;
+    promo_ever_written[var_slot] = true;
+}
+
+/* ================================================================
+ * Save/restore promoted variables across calls.
+ *
+ * All registers are caller-saved.  Promoted variables live in vregs
+ * which get physical registers via linscan.  Before a call, write
+ * every live promoted variable back to its stack slot; after the
+ * call, reload into fresh vregs so linscan never sees a live range
+ * that spans a call instruction.
+ * ================================================================ */
+#define MAX_PROMO_SAVE 64
+
+static struct { int slot; int offset; int size; } promo_save[MAX_PROMO_SAVE];
+static int n_promo_save;
+
+static void save_promoted_before_call(int bb_id, int line)
+{
+    n_promo_save = 0;
+    for (int s = 0; s < PROMOTE_SLOTS; s++) {
+        if (!promo_ever_written[s]) continue;
+        if (promo_slot_size[s] == 0) continue;
+        /* Ensure block_def is populated for this slot via readVariable */
+        int vreg = readVariable(bb_id, s);
+        if (vreg == IR3_VREG_NONE) continue;
+        int offset = s - PROMOTE_BASE;
+        IR3Inst *st = emit_ir3(IR3_STORE);
+        st->rd   = IR3_VREG_BP;
+        st->rs1  = vreg;
+        st->imm  = offset;
+        st->size = promo_slot_size[s];
+        st->line = line;
+        if (n_promo_save < MAX_PROMO_SAVE) {
+            promo_save[n_promo_save].slot   = s;
+            promo_save[n_promo_save].offset = offset;
+            promo_save[n_promo_save].size   = promo_slot_size[s];
+            n_promo_save++;
+        }
+    }
+}
+
+static void reload_promoted_after_call(int bb_id, int line)
+{
+    for (int k = 0; k < n_promo_save; k++) {
+        int fresh = ir3_new_vreg();
+        IR3Inst *ld = emit_ir3(IR3_LOAD);
+        ld->rd   = fresh;
+        ld->rs1  = IR3_VREG_BP;
+        ld->imm  = promo_save[k].offset;
+        ld->size = promo_save[k].size;
+        ld->line = line;
+        writeVariable(bb_id, promo_save[k].slot, fresh);
+    }
+    n_promo_save = 0;
 }
 
 /* Set phi_insert_point[bb_id] = node and flush any pending phis for this block.
@@ -404,8 +497,10 @@ static int tryRemoveTrivialPhi(int phi_vreg)
 
     /* Replace all uses of phi_vreg in already-emitted IR3 instructions.
      * This is necessary because readVariable may return a phi vreg that gets
-     * embedded in rs1/rs2 of emitted instructions before the phi is eliminated. */
-    for (IR3Inst *p = ir3_head; p; p = p->next) {
+     * embedded in rs1/rs2 of emitted instructions before the phi is eliminated.
+     * Scoped to the current function (func_ir3_start) because vreg IDs are
+     * reset per function and could collide with vregs from earlier functions. */
+    for (IR3Inst *p = func_ir3_start; p; p = p->next) {
         if (p->rs1 == phi_vreg) p->rs1 = unique;
         if (p->rs2 == phi_vreg) p->rs2 = unique;
         if (p->rd  == phi_vreg) p->rd  = unique;
@@ -529,6 +624,8 @@ static void reset_braun_state(void)
     memset(block_pretail, 0, sizeof(block_pretail));
     memset(preds_done, 0, sizeof(preds_done));
     memset(vreg_lea_offset, 0, sizeof(vreg_lea_offset));
+    memset(promo_slot_size, 0, sizeof(promo_slot_size));
+    memset(promo_ever_written, 0, sizeof(promo_ever_written));
     current_bb_id = 0;
     cur_n_blocks = 0;
     cur_blocks = NULL;
@@ -611,16 +708,9 @@ static void translate_bb(BB *bb, int bb_id)
              * With linear-scan + spilling, promoted variables that exceed
              * register pressure are automatically spilled to stack slots.
              *
-             * Currently disabled: enabling causes 7 test failures in
-             * variadic, coremark, and stdlib tests.  The promotion logic
-             * in braun.c likely needs fixes for:
-             *  - va_arg interaction (promoted va_list variables)
-             *  - phi deconstruction across loop back-edges
-             *  - promotion of variables modified inside loops
-             * Enable with: is_promo = (p->sym == ir_promote_sentinel);
              * Future work: add heuristics to promote only profitable
              * variables (loop counters, frequently-read scalars). */
-            bool is_promo = false;
+            bool is_promo = (!func_has_calls && p->sym == ir_promote_sentinel);
 
             /* Peek: if next instruction is a load, collapse to bp-relative load */
             int peek_sz = 0;
@@ -634,6 +724,8 @@ static void translate_bb(BB *bb, int bb_id)
                 /* Promotable read: use SSA definition */
                 int N    = p->operand;
                 int slot = N + PROMOTE_BASE;
+                if ((unsigned)slot < PROMOTE_SLOTS)
+                    promo_slot_size[slot] = peek_sz;
                 int val  = IR3_VREG_NONE;
                 if ((unsigned)slot < PROMOTE_SLOTS)
                     val = readVariable(bb_id, slot);
@@ -681,11 +773,18 @@ static void translate_bb(BB *bb, int bb_id)
             }
 
             /* Standalone LEA */
-            s = emit_ir3(IR3_LEA);
-            s->rd   = IR3_VREG_ACCUM;
-            s->imm  = p->operand;
-            s->line = p->line;
-            local_accum_offset = (is_promo && promote_slot(p->operand)) ? p->operand : 0;
+            if (is_promo && promote_slot(p->operand)) {
+                /* Promotable address: don't emit IR3_LEA — the address is only
+                 * needed for a later store which will be promoted (no IR3_STORE).
+                 * Just record the offset for the promoted store path. */
+                local_accum_offset = p->operand;
+            } else {
+                s = emit_ir3(IR3_LEA);
+                s->rd   = IR3_VREG_ACCUM;
+                s->imm  = p->operand;
+                s->line = p->line;
+                local_accum_offset = 0;
+            }
             break;
         }
 
@@ -701,12 +800,13 @@ static void translate_bb(BB *bb, int bb_id)
                     mv->rs1  = val;
                     mv->line = p->line;
                 } else {
-                    /* Load from memory, record as def */
+                    /* No SSA def yet: load from memory, record as def.
+                     * Use bp-relative addressing (the LEA was suppressed). */
                     int fresh = ir3_new_vreg();
                     s = emit_ir3(IR3_LOAD);
                     s->rd   = fresh;
-                    s->rs1  = IR3_VREG_ACCUM;
-                    s->imm  = 0;
+                    s->rs1  = IR3_VREG_BP;
+                    s->imm  = local_accum_offset;
                     s->size = sz;
                     s->line = p->line;
                     writeVariable(bb_id, slot, fresh);
@@ -733,13 +833,19 @@ static void translate_bb(BB *bb, int bb_id)
 
         case IR_PUSH: case IR_PUSHW: {
             int sz    = (p->op == IR_PUSH) ? 4 : 2;
-            int fresh = ir3_new_vreg();
-            IR3Inst *mov = emit_ir3(IR3_MOV);
-            mov->rd   = fresh;
-            mov->rs1  = IR3_VREG_ACCUM;
-            mov->line = p->line;
-            if (local_accum_offset != 0 && promote_slot(local_accum_offset))
+            int fresh;
+            if (local_accum_offset != 0 && promote_slot(local_accum_offset)) {
+                /* Promoted address push: no IR3_MOV needed — the address is only
+                 * used as a store target.  Use a dummy vreg with vlo tracking. */
+                fresh = ir3_new_vreg();
                 vlo_set(fresh, local_accum_offset);
+            } else {
+                fresh = ir3_new_vreg();
+                IR3Inst *mov = emit_ir3(IR3_MOV);
+                mov->rd   = fresh;
+                mov->rs1  = IR3_VREG_ACCUM;
+                mov->line = p->line;
+            }
             /* accum_offset preserved through PUSH */
             if (vs_depth >= MAX_VDEPTH)
                 fprintf(stderr, "braun: virtual stack overflow at depth %d\n", vs_depth);
@@ -769,12 +875,15 @@ static void translate_bb(BB *bb, int bb_id)
 
                 if (N != 0 && promote_slot(N)) {
                     /* Promoted store: update SSA def, do NOT emit IR3_STORE */
+                    int slot = N + PROMOTE_BASE;
+                    if ((unsigned)slot < PROMOTE_SLOTS)
+                        promo_slot_size[slot] = sz;
                     int fresh = ir3_new_vreg();
                     IR3Inst *mv = emit_ir3(IR3_MOV);
                     mv->rd   = fresh;
                     mv->rs1  = IR3_VREG_ACCUM;
                     mv->line = p->line;
-                    writeVariable(bb_id, N + PROMOTE_BASE, fresh);
+                    writeVariable(bb_id, slot, fresh);
                 } else {
                     /* Non-promoted: emit memory store */
                     s = emit_ir3(IR3_STORE);
@@ -837,8 +946,6 @@ static void translate_bb(BB *bb, int bb_id)
                 mv->line = p->line;
             }
 
-            /* True SSA: promoted variables live in vregs; linscan handles call-clobber.
-             * Only need to flush expression stack temps. */
             flush_for_call_n(arg_bytes, p->line);
 
             if (save_fp) {
@@ -856,8 +963,6 @@ static void translate_bb(BB *bb, int bb_id)
             }
             s->line = p->line;
 
-            /* SSA defs remain valid after call — linscan handles register save/restore.
-             * Just clear accum tracking. */
             local_accum_offset = 0;
 
             if (arg_bytes == 0 && spill_count > 0) {
@@ -872,11 +977,20 @@ static void translate_bb(BB *bb, int bb_id)
             s = emit_ir3(IR3_ENTER);
             s->imm  = p->operand;
             s->line = p->line;
-            /* After emitting ENTER, move phi_insert_point[0] to here so that
-             * any parameter loads generated by readVariableRecursive for the
-             * entry block are inserted AFTER enter (not before it). */
-            if (bb_id == 0)
-                phi_insert_point[0] = s;
+            /* After emitting ENTER, emit deferred parameter seed loads and
+             * move phi_insert_point[0] past them so that any phis inserted
+             * later by readVariableRecursive appear after all seed loads. */
+            if (bb_id == 0) {
+                for (int pi = 0; pi < n_param_seeds; pi++) {
+                    IR3Inst *ld = emit_ir3(IR3_LOAD);
+                    ld->rd   = param_seeds[pi].vreg;
+                    ld->rs1  = IR3_VREG_BP;
+                    ld->imm  = param_seeds[pi].offset;
+                    ld->size = param_seeds[pi].size;
+                    ld->line = p->line;
+                }
+                phi_insert_point[0] = ir3_last;
+            }
             break;
 
         case IR_ADJ:
@@ -965,6 +1079,12 @@ static void translate_bb(BB *bb, int bb_id)
 
         block_last_ir3[bb_id] = ir3_last;
     }
+
+    /* Ensure block_last_ir3 is set even for empty blocks (e.g. unlabeled
+     * fall-through blocks).  Without this, insert_phi_copy silently drops
+     * phi copies destined for empty predecessor blocks. */
+    if (!block_last_ir3[bb_id])
+        block_last_ir3[bb_id] = ir3_last;
 }
 
 /* ================================================================
@@ -1037,9 +1157,9 @@ static void deconstructPhis(BB *blocks, int n_blocks)
         /* Alternative: walk the entire IR3 list to find which LABEL/SYMLABEL precedes
          * this phi node. This works because phi nodes are inserted right after the
          * block's label node. */
-        /* Walk the IR3 list */
+        /* Walk the IR3 list (scoped to current function) */
         int cur_bb = -1;
-        for (IR3Inst *q = ir3_head; q; q = q->next) {
+        for (IR3Inst *q = func_ir3_start; q; q = q->next) {
             if (q->op == IR3_SYMLABEL) {
                 cur_bb = 0;
             } else if (q->op == IR3_LABEL) {
@@ -1140,6 +1260,7 @@ static void process_function(IRInst *sym_node)
     IR3Inst *symlabel_ir3 = emit_ir3(IR3_SYMLABEL);
     symlabel_ir3->sym  = sym_node->sym;
     symlabel_ir3->line = sym_node->line;
+    func_ir3_start = symlabel_ir3;
 
     /* Build CFG */
     int n_blocks = 0;
@@ -1159,6 +1280,65 @@ static void process_function(IRInst *sym_node)
     }
     cur_blocks = blocks;
     cur_n_blocks = n_blocks;
+
+    /* Pre-seed promoted parameters in the entry block.
+     *
+     * Parameters get their initial values from the caller via the stack frame,
+     * not from an explicit store in the function body.  If a promoted parameter
+     * is first read in a non-entry block (e.g. a loop header), the Braun SSA
+     * algorithm's readVariableRecursive will trace back to the entry block
+     * and find no definition — returning IR3_VREG_NONE.  This produces a
+     * non-trivial phi whose entry-block operand is undefined, causing the phi
+     * vreg to survive through to assembly as an unrewritten virtual register.
+     *
+     * Fix: scan the function's stack IR for all IR_LEA instructions marked as
+     * promotable (sym == ir_promote_sentinel) with positive bp-relative offsets
+     * (parameters).  For each unique parameter, pre-allocate a vreg and call
+     * writeVariable; the actual IR3_LOAD is deferred to the IR_ENTER handler
+     * (because bp must be set up before bp-relative loads). */
+    /* Scan for calls — promotion is disabled in functions with calls
+     * (all-caller-save ABI means every promoted variable must be saved
+     * and restored around each call, which negates the benefit). */
+    func_has_calls = false;
+    for (IRInst *p = sym_node->next; p && p->op != IR_SYMLABEL; p = p->next) {
+        if (p->op == IR_JL || p->op == IR_JLI) { func_has_calls = true; break; }
+    }
+
+    n_param_seeds = 0;
+    for (IRInst *p = sym_node->next; p && p->op != IR_SYMLABEL; p = p->next) {
+        if (func_has_calls) break;  /* skip param seeding if calls present */
+        if (p->op == IR_LEA && p->sym == ir_promote_sentinel
+            && p->operand > 0)  /* positive offset = parameter */
+        {
+            /* Determine load size from the following instruction */
+            int sz = 0;
+            IRInst *nxt = p->next;
+            if (nxt) {
+                if      (nxt->op == IR_LW) sz = 2;
+                else if (nxt->op == IR_LB) sz = 1;
+                else if (nxt->op == IR_LL) sz = 4;
+            }
+            if (sz == 0) sz = 2;  /* default to word */
+
+            /* Check for duplicate */
+            bool dup = false;
+            for (int i = 0; i < n_param_seeds; i++) {
+                if (param_seeds[i].offset == p->operand) { dup = true; break; }
+            }
+            if (!dup && n_param_seeds < MAX_PARAM_SEEDS) {
+                int slot = p->operand + PROMOTE_BASE;
+                if ((unsigned)slot < PROMOTE_SLOTS) {
+                    promo_slot_size[slot] = sz;
+                    int fresh = ir3_new_vreg();
+                    param_seeds[n_param_seeds].offset = p->operand;
+                    param_seeds[n_param_seeds].size   = sz;
+                    param_seeds[n_param_seeds].vreg   = fresh;
+                    n_param_seeds++;
+                    writeVariable(0, slot, fresh);
+                }
+            }
+        }
+    }
 
     /* Set phi insert point for entry block (block 0).
      * Entry block has no label, so phi_insert_point[0] is set to the SYMLABEL node.

@@ -450,8 +450,10 @@ static int push_args_list(Node *first_arg, Param *params)
             if (s == 0) s = WORD_SIZE;  // function designator decays to pointer size
             int slot_size = (s == 4) ? 4 : WORD_SIZE;
 
-            // When we know the declared parameter type and the arg is wider than the
-            // param slot (e.g. ee_u32 passed to ee_s16), truncate to the param's slot size.
+            // When we know the declared parameter type and the arg slot size
+            // differs from the param slot size, adjust:
+            //   - Wider arg than param (e.g. ee_u32 passed to ee_s16): truncate.
+            //   - Narrower arg than param (e.g. int passed to unsigned long): widen.
             if (i < np && param_arr[i] && param_arr[i]->type &&
                 param_arr[i]->type->base != TB_STRUCT)
             {
@@ -464,6 +466,17 @@ static int push_args_list(Node *first_arg, Param *params)
                     ir_append(IR_IMM,  0xffff, NULL);
                     ir_append(IR_AND,  0, NULL);
                     slot_size = WORD_SIZE;
+                }
+                else if (slot_size == WORD_SIZE && param_slot == 4)
+                {
+                    // Widen 16-bit value to 32 bits for a 4-byte param.
+                    // Sign-extend if the arg type is signed, otherwise
+                    // the upper 16 bits are already 0 from immw.
+                    if (push_type && (push_type->base == TB_INT ||
+                                     push_type->base == TB_SHORT ||
+                                     push_type->base == TB_CHAR))
+                        ir_append(IR_SXW, 0, NULL);
+                    slot_size = 4;
                 }
             }
 
@@ -1586,6 +1599,51 @@ static void gen_struct_mem_inits(char *data, Node *n, Type *st, int base)
     }
 }
 
+/* Return the assembly label for an address-of-global expression, or NULL.
+   Handles &var, (type *)&var, static globals, and static locals. */
+static const char *get_addr_of_label(Node *expr)
+{
+    while (expr->kind == ND_CAST) expr = expr->ch[1];
+    if (expr->kind != ND_UNARYOP || expr->op_kind != TK_AMPERSAND)
+        return NULL;
+    Node *child = expr->ch[0];
+    if (child->kind != ND_IDENT) return NULL;
+    Symbol *sym = child->symbol;
+    if (!sym) return child->u.ident.name;
+    if (sym->kind == SYM_STATIC_LOCAL) {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "_ls%d", sym->offset);
+        return arena_strdup(buf);
+    }
+    if (sym->kind == SYM_STATIC_GLOBAL) {
+        char buf[80];
+        snprintf(buf, sizeof(buf), "_s%d_%s", sym->tu_index, sym->name);
+        return arena_strdup(buf);
+    }
+    return sym->name;
+}
+
+/* Collect symbolic (address-of) fields in a struct initialiser, recursively. */
+typedef struct { int offset; const char *sym; } SymField;
+#define MAX_SYM_FIELDS 64
+static void collect_sym_fields(Node *n, Type *st, int base,
+                               SymField *out, int *count)
+{
+    Field *f = st->u.composite.members;
+    for (Node *child = n->ch[0]; child && f; child = child->next, f = f->next) {
+        if (child->kind == ND_INITLIST && f->type->base == TB_STRUCT)
+            collect_sym_fields(child, f->type, base + f->offset, out, count);
+        else {
+            const char *label = get_addr_of_label(child);
+            if (label && *count < MAX_SYM_FIELDS) {
+                out[*count].offset = base + f->offset;
+                out[*count].sym    = label;
+                (*count)++;
+            }
+        }
+    }
+}
+
 void gen_initlist(Node *n, Symbol *s)
 {
     // Address of variable to be initialised is on the stack
@@ -1628,9 +1686,37 @@ void gen_initlist(Node *n, Symbol *s)
     {
         if (t->base == TB_STRUCT)
         {
+            /* Check for symbolic (address-of-global) fields that can't be
+               represented in a flat byte buffer. */
+            SymField sym_fields[MAX_SYM_FIELDS];
+            int n_sym = 0;
+            collect_sym_fields(n, t, 0, sym_fields, &n_sym);
+
             char *data = arena_alloc(t->size);
             gen_struct_mem_inits(data, n, t, 0);
-            gen_bytes(data, t->size);
+
+            if (n_sym > 0)
+            {
+                /* Emit byte-by-byte, replacing 2-byte spans at symbolic
+                   field offsets with IR_WORD label references. */
+                int pos = 0;
+                for (int si = 0; si < n_sym; si++)
+                {
+                    /* Emit bytes before this symbolic field */
+                    for (; pos < sym_fields[si].offset; pos++)
+                        ir_append(IR_BYTE, (unsigned char)data[pos], NULL);
+                    /* Emit symbolic address as a word */
+                    ir_append(IR_WORD, 0, sym_fields[si].sym);
+                    pos += 2; /* pointer is 2 bytes */
+                }
+                /* Emit remaining bytes after the last symbolic field */
+                for (; pos < t->size; pos++)
+                    ir_append(IR_BYTE, (unsigned char)data[pos], NULL);
+            }
+            else
+            {
+                gen_bytes(data, t->size);
+            }
         }
         else if (!array_dimensions(t))
         {
