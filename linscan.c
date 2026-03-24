@@ -387,26 +387,8 @@ static int process_interval(int iv_idx, Segment *seg, int *serial_to_line, int n
         reg = v_seg->phys;
 
         /* Allocate spill slot for victim if needed */
-        int v_first_spill = (intervals[v_idx].spill_off == -1);
-        if (v_first_spill)
+        if (intervals[v_idx].spill_off == -1)
             intervals[v_idx].spill_off = alloc_spill_slot();
-
-        /* Record STORE: save victim's register after serial P-1 */
-        int store_serial = P - 1;
-        if (store_serial < 0) store_serial = 0;
-        int line = (store_serial < n_insts) ? serial_to_line[store_serial] : 0;
-        record_split_action(0, store_serial, reg, intervals[v_idx].spill_off, line);
-
-        /* If this is the first spill for this vreg, also record a STORE at
-         * the definition point.  Since SSA values never change, this ensures
-         * the spill slot is always populated regardless of control-flow path,
-         * eliminating the need for edge stores at branch points. */
-        if (v_first_spill) {
-            int def_serial = intervals[v_idx].orig_start;
-            int def_phys = intervals[v_idx].segments->phys;
-            int def_line = (def_serial < n_insts) ? serial_to_line[def_serial] : 0;
-            record_split_action(0, def_serial, def_phys, intervals[v_idx].spill_off, def_line);
-        }
 
         /* End victim's current segment.  If the victim has a reference
          * at serial P (e.g. as a source operand of the instruction where
@@ -461,25 +443,10 @@ static int process_interval(int iv_idx, Segment *seg, int *serial_to_line, int n
         reg = v_seg->phys;
 
         /* Allocate spill slots */
-        int v_first_spill = (intervals[v_idx].spill_off == -1);
-        if (v_first_spill)
+        if (intervals[v_idx].spill_off == -1)
             intervals[v_idx].spill_off = alloc_spill_slot();
         if (intervals[iv_idx].spill_off == -1)
             intervals[iv_idx].spill_off = alloc_spill_slot();
-
-        /* Save victim before P */
-        int store_serial = P - 1;
-        if (store_serial < 0) store_serial = 0;
-        int line = (store_serial < n_insts) ? serial_to_line[store_serial] : 0;
-        record_split_action(0, store_serial, reg, intervals[v_idx].spill_off, line);
-
-        /* Def-time STORE for victim if first spill */
-        if (v_first_spill) {
-            int def_serial = intervals[v_idx].orig_start;
-            int def_phys = intervals[v_idx].segments->phys;
-            int def_line = (def_serial < n_insts) ? serial_to_line[def_serial] : 0;
-            record_split_action(0, def_serial, def_phys, intervals[v_idx].spill_off, def_line);
-        }
 
         /* End victim's segment (extend through P if victim has a ref at P) */
         {
@@ -845,6 +812,30 @@ static void alloc_function(IR3Inst *func_head, IR3Inst *func_end,
             int line = (seg->start < n_insts) ? serial_to_line[seg->start] : 0;
             record_split_action(1, seg->start, assigned,
                                intervals[idx].spill_off, line);
+        }
+    }
+
+    /* --- Phase 3b: STORE at every definition of each spilled interval ---
+     * This keeps the spill slot current for all paths, including phi-copy
+     * loop variables that are redefined at the back-edge each iteration. */
+    for (int i = 0; i < n_intervals; i++) {
+        if (intervals[i].spill_off == -1) continue;
+        int base = ref_pos_start[i];
+        int cnt  = ref_pos_count[i];
+        for (int j = 0; j < cnt; j++) {
+            if (!ref_is_def[base + j]) continue;
+            int def_ser = ref_positions[base + j];
+            /* Find physical register assigned at this def serial */
+            int def_phys = -1;
+            for (Segment *s = intervals[i].segments; s; s = s->next) {
+                if (def_ser >= s->start && def_ser <= s->end && s->phys >= 0) {
+                    def_phys = s->phys;
+                    break;
+                }
+            }
+            if (def_phys < 0) continue;  /* in a gap — no register to store from */
+            int def_line = (def_ser < n_insts) ? serial_to_line[def_ser] : 0;
+            record_split_action(0, def_ser, def_phys, intervals[i].spill_off, def_line);
         }
     }
 
