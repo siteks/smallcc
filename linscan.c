@@ -25,6 +25,11 @@
 #include <string.h>
 #include "ir3.h"
 
+/* Allocate a globally-unique label ID (shared counter with codegen.c).
+ * Used for phi-resolution skip labels so they never collide with labels
+ * from any translation unit. */
+extern int new_label(void);
+
 /* ----------------------------------------------------------------
  * Segment: a sub-range of a vreg's live interval with a register
  * assignment.  Segments are linked chronologically per vreg.
@@ -45,6 +50,8 @@ typedef struct {
     int orig_end;         /* original interval end */
     Segment *segments;    /* linked list of segments */
     int spill_off;        /* bp-relative spill slot (-1 = none) */
+    int ref_pos_start;    /* index into ref_positions[] for this interval */
+    int ref_pos_count;    /* number of entries in ref_positions[] */
 } SplitInterval;
 
 #define MAX_INTERVALS 4096
@@ -55,15 +62,18 @@ static int n_intervals;
 #define VREG_MAP_SIZE (MAX_INTERVALS + IR3_VREG_BASE + 8)
 static int vreg_map[VREG_MAP_SIZE];
 
-/* Physical register pool: r1..r6.  r0 = ACCUM. */
-#define NPHYS 6
+
+/* Physical register pool: r1..r7.  r0 = ACCUM (reserved, never allocated).
+ * Split-interval spilling uses the segment's own register for LOAD/STORE,
+ * so no dedicated scratch register is needed. */
+#define NPHYS 7
 static int phys_pool[NPHYS];
 static int pool_size;
 
 static void pool_init(void) {
     pool_size = NPHYS;
     for (int i = 0; i < NPHYS; i++)
-        phys_pool[i] = NPHYS - i;  /* r6, r5, ..., r1 (r1 given out first) */
+        phys_pool[i] = NPHYS - i;  /* r7, r6, ..., r1 (r1 given out first) */
 }
 
 static int pool_alloc(void) {
@@ -114,8 +124,6 @@ static void active_remove(int pos) {
 #define MAX_REF_POS 32768
 static int ref_positions[MAX_REF_POS];
 static int ref_is_def[MAX_REF_POS];     /* 1 = def, 0 = use */
-static int ref_pos_start[MAX_INTERVALS]; /* start index into ref_positions[] */
-static int ref_pos_count[MAX_INTERVALS]; /* number of reference positions */
 static int n_ref_positions;
 
 /* Find the first reference of interval idx that is > serial.
@@ -123,8 +131,8 @@ static int n_ref_positions;
  * (e.g. via back-edge extension), or INT_MAX if truly dead.
  * If out_is_def is non-NULL, *out_is_def is set to 1 if the ref is a def. */
 static int next_ref_after(int idx, int serial, int *out_is_def) {
-    int base = ref_pos_start[idx];
-    int count = ref_pos_count[idx];
+    int base = intervals[idx].ref_pos_start;
+    int count = intervals[idx].ref_pos_count;
     /* Binary search for first entry > serial */
     int lo = 0, hi = count;
     while (lo < hi) {
@@ -268,12 +276,15 @@ static void record_def(int vreg, int serial) {
         intervals[k].orig_end = serial;
         intervals[k].segments = NULL;
         intervals[k].spill_off = -1;
+        intervals[k].ref_pos_start = 0;
+        intervals[k].ref_pos_count = 0;
         vreg_map[idx] = k;
     } else {
         int k = vreg_map[idx];
         if (serial < intervals[k].orig_start) intervals[k].orig_start = serial;
         if (serial > intervals[k].orig_end)   intervals[k].orig_end   = serial;
     }
+    intervals[vreg_map[idx]].ref_pos_count++;  /* count this reference */
 }
 
 static void record_use(int vreg, int serial) {
@@ -283,6 +294,7 @@ static void record_use(int vreg, int serial) {
     if (vreg_map[idx] == -1) return;
     int k = vreg_map[idx];
     if (serial > intervals[k].orig_end) intervals[k].orig_end = serial;
+    intervals[k].ref_pos_count++;  /* count this reference */
 }
 
 /* Comparator for sorting intervals by orig_start. */
@@ -398,8 +410,8 @@ static int process_interval(int iv_idx, Segment *seg, int *serial_to_line, int n
          * register at P.  The reload search starts from P either way. */
         {
             int has_ref_at_P = 0;
-            int base = ref_pos_start[v_idx];
-            int cnt = ref_pos_count[v_idx];
+            int base = intervals[v_idx].ref_pos_start;
+            int cnt  = intervals[v_idx].ref_pos_count;
             for (int j = 0; j < cnt; j++) {
                 if (ref_positions[base + j] == P) { has_ref_at_P = 1; break; }
                 if (ref_positions[base + j] > P) break;
@@ -451,8 +463,8 @@ static int process_interval(int iv_idx, Segment *seg, int *serial_to_line, int n
         /* End victim's segment (extend through P if victim has a ref at P) */
         {
             int has_ref_at_P = 0;
-            int base = ref_pos_start[v_idx];
-            int cnt = ref_pos_count[v_idx];
+            int base = intervals[v_idx].ref_pos_start;
+            int cnt  = intervals[v_idx].ref_pos_count;
             for (int j = 0; j < cnt; j++) {
                 if (ref_positions[base + j] == P) { has_ref_at_P = 1; break; }
                 if (ref_positions[base + j] > P) break;
@@ -474,9 +486,7 @@ static int process_interval(int iv_idx, Segment *seg, int *serial_to_line, int n
         seg->phys = reg;
         seg->end = P;  /* only one instruction */
 
-        /* Store current interval's value right after its def */
-        int def_line = (P < n_insts) ? serial_to_line[P] : 0;
-        record_split_action(0, P, reg, intervals[iv_idx].spill_off, def_line);
+        /* (Phase 3b will record the STORE for this def) */
 
         /* Create reload segment for current interval at its first ref */
         int my_is_def = 0;
@@ -551,15 +561,23 @@ static void alloc_function(IR3Inst *func_head, IR3Inst *func_end,
     for (IR3Inst *p = func_head; p != func_end; p = p->next, serial++) {
         serial_to_line[serial] = p->line;
         serial_to_node[serial] = p;
-        if (p->op == IR3_LABEL && p->imm >= 0 && p->imm < MAX_LABELS)
+        if (p->op == IR3_LABEL) {
+            if (p->imm < 0 || p->imm >= MAX_LABELS) {
+                fprintf(stderr, "linscan: label id %d exceeds MAX_LABELS %d\n",
+                        p->imm, MAX_LABELS);
+                exit(1);
+            }
             label_serial[p->imm] = serial;
+        }
 
         /* Definition: rd is a def for most ops.
-         * IR3_STORE's rd is a use (base address), but we still call
-         * record_def to ensure the interval is created if this is the
-         * first reference.  The start/end math is the same either way. */
-        if (p->rd != IR3_VREG_NONE && p->rd != IR3_VREG_BP)
-            record_def(p->rd, serial);
+         * IR3_STORE's rd is a USE (base address register), not a def. */
+        if (p->rd != IR3_VREG_NONE && p->rd != IR3_VREG_BP) {
+            if (p->op == IR3_STORE)
+                record_use(p->rd, serial);
+            else
+                record_def(p->rd, serial);
+        }
         /* Uses */
         if (p->rs1 != IR3_VREG_NONE && p->rs1 != IR3_VREG_BP)
             record_use(p->rs1, serial);
@@ -572,14 +590,76 @@ static void alloc_function(IR3Inst *func_head, IR3Inst *func_end,
         return;
     }
 
-    /* Sort each interval's use positions. Since we appended them in order,
-     * they should already be sorted, but sort to be safe. */
+    /* Assign ref_pos_start via prefix sums, then fill ref_positions[] in
+     * a single IR scan.  ref_pos_count was already incremented for each
+     * def/use by record_def/record_use above. */
+    n_ref_positions = 0;
     for (int i = 0; i < n_intervals; i++) {
-        if (ref_pos_count[i] > 1) {
-            qsort(&ref_positions[ref_pos_start[i]], ref_pos_count[i],
-                  sizeof(int), cmp_int);
+        intervals[i].ref_pos_start = n_ref_positions;
+        n_ref_positions += intervals[i].ref_pos_count;
+        intervals[i].ref_pos_count = 0;  /* reset for fill pass */
+    }
+    if (n_ref_positions > MAX_REF_POS) n_ref_positions = MAX_REF_POS;
+
+    int *fill_cursor = calloc(n_intervals, sizeof(int));
+    if (!fill_cursor) { fprintf(stderr, "linscan: OOM\n"); exit(1); }
+    for (int i = 0; i < n_intervals; i++)
+        fill_cursor[i] = intervals[i].ref_pos_start;
+
+    serial = 0;
+    for (IR3Inst *p = func_head; p != func_end; p = p->next, serial++) {
+        if (p->rd != IR3_VREG_NONE && p->rd != IR3_VREG_BP
+            && p->rd > IR3_VREG_ACCUM) {
+            int k = vreg_map[p->rd - IR3_VREG_BASE];
+            if (k >= 0 && fill_cursor[k] < MAX_REF_POS) {
+                int pos = fill_cursor[k]++;
+                ref_positions[pos] = serial;
+                ref_is_def[pos] = (p->op != IR3_STORE) ? 1 : 0;
+            }
+        }
+        if (p->rs1 != IR3_VREG_NONE && p->rs1 != IR3_VREG_BP
+            && p->rs1 > IR3_VREG_ACCUM) {
+            int k = vreg_map[p->rs1 - IR3_VREG_BASE];
+            if (k >= 0 && fill_cursor[k] < MAX_REF_POS) {
+                int pos = fill_cursor[k]++;
+                ref_positions[pos] = serial;
+                ref_is_def[pos] = 0;
+            }
+        }
+        if (p->rs2 != IR3_VREG_NONE && p->rs2 != IR3_VREG_BP
+            && p->rs2 > IR3_VREG_ACCUM) {
+            int k = vreg_map[p->rs2 - IR3_VREG_BASE];
+            if (k >= 0 && fill_cursor[k] < MAX_REF_POS) {
+                int pos = fill_cursor[k]++;
+                ref_positions[pos] = serial;
+                ref_is_def[pos] = 0;
+            }
         }
     }
+
+    /* Deduplicate (same serial appears multiple times if vreg is used in
+     * multiple operand slots of the same instruction).  Since positions were
+     * appended in serial order the array is already sorted — just collapse
+     * adjacent duplicates.  For the def/use tag: if any entry is a USE, keep
+     * it as USE (conservative). */
+    for (int i = 0; i < n_intervals; i++) {
+        int base = intervals[i].ref_pos_start;
+        int cnt = fill_cursor[i] - base;
+        if (cnt <= 1) { intervals[i].ref_pos_count = cnt; continue; }
+        int out = 1;
+        for (int j = 1; j < cnt; j++) {
+            if (ref_positions[base + j] != ref_positions[base + out - 1]) {
+                ref_positions[base + out] = ref_positions[base + j];
+                ref_is_def[base + out]    = ref_is_def[base + j];
+                out++;
+            } else {
+                if (!ref_is_def[base + j])
+                    ref_is_def[base + out - 1] = 0;
+            }
+        }
+        intervals[i].ref_pos_count = out;
+    }
+    free(fill_cursor);
 
     /* --- Phase 1b: extend intervals across loop back-edges --- */
     {
@@ -589,8 +669,14 @@ static void alloc_function(IR3Inst *func_head, IR3Inst *func_end,
 
         serial = 0;
         for (IR3Inst *p = func_head; p != func_end; p = p->next, serial++) {
+            if (p->op == IR3_J || p->op == IR3_JZ || p->op == IR3_JNZ) {
+                if (p->imm < 0 || p->imm >= MAX_LABELS) {
+                    fprintf(stderr, "linscan: jump target %d exceeds MAX_LABELS %d\n",
+                            p->imm, MAX_LABELS);
+                    exit(1);
+                }
+            }
             if ((p->op == IR3_J || p->op == IR3_JZ || p->op == IR3_JNZ)
-                && p->imm >= 0 && p->imm < MAX_LABELS
                 && label_serial[p->imm] >= 0
                 && label_serial[p->imm] < serial)
             {
@@ -627,141 +713,14 @@ static void alloc_function(IR3Inst *func_head, IR3Inst *func_end,
 
     qsort(intervals, n_intervals, sizeof(SplitInterval), cmp_by_start);
 
-    /* Rebuild vreg_map after sort.  Also fix ref_pos_start/count. */
-    /* We need to sort use positions along with intervals.  Since qsort
-     * moved intervals around, we need to rebuild the use-position index.
-     * The simplest approach: save and rebuild. */
-    {
-        /* Save old use-pos data keyed by vreg */
-        typedef struct { int start; int count; } UPInfo;
-        UPInfo up_old[MAX_INTERVALS];
-        /* Before sort, the use_pos arrays were indexed by old interval index.
-         * After sort, intervals[i] has a new vreg.  We need to map via vreg. */
-        /* Actually, ref_pos_start/count moved with the intervals during qsort
-         * only if they're part of the struct.  They're separate arrays, so they
-         * didn't move.  We need to fix this. */
-
-        /* Build a temporary map: vreg → old index */
-        /* We already have vreg_map from before sort, but it was indexed by
-         * vreg - IR3_VREG_BASE → old interval index.  After sort, intervals
-         * are in new positions.  Let's just rebuild use pos tracking. */
-
-        /* Copy the old use-pos info indexed by vreg */
-        int old_up_start[MAX_INTERVALS];
-        int old_up_count[MAX_INTERVALS];
-        memcpy(old_up_start, ref_pos_start, n_intervals * sizeof(int));
-        memcpy(old_up_count, ref_pos_count, n_intervals * sizeof(int));
-
-        /* vreg_map still has old mapping.  Build reverse: old_index → vreg */
-        /* Actually simpler: for each new position i, intervals[i].vreg tells us
-         * which vreg it is.  We can look up the old index via vreg_map. */
-        memset(vreg_map, -1, sizeof(vreg_map));
-        for (int i = 0; i < n_intervals; i++) {
-            int vidx = intervals[i].vreg - IR3_VREG_BASE;
-            if (vidx >= 0 && vidx < MAX_INTERVALS)
-                vreg_map[vidx] = i;
-        }
-
-        /* Now rebuild ref_pos_start/count for new ordering.
-         * We need to find the old index for each interval.  The old index
-         * is no longer stored.  But we can search by vreg in the old vreg_map.
-         * However vreg_map was just overwritten.  Let's take a different approach:
-         * just re-scan the IR to rebuild use positions from scratch. */
-
-        /* Rebuild reference positions with two passes: count, then fill.
-         * Records ALL references (defs and uses) so split decisions cover
-         * every instruction that touches the vreg. */
-        for (int i = 0; i < n_intervals; i++)
-            ref_pos_count[i] = 0;
-
-        /* Pass 1: count references per interval */
-        serial = 0;
-        for (IR3Inst *p = func_head; p != func_end; p = p->next, serial++) {
-            /* rd: def (or use for STORE) — either way, a reference */
-            if (p->rd != IR3_VREG_NONE && p->rd != IR3_VREG_BP
-                && p->rd > IR3_VREG_ACCUM) {
-                int k = vreg_map[p->rd - IR3_VREG_BASE];
-                if (k >= 0) ref_pos_count[k]++;
-            }
-            if (p->rs1 != IR3_VREG_NONE && p->rs1 != IR3_VREG_BP
-                && p->rs1 > IR3_VREG_ACCUM) {
-                int k = vreg_map[p->rs1 - IR3_VREG_BASE];
-                if (k >= 0) ref_pos_count[k]++;
-            }
-            if (p->rs2 != IR3_VREG_NONE && p->rs2 != IR3_VREG_BP
-                && p->rs2 > IR3_VREG_ACCUM) {
-                int k = vreg_map[p->rs2 - IR3_VREG_BASE];
-                if (k >= 0) ref_pos_count[k]++;
-            }
-        }
-
-        /* Assign start positions */
-        n_ref_positions = 0;
-        for (int i = 0; i < n_intervals; i++) {
-            ref_pos_start[i] = n_ref_positions;
-            n_ref_positions += ref_pos_count[i];
-        }
-        if (n_ref_positions > MAX_REF_POS)
-            n_ref_positions = MAX_REF_POS;
-
-        /* Pass 2: fill reference positions with def/use tags */
-        int fill_cursor[MAX_INTERVALS];
-        for (int i = 0; i < n_intervals; i++)
-            fill_cursor[i] = ref_pos_start[i];
-
-        serial = 0;
-        for (IR3Inst *p = func_head; p != func_end; p = p->next, serial++) {
-            /* rd: DEF for most ops; USE for IR3_STORE (base address) */
-            if (p->rd != IR3_VREG_NONE && p->rd != IR3_VREG_BP
-                && p->rd > IR3_VREG_ACCUM) {
-                int k = vreg_map[p->rd - IR3_VREG_BASE];
-                if (k >= 0 && fill_cursor[k] < MAX_REF_POS) {
-                    int pos = fill_cursor[k]++;
-                    ref_positions[pos] = serial;
-                    ref_is_def[pos] = (p->op != IR3_STORE) ? 1 : 0;
-                }
-            }
-            if (p->rs1 != IR3_VREG_NONE && p->rs1 != IR3_VREG_BP
-                && p->rs1 > IR3_VREG_ACCUM) {
-                int k = vreg_map[p->rs1 - IR3_VREG_BASE];
-                if (k >= 0 && fill_cursor[k] < MAX_REF_POS) {
-                    int pos = fill_cursor[k]++;
-                    ref_positions[pos] = serial;
-                    ref_is_def[pos] = 0;
-                }
-            }
-            if (p->rs2 != IR3_VREG_NONE && p->rs2 != IR3_VREG_BP
-                && p->rs2 > IR3_VREG_ACCUM) {
-                int k = vreg_map[p->rs2 - IR3_VREG_BASE];
-                if (k >= 0 && fill_cursor[k] < MAX_REF_POS) {
-                    int pos = fill_cursor[k]++;
-                    ref_positions[pos] = serial;
-                    ref_is_def[pos] = 0;
-                }
-            }
-        }
-
-        /* Deduplicate (same serial can appear multiple times if vreg is
-         * used in multiple operand slots of the same instruction).
-         * If any entry at a serial is a USE, keep it as USE (conservative). */
-        for (int i = 0; i < n_intervals; i++) {
-            int base = ref_pos_start[i];
-            int cnt = fill_cursor[i] - base;
-            if (cnt <= 1) { ref_pos_count[i] = cnt; continue; }
-            int out = 1;
-            for (int j = 1; j < cnt; j++) {
-                if (ref_positions[base + j] != ref_positions[base + out - 1]) {
-                    ref_positions[base + out] = ref_positions[base + j];
-                    ref_is_def[base + out] = ref_is_def[base + j];
-                    out++;
-                } else {
-                    /* Same serial: if either is a use, mark as use */
-                    if (!ref_is_def[base + j])
-                        ref_is_def[base + out - 1] = 0;
-                }
-            }
-            ref_pos_count[i] = out;
-        }
+    /* Rebuild vreg_map after sort.  ref_pos_start/ref_pos_count are fields
+     * inside SplitInterval so they moved with their intervals during qsort —
+     * no IR rescan is needed. */
+    memset(vreg_map, -1, sizeof(vreg_map));
+    for (int i = 0; i < n_intervals; i++) {
+        int vidx = intervals[i].vreg - IR3_VREG_BASE;
+        if (vidx >= 0 && vidx < MAX_INTERVALS)
+            vreg_map[vidx] = i;
     }
 
     /* --- Phase 3: linear scan with splitting --- */
@@ -820,8 +779,8 @@ static void alloc_function(IR3Inst *func_head, IR3Inst *func_end,
      * loop variables that are redefined at the back-edge each iteration. */
     for (int i = 0; i < n_intervals; i++) {
         if (intervals[i].spill_off == -1) continue;
-        int base = ref_pos_start[i];
-        int cnt  = ref_pos_count[i];
+        int base = intervals[i].ref_pos_start;
+        int cnt  = intervals[i].ref_pos_count;
         for (int j = 0; j < cnt; j++) {
             if (!ref_is_def[base + j]) continue;
             int def_ser = ref_positions[base + j];
@@ -833,7 +792,7 @@ static void alloc_function(IR3Inst *func_head, IR3Inst *func_end,
                     break;
                 }
             }
-            if (def_phys < 0) continue;  /* in a gap — no register to store from */
+            if (def_phys < 0) continue;
             int def_line = (def_ser < n_insts) ? serial_to_line[def_ser] : 0;
             record_split_action(0, def_ser, def_phys, intervals[i].spill_off, def_line);
         }
@@ -858,24 +817,43 @@ static void alloc_function(IR3Inst *func_head, IR3Inst *func_end,
      *   JZ _target  →  JNZ _skip; <MOVs>; J _target; _skip:
      * Multiple MOVs are topologically sorted (parallel move problem). */
     {
-        /* Find max label ID for allocating resolution labels */
-        int resolve_label = 0;
-        for (IR3Inst *p = func_head; p != func_end; p = p->next)
-            if (p->op == IR3_LABEL && p->imm >= resolve_label)
-                resolve_label = p->imm + 1;
+        /* Resolution labels for conditional branch inversion blocks are
+         * allocated via new_label() — the same global counter used by
+         * codegen.c — so they are unique across all translation units
+         * and all passes. */
 
         serial = 0;
         IR3Inst *prev_node = NULL;
         for (IR3Inst *p = func_head; p != func_end; ) {
+            /* Only count ORIGINAL instructions (those mapped in serial_to_node).
+             * Phase 4b-inserted MOVs must not increment serial, as that would
+             * cause the serial counter to diverge from Phase 1's numbering and
+             * break segment lookup for later jumps. */
+            int is_original = (serial < n_insts && serial_to_node[serial] == p);
+            if ((p->op == IR3_J || p->op == IR3_JZ || p->op == IR3_JNZ)
+                && is_original) {
+                if (p->imm < 0 || p->imm >= MAX_LABELS) {
+                    fprintf(stderr, "linscan: jump target %d exceeds MAX_LABELS %d\n",
+                            p->imm, MAX_LABELS);
+                    exit(1);
+                }
+            }
+            /* Phase 4b-inserted jumps (skip labels) have IDs from new_label() which
+             * may exceed MAX_LABELS; they won't be in label_serial[], so skip them. */
             if ((p->op == IR3_J || p->op == IR3_JZ || p->op == IR3_JNZ)
                 && p->imm >= 0 && p->imm < MAX_LABELS
                 && label_serial[p->imm] >= 0)
             {
                 int target_serial = label_serial[p->imm];
 
-                /* Collect resolution moves */
+                /* Collect resolution moves and back-edge loads */
                 struct { int dst; int src; } moves[8];
                 int n_moves = 0;
+                /* Back-edge loads: spilled at jump source but expected in reg at target */
+                struct { int dst; int spill_off; } back_loads[8];
+                int n_back_loads = 0;
+
+                int is_back_edge = (target_serial < serial);
 
                 for (int i = 0; i < n_intervals; i++) {
                     int phys_src = -1, phys_dst = -1;
@@ -891,9 +869,26 @@ static void alloc_function(IR3Inst *func_head, IR3Inst *func_end,
                             moves[n_moves].src = phys_src;
                             n_moves++;
                         }
+                    } else if (is_back_edge && phys_src < 0 && phys_dst >= 0
+                               && intervals[i].spill_off != -1) {
+                        /* Back-edge: vreg is spilled at jump but expected in a
+                         * register at the loop header.  Insert a LOAD to reload
+                         * the value (kept current by Phase 3b def-time STOREs). */
+                        if (n_back_loads < 8) {
+                            back_loads[n_back_loads].dst = phys_dst;
+                            back_loads[n_back_loads].spill_off = intervals[i].spill_off;
+                            n_back_loads++;
+                        }
                     }
                     /* No edge stores needed: def-time STOREs ensure spill slots
                      * are always populated from the definition point. */
+                }
+
+                /* Back-edge LOADs: record as split actions so Phase 5b inserts
+                 * them after Phase 5a (using unshifted spill offsets correctly). */
+                for (int i = 0; i < n_back_loads; i++) {
+                    record_split_action(1, serial, back_loads[i].dst,
+                                       back_loads[i].spill_off, p->line);
                 }
 
                 if (n_moves > 0) {
@@ -906,7 +901,7 @@ static void alloc_function(IR3Inst *func_head, IR3Inst *func_end,
 
                     if (is_conditional) {
                         /* Create: <inverse branch> _skip; ... <MOVs> ... J _target; _skip: */
-                        int skip_label = resolve_label++;
+                        int skip_label = new_label();
                         int orig_target = p->imm;
 
                         /* Change the conditional branch to the inverse, targeting skip */
@@ -1010,14 +1005,14 @@ static void alloc_function(IR3Inst *func_head, IR3Inst *func_end,
                         IR3Inst *q = insert_point; /* jmp node */
                         prev_node = q->next; /* lbl node */
                         p = prev_node->next; /* original p->next */
-                        serial++;
+                        if (is_original) serial++;
                         continue;
                     }
                 }
             }
             prev_node = p;
             p = p->next;
-            serial++;
+            if (is_original) serial++;
         }
     }
 

@@ -145,4 +145,8 @@ SSAInst *ir3_lower(IR3Inst *head);
 /* Release IR3Inst list (all nodes heap-allocated). */
 void free_ir3(IR3Inst *head);
 
+/* Dump IR3 list in human-readable SSA notation to f.
+ * Intended for use after call_spill_insert, before linscan_regalloc. */
+void ir3_dump(IR3Inst *head, FILE *f);
+
 #endif /* IR3_H */

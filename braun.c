@@ -86,7 +86,14 @@ static void lvsp_record(int label_id, int vsp_val_)
 {
     if (lvsp_base < 0) lvsp_base = label_id;
     int idx = label_id - lvsp_base;
-    if (idx >= 0 && idx < LABEL_VID_MAX && !lvsp_set[idx]) {
+    /* Negative idx: back-edge to a label already emitted; no fixup needed. */
+    if (idx < 0) return;
+    if (idx >= LABEL_VID_MAX) {
+        fprintf(stderr, "braun: label ID span %d (base %d, id %d) exceeds LABEL_VID_MAX %d\n",
+                idx, lvsp_base, label_id, LABEL_VID_MAX);
+        exit(1);
+    }
+    if (!lvsp_set[idx]) {
         lvsp_val[idx] = vsp_val_;
         lvsp_set[idx] = true;
     }
@@ -393,6 +400,7 @@ static IR3Inst *emit_phi_at(int bb_id, int phi_vreg)
     IR3Inst *phi = new_ir3(IR3_PHI);
     phi->rd = phi_vreg;
     phi->n_phi_ops = 0;
+    phi->imm = bb_id;  /* owner block — used by deconstructPhis */
 
     /* Register in map */
     int idx = phi_vreg - IR3_VREG_BASE;
@@ -550,6 +558,11 @@ static int readVariableRecursive(int bb_id, int var_slot)
             }
         }
         if (phi && phi->op == IR3_PHI) {
+            if (bb->n_preds > BB_MAX_PREDS) {
+                fprintf(stderr, "braun: block %d has %d predecessors, exceeds BB_MAX_PREDS %d\n",
+                        bb_id, bb->n_preds, BB_MAX_PREDS);
+                exit(1);
+            }
             phi->n_phi_ops = bb->n_preds;
             for (int i = 0; i < bb->n_preds; i++)
                 phi->phi_ops[i] = readVariable(bb->preds[i], var_slot);
@@ -600,6 +613,11 @@ static void sealBlock(int bb_id)
             }
         }
         if (phi && phi->op == IR3_PHI) {
+            if (bb->n_preds > BB_MAX_PREDS) {
+                fprintf(stderr, "braun: block %d has %d predecessors, exceeds BB_MAX_PREDS %d\n",
+                        bb_id, bb->n_preds, BB_MAX_PREDS);
+                exit(1);
+            }
             phi->n_phi_ops = bb->n_preds;
             for (int i = 0; i < bb->n_preds; i++)
                 phi->phi_ops[i] = readVariable(bb->preds[i], ip->var_slot);
@@ -1121,72 +1139,110 @@ static void insert_phi_copy(int pred_id, int dst, int src, int line)
 
 static void deconstructPhis(BB *blocks, int n_blocks)
 {
-    /* Scan all phi nodes in phi_node_map */
+    /* Pass 1: collect all (pred, dst, src) copy pairs and mark phis dead.
+     * Using phi->imm as the owner bb_id (stored by emit_phi_at). */
+#define MAX_PHI_COPIES 512
+    typedef struct { int pred; int dst; int src; int line; } PhiCopyRec;
+    static PhiCopyRec all_copies[MAX_PHI_COPIES];
+    int n_all = 0;
+
     for (int i = 0; i < PHI_MAP_SIZE; i++) {
         IR3Inst *phi = phi_node_map[i];
         if (!phi || phi->op != IR3_PHI) continue;
-        if (phi->rd == IR3_VREG_NONE) continue;  /* already trivially eliminated */
+        if (phi->rd == IR3_VREG_NONE) continue;
 
-        int dst = phi->rd;
-        int line = phi->line;
+        int dst      = phi->rd;
+        int owner_bb = phi->imm;  /* set by emit_phi_at (Change 1) */
+        int line     = phi->line;
 
-        /* Find which block this phi belongs to — search by matching phi_insert_point */
-        /* We can find the block by finding which BB has this phi in its phi chain.
-         * Simpler: since n_phi_ops == n_preds for the block, use the bb_id stored
-         * in the IncPhi list or search blocks. */
-        /* Actually, we need to know the BB that owns this phi. Walk all blocks. */
-        int owner_bb = -1;
-        for (int b = 0; b < n_blocks && owner_bb < 0; b++) {
-            /* The phi's block is the one whose phi_insert_point chain contains it.
-             * Alternative: track bb_id in the phi node itself. */
-            /* We don't have a direct mapping. Search phi_insert_point chain per block. */
-            /* phi_insert_point[b] is the last phi inserted for block b.
-             * Walk backwards from phi_insert_point[b] until we find this phi or a label. */
-            /* Too expensive. Instead, use n_phi_ops == blocks[b].n_preds heuristic
-             * combined with checking phi_node_map registration. */
-            /* Simplest approach: store bb_id in phi->imm during emit_phi_at */
-            /* We actually stored it in n_phi_ops = bb->n_preds at fill time.
-             * Use: which block has n_preds == phi->n_phi_ops? Multiple could match. */
-            /* BEST: just scan for it in block's IR3 region via phi_insert_point */
-            (void)b;
-        }
-
-        /* Alternative: walk the entire IR3 list to find which LABEL/SYMLABEL precedes
-         * this phi node. This works because phi nodes are inserted right after the
-         * block's label node. */
-        /* Walk the IR3 list (scoped to current function) */
-        int cur_bb = -1;
-        for (IR3Inst *q = func_ir3_start; q; q = q->next) {
-            if (q->op == IR3_SYMLABEL) {
-                cur_bb = 0;
-            } else if (q->op == IR3_LABEL) {
-                /* Find the block with this label */
-                int lbl = q->imm;
-                for (int b = 0; b < n_blocks; b++) {
-                    if (blocks[b].label_id == lbl) { cur_bb = b; break; }
-                }
-            } else if (q == phi) {
-                owner_bb = cur_bb;
-                break;
+        /* Fallback: scan IR if owner not recorded (shouldn't happen) */
+        if (owner_bb < 0 || owner_bb >= n_blocks) {
+            owner_bb = -1;
+            int cur = -1;
+            for (IR3Inst *q = func_ir3_start; q; q = q->next) {
+                if (q->op == IR3_SYMLABEL) { cur = 0; }
+                else if (q->op == IR3_LABEL) {
+                    int lbl = q->imm;
+                    for (int b = 0; b < n_blocks; b++)
+                        if (blocks[b].label_id == lbl) { cur = b; break; }
+                } else if (q == phi) { owner_bb = cur; break; }
             }
         }
 
-        if (owner_bb < 0) continue;  /* can't find owner; skip */
+        /* Mark phi dead before collecting copies */
+        phi->op  = IR3_MOV;
+        phi->rd  = IR3_VREG_NONE;
+        phi->rs1 = IR3_VREG_NONE;
+        phi_node_map[i] = NULL;
+
+        if (owner_bb < 0 || owner_bb >= n_blocks) continue;
 
         BB *bb = &blocks[owner_bb];
-        /* Insert copies at each predecessor */
         for (int pi = 0; pi < bb->n_preds && pi < phi->n_phi_ops; pi++) {
             int pred = bb->preds[pi];
             int src  = phi->phi_ops[pi];
-            if (src == IR3_VREG_NONE) continue;
-            insert_phi_copy(pred, dst, src, line);
+            if (src == IR3_VREG_NONE || dst == src) continue;
+            if (n_all < MAX_PHI_COPIES) {
+                all_copies[n_all].pred = pred;
+                all_copies[n_all].dst  = dst;
+                all_copies[n_all].src  = src;
+                all_copies[n_all].line = line;
+                n_all++;
+            }
         }
+    }
 
-        /* Mark phi dead */
-        phi->op = IR3_MOV;
-        phi->rd = IR3_VREG_NONE;
-        phi->rs1 = IR3_VREG_NONE;
-        phi_node_map[i] = NULL;
+    /* Pass 2: for each predecessor block P, sequentialize its copy set
+     * (topological sort + temp-vreg cycle breaking) then insert. */
+    for (int p = 0; p < n_blocks; p++) {
+        /* Gather copies sourced from predecessor p */
+        int n_cps = 0;
+        int cps_dst[MAX_PHI_COPIES], cps_src[MAX_PHI_COPIES], cps_line[MAX_PHI_COPIES];
+        for (int i = 0; i < n_all; i++) {
+            if (all_copies[i].pred == p) {
+                cps_dst[n_cps]  = all_copies[i].dst;
+                cps_src[n_cps]  = all_copies[i].src;
+                cps_line[n_cps] = all_copies[i].line;
+                n_cps++;
+            }
+        }
+        if (n_cps == 0) continue;
+
+        /* Sequentialize: emit copies whose dst is not another undone copy's src.
+         * On cycle: save the cycle-entry dst to a fresh vreg and redirect readers. */
+        int done[MAX_PHI_COPIES];
+        memset(done, 0, n_cps * sizeof(int));
+        int emitted = 0;
+
+        while (emitted < n_cps) {
+            int progress = 0;
+            for (int i = 0; i < n_cps; i++) {
+                if (done[i]) continue;
+                int blocked = 0;
+                for (int j = 0; j < n_cps; j++) {
+                    if (!done[j] && j != i && cps_src[j] == cps_dst[i]) {
+                        blocked = 1; break;
+                    }
+                }
+                if (!blocked) {
+                    insert_phi_copy(p, cps_dst[i], cps_src[i], cps_line[i]);
+                    done[i] = 1; emitted++; progress = 1;
+                }
+            }
+            if (!progress) {
+                /* Cycle: save first undone copy's dst in a temp vreg,
+                 * redirect every undone copy that reads that dst to read tmp. */
+                int i;
+                for (i = 0; i < n_cps; i++) if (!done[i]) break;
+                int tmp = ir3_new_vreg();
+                insert_phi_copy(p, tmp, cps_dst[i], cps_line[i]);
+                for (int j = 0; j < n_cps; j++) {
+                    if (!done[j] && cps_src[j] == cps_dst[i])
+                        cps_src[j] = tmp;
+                }
+                /* cps[i] is now unblocked on the next iteration */
+            }
+        }
     }
 }
 
@@ -1294,7 +1350,7 @@ static void process_function(IRInst *sym_node)
      * Non-leaf functions: promote up to MAX_PROMO_NONLEAF distinct variables.
      * call_spill_insert handles save/restore around calls for promoted vars.
      */
-    #define MAX_PROMO_NONLEAF 4
+    #define MAX_PROMO_NONLEAF 8
     bool func_has_calls_scan = false;
     int n_promo_vars = 0;
     int promo_offsets[64];
