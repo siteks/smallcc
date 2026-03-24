@@ -424,16 +424,16 @@ static void build_interference(IR3Inst *func_head, IR3Inst *func_end)
 
             /* Special: CALL/CALLR — force interference of live vregs with r0-r7 */
             if (p->op == IR3_CALL || p->op == IR3_CALLR) {
-                /* Any virtual node in live must interfere with r1-r7
-                 * (the call clobbers all caller-saved regs).
-                 * r0 is handled normally below as the call's def. */
-                for (int r = 1; r < IRC_PHYS; r++) {
+                /* All physical regs (r0-r7) are clobbered by the call.
+                 * r0 is the return value; r1-r7 are caller-saved scratch.
+                 * Must include r0 to prevent coalescing a live vreg into r0
+                 * (which would be overwritten by the call's return value). */
+                for (int r = 0; r < IRC_PHYS; r++) {
                     for (int t = bs_next(live, -1); t >= 0; t = bs_next(live, t))
                         add_irc_edge(r, t);
                 }
-                /* Remove r1-r7 from live (they're "defined" / clobbered) */
-                for (int r = 1; r < IRC_PHYS; r++) bs_clr(live, r);
-                /* Fall through to handle r0 as a normal def below */
+                /* Remove r0-r7 from live (all clobbered) */
+                for (int r = 0; r < IRC_PHYS; r++) bs_clr(live, r);
             }
 
             /* For MOV d ← s: record as coalescing candidate, don't add (d,s) edge */

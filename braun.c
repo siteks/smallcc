@@ -1164,8 +1164,28 @@ static void split_critical_edges(BB **blocks_ptr, int *n_blocks_ptr)
             IR3Inst *term = block_pretail[pred] ? block_pretail[pred]->next
                                                  : block_last_ir3[pred];
             if (term && (term->op == IR3_JZ || term->op == IR3_JNZ)
-                     && term->imm == blocks[succ].label_id)
+                     && term->imm == blocks[succ].label_id) {
                 term->imm = lbl_new;
+            } else {
+                /* It's a fall-through edge: the conditional branches to the
+                 * OTHER successor, and execution falls through into succ.
+                 * Insert an explicit J to the landing pad immediately after
+                 * the conditional branch so the fall-through is intercepted. */
+                IR3Inst *j_fall = new_ir3(IR3_J);
+                j_fall->imm = lbl_new;
+
+                IR3Inst *after_this = block_last_ir3[pred];
+                j_fall->next = after_this->next;
+                after_this->next = j_fall;
+                if (ir3_tail == &after_this->next) {
+                    ir3_tail = &j_fall->next;
+                    ir3_last = j_fall;
+                }
+
+                /* Update trackers so deconstructPhis sees the correct tail. */
+                block_pretail[pred] = after_this;
+                block_last_ir3[pred] = j_fall;
+            }
 
             /* Append the landing pad at the END of the function's IR3 list:
              *
