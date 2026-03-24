@@ -369,6 +369,10 @@ static void compute_liveness(IR3Inst *func_head, IR3Inst *func_end)
             /* Defs */
             if (p->rd != IR3_VREG_NONE && p->rd != IR3_VREG_BP && p->op != IR3_STORE)
                 note_def(g_kill[i], p->rd);
+            /* Implicit use of r0 by CALLR (function pointer), RET (return value),
+             * PUTCHAR (char in r0) — not captured by rs1/rs2 fields */
+            if (p->op == IR3_CALLR || p->op == IR3_RET || p->op == IR3_PUTCHAR)
+                note_use(g_gen[i], g_kill[i], IR3_VREG_ACCUM);
             /* CALL/CALLR kills all physical regs (caller-saved ABI) */
             if (p->op == IR3_CALL || p->op == IR3_CALLR)
                 for (int r = 0; r < IRC_PHYS; r++)
@@ -421,6 +425,12 @@ static void build_interference(IR3Inst *func_head, IR3Inst *func_end)
 
         for (int k = n_insts - 1; k >= 0; k--) {
             IR3Inst *p = g_rev[k];
+
+            /* Implicit use of r0 by CALLR (function pointer), RET (return value),
+             * PUTCHAR (char in r0). Adding r0 to live here ensures that any vreg
+             * assigned to r0 interferes with other vregs live at these points. */
+            if (p->op == IR3_CALLR || p->op == IR3_RET || p->op == IR3_PUTCHAR)
+                bs_set(live, 0);  /* node 0 = r0 = ACCUM */
 
             /* Special: CALL/CALLR — force interference of live vregs with r0-r7 */
             if (p->op == IR3_CALL || p->op == IR3_CALLR) {

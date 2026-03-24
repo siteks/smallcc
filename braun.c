@@ -28,16 +28,17 @@ extern int new_label(void);
  * ================================================================ */
 #define MAX_VDEPTH 8
 
-static int vs_reg[MAX_VDEPTH];    /* fresh vreg at each depth slot   */
-static int vs_size[MAX_VDEPTH];   /* push size in bytes (2 or 4)     */
-static int vs_depth;              /* current virtual stack depth      */
-static int vsp;                   /* running (sp - bp) byte offset    */
+static int vs_size[MAX_VDEPTH];   /* push size in bytes (2 or 4) for each active depth */
+static int vs_depth;              /* current virtual stack depth */
+static int vsp;                   /* running (sp - bp) byte offset */
 
 /* ================================================================
  * Promotion slot helpers
  * ================================================================ */
 #define PROMOTE_BASE  128
-#define PROMOTE_SLOTS 256   /* bp offsets -128..+127 */
+#define PROMOTE_SLOTS 256                        /* bp offsets -128..+127 */
+#define VSTACK_BASE   PROMOTE_SLOTS              /* virtual stack slots start here */
+#define TOTAL_SLOTS   (PROMOTE_SLOTS + MAX_VDEPTH) /* promoted vars + vstack */
 
 static bool promote_slot(int offset)
 {
@@ -117,17 +118,6 @@ static void lvsp_apply(int label_id)
 static struct { int offset; int size; int vreg; } param_seeds[MAX_PARAM_SEEDS];
 static int n_param_seeds;
 
-/* ================================================================
- * Post-call restore state (spill outer expression temps across calls)
- * ================================================================ */
-static int spill_off[MAX_VDEPTH];
-static int spill_sz[MAX_VDEPTH];
-static int spill_vreg[MAX_VDEPTH];   /* original vreg (for promo dummies) */
-static int spill_is_promo[MAX_VDEPTH]; /* 1 = promoted-address dummy, skip spill/reload */
-static int spill_count;
-static int spill_total_bytes;
-static int await_post_call_adj;
-
 static bool func_can_promote;        /* true if promotion is enabled for current function */
 
 /* ================================================================
@@ -171,15 +161,21 @@ static IR3Inst *insert_after(IR3Inst *after, IR3Op op)
     return s;
 }
 
+/* Forward declarations needed by flush_for_call_n */
+static int readVariable(int bb_id, int var_slot);
+static int current_bb_id;
+
 /* ================================================================
- * flush_for_call_n — spill outer expression temps to stack before call
+ * flush_for_call_n — push argument vregs onto the machine stack before a call.
+ *
+ * Outer expression temporaries (at depths 0..first_arg-1) are NOT spilled
+ * to memory here.  Their vregs remain live across the call in the Braun SSA
+ * representation; IRC will assign physical registers and spill them if needed.
+ * After flush, vs_depth is set to first_arg so that the outer temps remain
+ * accessible via readVariable(current_bb_id, VSTACK_BASE + k).
  * ================================================================ */
 static void flush_for_call_n(int arg_bytes, int line)
 {
-    spill_count       = 0;
-    spill_total_bytes = 0;
-    await_post_call_adj = 0;
-
     if (vs_depth == 0) return;
 
     int n_args  = 0;
@@ -190,44 +186,6 @@ static void flush_for_call_n(int arg_bytes, int line)
     }
     int first_arg = vs_depth - n_args;
 
-    if (first_arg > 0) {
-        int outer_bytes = 0;
-        for (int k = 0; k < first_arg; k++) {
-            if (vlo_get(vs_reg[k]) != 0) continue; /* promo dummy: no memory needed */
-            outer_bytes += vs_size[k];
-        }
-
-        if (outer_bytes > 0) {
-            IR3Inst *adj = emit_ir3(IR3_ADJ);
-            adj->imm  = -outer_bytes;
-            adj->line = line;
-            vsp -= outer_bytes;
-        }
-
-        int boff = vsp;
-        for (int k = 0; k < first_arg; k++) {
-            int is_promo_dummy = (vlo_get(vs_reg[k]) != 0);
-            spill_is_promo[spill_count] = is_promo_dummy;
-            spill_vreg[spill_count]     = vs_reg[k];
-            if (!is_promo_dummy) {
-                IR3Inst *st = emit_ir3(IR3_STORE);
-                st->rd   = IR3_VREG_BP;
-                st->rs1  = vs_reg[k];
-                st->imm  = boff;
-                st->size = vs_size[k];
-                st->line = line;
-                spill_off[spill_count] = boff;
-                boff += vs_size[k];
-            } else {
-                spill_off[spill_count] = 0; /* unused */
-            }
-            spill_sz [spill_count] = vs_size[k];
-            spill_count++;
-        }
-        spill_total_bytes   = outer_bytes;
-        await_post_call_adj = 1;
-    }
-
     if (arg_sum > 0) {
         IR3Inst *adj = emit_ir3(IR3_ADJ);
         adj->imm  = -arg_sum;
@@ -236,9 +194,10 @@ static void flush_for_call_n(int arg_bytes, int line)
 
         int boff = vsp;
         for (int k = vs_depth - 1; k >= first_arg; k--) {
+            int vreg = readVariable(current_bb_id, VSTACK_BASE + k);
             IR3Inst *st = emit_ir3(IR3_STORE);
             st->rd   = IR3_VREG_BP;
-            st->rs1  = vs_reg[k];
+            st->rs1  = vreg;
             st->imm  = boff;
             st->size = vs_size[k];
             st->line = line;
@@ -246,40 +205,9 @@ static void flush_for_call_n(int arg_bytes, int line)
         }
     }
 
-    vs_depth = 0;
-}
-
-static void restore_outer_temps(int line)
-{
-    if (spill_count == 0) return;
-    for (int k = 0; k < spill_count; k++) {
-        if (spill_is_promo[k]) {
-            /* Promoted-address dummy: no memory spill happened.
-             * Preserve the original vreg and its vlo mapping. */
-            vs_reg[k]  = spill_vreg[k];
-            vs_size[k] = spill_sz[k];
-        } else {
-            int fresh = ir3_new_vreg();
-            IR3Inst *ld = emit_ir3(IR3_LOAD);
-            ld->rd   = fresh;
-            ld->rs1  = IR3_VREG_BP;
-            ld->imm  = spill_off[k];
-            ld->size = spill_sz[k];
-            ld->line = line;
-            vs_reg[k]  = fresh;
-            vs_size[k] = spill_sz[k];
-        }
-    }
-    if (spill_total_bytes > 0) {
-        IR3Inst *adj2 = emit_ir3(IR3_ADJ);
-        adj2->imm  = spill_total_bytes;
-        adj2->line = line;
-        vsp += spill_total_bytes;
-    }
-
-    vs_depth          = spill_count;
-    spill_count       = 0;
-    spill_total_bytes = 0;
+    /* Outer temps (0..first_arg-1) remain in SSA vregs — IRC handles live ranges.
+     * Lower vs_depth to first_arg; outer slots still readable via readVariable. */
+    vs_depth = first_arg;
 }
 
 /* ================================================================
@@ -288,8 +216,10 @@ static void restore_outer_temps(int line)
 #define MAX_BLOCKS 512
 #define PHI_MAP_SIZE 8192
 
-/* Per-block current definition: block_def[bb_id][slot] = vreg or IR3_VREG_NONE */
-static int block_def[MAX_BLOCKS][PROMOTE_SLOTS];
+/* Per-block current definition: block_def[bb_id][slot] = vreg or IR3_VREG_NONE.
+ * Slots 0..PROMOTE_SLOTS-1: promoted variable SSA defs (indexed by bp_offset + PROMOTE_BASE).
+ * Slots VSTACK_BASE..TOTAL_SLOTS-1: virtual expression stack SSA defs (indexed by depth). */
+static int block_def[MAX_BLOCKS][TOTAL_SLOTS];
 
 
 /* Phi node lookup: phi_node_map[vreg - IR3_VREG_BASE] = IR3Inst* or NULL */
@@ -310,9 +240,6 @@ static IR3Inst *block_last_ir3[MAX_BLOCKS];
 
 /* Last IR3 node before the terminator for each block (for phi deconstruction) */
 static IR3Inst *block_pretail[MAX_BLOCKS];
-
-/* Current block being translated */
-static int current_bb_id;
 
 /* Incomplete phis for unsealed blocks */
 typedef struct IncPhi {
@@ -339,7 +266,6 @@ static bool rpo_visited[MAX_BLOCKS];
  * Braun SSA helpers
  * ================================================================ */
 
-static int readVariable(int bb_id, int var_slot);
 static int readVariableRecursive(int bb_id, int var_slot);
 static void sealBlock(int bb_id);
 
@@ -468,9 +394,9 @@ static int tryRemoveTrivialPhi(int phi_vreg)
                 if (pp->phi_ops[j] == phi_vreg) pp->phi_ops[j] = unique;
         }
     }
-    /* Replace in block_def */
+    /* Replace in block_def (covers both promoted-var slots and vstack slots) */
     for (int b = 0; b < cur_n_blocks; b++)
-        for (int s = 0; s < PROMOTE_SLOTS; s++)
+        for (int s = 0; s < TOTAL_SLOTS; s++)
             if (block_def[b][s] == phi_vreg) block_def[b][s] = unique;
 
     /* Replace all uses of phi_vreg in already-emitted IR3 instructions.
@@ -853,7 +779,7 @@ static void translate_bb(BB *bb, int bb_id)
             /* accum_offset preserved through PUSH */
             if (vs_depth >= MAX_VDEPTH)
                 fprintf(stderr, "braun: virtual stack overflow at depth %d\n", vs_depth);
-            vs_reg[vs_depth]  = fresh;
+            writeVariable(current_bb_id, VSTACK_BASE + vs_depth, fresh);
             vs_size[vs_depth] = sz;
             vs_depth++;
             break;
@@ -864,7 +790,7 @@ static void translate_bb(BB *bb, int bb_id)
                 vs_depth--;
                 s = emit_ir3(IR3_MOV);
                 s->rd   = IR3_VREG_ACCUM;
-                s->rs1  = vs_reg[vs_depth];
+                s->rs1  = readVariable(current_bb_id, VSTACK_BASE + vs_depth);
                 s->line = p->line;
                 local_accum_offset = 0;
             }
@@ -874,7 +800,7 @@ static void translate_bb(BB *bb, int bb_id)
             if (vs_depth > 0) {
                 int sz = (p->op == IR_SW) ? 2 : (p->op == IR_SB) ? 1 : 4;
                 vs_depth--;
-                int addr_vreg = vs_reg[vs_depth];
+                int addr_vreg = readVariable(current_bb_id, VSTACK_BASE + vs_depth);
                 int N = vlo_get(addr_vreg);
 
                 if (N != 0 && promote_slot(N)) {
@@ -915,7 +841,7 @@ static void translate_bb(BB *bb, int bb_id)
                 s = emit_ir3(IR3_ALU);
                 s->alu_op = p->op;
                 s->rd     = IR3_VREG_ACCUM;
-                s->rs1    = vs_reg[vs_depth];
+                s->rs1    = readVariable(current_bb_id, VSTACK_BASE + vs_depth);
                 s->rs2    = IR3_VREG_ACCUM;
                 s->line   = p->line;
                 local_accum_offset = 0;
@@ -968,11 +894,6 @@ static void translate_bb(BB *bb, int bb_id)
             s->line = p->line;
 
             local_accum_offset = 0;
-
-            if (arg_bytes == 0 && spill_count > 0) {
-                await_post_call_adj = 0;
-                restore_outer_temps(p->line);
-            }
             break;
         }
 
@@ -1002,10 +923,6 @@ static void translate_bb(BB *bb, int bb_id)
             s = emit_ir3(IR3_ADJ);
             s->imm  = p->operand;
             s->line = p->line;
-            if (await_post_call_adj && p->operand > 0 && spill_count > 0) {
-                await_post_call_adj = 0;
-                restore_outer_temps(p->line);
-            }
             break;
 
         case IR_RET:
@@ -1422,7 +1339,6 @@ static void process_function(IRInst *sym_node)
 {
     /* Reset per-function state */
     vs_depth = 0; vsp = 0;
-    spill_count = 0; spill_total_bytes = 0; await_post_call_adj = 0;
     lvsp_reset();
     reset_braun_state();
     ir3_reset();  /* reset vreg counter per function */
@@ -1612,9 +1528,6 @@ IR3Inst *braun_ssa(BB *blocks_ignored, int n_blocks_ignored, IRInst *ir_head)
     ir3_last = NULL;
     vs_depth = 0;
     vsp = 0;
-    spill_count = 0;
-    spill_total_bytes = 0;
-    await_post_call_adj = 0;
     lvsp_reset();
     reset_braun_state();
 
