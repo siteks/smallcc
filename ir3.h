@@ -13,7 +13,7 @@
  *   IR3_VREG_BP    (-2)  — bp-relative addressing (LOAD/STORE only)
  *   IR3_VREG_ACCUM (100) — the accumulator; always mapped to physical r0
  *   101, 102, …          — fresh scratch vregs allocated by ir3_new_vreg()
- *   0 – 7                — physical registers (only after linscan_regalloc())
+ *   0 – 7                — physical registers (only after irc_regalloc())
  */
 
 #include "smallcc.h"
@@ -45,7 +45,7 @@ typedef enum {
     IR3_JNZ,      /* jump if r0 != 0; imm = label id                        */
     IR3_ENTER,    /* enter N                                                 */
     IR3_ADJ,      /* sp += imm                                               */
-    IR3_PHI,      /* rd = phi(phi_ops[0..n_phi_ops-1]); eliminated before linscan */
+    IR3_PHI,      /* rd = phi(phi_ops[0..n_phi_ops-1]); eliminated before irc_regalloc */
     /* Data-section / label pass-throughs (no virtual regs involved): */
     IR3_SYMLABEL, /* named label (function entry or data label)             */
     IR3_LABEL,    /* numeric label                                           */
@@ -93,22 +93,6 @@ typedef struct BB {
 extern const char ir_promote_sentinel[];
 
 /* ----------------------------------------------------------------
- * Promoted-variable vreg metadata (populated by braun_ssa, consumed
- * by call_spill_insert).  Maps each vreg that defines a promoted
- * variable to its bp-relative offset and access size.
- * ---------------------------------------------------------------- */
-typedef struct {
-    int vreg;       /* virtual register ID (>= IR3_VREG_BASE+1) */
-    int bp_offset;  /* bp-relative byte offset of the stack slot */
-    int size;       /* access size: 1, 2, or 4 bytes */
-    const char *func_sym;  /* function name (for disambiguation — vreg IDs restart per function) */
-} PromoVregInfo;
-
-#define MAX_PROMO_VREG_INFO 4096
-extern PromoVregInfo promo_vreg_info[];
-extern int n_promo_vreg_info;
-
-/* ----------------------------------------------------------------
  * API
  * ---------------------------------------------------------------- */
 
@@ -127,17 +111,14 @@ void free_cfg(BB *blocks, int n_blocks);
 IR3Inst *braun_ssa(BB *blocks, int n_blocks, IRInst *ir_head);
 
 /* IR3-level optimizations: copy prop, constant prop/fold, DCE.
- * Runs after braun_ssa() and before linscan_regalloc().
+ * Runs after braun_ssa() and before irc_regalloc().
  * opt_level: 0 = skip, >= 1 = run all passes. */
 void ir3_optimize(IR3Inst *head, int opt_level);
 
-/* Insert STORE/LOAD pairs around call sites for vregs live across calls.
- * Runs after ir3_optimize() and before linscan_regalloc(). */
-void call_spill_insert(IR3Inst *head);
-
-/* Linear-scan register allocator: rewrites virtual vregs (>= IR3_VREG_BASE)
- * to physical registers 0-7 in place.  Also rewrites IR3_VREG_ACCUM → 0. */
-void linscan_regalloc(IR3Inst *head);
+/* Iterated Register Coalescing allocator (Appel & George 1996).
+ * Rewrites virtual vregs (>= IR3_VREG_BASE) to physical r0-r7 in place.
+ * Handles call-site spilling and coalescing of phi-generated moves. */
+void irc_regalloc(IR3Inst *head);
 
 /* Lower IR3Inst list to SSAInst for risc_backend_emit(). */
 SSAInst *ir3_lower(IR3Inst *head);
@@ -146,7 +127,7 @@ SSAInst *ir3_lower(IR3Inst *head);
 void free_ir3(IR3Inst *head);
 
 /* Dump IR3 list in human-readable SSA notation to f.
- * Intended for use after call_spill_insert, before linscan_regalloc. */
+ * Intended for use after ir3_optimize, before irc_regalloc. */
 void ir3_dump(IR3Inst *head, FILE *f);
 
 #endif /* IR3_H */

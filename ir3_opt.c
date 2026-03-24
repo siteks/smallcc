@@ -1,6 +1,6 @@
 /* ir3_opt.c — IR3-level optimizations for the CPU4 backend.
  *
- * Runs after braun_ssa() and before linscan_regalloc().
+ * Runs after braun_ssa() and before irc_regalloc().
  * Three passes per function, iterated until stable:
  *   1. Copy propagation   — eliminates MOV chains between fresh vregs
  *   2. Constant prop/fold — folds ALU ops with known-constant operands
@@ -11,11 +11,9 @@
  * const_prop_fold tracks "accum_cval" similarly for constants.
  *
  * CALL/CALLR invalidate ACCUM tracking (return value overwrites r0) and
- * also reset fresh vreg copy/const maps.  While IR3 vregs are virtual,
- * propagation across calls can extend non-promoted vreg live ranges past
- * call sites where call_spill_insert cannot save/restore them (no stack
- * slot metadata).  Promoted vregs that genuinely span calls are handled
- * by call_spill_insert (STORE/LOAD around calls).
+ * also reset fresh vreg copy/const maps.  Propagation across calls can
+ * extend non-promoted vreg live ranges past call sites; irc_regalloc
+ * handles spilling for any vreg whose live range spans a call.
  */
 
 #include <stdlib.h>
@@ -205,11 +203,8 @@ static bool copy_propagate(IR3Inst *start, IR3Inst *end)
             accum_copy = -1;
 
         /* CALL/CALLR clobber ACCUM (return value overwrites r0).
-         * Also reset fresh vreg copy maps — while IR3 vregs are virtual,
-         * copy propagation across calls can extend non-promoted vreg live
-         * ranges past call sites, causing them to need spill slots that
-         * call_spill_insert cannot provide (no promo_vreg_info entry).
-         * Promoted vregs that span calls are handled by call_spill_insert. */
+         * Also reset fresh vreg copy maps to prevent extending live ranges
+         * across calls unnecessarily; irc_regalloc will spill as needed. */
         if (p->op == IR3_CALL || p->op == IR3_CALLR) {
             accum_copy = -1;
             memset(copy_of, -1, sizeof(copy_of));
@@ -571,7 +566,7 @@ static bool dce(IR3Inst *start, IR3Inst *end)
  *          CONST v_zero, 0
  *          ALU rd, rd, v_zero, IR_EQ   (negate result)
  *
- * This must run after optimization but before linscan, so the fresh
+ * This must run after optimization but before irc_regalloc, so the fresh
  * vreg gets a proper register allocation.  risc_backend's expansion
  * (which reuses rs1 as the temp) remains as a fallback for -O0.
  * ---------------------------------------------------------------- */

@@ -198,7 +198,9 @@ static void collect_labels(Node *node)
 //  push
 //  
 //--------------------------------------------------------------------------------
-int new_label() { return codegen_ctx.label_counter++; }
+int new_label() {
+    return codegen_ctx.label_counter++;
+}
 
 
 void gen_zeros(int bytes)

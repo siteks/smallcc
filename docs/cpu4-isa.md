@@ -9,8 +9,7 @@ A custom 32-bit RISC-like machine with a dense variable-width encoding. Simulate
 |---|---|---|
 | `r0`–`r7` | 32-bit | General-purpose; r0 is the return value and implicit operand for some F0/F3a ops |
 | `r0` | 32-bit | Accumulator and function return value |
-| `r1`–`r6` | 32-bit | Scratch (caller-saved) |
-| `r7` | 32-bit | Scratch (caller-saved); reserved as spill scratch by the register allocator |
+| `r1`–`r7` | 32-bit | Scratch (caller-saved); all available for register allocation |
 | `bp` | 16-bit | Frame pointer |
 | `sp` | 16-bit | Stack pointer (grows downward) |
 | `lr` | 16-bit | Link register (return address) |

@@ -114,10 +114,9 @@ Every phase prints debug information to stderr. `-stats` prints per-TU and total
 | `codegen.c` | AST walk; builds flat IR instruction list (`gen_ir`); `reset_codegen`; static label mangling; `mark_basic_blocks` |
 | `optimise.c` | Peephole optimiser (`peephole`); rules 1–9; constant folding, dead branch elim, store/reload elim |
 | `backend.c` | IR → assembly emission (`backend_emit_asm`); `set_asm_out`; `-ann` annotation mode; retargeting point |
-| `braun.c` | Braun SSA construction — stack IR → `IR3Inst` with fresh vregs; phi placement; SSA promotion (leaf functions unconditionally, non-leaf with ≤4 promotable vars); phi forwarding table; vreg→slot metadata export for `call_spill.c` |
-| `call_spill.c` | Liveness-driven call spill insertion — inserts STORE/LOAD around calls for promoted vregs live across each call; bp_offset deduplication; runs after `ir3_optimize`, before `linscan_regalloc` |
-| `ir3.c` / `ir3.h` | IR3 infrastructure — `IR3Inst`/`IR3Op` definitions; `build_cfg`; `ir3_new_vreg`; `PromoVregInfo` struct and table |
-| `linscan.c` | Linear-scan register allocation (Poletto/Sarkar) — vregs → physical r0–r6; spilling via r7 |
+| `braun.c` | Braun SSA construction — stack IR → `IR3Inst` with fresh vregs; phi placement; SSA promotion (leaf functions unconditionally, non-leaf with ≤8 promotable vars); phi forwarding table |
+| `irc.c` | Iterated Register Coalescing (Appel & George 1996) — graph-coloring allocator; vregs → physical r0–r7; coalesces phi-generated moves; forces call-site spills via interference edges; spill rewriting with frame expansion |
+| `ir3.c` / `ir3.h` | IR3 infrastructure — `IR3Inst`/`IR3Op` definitions; `build_cfg`; `ir3_new_vreg` |
 | `ir3_lower.c` | IR3 → SSA lowering — near-1:1 `IR3Inst` → `SSAInst` for `risc_backend_emit` |
 | `risc_backend.c` | CPU4 emitter — `SSAInst` → CPU4 assembly; F2 bp-relative selection; all comparisons single-instruction (le/ge via assembler pseudo-ops) |
 | `sim_c.c` | Primary simulator — self-contained C assembler + CPU3/CPU4 executor; `make sim_c` |

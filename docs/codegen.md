@@ -14,8 +14,7 @@ backend_emit_asm()    [backend.c]    stack IR → CPU3 assembly
 ── CPU4 ──────────────────────────────────────────────────────────────────────
 braun_ssa()           [braun.c]       stack IR → IR3Inst (fresh vregs)
 ir3_optimize()        [ir3_opt.c]     copy prop, const prop/fold, DCE
-call_spill_insert()   [call_spill.c]  STORE/LOAD around calls for live promoted vregs
-linscan_regalloc()    [linscan.c]     vregs → physical r0–r7 (linear-scan)
+irc_regalloc()        [irc.c]         IRC graph-coloring; vregs → physical r0–r7
 ir3_lower()           [ir3_lower.c]   IR3Inst → SSAInst
 risc_backend_emit()   [risc_backend.c]  SSAInst → CPU4 assembly
 ```
@@ -337,27 +336,25 @@ source text.
 
 ## CPU4 Backend
 
-After `peephole`, the CPU4 path runs five additional passes (braun_ssa, ir3_optimize,
-call_spill_insert, linscan_regalloc, ir3_lower) before reaching the unchanged
-`risc_backend_emit`.
+After `peephole`, the CPU4 path runs four additional passes (braun_ssa, ir3_optimize,
+irc_regalloc, ir3_lower) before reaching the unchanged `risc_backend_emit`.
 
 ```
 Stack IR (codegen.c, unchanged)
     ↓  peephole(opt_level)      [optimise.c]    — unchanged
     ↓  braun_ssa()              [braun.c]        stack IR → IR3Inst (fresh vregs)
     ↓  ir3_optimize()           [ir3_opt.c]      copy prop, const prop/fold, DCE
-    ↓  call_spill_insert()      [call_spill.c]   STORE/LOAD for vregs live across calls
-    ↓  linscan_regalloc()       [linscan.c]      vregs → physical r0–r6 (r7 = spill scratch)
+    ↓  irc_regalloc()           [irc.c]          IRC graph-coloring; vregs → physical r0–r7
     ↓  ir3_lower()              [ir3_lower.c]    IR3Inst → SSAInst
     ↓  risc_backend_emit()      [risc_backend.c] SSAInst → CPU4 assembly (unchanged)
 ```
 
 **Removed from old pipeline:** `lift_to_ssa` (`ssa.c`), `ssa_peephole` (`ssa_opt.c`),
-`rb_prescan` (callee-save pre-scan), depth-indexed `regalloc` (`regalloc.c`).
+`rb_prescan` (callee-save pre-scan), depth-indexed `regalloc` (`regalloc.c`),
+`call_spill_insert` (`call_spill.c`), `linscan_regalloc` (`linscan.c`).
 
 **ABI:** All-caller-save.  r0–r7 are all caller-saved.  No callee-save infrastructure.
-r7 is reserved as the spill scratch register; r0 is the accumulator; r1–r6 are available
-for allocation.
+r0 is reserved for the accumulator (ACCUM); r1–r7 are all available for allocation.
 
 ### IR3: the intermediate representation
 
@@ -409,12 +406,12 @@ typedef struct IR3Inst {
 |---|---|
 | `-2` (`IR3_VREG_BP`) | bp-relative addressing sentinel (not a real register) |
 | `-1` (`IR3_VREG_NONE`) | no destination / unused operand |
-| `0–7` | physical registers (only after `linscan_regalloc`) |
+| `0–7` | physical registers (only after `irc_regalloc`) |
 | `100` (`IR3_VREG_ACCUM`) | accumulator — always maps to physical r0; never allocated |
 | `101, 102, …` | fresh scratch vregs, allocated by `ir3_new_vreg()` |
 
 The fresh-vreg scheme replaces the old depth-indexed scheme (`VREG_START + depth`). Every
-expression result gets a unique ID, so the linear-scan allocator can assign physical registers
+expression result gets a unique ID, so the IRC allocator can assign physical registers
 based on actual live ranges rather than expression depth.
 
 ---
@@ -432,18 +429,14 @@ operands identical) are eliminated. Phi deconstruction inserts parallel copies a
 block tails.
 
 Promotion is enabled for all leaf functions (no `IR_JL`/`IR_JLI`) unconditionally, and for
-non-leaf functions with at most `MAX_PROMO_NONLEAF` (4) distinct promotable variables.
-For non-leaf promoted functions, `call_spill_insert()` (a separate pass after
-`ir3_optimize`) inserts STORE/LOAD pairs around call sites for promoted vregs that are
-actually live across each call, using the vreg's original stack slot. This is more efficient
-than saving all promoted variables at every call — only live-across-call vregs incur
-save/restore overhead.
+non-leaf functions with at most `MAX_PROMO_NONLEAF` (8) distinct promotable variables.
+For non-leaf promoted functions, `irc_regalloc` handles spilling of any promoted vreg whose
+live range spans a call, by forcing interference edges from all caller-saved registers to
+every live vreg at each call site.
 
-The 4-variable limit avoids spill-register exhaustion: with only one spill scratch register
-(r7), linscan cannot handle multiple simultaneously-spilled promoted vregs at the same
-program point (all reloads write r7, clobbering each other). Promoting more variables than
-the register pool (6) guarantees spills, and even at the pool boundary, expression
-temporaries still need registers. Functions exceeding the limit use the unpromoted
+The 8-variable limit balances promotion benefit against register pressure: with 7 allocatable
+registers (r1–r7), more than 8 promoted variables in a non-leaf function rarely yields
+additional gains. Functions exceeding the limit use the unpromoted
 `IR3_LEA + IR3_LOAD / IR3_STORE` path, which is efficient via F2 bp-relative instructions
 (2 bytes, 1 cycle).
 
@@ -473,13 +466,6 @@ it records the mapping in a forwarding table (`phi_fwd[V] = W`). `readVariable` 
 `readVariableRecursive` paths, ensuring that simplified phi vregs are never emitted in IR3
 instructions. Without this, a multi-step simplification chain (V→W→X) could leave stale
 vreg references that survive to assembly as unrewritten virtual registers.
-
-**Vreg→slot metadata export**: `writeVariable()` records a mapping from each promoted vreg
-to its bp-relative offset and size in the `promo_vreg_info[]` table (defined in `braun.c`,
-declared in `ir3.h`). Each entry also stores the function name (`func_sym`) to disambiguate
-vregs across functions (vreg IDs restart at 101 per function via `ir3_reset`). This table
-is consumed by `call_spill_insert()` to determine which stack slot to save/restore for
-each live-across-call vreg.
 
 #### Virtual stack model
 
@@ -599,107 +585,27 @@ into it, const prop does not invalidate it, and DCE counts it as a use.
 
 ---
 
-### Pass 1c: `call_spill_insert()` (`call_spill.c`)
+### Pass 2: `irc_regalloc()` (`irc.c`)
 
-Inserts STORE/LOAD pairs around call sites for promoted vregs that are live across each
-call. Runs after `ir3_optimize()` and before `linscan_regalloc()`. Uses the
-`promo_vreg_info[]` table (populated by `writeVariable` in `braun.c`) to find each vreg's
-bp-relative save slot and size.
+Iterated Register Coalescing allocator (Appel & George 1996). Runs per function (between
+`IR3_SYMLABEL` nodes). Rewrites `rd`/`rs1`/`rs2` in-place. Handles call-site spilling and
+coalescing of phi-generated moves — replaces both `call_spill_insert` and `linscan_regalloc`.
 
-**Design: same-vreg reload.** For each vreg V live across a call:
-```
-IR3_STORE [bp+offset], V    ; before the call
-IR3_LOAD  V, [bp+offset]    ; after the call
-```
-linscan allocates V a physical register for its entire interval. The STORE saves the value
-before the call clobbers registers; the LOAD restores it afterward.
+**K = 7**: r1–r7 are allocatable; r0 is pre-colored for ACCUM. Main loop: Simplify →
+Coalesce → Freeze → SelectSpill, repeated until stable. AssignColors pops the select stack;
+actual spills trigger RewriteProgram and a fresh iteration.
 
-Advantages over a fresh-vreg reload approach:
-- No vreg renaming or substitution needed
-- No additional phi insertion needed at merge points
-- No back-edge copy insertion needed
-- linscan sees longer intervals but fewer total vregs
+**Call interference**: at each `IR3_CALL`/`IR3_CALLR`, interference edges are added from
+every live vreg to all physical registers r1–r7. This forces any vreg spanning a call to
+spill, without a separate pass.
 
-**Algorithm (per function):**
+**Move coalescing**: `IR3_MOV d ← s` nodes are recorded as candidates. George criterion
+(pre-colored target) and Briggs criterion (both virtual) control when merging is safe.
+Post-coloring MOVs where both operands received the same color are eliminated.
 
-1. Scan for `IR3_CALL`/`IR3_CALLR`. If none, skip function.
-2. Number instructions sequentially (serial 0, 1, 2, …).
-3. Compute live intervals for all fresh vregs (same as linscan Phase 1: `record_def`/
-   `record_use`).
-4. **Back-edge extension**: find `J`/`JZ`/`JNZ` to lower-serial labels, extend overlapping
-   intervals to the back-edge. Iterate up to 4 times until stable (handles nested loops).
-5. For each call at serial S, find all vregs with `start <= S && end > S` (live across call).
-   For each such vreg V:
-   - Look up V in `promo_vreg_info[]` → get `bp_offset`, `size`
-   - Insert `IR3_STORE rd=BP, rs1=V, imm=bp_offset, size` before the call
-   - Insert `IR3_LOAD rd=V, rs1=BP, imm=bp_offset, size` after the call
-   - Vregs without promo info (e.g. expression temps) are skipped with a warning — they
-     should not appear live across calls because `flush_for_call_n` handles them
-
-**bp_offset deduplication**: Back-edge live-range extension can make multiple SSA vregs for
-the same promoted variable (same `bp_offset`) appear simultaneously live at a call site.
-The pass deduplicates by `bp_offset`, keeping only the vreg with the latest definition
-(highest interval start), since that is the most recent SSA definition of the variable.
-
----
-
-### Pass 2: `linscan_regalloc()` (`linscan.c`)
-
-Standard Poletto/Sarkar (1999) linear-scan allocator. Runs per function (between
-`IR3_SYMLABEL` nodes). Rewrites `rd`/`rs1`/`rs2` in-place.
-
-#### Physical register pool
-
-`r1`–`r6` are available for allocation. `r0` is permanently reserved for `IR3_VREG_ACCUM`.
-`r7` is reserved as the spill scratch register. Both are handled by a final rewrite pass.
-
-#### Live intervals
-
-1. **Number instructions** sequentially (0, 1, 2, …) within the function.
-2. **Scan each `IR3Inst`**: `rd` records a definition; `rs1`/`rs2` record uses.
-   Guard: `vreg <= IR3_VREG_ACCUM` (i.e., ≤ 100) skips ACCUM, BP, NONE, and physical regs.
-3. For each vreg, `interval.start = serial of first definition`, `interval.end = serial of
-   last use`.
-
-#### Back-edge live-range extension (Phase 1b)
-
-After computing initial intervals, a second pass extends live ranges across loop back-edges.
-A back-edge is a `J`/`JZ`/`JNZ` whose target label has a lower serial number than the jump.
-Any vreg whose interval overlaps the loop body `[header_serial, back_edge_serial]` has its
-`end` extended to at least `back_edge_serial`. This iterates until stable (handles nested
-loops). Without this, promoted variables used in loops would appear dead before the back-edge
-and get their register reused.
-
-#### Scan
-
-1. Sort intervals by `start`.
-2. For each interval, expire all active intervals whose `end < current.start` and return
-   their registers to the pool.
-3. `pool_alloc()` returns the next available physical register (r1 first, then r2, …, r6).
-4. If the pool is empty, spill the longest-lived active interval: steal its register for the
-   current interval; record a bp-relative spill slot for the displaced interval.
-
-#### Frame expansion and flush-offset shifting (Phase 5a)
-
-When spills exist, the ENTER frame must be expanded to cover the spill area. This is done
-**before** spill insertion to avoid double-shifting spill offsets. All bp-relative offsets
-below the original ENTER boundary (call-arg flush stores/loads and LEAs emitted by
-`flush_for_call_n`) are shifted down by the expansion amount.
-
-#### Spill insertion (Phase 5b)
-
-After frame expansion, spill stores and loads are inserted:
-- Insert `IR3_LOAD rd=r7, rs1=BP, imm=spill_off` before each USE of a spilled vreg.
-- Insert `IR3_STORE rd=BP, rs1=r7, imm=spill_off` after each DEF of a spilled vreg.
-
-The spill offsets are allocated by `alloc_spill_slot` below the ENTER boundary and are
-already correct relative to bp — they are not shifted by Phase 5a.
-
-#### ACCUM rewrite
-
-After the per-function scan, a final pass over the entire IR3 list rewrites every occurrence
-of `IR3_VREG_ACCUM` (100) to physical register 0. This handles ACCUM in SYMLABEL/LABEL/data
-nodes as well as inside function bodies.
+**Spill rewriting**: each spilled vreg is replaced by fresh tmps at every def (+ STORE) and
+use (+ LOAD). The ENTER frame is expanded and all bp-relative offsets below the original
+boundary are shifted down to accommodate the new spill slots.
 
 ---
 

@@ -146,7 +146,7 @@ void free_cfg(BB *blocks, int n_blocks)
 
 /* ----------------------------------------------------------------
  * ir3_dump — print the IR3 list in a human-readable SSA notation.
- * Called after call_spill_insert, before linscan_regalloc.
+ * Called after ir3_optimize, before irc_regalloc.
  * ---------------------------------------------------------------- */
 
 static const char *dump_reg(int v, char *buf, size_t cap)

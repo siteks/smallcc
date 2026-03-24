@@ -10,7 +10,7 @@
  *   • Structural LEAs: p->sym == NULL.
  *   • Address-taken / aggregate LEAs: p->sym = variable-name string.
  *   • Promoted variables live ONLY in SSA vregs (no memory backing),
- *     except when spilled by linscan across call sites.
+ *     except when spilled by irc_regalloc across call sites.
  *   • Non-promoted variables still go through IR3_LOAD / IR3_STORE.
  */
 
@@ -128,12 +128,6 @@ static int spill_count;
 static int spill_total_bytes;
 static int await_post_call_adj;
 
-/* ================================================================
- * Promoted-variable vreg metadata (exported for call_spill_insert)
- * ================================================================ */
-PromoVregInfo promo_vreg_info[MAX_PROMO_VREG_INFO];
-int n_promo_vreg_info;
-static const char *current_func_sym;  /* current function name for promo_vreg_info tagging */
 static bool func_can_promote;        /* true if promotion is enabled for current function */
 
 /* ================================================================
@@ -297,7 +291,6 @@ static void restore_outer_temps(int line)
 /* Per-block current definition: block_def[bb_id][slot] = vreg or IR3_VREG_NONE */
 static int block_def[MAX_BLOCKS][PROMOTE_SLOTS];
 
-/* (promo_ever_written removed — call save/restore now in call_spill.c) */
 
 /* Phi node lookup: phi_node_map[vreg - IR3_VREG_BASE] = IR3Inst* or NULL */
 static IR3Inst *phi_node_map[PHI_MAP_SIZE];
@@ -353,13 +346,6 @@ static void sealBlock(int bb_id);
 static void writeVariable(int bb_id, int var_slot, int vreg)
 {
     block_def[bb_id][var_slot] = vreg;
-    /* Record vreg→slot mapping for call_spill_insert */
-    if (vreg > IR3_VREG_ACCUM && n_promo_vreg_info < MAX_PROMO_VREG_INFO) {
-        promo_vreg_info[n_promo_vreg_info++] = (PromoVregInfo){
-            vreg, var_slot - PROMOTE_BASE, promo_slot_size[var_slot],
-            current_func_sym
-        };
-    }
 }
 
 /* Set phi_insert_point[bb_id] = node and flush any pending phis for this block.
@@ -500,7 +486,7 @@ static int tryRemoveTrivialPhi(int phi_vreg)
 
     /* Mark phi dead and record forwarding */
     phi->op = IR3_MOV;
-    phi->rd = IR3_VREG_NONE;  /* linscan will skip rd=NONE */
+    phi->rd = IR3_VREG_NONE;  /* irc_regalloc will skip rd=NONE */
     phi->rs1 = unique;
     phi_fwd[idx] = unique;
     phi_node_map[idx] = NULL;
@@ -1417,15 +1403,11 @@ static void process_function(IRInst *sym_node)
     /* Reset per-function state */
     vs_depth = 0; vsp = 0;
     spill_count = 0; spill_total_bytes = 0; await_post_call_adj = 0;
-    /* NOTE: do NOT reset n_promo_vreg_info here — it accumulates across
-     * all functions so call_spill_insert (which runs after braun_ssa
-     * finishes) can look up any vreg from any function. */
     lvsp_reset();
     reset_braun_state();
     ir3_reset();  /* reset vreg counter per function */
 
     /* Emit the function's SYMLABEL */
-    current_func_sym = sym_node->sym;
     IR3Inst *symlabel_ir3 = emit_ir3(IR3_SYMLABEL);
     symlabel_ir3->sym  = sym_node->sym;
     symlabel_ir3->line = sym_node->line;
@@ -1453,14 +1435,13 @@ static void process_function(IRInst *sym_node)
     /* Promotion gating for non-leaf functions.
      *
      * Promoting all scalars in a function with many calls and many locals
-     * creates long-lived vregs that saturate the register file.  linscan
-     * spills the excess, expanding the ENTER frame.  For large functions
-     * (e.g. CoreMark main with a 2000-byte local array) this can overflow
-     * the stack.
+     * creates long-lived vregs that saturate the register file.  For large
+     * functions (e.g. CoreMark main with a 2000-byte local array) excessive
+     * promotion can overflow the stack.
      *
      * Leaf functions: promote unconditionally (no call-spanning issues).
      * Non-leaf functions: promote up to MAX_PROMO_NONLEAF distinct variables.
-     * call_spill_insert handles save/restore around calls for promoted vars.
+     * irc_regalloc spills any promoted vregs that span calls.
      */
     #define MAX_PROMO_NONLEAF 8
     bool func_has_calls_scan = false;
@@ -1614,7 +1595,6 @@ IR3Inst *braun_ssa(BB *blocks_ignored, int n_blocks_ignored, IRInst *ir_head)
     spill_count = 0;
     spill_total_bytes = 0;
     await_post_call_adj = 0;
-    n_promo_vreg_info = 0;  /* reset once for all functions */
     lvsp_reset();
     reset_braun_state();
 

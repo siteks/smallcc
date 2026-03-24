@@ -580,8 +580,8 @@ registers. Uses the Braun et al. (2013) SSA construction algorithm with
 the stack machine's expression stack as a virtual register stack, peeks ahead to collapse
 `LEA+LOAD`/`LEA+STORE` pairs into bp-relative IR3 ops, and handles call-site
 argument/temporary partitioning via `flush_for_call_n`. SSA promotion of scalar locals is
-enabled for leaf functions unconditionally and for non-leaf functions with ≤4 promotable
-variables (with call save/restore to split live ranges at call sites).
+enabled for leaf functions unconditionally and for non-leaf functions with ≤8 promotable
+variables.
 
 ### `ir3.c` / `ir3.h` — IR3 Infrastructure (CPU4)
 
@@ -589,13 +589,16 @@ Defines the `IR3Inst` struct and `IR3Op` enum. `build_cfg()` constructs a basic-
 from the stack IR for the Braun SSA algorithm. `ir3_new_vreg()` allocates fresh virtual
 register IDs.
 
-### `linscan.c` — Linear-Scan Register Allocation (CPU4)
+### `irc.c` — Iterated Register Coalescing (CPU4)
 
-`linscan_regalloc(head)` implements the Poletto/Sarkar (1999) linear-scan algorithm. Runs
-per function, computing live intervals with back-edge extension for loops. Maps virtual
-registers to physical r1–r6 (r0 reserved for accumulator, r7 for spill scratch). Handles
-spilling with Phase 5a (frame expansion + flush-offset shifting) and Phase 5b (spill
-store/load insertion).
+`irc_regalloc(head)` implements Iterated Register Coalescing (Appel & George 1996). Runs
+per function. Phases: liveness analysis → interference graph build → Simplify/Coalesce/
+Freeze/SelectSpill loop → AssignColors → RewriteProgram (if spills), then repeats. Maps
+virtual registers to physical r1–r7 (r0 reserved for ACCUM). At each call site, adds
+interference edges from all live vregs to r1–r7, forcing call-spanning vregs to spill —
+no separate call-spill pass needed. Post-coloring MOVs with same-colored operands are
+eliminated. Frame expansion mirrors the linscan approach: ENTER imm is patched and
+bp-relative offsets are shifted down.
 
 ### `ir3_lower.c` — IR3 → SSA Lowering (CPU4)
 

@@ -1,6 +1,6 @@
 /* ir3_lower.c — Lower IR3Inst list to SSAInst for risc_backend_emit().
  *
- * After linscan_regalloc() all virtual registers in IR3Inst have been
+ * After irc_regalloc() all virtual registers in IR3Inst have been
  * replaced with physical registers 0-7.  This pass performs a near-1:1
  * translation to SSAInst so that the unchanged risc_backend_emit() can
  * emit CPU4 assembly.

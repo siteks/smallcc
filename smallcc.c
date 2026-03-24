@@ -246,6 +246,7 @@ int main(int argc, char **argv)
     int opt_level = 0;
     const char *cmdline_defines[256];
     int num_defines = 0;
+    const char *ssa_dump_path = NULL;
 
     while (file_start < argc && argv[file_start][0] == '-')
     {
@@ -294,6 +295,11 @@ int main(int argc, char **argv)
             add_include_dir(dir);
             file_start++;
         }
+        else if (strcmp(argv[file_start], "-ssa") == 0 && file_start + 1 < argc)
+        {
+            ssa_dump_path = argv[file_start + 1];
+            file_start += 2;
+        }
         else if (strcmp(argv[file_start], "-arch") == 0 && file_start + 1 < argc)
         {
             const char *a = argv[file_start + 1];
@@ -314,11 +320,17 @@ int main(int argc, char **argv)
 
     if (argc <= file_start)
     {
-        fprintf(stderr, "Usage: smallcc [-o outfile] [-E] [-stats] [-ann] [-arch cpu3|cpu4] [-DNAME[=VAL]] [-Idir] <source.c> [source2.c ...]\n");
+        fprintf(stderr, "Usage: smallcc [-o outfile] [-E] [-stats] [-ann] [-arch cpu3|cpu4] [-ssa file] [-DNAME[=VAL]] [-Idir] <source.c> [source2.c ...]\n");
         return 1;
     }
 
     set_asm_out(out);
+
+    FILE *ssa_out = NULL;
+    if (ssa_dump_path) {
+        ssa_out = fopen(ssa_dump_path, "w");
+        if (!ssa_out) { perror(ssa_dump_path); return 1; }
+    }
 
     // Determine compiler binary directory for include/ and lib/ resolution
     char compiler_dir[4096];
@@ -452,8 +464,8 @@ int main(int argc, char **argv)
             BB *blocks = build_cfg(codegen_ctx.ir_head, &n_blocks);
             IR3Inst *ir3 = braun_ssa(blocks, n_blocks, codegen_ctx.ir_head);
             ir3_optimize(ir3, opt_level);
-            call_spill_insert(ir3);
-            linscan_regalloc(ir3);
+            if (ssa_out) ir3_dump(ir3, ssa_out);
+            irc_regalloc(ir3);
             SSAInst *ssa = ir3_lower(ir3);
             risc_backend_emit(ssa);
             free_ssa(ssa);
@@ -479,6 +491,7 @@ int main(int argc, char **argv)
                 100.0 * (double)arena.used / (double)arena.cap);
 
     if (out != stdout) fclose(out);
+    if (ssa_out) fclose(ssa_out);
     return 0;
 }
 
