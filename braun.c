@@ -20,6 +20,9 @@
 #include <assert.h>
 #include "ir3.h"
 
+/* Allocate a globally-unique label ID (shared counter with codegen.c). */
+extern int new_label(void);
+
 /* ================================================================
  * Virtual stack state (expression temporaries, reset per function)
  * ================================================================ */
@@ -1103,6 +1106,115 @@ static void translate_bb(BB *bb, int bb_id)
 }
 
 /* ================================================================
+ * Critical-edge splitting
+ *
+ * A critical edge goes from a block with >1 successors to a block
+ * with >1 predecessors.  Phi copies inserted into such a predecessor
+ * would execute on ALL outgoing paths, not just the one to the merge
+ * block, silently corrupting the other successor's values.
+ *
+ * Fix: insert an empty landing-pad block on every critical edge.
+ * The landing pad has a single predecessor (the original pred) and
+ * a single successor (the original succ), so phi copies placed there
+ * execute on exactly one path.
+ *
+ * Called after all blocks are translated and before deconstructPhis.
+ * ================================================================ */
+static void split_critical_edges(BB **blocks_ptr, int *n_blocks_ptr)
+{
+    BB  *blocks = *blocks_ptr;
+    int  n_orig = *n_blocks_ptr;
+
+    /* Count critical edges first so we can realloc once. */
+    int n_crit = 0;
+    for (int p = 0; p < n_orig; p++) {
+        if (blocks[p].n_succs <= 1) continue;
+        for (int si = 0; si < blocks[p].n_succs; si++) {
+            int s = blocks[p].succs[si];
+            if (blocks[s].n_preds > 1) n_crit++;
+        }
+    }
+    if (n_crit == 0) return;
+
+    blocks = realloc(blocks, (n_orig + n_crit) * sizeof(BB));
+    if (!blocks) { fprintf(stderr, "braun: split_critical_edges OOM\n"); exit(1); }
+    memset(blocks + n_orig, 0, n_crit * sizeof(BB));
+    *blocks_ptr = blocks;
+
+    /* Split each critical edge.  Iterate only original blocks so landing
+     * pads (which have n_succs=1) are never re-processed. */
+    int n_blocks = n_orig;
+    for (int pred = 0; pred < n_orig; pred++) {
+        if (blocks[pred].n_succs <= 1) continue;
+        for (int si = 0; si < blocks[pred].n_succs; si++) {
+            int succ = blocks[pred].succs[si];
+            if (blocks[succ].n_preds <= 1) continue;
+
+            /* --- Critical edge pred → succ --- */
+            int lbl_new = new_label();
+            int landing = n_blocks++;
+
+            /* Landing-pad BB: one pred, one succ. */
+            blocks[landing].id       = landing;
+            blocks[landing].label_id = lbl_new;
+            blocks[landing].n_preds  = 1;
+            blocks[landing].preds[0] = pred;
+            blocks[landing].n_succs  = 1;
+            blocks[landing].succs[0] = succ;
+            blocks[landing].sealed   = true;
+
+            /* Rewire: pred → landing, succ replaces pred with landing. */
+            blocks[pred].succs[si] = landing;
+            for (int pi = 0; pi < blocks[succ].n_preds; pi++) {
+                if (blocks[succ].preds[pi] == pred) {
+                    blocks[succ].preds[pi] = landing;
+                    break;
+                }
+            }
+
+            /* Retarget pred's JZ/JNZ from succ.label_id → lbl_new.
+             * The terminator is block_pretail[pred]->next, or block_last_ir3
+             * when pretail is NULL (block had only the terminator). */
+            IR3Inst *term = block_pretail[pred] ? block_pretail[pred]->next
+                                                 : block_last_ir3[pred];
+            if (term && (term->op == IR3_JZ || term->op == IR3_JNZ)
+                     && term->imm == blocks[succ].label_id)
+                term->imm = lbl_new;
+
+            /* Append the landing pad at the END of the function's IR3 list:
+             *
+             *   lbl_new:            ← IR3_LABEL  (block_pretail[landing])
+             *   [phi copies go here, inserted later by deconstructPhis]
+             *   j succ.label_id     ← IR3_J      (block_last_ir3[landing])
+             *
+             * Placing it at the end (rather than before succ's label) ensures
+             * it is only reachable via the retargeted jump — fall-through paths
+             * from other predecessors of succ reach succ's label directly and
+             * never execute the landing-pad copies. */
+            IR3Inst *lnode = new_ir3(IR3_LABEL);
+            lnode->imm = lbl_new;
+            *ir3_tail  = lnode;
+            ir3_tail   = &lnode->next;
+            ir3_last   = lnode;
+
+            IR3Inst *jnode = new_ir3(IR3_J);
+            jnode->imm = blocks[succ].label_id;
+            *ir3_tail  = jnode;
+            ir3_tail   = &jnode->next;
+            ir3_last   = jnode;
+
+            /* deconstructPhis will call insert_phi_copy(landing, ...) which
+             * inserts copies after block_pretail[landing] (= lnode), stacking
+             * them between the label and the J. */
+            block_pretail[landing]  = lnode;
+            block_last_ir3[landing] = jnode;
+        }
+    }
+
+    *n_blocks_ptr = n_blocks;
+}
+
+/* ================================================================
  * Phi deconstruction
  *
  * For each surviving IR3_PHI node, insert a parallel copy at the
@@ -1475,6 +1587,10 @@ static void process_function(IRInst *sym_node)
             translate_bb(&blocks[i], i);
         }
     }
+
+    /* Critical-edge splitting: insert landing pads so phi copies don't
+     * corrupt paths to the other successor of a multi-way branch. */
+    split_critical_edges(&blocks, &n_blocks);
 
     /* Phi deconstruction: convert phi nodes to parallel copies */
     deconstructPhis(blocks, n_blocks);
