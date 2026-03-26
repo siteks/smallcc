@@ -481,18 +481,6 @@ static int push_args_list(Node *first_arg, Param *params)
                     slot_size = 4;
                 }
             }
-            // Variadic arguments (beyond declared params) need default promotion:
-            // integer types smaller than 4 bytes must be widened to 4 bytes
-            // for proper va_arg handling (e.g., int passed to printf %lu).
-            else if (i >= np && slot_size < 4)
-            {
-                // Promote to 4 bytes. Sign-extend signed types.
-                if (push_type && (push_type->base == TB_INT ||
-                                 push_type->base == TB_SHORT ||
-                                 push_type->base == TB_CHAR))
-                    ir_append(IR_SXW, 0, NULL);
-                slot_size = 4;
-            }
 
             if (slot_size == 4) { ir_append(IR_PUSH,  0, NULL); param_size += 4; }
             else                { ir_append(IR_PUSHW, 0, NULL); param_size += WORD_SIZE; }
