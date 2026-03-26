@@ -1943,6 +1943,14 @@ static void insert_coercions_step(Node *n)
     }
     if (n->is_expr && n->kind == ND_UNARYOP)
         insert_unary_coercions(n);
+    if (n->kind == ND_ASSIGN)
+    {
+        Node *lhs = n->ch[0];
+        Node *rhs = n->ch[1];
+        Type *lhs_type = lhs->type;
+        if (rhs->type != lhs_type)
+            insert_cast(n, 1, lhs_type);
+    }
     if (n->kind == ND_COMPOUND_ASSIGN)
     {
         // If RHS type differs from LHS type, cast RHS so codegen uses consistent ops.
@@ -1951,6 +1959,13 @@ static void insert_coercions_step(Node *n)
         Type *lhs_type = lhs->type;
         if (rhs->type != lhs_type)
             insert_cast(n, 1, lhs_type);
+    }
+    if (n->kind == ND_DECLARATOR && n->ch[1] && n->symbol)
+    {
+        Node *init = n->ch[1];
+        if (init->kind != ND_INITLIST && !istype_array(n->symbol->type)
+                && init->type != n->symbol->type)
+            insert_cast(n, 1, n->symbol->type);
     }
     if (n->kind == ND_RETURNSTMT && n->ch[0])   // expr
     {

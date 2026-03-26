@@ -481,6 +481,18 @@ static int push_args_list(Node *first_arg, Param *params)
                     slot_size = 4;
                 }
             }
+            // Variadic arguments (beyond declared params) need default promotion:
+            // integer types smaller than 4 bytes must be widened to 4 bytes
+            // for proper va_arg handling (e.g., int passed to printf %lu).
+            else if (i >= np && slot_size < 4)
+            {
+                // Promote to 4 bytes. Sign-extend signed types.
+                if (push_type && (push_type->base == TB_INT ||
+                                 push_type->base == TB_SHORT ||
+                                 push_type->base == TB_CHAR))
+                    ir_append(IR_SXW, 0, NULL);
+                slot_size = 4;
+            }
 
             if (slot_size == 4) { ir_append(IR_PUSH,  0, NULL); param_size += 4; }
             else                { ir_append(IR_PUSHW, 0, NULL); param_size += WORD_SIZE; }
@@ -537,25 +549,40 @@ static void gen_struct_copy(int src_slot_bp, int dst_slot_bp, Type *st)
 // The copy uses balanced push/pop pairs, leaving sp and adj_depth unchanged on exit.
 static int push_struct_arg(Node *arg, int copybuf_lea)
 {
+    // Copy a struct arg into its pre-allocated copy buffer.
+    // copybuf_lea is the bp offset of the copy buffer (already allocated in phase 1).
+    // We need additional slots for src/dst addresses during the copy.
     int adj_before = codegen_ctx.adj_depth;
 
-    // Evaluate the source struct: r0 = src base address.
-    // adj_depth may grow if gen_expr allocates a retbuf for a struct-returning call.
-    gen_expr(arg);
-    ir_append(IR_PUSH, 0, NULL);                          // stack: [src_addr]
-    // sp = bp - adj_depth - 4 (adj_depth may have grown)
-    int src_slot = -(codegen_ctx.adj_depth + 4);
+    // The copy buffer is at 'copybuf_lea' (a negative bp offset).
+    // We'll use the space BELOW the copy buffer for src/dst slots.
+    // Since copybuf_lea = -(adj_before - sz) where sz is the struct size,
+    // the copy buffer spans [copybuf_lea - sz + 4, copybuf_lea] in 4-byte chunks.
+    // We can safely use the next 8 bytes below copybuf_lea for our slots.
+    int dst_slot = copybuf_lea - 8;  // below the copy buffer
+    int src_slot = copybuf_lea - 4;  // above dst_slot
 
-    ir_append(IR_LEA, copybuf_lea, NULL);                 // r0 = copy buffer address
-    ir_append(IR_PUSH, 0, NULL);                          // stack: [src_addr, dst_addr]
-    int dst_slot = -(codegen_ctx.adj_depth + 8);
+    // Allocate slots for src and dst addresses (below the copy buffer)
+    ir_append(IR_ADJ, -8, NULL);
+    codegen_ctx.adj_depth += 8;
+
+    // Store src addr
+    ir_append(IR_LEA, src_slot, NULL);
+    ir_append(IR_PUSH, 0, NULL);
+    gen_expr(arg);
+    ir_append(IR_SW, 0, NULL);
+
+    // Store dst addr (copy buffer address)
+    ir_append(IR_LEA, dst_slot, NULL);
+    ir_append(IR_PUSH, 0, NULL);
+    ir_append(IR_LEA, copybuf_lea, NULL);
+    ir_append(IR_SW, 0, NULL);
 
     gen_struct_copy(src_slot, dst_slot, arg->type);
-
-    ir_append(IR_ADJ, 8, NULL);                           // pop the two address slots
+    ir_append(IR_ADJ, 8, NULL);  // free the src/dst slots
 
     // Free any retbuf allocated by gen_expr(arg)
-    int retbuf_sz = codegen_ctx.adj_depth - adj_before;
+    int retbuf_sz = codegen_ctx.adj_depth - adj_before - 8;
     if (retbuf_sz > 0)
     {
         ir_append(IR_ADJ, retbuf_sz, NULL);
@@ -1078,15 +1105,32 @@ void gen_expr(Node *node)
         if (lhs->type->base == TB_STRUCT)
         {
             // Struct assignment: copy field by field.
+            // Use explicit ADJ to allocate slots, then SW to store addresses.
+            // This ensures addresses are in memory for LEA+LW in gen_copy_fields.
             int adj_before = codegen_ctx.adj_depth;
-            gen_expr(rhs);                                            // r0 = rhs struct addr
+
+            // Allocate slots for src and dst addresses
+            ir_append(IR_ADJ, -8, NULL);
+            codegen_ctx.adj_depth += 8;
+            int src_slot = -(codegen_ctx.adj_depth - 4);
+            int dst_slot = -(codegen_ctx.adj_depth);
+
+            // Store src addr: LEA slot, PUSH (&slot), gen_expr (r0=addr), SW
+            ir_append(IR_LEA, src_slot, NULL);
             ir_append(IR_PUSH, 0, NULL);
-            int src_slot = -(codegen_ctx.adj_depth + 4);             // slot for src ptr
-            gen_addr(lhs);                                            // r0 = lhs struct addr
+            gen_expr(rhs);
+            ir_append(IR_SW, 0, NULL);
+
+            // Store dst addr: LEA slot, PUSH (&slot), gen_addr (r0=addr), SW
+            ir_append(IR_LEA, dst_slot, NULL);
             ir_append(IR_PUSH, 0, NULL);
-            int dst_slot = -(codegen_ctx.adj_depth + 8);             // slot for dst ptr
+            gen_addr(lhs);
+            ir_append(IR_SW, 0, NULL);
+
             gen_struct_copy(src_slot, dst_slot, lhs->type);
-            ir_append(IR_ADJ, 8, NULL);                               // free the two pushed slots
+            ir_append(IR_ADJ, 8, NULL);  // free the two slots
+            codegen_ctx.adj_depth -= 8;
+
             // Free any retbuf allocated by gen_expr(rhs)
             int retbuf_sz = codegen_ctx.adj_depth - adj_before;
             if (retbuf_sz > 0)
@@ -1094,7 +1138,7 @@ void gen_expr(Node *node)
                 ir_append(IR_ADJ, retbuf_sz, NULL);
                 codegen_ctx.adj_depth -= retbuf_sz;
             }
-            gen_addr(lhs);                                            // r0 = lhs addr (expression result)
+            gen_addr(lhs);  // r0 = lhs addr (expression result)
         }
         else
         {
@@ -1217,17 +1261,32 @@ void gen_returnstmt(Node *node)
     if (expr && ret && ret->base == TB_STRUCT)
     {
         // Struct return: copy src struct to caller's retbuf.
+        // Use explicit ADJ to allocate slots, then SW to store addresses.
         int adj_before = codegen_ctx.adj_depth;
-        gen_expr(expr);                              // r0 = src struct addr
+
+        // Allocate slots for src and dst addresses
+        ir_append(IR_ADJ, -8, NULL);
+        codegen_ctx.adj_depth += 8;
+        int src_slot = -(codegen_ctx.adj_depth - 4);
+        int dst_slot = -(codegen_ctx.adj_depth);
+
+        // Store src addr
+        ir_append(IR_LEA, src_slot, NULL);
         ir_append(IR_PUSH, 0, NULL);
-        int src_slot = -(codegen_ctx.adj_depth + 4);
-        // Load the hidden retbuf ptr from bp+FRAME_OVERHEAD (callee's first param slot)
+        gen_expr(expr);
+        ir_append(IR_SW, 0, NULL);
+
+        // Store dst addr (caller's retbuf ptr from bp+FRAME_OVERHEAD)
+        ir_append(IR_LEA, dst_slot, NULL);
+        ir_append(IR_PUSH, 0, NULL);
         ir_append(IR_LEA, FRAME_OVERHEAD, NULL);
-        gen_ld(WORD_SIZE);                           // r0 = caller's retbuf addr
-        ir_append(IR_PUSH, 0, NULL);
-        int dst_slot = -(codegen_ctx.adj_depth + 8);
+        gen_ld(WORD_SIZE);
+        ir_append(IR_SW, 0, NULL);
+
         gen_struct_copy(src_slot, dst_slot, ret);
-        ir_append(IR_ADJ, 8, NULL);                  // free the two pushed slots
+        ir_append(IR_ADJ, 8, NULL);  // free the two slots
+        codegen_ctx.adj_depth -= 8;
+
         // Free any retbuf allocated by gen_expr(expr)
         int retbuf_sz = codegen_ctx.adj_depth - adj_before;
         if (retbuf_sz > 0)
@@ -1834,15 +1893,30 @@ void gen_decl(Node *node)
                 else if (n->symbol->type->base == TB_STRUCT)
                 {
                     // Struct initializer from expression (e.g. struct P p = make(3, 7))
+                    // Use explicit ADJ to allocate slots, then SW to store addresses.
                     int adj_before = codegen_ctx.adj_depth;
-                    gen_expr(init);                                   // r0 = src struct addr
+
+                    // Allocate slots for src and dst addresses
+                    ir_append(IR_ADJ, -8, NULL);
+                    codegen_ctx.adj_depth += 8;
+                    int src_slot = -(codegen_ctx.adj_depth - 4);
+                    int dst_slot = -(codegen_ctx.adj_depth);
+
+                    // Store src addr
+                    ir_append(IR_LEA, src_slot, NULL);
                     ir_append(IR_PUSH, 0, NULL);
-                    int src_slot = -(codegen_ctx.adj_depth + 4);
-                    gen_varaddr_from_ident(n, n->symbol->name);       // r0 = dst addr
+                    gen_expr(init);
+                    ir_append(IR_SW, 0, NULL);
+
+                    // Store dst addr
+                    ir_append(IR_LEA, dst_slot, NULL);
                     ir_append(IR_PUSH, 0, NULL);
-                    int dst_slot = -(codegen_ctx.adj_depth + 8);
+                    gen_varaddr_from_ident(n, n->symbol->name);
+                    ir_append(IR_SW, 0, NULL);
+
                     gen_struct_copy(src_slot, dst_slot, n->symbol->type);
                     ir_append(IR_ADJ, 8, NULL);
+                    codegen_ctx.adj_depth -= 8;
                     // Free any retbuf allocated by gen_expr(init)
                     int retbuf_sz = codegen_ctx.adj_depth - adj_before;
                     if (retbuf_sz > 0)

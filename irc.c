@@ -50,8 +50,9 @@ static int vreg_to_node(int v)
     if (v > IR3_VREG_ACCUM) {
         int n = IRC_PHYS + (v - (IR3_VREG_BASE + 1));
         if (n >= IRC_MAX_NODES) {
-            fprintf(stderr, "irc: vreg %d → node %d out of range\n", v, n);
-            return -1;
+            fprintf(stderr, "irc: fatal: vreg %d maps to node %d, exceeds IRC_MAX_NODES=%d\n",
+                    v, n, IRC_MAX_NODES);
+            exit(1);
         }
         return n;
     }
@@ -182,7 +183,7 @@ static void irc_reset_fn(void)
     bs_zero(select_set);
     select_sp = 0;
     bs_zero(actual_spill);
-    memset(spill_slot, 0, sizeof(spill_slot));
+    // memset(spill_slot, 0, sizeof(spill_slot));
     bs_zero(seen_nodes);
     n_bbs = 0;
     g_max_node = IRC_PHYS - 1;
@@ -243,15 +244,41 @@ static bool is_move_related(int n)
 
 static void record_move(int u, int v)
 {
-    if (n_moves >= IRC_MAX_MOVES) return;
+    if (n_moves >= IRC_MAX_MOVES) {
+        static bool warned = false;
+        if (!warned) {
+            fprintf(stderr, "irc: warning: IRC_MAX_MOVES=%d exceeded; coalescing opportunities dropped\n",
+                    IRC_MAX_MOVES);
+            warned = true;
+        }
+        return;
+    }
     /* Dedup */
     for (int i = 0; i < n_moves; i++)
         if ((g_moves[i].u == u && g_moves[i].v == v) ||
             (g_moves[i].u == v && g_moves[i].v == u)) return;
     int mi = n_moves++;
     g_moves[mi].u = u; g_moves[mi].v = v; g_moves[mi].state = MOVE_WORKLIST;
-    if (n_node_moves[u] < NODE_MOVES_MAX) node_moves[u][n_node_moves[u]++] = mi;
-    if (n_node_moves[v] < NODE_MOVES_MAX) node_moves[v][n_node_moves[v]++] = mi;
+    if (n_node_moves[u] < NODE_MOVES_MAX) {
+        node_moves[u][n_node_moves[u]++] = mi;
+    } else {
+        static bool warned_nm = false;
+        if (!warned_nm) {
+            fprintf(stderr, "irc: warning: NODE_MOVES_MAX=%d exceeded for node %d; coalescing dropped\n",
+                    NODE_MOVES_MAX, u);
+            warned_nm = true;
+        }
+    }
+    if (n_node_moves[v] < NODE_MOVES_MAX) {
+        node_moves[v][n_node_moves[v]++] = mi;
+    } else {
+        static bool warned_nm2 = false;
+        if (!warned_nm2) {
+            fprintf(stderr, "irc: warning: NODE_MOVES_MAX=%d exceeded for node %d; coalescing dropped\n",
+                    NODE_MOVES_MAX, v);
+            warned_nm2 = true;
+        }
+    }
 }
 
 /* ================================================================
@@ -273,7 +300,11 @@ static void build_cfg_irc(IR3Inst *func_head, IR3Inst *func_end)
                 /* Previous BB is empty except for its leader; set last = prev */
                 /* Actually this won't happen; continue */
             }
-            if (n_bbs >= IRC_MAX_BB) break;
+            if (n_bbs >= IRC_MAX_BB) {
+                fprintf(stderr, "irc: fatal: function has >%d basic blocks (IRC_MAX_BB)\n",
+                        IRC_MAX_BB);
+                exit(1);
+            }
             g_bbs[n_bbs].first    = p;
             g_bbs[n_bbs].last     = p;
             g_bbs[n_bbs].n_succs  = 0;
@@ -281,14 +312,26 @@ static void build_cfg_irc(IR3Inst *func_head, IR3Inst *func_end)
             g_bbs[n_bbs].label_id = is_label ? p->imm : -1;
             bs_zero(g_bbs[n_bbs].live_in);
             bs_zero(g_bbs[n_bbs].live_out);
-            if (is_label && p->imm >= 0 && p->imm < 2048)
+            if (is_label && p->imm >= 0) {
+                if (p->imm >= 2048) {
+                    fprintf(stderr, "irc: fatal: label id %d exceeds label_to_bb size 2048\n",
+                            p->imm);
+                    exit(1);
+                }
                 label_to_bb[p->imm] = n_bbs;
+            }
             n_bbs++;
             new_bb = false;
         } else {
             g_bbs[n_bbs-1].last = p;
-            if (p->op == IR3_LABEL && p->imm >= 0 && p->imm < 2048)
+            if (p->op == IR3_LABEL && p->imm >= 0) {
+                if (p->imm >= 2048) {
+                    fprintf(stderr, "irc: fatal: label id %d exceeds label_to_bb size 2048\n",
+                            p->imm);
+                    exit(1);
+                }
                 label_to_bb[p->imm] = n_bbs - 1;
+            }
         }
         if (p->op == IR3_J || p->op == IR3_JZ || p->op == IR3_JNZ || p->op == IR3_RET)
             new_bb = true;
@@ -305,25 +348,41 @@ static void build_cfg_irc(IR3Inst *func_head, IR3Inst *func_end)
             int tgt = (last->imm >= 0 && last->imm < 2048) ? label_to_bb[last->imm] : -1;
             if (tgt >= 0) {
                 g_bbs[i].succs[g_bbs[i].n_succs++] = tgt;
-                if (g_bbs[tgt].n_preds < 16) g_bbs[tgt].preds[g_bbs[tgt].n_preds++] = i;
+                if (g_bbs[tgt].n_preds >= 16) {
+                    fprintf(stderr, "irc: fatal: BB %d has >16 predecessors\n", tgt);
+                    exit(1);
+                }
+                g_bbs[tgt].preds[g_bbs[tgt].n_preds++] = i;
             }
         } else if (op == IR3_JZ || op == IR3_JNZ) {
             /* fall-through */
             if (i+1 < n_bbs) {
                 g_bbs[i].succs[g_bbs[i].n_succs++] = i+1;
-                if (g_bbs[i+1].n_preds < 16) g_bbs[i+1].preds[g_bbs[i+1].n_preds++] = i;
+                if (g_bbs[i+1].n_preds >= 16) {
+                    fprintf(stderr, "irc: fatal: BB %d has >16 predecessors\n", i+1);
+                    exit(1);
+                }
+                g_bbs[i+1].preds[g_bbs[i+1].n_preds++] = i;
             }
             /* branch target */
             int tgt = (last->imm >= 0 && last->imm < 2048) ? label_to_bb[last->imm] : -1;
             if (tgt >= 0 && tgt != i+1) {
                 g_bbs[i].succs[g_bbs[i].n_succs++] = tgt;
-                if (g_bbs[tgt].n_preds < 16) g_bbs[tgt].preds[g_bbs[tgt].n_preds++] = i;
+                if (g_bbs[tgt].n_preds >= 16) {
+                    fprintf(stderr, "irc: fatal: BB %d has >16 predecessors\n", tgt);
+                    exit(1);
+                }
+                g_bbs[tgt].preds[g_bbs[tgt].n_preds++] = i;
             }
         } else {
             /* fall-through */
             if (i+1 < n_bbs) {
                 g_bbs[i].succs[g_bbs[i].n_succs++] = i+1;
-                if (g_bbs[i+1].n_preds < 16) g_bbs[i+1].preds[g_bbs[i+1].n_preds++] = i;
+                if (g_bbs[i+1].n_preds >= 16) {
+                    fprintf(stderr, "irc: fatal: BB %d has >16 predecessors\n", i+1);
+                    exit(1);
+                }
+                g_bbs[i+1].preds[g_bbs[i+1].n_preds++] = i;
             }
         }
     }
@@ -414,7 +473,12 @@ static void build_interference(IR3Inst *func_head, IR3Inst *func_end)
     for (int bi = 0; bi < n_bbs; bi++) {
         /* Collect instructions in forward order */
         int n_insts = 0;
-        for (IR3Inst *p = g_bbs[bi].first; p && p != func_end && n_insts < BB_INST_MAX; p = p->next) {
+        for (IR3Inst *p = g_bbs[bi].first; p && p != func_end; p = p->next) {
+            if (n_insts >= BB_INST_MAX) {
+                fprintf(stderr, "irc: fatal: BB %d has >%d instructions (BB_INST_MAX)\n",
+                        bi, BB_INST_MAX);
+                exit(1);
+            }
             g_rev[n_insts++] = p;
             if (p == g_bbs[bi].last) break;
         }
@@ -426,25 +490,26 @@ static void build_interference(IR3Inst *func_head, IR3Inst *func_end)
         for (int k = n_insts - 1; k >= 0; k--) {
             IR3Inst *p = g_rev[k];
 
-            /* Implicit use of r0 by CALLR (function pointer), RET (return value),
-             * PUTCHAR (char in r0). Adding r0 to live here ensures that any vreg
-             * assigned to r0 interferes with other vregs live at these points. */
-            if (p->op == IR3_CALLR || p->op == IR3_RET || p->op == IR3_PUTCHAR)
-                bs_set(live, 0);  /* node 0 = r0 = ACCUM */
-
-            /* Special: CALL/CALLR — force interference of live vregs with r0-r7 */
+            /* Backward analysis: defs/clobbers before uses.
+             *
+             * Step 1 — CALL/CALLR clobbers: r0-r7 are all overwritten by the call.
+             * Interfere each clobbered physical reg with everything live after the
+             * call (current live set), then remove them from live. */
             if (p->op == IR3_CALL || p->op == IR3_CALLR) {
-                /* All physical regs (r0-r7) are clobbered by the call.
-                 * r0 is the return value; r1-r7 are caller-saved scratch.
-                 * Must include r0 to prevent coalescing a live vreg into r0
-                 * (which would be overwritten by the call's return value). */
                 for (int r = 0; r < IRC_PHYS; r++) {
                     for (int t = bs_next(live, -1); t >= 0; t = bs_next(live, t))
                         add_irc_edge(r, t);
                 }
-                /* Remove r0-r7 from live (all clobbered) */
                 for (int r = 0; r < IRC_PHYS; r++) bs_clr(live, r);
             }
+
+            /* Step 2 — implicit uses of r0: CALLR reads r0 as the function pointer;
+             * RET reads r0 as the return value; PUTCHAR reads r0 as the character.
+             * Add r0 to live so that its producer sees it as live at this point.
+             * This must happen after the clobber step so that for CALLR the function
+             * pointer use is correctly live above (not swept away by the bs_clr). */
+            if (p->op == IR3_CALLR || p->op == IR3_RET || p->op == IR3_PUTCHAR)
+                bs_set(live, 0);  /* node 0 = r0 = ACCUM */
 
             /* For MOV d ← s: record as coalescing candidate, don't add (d,s) edge */
             if (p->op == IR3_MOV &&
@@ -569,6 +634,10 @@ static void simplify(void)
     int n = bs_next(simplify_wl, -1);
     if (n < 0) return;
     bs_clr(simplify_wl, n);
+    if (select_sp >= IRC_MAX_NODES) {
+        fprintf(stderr, "irc: fatal: select_stack overflow (IRC_MAX_NODES=%d)\n", IRC_MAX_NODES);
+        exit(1);
+    }
     select_stack[select_sp++] = n;
     bs_set(select_set, n);
     /* Decrement degree of all neighbors */
@@ -920,21 +989,17 @@ static void apply_colors(IR3Inst *func_head, IR3Inst *func_end)
 static void alloc_function(IR3Inst **func_head_ptr, IR3Inst *func_end,
                            IR3Inst *enter_node)
 {
-    /* Compute spill-slot floor: below the deepest existing bp-relative access */
+    /* Spill slots go immediately below the current enter frame.
+     * Do NOT scan for the deepest bp-relative access: call-arg saves inside
+     * adjw scopes can reach very deep offsets, and placing the spill floor
+     * below them would make the enter expansion huge and overflow the stack.
+     * Instead, start at -orig_N and grow downward; expand_frame shifts all
+     * existing bp-relative offsets (including adjw-space call-arg saves) by
+     * the expansion, which correctly adjusts them for the larger enter frame. */
     int orig_N = enter_node ? enter_node->imm : 0;
-    int min_bp = -orig_N;
+    int spill_floor = -orig_N;
 
-    for (IR3Inst *p = *func_head_ptr; p && p != func_end; p = p->next) {
-        if (p->op == IR3_LOAD  && p->rs1 == IR3_VREG_BP && p->imm < min_bp)
-            min_bp = p->imm;
-        if (p->op == IR3_STORE && p->rd  == IR3_VREG_BP && p->imm < min_bp)
-            min_bp = p->imm;
-        if (p->op == IR3_LEA   && p->imm < min_bp)
-            min_bp = p->imm;
-    }
-    int spill_floor = (min_bp & ~3);
-    if (spill_floor >= min_bp) spill_floor -= 4;
-
+    memset(spill_slot, 0, sizeof(spill_slot));
     for (int iter = 0; iter < IRC_MAX_ITERS; iter++) {
         irc_reset_fn();
         g_enter_N    = enter_node ? enter_node->imm : 0;
@@ -973,6 +1038,12 @@ static void alloc_function(IR3Inst **func_head_ptr, IR3Inst *func_end,
         rewrite_spills(func_head_ptr, func_end);
         /* Update spill_floor for next iteration */
         spill_floor = g_spill_next;
+
+        if (iter + 1 == IRC_MAX_ITERS) {
+            fprintf(stderr, "irc: fatal: spill rewrite did not converge after %d iterations "
+                    "(IRC_MAX_ITERS); vregs remain uncolored\n", IRC_MAX_ITERS);
+            exit(1);
+        }
     }
 
     /* Apply final colors */

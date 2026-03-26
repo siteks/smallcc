@@ -10,10 +10,12 @@
  * so that copies flowing through ACCUM can propagate to fresh vregs.
  * const_prop_fold tracks "accum_cval" similarly for constants.
  *
- * CALL/CALLR invalidate ACCUM tracking (return value overwrites r0) and
- * also reset fresh vreg copy/const maps.  Propagation across calls can
- * extend non-promoted vreg live ranges past call sites; irc_regalloc
- * handles spilling for any vreg whose live range spans a call.
+ * CALL/CALLR invalidate ACCUM tracking (return value overwrites r0).
+ * copy_propagate also resets fresh vreg copy maps at calls (propagating a
+ * pre-call vreg into a post-call use extends its live range across the call).
+ * const_prop_fold does NOT reset cval maps at calls: constants are immediates
+ * and can be rematerialized at any post-call use with a fresh IR3_CONST,
+ * so keeping the knowledge avoids live-range extension rather than causing it.
  */
 
 #include <stdlib.h>
@@ -455,13 +457,14 @@ skip_alu1:
         if (p->op != IR3_STORE && p->rd == IR3_VREG_ACCUM)
             accum_cval_valid = false;
 
-        /* CALL/CALLR clobber ACCUM and reset fresh vreg const maps
-         * (same rationale as copy_propagate — prevent non-promoted vregs
-         * from appearing live across calls). */
-        if (p->op == IR3_CALL || p->op == IR3_CALLR) {
+        /* CALL/CALLR: r0 receives the return value, so its constant is unknown.
+         * Do NOT wipe cval_valid for fresh vregs: constants are immediates and
+         * can be rematerialized with a fresh IR3_CONST at any post-call use.
+         * Wiping would cause post-call uses to retain references to the original
+         * pre-call vreg, extending its live range across the call and forcing a
+         * spill instead of a trivial immw rematerialization. */
+        if (p->op == IR3_CALL || p->op == IR3_CALLR)
             accum_cval_valid = false;
-            memset(cval_valid, 0, sizeof(cval_valid));
-        }
     }
 
     return changed;
@@ -470,14 +473,17 @@ skip_alu1:
 /* ----------------------------------------------------------------
  * Pass 3: Dead Code Elimination (per function, global use count)
  * ---------------------------------------------------------------- */
-/* Does this instruction read ACCUM (as rs1, rs2, or implicitly)? */
+/* Does this instruction read ACCUM (as rs1, rs2, STORE base, or implicitly)? */
 static bool reads_accum(IR3Inst *p)
 {
     if (p->rs1 == IR3_VREG_ACCUM || p->rs2 == IR3_VREG_ACCUM)
         return true;
-    /* JZ/JNZ/CALLR/RET implicitly read r0 (ACCUM) */
+    /* IR3_STORE: rd is the base address register (a read, not a def) */
+    if (p->op == IR3_STORE && p->rd == IR3_VREG_ACCUM)
+        return true;
+    /* JZ/JNZ/CALLR/RET/PUTCHAR implicitly read r0 (ACCUM) */
     switch (p->op) {
-    case IR3_JZ: case IR3_JNZ: case IR3_CALLR: case IR3_RET:
+    case IR3_JZ: case IR3_JNZ: case IR3_CALLR: case IR3_RET: case IR3_PUTCHAR:
         return true;
     default:
         return false;
@@ -557,19 +563,6 @@ static bool dce(IR3Inst *start, IR3Inst *end)
     return changed;
 }
 
-/* ----------------------------------------------------------------
- * le/ge expansion: rewrite IR3_ALU le/ge/les/ges/fle/fge into
- * a 3-instruction sequence with a fresh vreg for the zero constant.
- *
- * Before:  ALU rd, rs1, rs2, IR_LE
- * After:   ALU rd, rs1, rs2, IR_GT    (inverse comparison)
- *          CONST v_zero, 0
- *          ALU rd, rd, v_zero, IR_EQ   (negate result)
- *
- * This must run after optimization but before irc_regalloc, so the fresh
- * vreg gets a proper register allocation.  risc_backend's expansion
- * (which reuses rs1 as the temp) remains as a fallback for -O0.
- * ---------------------------------------------------------------- */
 /* Remove IR3_COMMENT nodes with no sym (dead instruction stubs). */
 static void compact_ir3(IR3Inst *head)
 {
