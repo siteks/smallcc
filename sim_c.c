@@ -153,7 +153,21 @@ static void write32_inner(uint16_t a, uint32_t v) { if (a >= MMIO_BASE) return; 
 #define write32 write32_inner
 static uint8_t  read8 (uint16_t a) { if (a >= MMIO_BASE) return mmio_read8(a); return mem[a]; }
 static uint16_t read16(uint16_t a) { if (a >= MMIO_BASE) return (uint16_t)mmio_read8(a) | ((uint16_t)mmio_read8((uint16_t)(a+1))<<8); return (uint16_t)mem[a] | ((uint16_t)mem[(uint16_t)(a+1)] << 8); }
-static uint32_t read32(uint16_t a) { if (a >= MMIO_BASE) return (uint32_t)mmio_read8(a)|((uint32_t)mmio_read8((uint16_t)(a+1))<<8)|((uint32_t)mmio_read8((uint16_t)(a+2))<<16)|((uint32_t)mmio_read8((uint16_t)(a+3))<<24); return (uint32_t)read16(a) | ((uint32_t)read16((uint16_t)(a+2)) << 16); }
+static uint32_t read32(uint16_t a) { if (a >= MMIO_BASE) return (uint32_t)mmio_read8(a)|((uint32_t)mmio_read8((uint16_t)(a+1))<<8)|((uint32_t)mmio_read8((uint16_t)(a+2))<<16)|((uint32_t)mmio_read8((uint16_t)(a+3))<<24); return (uint16_t)read16(a) | ((uint32_t)read16((uint16_t)(a+2)) << 16); }
+
+/* CPU4 alignment checking */
+static void check_align16(uint16_t addr, uint16_t pc) {
+    if (addr & 1) {
+        fprintf(stderr, "CPU4 alignment error: 16-bit access to unaligned address 0x%04x at pc=0x%04x\n", addr, pc);
+        exit(1);
+    }
+}
+static void check_align32(uint16_t addr, uint16_t pc) {
+    if (addr & 3) {
+        fprintf(stderr, "CPU4 alignment error: 32-bit access to unaligned address 0x%04x at pc=0x%04x\n", addr, pc);
+        exit(1);
+    }
+}
 
 /* ------------------------------------------------------------------ */
 /* Symbol table                                                         */
@@ -935,13 +949,13 @@ static void run_cpu4(int verbose)
             break;
         /* F2 — bp-relative (imm is raw 7-bit; scaled by access size) */
         case 0x80: r[rd]=read8 ((uint16_t)((int32_t)bp+sx7(imm)));     break; /* lb  */
-        case 0x84: r[rd]=read16((uint16_t)((int32_t)bp+sx7(imm)*2));   break; /* lw  */
-        case 0x88: r[rd]=read32((uint16_t)((int32_t)bp+sx7(imm)*4));   break; /* ll  */
+        case 0x84: { uint16_t a = (uint16_t)((int32_t)bp+sx7(imm)*2); check_align16(a, oldpc); r[rd]=read16(a); } break; /* lw  */
+        case 0x88: { uint16_t a = (uint16_t)((int32_t)bp+sx7(imm)*4); check_align32(a, oldpc); r[rd]=read32(a); } break; /* ll  */
         case 0x8c: write8 ((uint16_t)((int32_t)bp+sx7(imm)),    (uint8_t) r[rx]); break; /* sb  */
-        case 0x90: write16((uint16_t)((int32_t)bp+sx7(imm)*2),  (uint16_t)r[rx]); break; /* sw  */
-        case 0x94: write32((uint16_t)((int32_t)bp+sx7(imm)*4),          r[rx]);   break; /* sl  */
+        case 0x90: { uint16_t a = (uint16_t)((int32_t)bp+sx7(imm)*2); check_align16(a, oldpc); write16(a, (uint16_t)r[rx]); } break; /* sw  */
+        case 0x94: { uint16_t a = (uint16_t)((int32_t)bp+sx7(imm)*4); check_align32(a, oldpc); write32(a, r[rx]); } break; /* sl  */
         case 0x98: r[rd]=(uint32_t)(int32_t)(int8_t) read8 ((uint16_t)((int32_t)bp+sx7(imm)));   break; /* lbx */
-        case 0x9c: r[rd]=(uint32_t)(int32_t)(int16_t)read16((uint16_t)((int32_t)bp+sx7(imm)*2)); break; /* lwx */
+        case 0x9c: { uint16_t a = (uint16_t)((int32_t)bp+sx7(imm)*2); check_align16(a, oldpc); r[rd]=(uint32_t)(int32_t)(int16_t)read16(a); } break; /* lwx */
         case 0xa0: r[rd]=r[rx]+(uint32_t)sx7(imm); break; /* addi */
         /* F3a */
         case 0xc0: pc=(uint16_t)imm; break;  /* j   */
@@ -956,13 +970,13 @@ static void run_cpu4(int verbose)
         case 0xc6: sp=(uint16_t)(sp+sx16(imm)); break; /* adjw */
         /* F3b — register-relative */
         case 0xd0: r[rx]=read8 ((uint16_t)((int32_t)r[ry]+sx10(imm)));     break; /* llb  */
-        case 0xd1: r[rx]=read16((uint16_t)((int32_t)r[ry]+sx10(imm)*2));   break; /* llw  */
-        case 0xd2: r[rx]=read32((uint16_t)((int32_t)r[ry]+sx10(imm)*4));   break; /* lll  */
+        case 0xd1: { uint16_t a = (uint16_t)((int32_t)r[ry]+sx10(imm)*2); check_align16(a, oldpc); r[rx]=read16(a); } break; /* llw  */
+        case 0xd2: { uint16_t a = (uint16_t)((int32_t)r[ry]+sx10(imm)*4); check_align32(a, oldpc); r[rx]=read32(a); } break; /* lll  */
         case 0xd3: write8 ((uint16_t)((int32_t)r[ry]+sx10(imm)),    (uint8_t) r[rx]); break; /* slb  */
-        case 0xd4: write16((uint16_t)((int32_t)r[ry]+sx10(imm)*2),  (uint16_t)r[rx]); break; /* slw  */
-        case 0xd5: write32((uint16_t)((int32_t)r[ry]+sx10(imm)*4),          r[rx]);   break; /* sll  */
+        case 0xd4: { uint16_t a = (uint16_t)((int32_t)r[ry]+sx10(imm)*2); check_align16(a, oldpc); write16(a, (uint16_t)r[rx]); } break; /* slw  */
+        case 0xd5: { uint16_t a = (uint16_t)((int32_t)r[ry]+sx10(imm)*4); check_align32(a, oldpc); write32(a, r[rx]); } break; /* sll  */
         case 0xd6: r[rx]=(uint32_t)(int32_t)(int8_t) read8 ((uint16_t)((int32_t)r[ry]+sx10(imm)));   break; /* llbx */
-        case 0xd7: r[rx]=(uint32_t)(int32_t)(int16_t)read16((uint16_t)((int32_t)r[ry]+sx10(imm)*2)); break; /* llwx */
+        case 0xd7: { uint16_t a = (uint16_t)((int32_t)r[ry]+sx10(imm)*2); check_align16(a, oldpc); r[rx]=(uint32_t)(int32_t)(int16_t)read16(a); } break; /* llwx */
         case 0xd8: if(r[rx]==r[ry]) pc=(uint16_t)(pc+sx10(imm)); break; /* beq  */
         case 0xd9: if(r[rx]!=r[ry]) pc=(uint16_t)(pc+sx10(imm)); break; /* bne  */
         case 0xda: if(r[rx]< r[ry]) pc=(uint16_t)(pc+sx10(imm)); break; /* blt  */

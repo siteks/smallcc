@@ -173,27 +173,39 @@ static int current_bb_id;
  * representation; IRC will assign physical registers and spill them if needed.
  * After flush, vs_depth is set to first_arg so that the outer temps remain
  * accessible via readVariable(current_bb_id, VSTACK_BASE + k).
+ *
+ * Returns the actual number of bytes allocated (may be larger than arg_bytes
+ * due to alignment padding on CPU4).
  * ================================================================ */
-static void flush_for_call_n(int arg_bytes, int line)
+static int flush_for_call_n(int arg_bytes, int line)
 {
-    if (vs_depth == 0) return;
+    if (vs_depth == 0) return 0;
 
     int n_args  = 0;
     int arg_sum = 0;
-    for (int i = vs_depth - 1; i >= 0 && arg_sum < arg_bytes; i--) {
+    for (int i = vs_depth - 1; i >= 0 && arg_sum + vs_size[i] <= arg_bytes; i--) {
         arg_sum += vs_size[i];
         n_args++;
     }
     int first_arg = vs_depth - n_args;
 
+    int aligned_arg_sum = 0;
     if (arg_sum > 0) {
+        // CPU4: align arg_sum to 4 bytes to maintain stack alignment
+        aligned_arg_sum = arg_sum;
+        if (g_target_arch == 4 && (arg_sum & 3))
+            aligned_arg_sum = (arg_sum + 4) & ~3;
         IR3Inst *adj = emit_ir3(IR3_ADJ);
-        adj->imm  = -arg_sum;
+        adj->imm  = -aligned_arg_sum;
         adj->line = line;
-        vsp -= arg_sum;
+        vsp -= aligned_arg_sum;
 
+        // Compute store offsets respecting alignment for CPU4
         int boff = vsp;
         for (int k = vs_depth - 1; k >= first_arg; k--) {
+            // CPU4: 4-byte stores must be at 4-byte aligned offsets
+            if (g_target_arch == 4 && vs_size[k] == 4 && (boff & 3))
+                boff = (boff + 4) & ~3;
             int vreg = readVariable(current_bb_id, VSTACK_BASE + k);
             IR3Inst *st = emit_ir3(IR3_STORE);
             st->rd   = IR3_VREG_BP;
@@ -208,6 +220,7 @@ static void flush_for_call_n(int arg_bytes, int line)
     /* Outer temps (0..first_arg-1) remain in SSA vregs — IRC handles live ranges.
      * Lower vs_depth to first_arg; outer slots still readable via readVariable. */
     vs_depth = first_arg;
+    return aligned_arg_sum;
 }
 
 /* ================================================================
@@ -876,7 +889,19 @@ static void translate_bb(BB *bb, int bb_id)
                 mv->line = p->line;
             }
 
-            flush_for_call_n(arg_bytes, p->line);
+            int aligned_bytes = flush_for_call_n(arg_bytes, p->line);
+            // Update the cleanup ADJ to use the aligned size for CPU4
+            if (g_target_arch == 4 && aligned_bytes > arg_bytes) {
+                for (IRInst *q = p->next; q; q = q->next) {
+                    if (q->op == IR_NOP || q->op == IR_BB_START) continue;
+                    if (q->op == IR_ADJ && q->operand > 0) {
+                        q->operand = aligned_bytes;
+                        break;
+                    }
+                    if (q->op == IR_JL || q->op == IR_JLI || q->op == IR_RET ||
+                        q->op == IR_J  || q->op == IR_JZ  || q->op == IR_JNZ) break;
+                }
+            }
 
             if (save_fp) {
                 IR3Inst *mv = emit_ir3(IR3_MOV);

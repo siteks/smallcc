@@ -405,6 +405,8 @@ static int push_args_list(Node *first_arg, Param *params)
         if (arg->type && arg->type->base == TB_STRUCT)
         {
             int sz = arg->type->size;
+            // CPU4: align copy buffer size to 4 bytes to maintain stack alignment
+            if (g_target_arch == 4 && (sz & 3)) sz = (sz + 4) & ~3;
             copybuf_leas[i] = -(codegen_ctx.adj_depth + sz);
             ir_append(IR_ADJ, -sz, NULL);
             codegen_ctx.adj_depth += sz;
@@ -603,6 +605,9 @@ void gen_callfunction_via_ptr(Node *node)
         ir_append(IR_PUSHW, 0, NULL);
         param_size += WORD_SIZE;
     }
+    // CPU4: param_size includes padding for alignment (allocation handled by flush_for_call_n)
+    if (g_target_arch == 4 && (param_size & 3))
+        param_size = (param_size + 4) & ~3;
     gen_varaddr(node);
     gen_ld(node->symbol->type->size);
     ir_append(IR_JLI,   0, NULL);
@@ -643,6 +648,9 @@ void gen_callfunction_via_deref(Node *node)
         ir_append(IR_PUSHW, 0, NULL);
         param_size += WORD_SIZE;
     }
+    // CPU4: param_size includes padding for alignment (allocation handled by flush_for_call_n)
+    if (g_target_arch == 4 && (param_size & 3))
+        param_size = (param_size + 4) & ~3;
     gen_expr(node->ch[0]);                           // operand: function pointer value or address
     // For (*fp)(args): gen_expr(ND_IDENT "fp") already loads the 2-byte fp value.
     // For arr[i](args): ch[0] is ND_BINOP "+" (subscript address arithmetic), so gen_expr
@@ -696,6 +704,9 @@ void gen_callfunction(Node *node)
         ir_append(IR_PUSHW, 0, NULL);
         param_size += WORD_SIZE;
     }
+    // CPU4: param_size includes padding for alignment (allocation handled by flush_for_call_n)
+    if (g_target_arch == 4 && (param_size & 3))
+        param_size = (param_size + 4) & ~3;
     if (node->symbol->kind == SYM_STATIC_GLOBAL)
     {
         char mangled[80];
@@ -1171,6 +1182,12 @@ void gen_expr(Node *node)
     {
         // Call through a function-pointer struct member: s.fp(args) or s->fp(args)
         int param_size = push_args_list(node->ch[1], NULL);   // args list (fn-ptr member: param types unknown)
+        // CPU4: align param_size to 4 bytes to maintain stack alignment
+        if (g_target_arch == 4 && (param_size & 3)) {
+            int pad = 4 - (param_size & 3);
+            ir_append(IR_ADJ, -pad, NULL);  // allocate padding
+            param_size += pad;
+        }
         gen_addr(node);
         gen_ld(WORD_SIZE);  // load function pointer (pointer-sized)
         ir_append(IR_JLI,   0, NULL);
@@ -1338,9 +1355,9 @@ void gen_forstmt(Node *node)
     Node *inc  = node->ch[2];
     Node *body = node->ch[3];
     // If the init was a declaration, node->symtable holds the for-init scope.
-    // CPU4: round up to even to keep sp 2-byte aligned.
+    // CPU4: round up to multiple of 4 to keep sp 4-byte aligned.
     int for_init_sz = node->symtable ? node->symtable->size : 0;
-    if (g_target_arch == 4 && (for_init_sz & 1)) for_init_sz++;
+    if (g_target_arch == 4 && (for_init_sz & 3)) for_init_sz = (for_init_sz + 4) & ~3;
     if (node->symtable)
     {
         codegen_ctx.adj_depth += for_init_sz;
@@ -1985,10 +2002,10 @@ void gen_decl(Node *node)
 void gen_compstmt(Node *node)
 {
     // Make space on stack for this scope's locals.
-    // CPU4: round up to even so sp stays 2-byte aligned (F2 bp-relative instructions
-    // require bp to be even; odd adjw would make callee bp odd).
+    // CPU4: round up to multiple of 4 so sp stays 4-byte aligned (enter instruction
+    // does 4-byte writes at sp-4 and sp-8; misaligned sp causes bus error).
     int sz = node->symtable->size;
-    if (g_target_arch == 4 && (sz & 1)) sz++;
+    if (g_target_arch == 4 && (sz & 3)) sz = (sz + 4) & ~3;
     codegen_ctx.adj_depth += sz;
     ir_append(IR_ADJ, -sz, NULL);
     for (Node *n = node->ch[0]; n; n = n->next)   // stmts list
@@ -2051,9 +2068,9 @@ void gen_switchstmt(Node *node)
     codegen_ctx.cont_labels[codegen_ctx.loop_depth]  = -1;
     codegen_ctx.loop_adj[codegen_ctx.loop_depth]     = codegen_ctx.adj_depth;
     codegen_ctx.loop_depth++;
-    // CPU4: round up to even to keep sp 2-byte aligned.
+    // CPU4: round up to multiple of 4 to keep sp 4-byte aligned.
     int sw_sz = body->symtable->size;
-    if (g_target_arch == 4 && (sw_sz & 1)) sw_sz++;
+    if (g_target_arch == 4 && (sw_sz & 3)) sw_sz = (sw_sz + 4) & ~3;
     codegen_ctx.adj_depth += sw_sz;
     ir_append(IR_ADJ, -sw_sz, NULL);
     for (Node *ch = body->ch[0]; ch; ch = ch->next)   // stmts list

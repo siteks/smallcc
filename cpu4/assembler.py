@@ -189,7 +189,8 @@ class Assembler:
                 if mnemonic in G.directive:
                     size = G.directive[mnemonic]
                     if mnemonic == 'align':
-                        if adr() & 1:
+                        # Align to 4 bytes for CPU4 (required for 32-bit accesses)
+                        while adr() & 3:
                             adr(adr() + 1)
                         i.length = 0
                         i.ins = []

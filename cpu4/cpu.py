@@ -258,6 +258,10 @@ class Mem:
 
     def read16(self, addr, trace=True):
         addr &= 0xffff
+        if addr & 1:
+            import sys
+            sys.stderr.write(f"CPU4 alignment error: 16-bit read from unaligned address 0x{addr:04x}\n")
+            sys.exit(1)
         if addr >= MMIO_BASE:
             return self._mmio_read8(addr) | (self._mmio_read8(addr + 1) << 8)
         d = int(self.mem[addr]) | (int(self.mem[addr + 1]) << 8)
@@ -266,6 +270,10 @@ class Mem:
 
     def read32(self, addr, trace=True):
         addr &= 0xffff
+        if addr & 3:
+            import sys
+            sys.stderr.write(f"CPU4 alignment error: 32-bit read from unaligned address 0x{addr:04x}\n")
+            sys.exit(1)
         if addr >= MMIO_BASE:
             return (self._mmio_read8(addr) | (self._mmio_read8(addr + 1) << 8) |
                     (self._mmio_read8(addr + 2) << 16) | (self._mmio_read8(addr + 3) << 24))
@@ -289,6 +297,10 @@ class Mem:
 
     def write16(self, addr, data):
         addr &= 0xffff
+        if addr & 1:
+            import sys
+            sys.stderr.write(f"CPU4 alignment error: 16-bit write to unaligned address 0x{addr:04x}\n")
+            sys.exit(1)
         if addr >= MMIO_BASE:
             return
         self.trace += 'w16[%04x]<=%04x ' % (addr, data & 0xffff)
@@ -297,6 +309,10 @@ class Mem:
 
     def write32(self, addr, data):
         addr &= 0xffff
+        if addr & 3:
+            import sys
+            sys.stderr.write(f"CPU4 alignment error: 32-bit write to unaligned address 0x{addr:04x}\n")
+            sys.exit(1)
         if addr >= MMIO_BASE:
             return
         self.trace += 'w32[%04x]<=%08x ' % (addr, data & 0xffffffff)
