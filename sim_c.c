@@ -253,7 +253,8 @@ static const Instr4 itab4[] = {
     /* F0 — 1 byte, no operands */
     {"halt",   0x00,0,0,0}, {"ret",    0x01,0,0,0},
     {"itof",   0x02,0,0,0}, {"ftoi",   0x03,0,0,0},
-    {"jlr",    0x04,0,0,0}, {"putchar",0x1e,0,0,0},
+    {"jlr",    0x04,0,0,0}, {"push",   0x05,0,0,0}, {"pop",    0x06,0,0,0},
+    {"putchar",0x1e,0,0,0},
     /* F1a — 2 bytes, rd rx ry */
     {"add",    0x40,1,0,0}, {"sub",    0x42,1,0,0},
     {"mul",    0x44,1,0,0}, {"div",    0x46,1,0,0},
@@ -271,6 +272,7 @@ static const Instr4 itab4[] = {
     /* F1b — 2 bytes, rd only; subop distinguishes the operation */
     {"sxb",    0x7e,1,1,0x00}, {"sxw",   0x7e,1,1,0x01},
     {"inc",    0x7e,1,1,0x02}, {"dec",   0x7e,1,1,0x03},
+    {"pushr",  0x7e,1,1,0x04}, {"popr",  0x7e,1,1,0x05},
     /* F2 — 2 bytes, rx imm7 (bp-relative; imm scaled by access width) */
     {"lb",     0x80,1,0,0}, {"lw",     0x84,1,0,0},
     {"ll",     0x88,1,0,0}, {"sb",     0x8c,1,0,0},
@@ -913,6 +915,14 @@ static void run_cpu4(int verbose)
         case 0x02: { int32_t iv=(r[0]<0x80000000u)?(int32_t)r[0]:(int32_t)(r[0]-0x100000000ull); r[0]=float2bits((float)iv); } break; /* itof */
         case 0x03: { float f=bits2float(r[0]); r[0]=(uint32_t)(int32_t)f; } break; /* ftoi */
         case 0x04: { uint16_t t=pc; pc=(uint16_t)(r[0]&0xffff); lr=t; } break; /* jlr */
+        case 0x05:                /* push */
+            sp = (uint16_t)(sp - 4);
+            write32(sp, r[0]);
+            break;
+        case 0x06:                /* pop */
+            r[0] = read32(sp);
+            sp = (uint16_t)(sp + 4);
+            break;
         case 0x1e: fputc((int)(r[0]&0xff),stderr); fflush(stderr); break; /* putchar */
         /* F1a */
         case 0x40: r[rd]=r[rx]+r[ry]; break;  /* add */
@@ -946,6 +956,8 @@ static void run_cpu4(int verbose)
             else if (subop==0x01) r[rd]=(uint32_t)(int32_t)(int16_t)(r[rd]&0xffff); /* sxw */
             else if (subop==0x02) r[rd]=(r[rd]+1)&0xffffffff;                        /* inc */
             else if (subop==0x03) r[rd]=(r[rd]-1)&0xffffffff;                        /* dec */
+            else if (subop==0x04) { sp -= 4; write32(sp, r[rd]); }                   /* pushr */
+            else if (subop==0x05) { r[rd] = read32(sp); sp += 4; }                   /* popr */
             break;
         /* F2 — bp-relative (imm is raw 7-bit; scaled by access size) */
         case 0x80: r[rd]=read8 ((uint16_t)((int32_t)bp+sx7(imm)));     break; /* lb  */
@@ -1003,6 +1015,16 @@ static void run_cpu4(int verbose)
 
         for (int i = 0; i < 8; i++) r[i] &= 0xffffffff;
         sp &= 0xffff; bp &= 0xffff; lr &= 0xffff; pc &= 0xffff;
+
+        /* SP/BP must be 4-byte aligned at all times */
+        if (sp & 3) {
+            fprintf(stderr, "CPU4 alignment error: SP misaligned 0x%04x at pc=0x%04x\n", sp, oldpc);
+            H = 1;
+        }
+        if (bp & 3) {
+            fprintf(stderr, "CPU4 alignment error: BP misaligned 0x%04x at pc=0x%04x\n", bp, oldpc);
+            H = 1;
+        }
     }
 
     printf("r0:%08x r1:%08x r2:%08x r3:%08x r4:%08x r5:%08x r6:%08x r7:%08x sp:%04x bp:%04x lr:%04x pc:%04x H:%x cycles:%u\n",

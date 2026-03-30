@@ -35,6 +35,8 @@ import sys
 #   itof
 #   ftoi
 #   jlr     lr = pc; pc = r0 & 0xffff
+#   push    sp-=4; *sp = r0
+#   pop     r0 = *sp; sp += 4
 #   __putchar
 #
 #   Format 1a - three op (31 slots)
@@ -70,6 +72,8 @@ import sys
 #   sxw     rd
 #   inc     rd
 #   dec     rd
+#   pushr   rd
+#   popr    rd
 #   
 #   Format 2 - one op + imm7; stack frame access (16 slots)
 #   lb      rx = [bp+sxt(imm7)]   
@@ -146,6 +150,8 @@ class G:
         'itof'  :   (0x02, 0, 0, 0),
         'ftoi'  :   (0x03, 0, 0, 0),
         'jlr'   :   (0x04, 0, 0, 0),
+        'push'  :   (0x05, 0, 0, 0),
+        'pop'   :   (0x06, 0, 0, 0),
         'putchar':  (0x1e, 0, 0, 0),
         # format 1a - three op, 16 bits 01ooooodddxxxyyy
         'add'   :   (0x40, 1, 0, 0),
@@ -179,6 +185,8 @@ class G:
         'sxw'   :   (0x7e, 1, 1, 0x01),
         'inc'   :   (0x7e, 1, 1, 0x02),
         'dec'   :   (0x7e, 1, 1, 0x03),
+        'pushr' :   (0x7e, 1, 1, 0x04),
+        'popr'  :   (0x7e, 1, 1, 0x05),
         # format 2 - one op + imm7      10ooooxxxiiiiiii
         'lb'    :   (0x80, 1, 0, 0),
         'lw'    :   (0x84, 1, 0, 0),
@@ -427,6 +435,8 @@ class CPU:
         elif    i == 'itof':    iv = s.r[0] if s.r[0] < 0x80000000 else s.r[0] - 0x100000000; s.r[0] = f2b(float(iv))
         elif    i == 'ftoi':    s.r[0] = int(b2f(s.r[0])) & 0xffffffff
         elif    i == 'jlr':     s.pc, s.lr = s.r[0], s.pc
+        elif    i == 'push':    s.sp -= 4; m.write32(s.sp, s.r[0])
+        elif    i == 'pop':     s.r[0] = m.read32(s.sp); s.sp += 4
         elif    i == 'putchar': sys.stderr.write(chr(s.r[0] & 0xff)); sys.stderr.flush()
         # f1a
         elif    i == 'add':     s.r[dst] = s.r[src0] + s.r[src1]
@@ -459,6 +469,8 @@ class CPU:
         elif    i == 'sxw':     s.r[dst] = 0xffff0000 | s.r[src0] if s.r[src0] & 0x8000 else 0xffff & s.r[src0]
         elif    i == 'inc':     s.r[dst] = s.r[src0] + 1
         elif    i == 'dec':     s.r[dst] = s.r[src0] - 1
+        elif    i == 'pushr':   s.sp -= 4; m.write32(s.sp, s.r[src0])
+        elif    i == 'popr':    s.r[dst] = m.read32(s.sp); s.sp += 4
         # f2
         elif    i == 'lb':      s.r[dst] = m.read8(s.bp + sext(imm, 7))
         elif    i == 'lw':      s.r[dst] = m.read16(s.bp + sext(imm<<1, 8))
@@ -505,6 +517,15 @@ class CPU:
         s.bp &= 0xffff
         s.lr &= 0xffff
         s.pc &= 0xffff
+
+        # Exception in illegal sp, bp state
+        if s.sp & 3:
+            sys.stderr.write(f"CPU4 alignment error: SP misaligned 0x{s.sp:04x}\n")
+            sys.exit(1)
+        if s.bp & 3:
+            sys.stderr.write(f"CPU4 alignment error: BP misaligned 0x{s.bp:04x}\n")
+            sys.exit(1)
+
 
         if trace:
             sins = '%02x    ' % ins if ilen == 1 else '%02x%02x  ' % (ins,imm&0xff) if ilen == 2 else '%02x%02x%02x' % (ins,imm&0xff,(imm>>8)&0xff)

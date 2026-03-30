@@ -105,7 +105,7 @@ static void emit_bp_load(int rd, int byte_off, int size, int sign_ext,
 /* ----------------------------------------------------------------
  * Emit a bp-relative store (F2 if in range, else F3b via lea+slw)
  * ---------------------------------------------------------------- */
-static void emit_bp_store(int val_reg, int byte_off, int size, int scratch,
+static void emit_bp_store(int val_reg, int byte_off, int size,
                           const char *sym)
 {
     const char *ann = (flag_annotate && sym) ? sym : NULL;
@@ -122,13 +122,49 @@ static void emit_bp_store(int val_reg, int byte_off, int size, int scratch,
         if (ann) fprintf(asm_out, "  ; %s", ann);
         fputc('\n', asm_out);
     } else {
-        /* Fallback: lea scratch, byte_off; store via scratch */
-        fprintf(asm_out, "    lea     r%d, %d\n", scratch, byte_off);
-        if      (size == 2) fprintf(asm_out, "    slw     r%d, r%d, 0", val_reg, scratch);
-        else if (size == 1) fprintf(asm_out, "    slb     r%d, r%d, 0", val_reg, scratch);
-        else                fprintf(asm_out, "    sll     r%d, r%d, 0", val_reg, scratch);
-        if (ann) fprintf(asm_out, "  ; %s", ann);
-        fputc('\n', asm_out);
+        /* Fallback: use r7 for address, save/restore r7 via r0 or stack.
+         * If val_reg == 7: we can't use r7 for address. Use push/pop to save r7,
+         *   then lea r7, byte_off, move val from stack to r0, store r0 via r7.
+         * If val_reg != 7: save r7 to r0, lea r7, byte_off, store val_reg via r7,
+         *   restore r7 from r0. */
+        if (val_reg == 7) {
+            /* val is in r7. Save r0, move val to r0, compute addr in r7, store, restore r0.
+             * r7 is caller-saved so we don't need to restore it. */
+            fprintf(asm_out, "    push\n");                  /* save r0 */
+            fprintf(asm_out, "    or      r0, r7, r7\n");   /* r0 = r7 (val) */
+            fprintf(asm_out, "    lea     r7, %d\n", byte_off); /* r7 = address */
+            if      (size == 2) fprintf(asm_out, "    slw     r0, r7, 0");
+            else if (size == 1) fprintf(asm_out, "    slb     r0, r7, 0");
+            else                fprintf(asm_out, "    sll     r0, r7, 0");
+            if (ann) fprintf(asm_out, "  ; %s", ann);
+            fputc('\n', asm_out);
+            fprintf(asm_out, "    pop\n");                  /* restore r0 */
+        } else if (val_reg == 0) {
+            /* val_reg is 0. Value is in r0. Use pushr/popr to save/restore r7:
+             * 1. pushr r7 (save r7 to stack)
+             * 2. lea r7, byte_off (r7 = address)
+             * 3. slw r0, r7, 0 (store r0 via r7)
+             * 4. popr r7 (restore r7)
+             * r0 is preserved throughout. */
+            fprintf(asm_out, "    pushr   r7\n");             /* save r7 */
+            fprintf(asm_out, "    lea     r7, %d\n", byte_off); /* r7 = address */
+            if      (size == 2) fprintf(asm_out, "    slw     r0, r7, 0");
+            else if (size == 1) fprintf(asm_out, "    slb     r0, r7, 0");
+            else                fprintf(asm_out, "    sll     r0, r7, 0");
+            if (ann) fprintf(asm_out, "  ; %s", ann);
+            fputc('\n', asm_out);
+            fprintf(asm_out, "    popr    r7\n");             /* restore r7 */
+        } else {
+            /* val_reg is not 0 or 7. Value is in val_reg. Use pushr/popr to save/restore r7. */
+            fprintf(asm_out, "    pushr   r7\n");             /* save r7 */
+            fprintf(asm_out, "    lea     r7, %d\n", byte_off); /* r7 = address */
+            if      (size == 2) fprintf(asm_out, "    slw     r%d, r7, 0", val_reg);
+            else if (size == 1) fprintf(asm_out, "    slb     r%d, r7, 0", val_reg);
+            else                fprintf(asm_out, "    sll     r%d, r7, 0", val_reg);
+            if (ann) fprintf(asm_out, "  ; %s", ann);
+            fputc('\n', asm_out);
+            fprintf(asm_out, "    popr    r7\n");             /* restore r7 */
+        }
     }
 }
 
@@ -299,9 +335,8 @@ void risc_backend_emit(SSAInst *head)
         /* ---- Stores ---- */
         case SSA_STORE:
             if (p->rd == -2) {
-                /* bp-relative store (F2); use rs1+1 as scratch if needed. */
-                int scratch = (p->rs1 == 0) ? 1 : 0;
-                emit_bp_store(p->rs1, p->imm, p->size, scratch, p->sym);
+                /* bp-relative store (F2 or fallback). */
+                emit_bp_store(p->rs1, p->imm, p->size, p->sym);
             } else {
                 /* Register-relative store (F3b):
                  * rd = base address register, rs1 = value register */
