@@ -1,7 +1,8 @@
 # Target ISA: CPU4
 
 A custom 32-bit RISC-like machine with a dense variable-width encoding. Simulated by
-`cpu4/sim.py` (`cpu4/assembler.py` + `cpu4/cpu.py`). The canonical reference is `cpu4/cpu.py`.
+`sim_c` (fast C simulator supporting both CPU3 and CPU4 ISAs) and `cpu4/sim.py` (Python
+reference implementation). The canonical reference is `cpu4/cpu.py`.
 
 ## Registers
 
@@ -19,6 +20,11 @@ A custom 32-bit RISC-like machine with a dense variable-width encoding. Simulate
 All registers r0–r7 are caller-saved — any call may clobber all of them. The compiler's
 call flushing mechanism ensures all live values are saved to memory before calls and
 restored afterward.
+
+**Alignment Requirements (CPU4 only):** `sp` and `bp` must be 32-bit aligned at all times.
+Any misaligned access (16-bit or 32-bit load/store to an odd address, or 32-bit access to an
+address not divisible by 4) causes an alignment exception and the simulator will terminate
+with an error. The `sim_c` simulator enforces this strictly in CPU4 mode.
 
 Memory is 65536 bytes. Data is little-endian. The stack starts at `sp = 0x1000` (set by `ssp`).
 
@@ -53,9 +59,11 @@ Operates on `r0` or special registers implicitly.
 | 0x02 | `itof` | r0 = float_bits(float(signed32(r0))) |
 | 0x03 | `ftoi` | r0 = int(float(r0)) truncated toward zero |
 | 0x04 | `jlr` | lr = pc; pc = r0 & 0xffff (indirect call via r0) |
+| 0x05 | `push` | sp -= 4; mem32[sp] = r0 |
+| 0x06 | `pop` | r0 = mem32[sp]; sp += 4 |
 | 0x1e | `putchar` | write chr(r0 & 0xff) to stderr; r0 unchanged |
 
-*(~58 slots reserved for future hotspot encodings.)*
+*(~56 slots reserved for future hotspot encodings.)*
 
 ---
 
@@ -131,8 +139,10 @@ slots.
 | 0x01 | `sxw rd` | rd = sign_extend_16(rd) (in-place) |
 | 0x02 | `inc rd` | rd = rd + 1 |
 | 0x03 | `dec rd` | rd = rd − 1 |
+| 0x04 | `pushr rd` | sp -= 4; mem32[sp] = rd |
+| 0x05 | `popr rd` | rd = mem32[sp]; sp += 4 |
 
-*(60 slots reserved for future hotspot encodings.)*
+*(58 slots reserved for future hotspot encodings.)*
 
 `inc`/`dec` cover the K=±1 in-place case in 2 bytes, compared to 5 bytes for the general
 `immw r_tmp, 1; add rd, rd, r_tmp` sequence. They are particularly effective for loop counters

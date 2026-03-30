@@ -548,6 +548,71 @@ When a real definition arrives for the same name (in the same or a later TU), `i
 
 ---
 
+## Variadic Functions
+
+The compiler supports C89-style variadic functions using `...` in the parameter list and the standard `<stdarg.h>` macros.
+
+### Parsing and Type Representation
+
+- The `...` token is recognized as `TK_ELLIPSIS` in the tokeniser
+- `ND_PTYPE_LIST` has an `is_variadic` flag set when `...` appears in the parameter list
+- Function types store `is_variadic` in `Type.u.fn.is_variadic`
+- `va_list` is pre-registered by the compiler as a typedef for `int` (a pointer-sized type)
+- `va_start`, `va_arg`, and `va_end` are built-in keywords handled by the parser (not macros)
+
+### Code Generation
+
+**va_start(ap, last_param)** (`codegen.c`):
+- Calculates the offset immediately after the last named parameter
+- Emits: `ap = bp + last_param.offset + last_param.size`
+- This points `ap` to the first variadic argument on the stack
+
+**va_arg(ap, T)** (`codegen.c`):
+1. Saves the current `ap` value (old pointer)
+2. Advances `ap` by `sizeof(T)` bytes
+3. Loads the value from `*old_ap` with proper type size and sign extension
+- Works for `int`, `long`, `float`, `double`, and pointer types
+- **Not supported**: struct types (incompatible with struct-by-value ABI)
+
+**va_end(ap)** (`codegen.c`):
+- No-op — the compiler generates no code
+
+### Stack Layout for Variadic Calls
+
+Arguments are pushed right-to-left by the caller. Named parameters are accessed at fixed `bp+offset` locations. Variadic arguments are accessed through the `ap` pointer which iterates forward through the argument stack area.
+
+```
+bp+8+2*(n-1)   param n (first variadic, accessed via *ap)
+    ...
+bp+8           param 0 (last named, accessed via bp+offset)
+bp+4           return address (lr)
+bp+0           saved bp
+```
+
+### Usage Example
+
+```c
+#include <stdarg.h>
+
+int sum(int count, ...) {
+    va_list ap;
+    va_start(ap, count);
+    int total = 0;
+    for (int i = 0; i < count; i++) {
+        total += va_arg(ap, int);
+    }
+    va_end(ap);
+    return total;
+}
+```
+
+### Limitations
+
+- `va_arg(ap, struct S)` is not supported. Struct arguments are passed via hidden-copy pointers, but `va_arg` reads raw bytes based on `sizeof(type)`. Pass a `struct S *` instead.
+- Variadic functions cannot be inlined by the compiler (no inline assembly generation for varargs).
+
+---
+
 ## Backend Files
 
 After `gen_ir` and `peephole`, the pipeline splits by target architecture. All backend files
@@ -564,7 +629,7 @@ identical for both CPU3 and CPU4 targets.
 
 Rules 1–9: constant folding, dead branch elimination, `adj` merging, multiply strength-reduction,
 and store/reload elimination. Runs on the stack IR before the target split. Rule 9 (store/reload
-elim) is currently gated on CPU3 only. See `docs/codegen.md` for rule details.
+elim) is currently gated on CPU3 only. See `docs/backend.md` for rule details.
 
 ### `backend.c` — CPU3 Emitter
 

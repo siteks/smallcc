@@ -18,9 +18,7 @@ Deliberate deviations from C89 standard:
 
 Translation units supported, linkage in memory, no object files. Very basic preprocessor functionality.
 
-Targets a custom stack-based 32 bit processor with 16 bit address space. 
-
-Detailed information in `docs/`.
+Targets a custom stack-based 32 bit processor with 16 bit address space. Also supports a RISC-like register machine variant (CPU4).
 
 ## Compile and test
 
@@ -41,8 +39,8 @@ r0:00000000 sp:1000 bp:0000 lr:0229 pc:0007 H:1
 
 ```
 
-## TODO
+## Documentation
 
-* Peephole optimiser
-* Clean backend separation and alternative targets
+- [docs/README.md](docs/README.md) — Documentation index and architecture overview
+- [CLAUDE.md](CLAUDE.md) — Build/test commands and quick reference for developers
   

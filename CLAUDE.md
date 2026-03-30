@@ -70,36 +70,30 @@ C89 subset compiler. Input is one or more `.c` files; assembly is written to std
 
 ```
 Startup [smallcc.c]:
-  get_compiler_dir(argv[0])                 Locate the directory of the compiler binary
-  set_include_dir("$bindir/include")        Set system header search path for #include <>
+  get_compiler_dir(argv[0])                 Locate compiler binary directory
+  set_include_dir("$bindir/include")        Set header search path
   scan_lib_files("$bindir/lib")             Collect lib/*.c — prepended before user files
 
-Preamble (ssp / jl main / halt) is emitted once before the per-TU loop.
+Preamble (ssp / jl main / halt) emitted once before per-TU loop.
 
-Per-TU loop [smallcc.c]  (lib TUs first, then user TUs):
-  read_file()               [smallcc.c]     Read source bytes from disk
-  preprocess()              [preprocess.c]  Macro expansion, #include, #ifdef/#endif
-  reset_codegen()           [codegen.c]     Clear per-TU codegen state
-  reset_parser()            [parser.c]      Clear per-TU parser state
-  reset_types_state()       [types.c]       Fresh symbol/scope tables (type list preserved;
-                                            SYM_EXTERN symbols carried forward from prev TU)
-  reset_preprocessor()      [preprocess.c]  Clear macro table and include-depth counter
-  make_basic_types()        [types.c]       Populate/reuse global type table
+Per-TU loop [smallcc.c] (lib TUs first, then user TUs):
+  read_file()               [smallcc.c]     Read source from disk
+  preprocess()              [preprocess.c]  Macro expansion, #include, conditionals
+  reset_codegen/parse/types/preprocessor()  Reset per-TU state
+  make_basic_types()        [types.c]       Populate type table
   tokenise()                [tokeniser.c]   Token linked list
   program()                 [parser.c]      AST (Node tree)
-  resolve_symbols(root)     [parser.c]      Set ND_IDENT types via symbol table lookup
-  derive_types(root)        [parser.c]      Propagate types bottom-up through the AST
-  insert_coercions(root)    [parser.c]      Insert ND_CAST / stride-scale nodes
-  label_su(root)            [parser.c]      Sethi-Ullman labelling; reorder commutative children
-  finalize_local_offsets()  [types.c]       Compute bp-relative offsets for all locals
-  gen_ir(node, tu_index)    [codegen.c]     Walk AST; build flat IR instruction list
-  mark_basic_blocks()       [codegen.c]     Insert IR_BB_START sentinels between basic blocks
-  peephole(opt_level)       [optimise.c]    Constant folding, dead branches, store/reload elim
-  backend_emit_asm(ir_head) [backend.c]     Walk IR list; emit assembly text
-  harvest_globals()         [smallcc.c]     Mark non-static globals SYM_EXTERN for next TU
+  resolve_symbols()         [parser.c]      Symbol table lookup
+  derive_types()            [parser.c]      Bottom-up type propagation
+  insert_coercions()        [parser.c]      Insert casts and stride-scaling
+  label_su()                [parser.c]      Sethi-Ullman labelling
+  finalize_local_offsets()  [types.c]       Compute bp-relative offsets
+  gen_ir()                  [codegen.c]     Build IR instruction list
+  mark_basic_blocks()       [codegen.c]     Insert BB sentinels
+  peephole()                [optimise.c]    Constant fold, dead branch elim
+  backend_emit_asm()        [backend.c]     Emit assembly text
+  harvest_globals()         [smallcc.c]     Carry globals to next TU
 ```
-
-Every phase prints debug information to stderr. `-stats` prints per-TU and total arena usage to stderr after compilation.
 
 ### Source Files
 
@@ -149,8 +143,9 @@ Every phase prints debug information to stderr. `-stats` prints per-TU and total
 
 ## Detailed Reference
 
-- @docs/architecture.md — tokeniser, parser (grammar, AST nodes, node struct), type system, per-TU compilation, backend file overview
-- @docs/codegen.md — stack IR (`IRInst`/`IROp`), CPU3 backend (frame layout, expression idioms, cast gen, peephole), CPU4 backend (Braun SSA, IR3, linear-scan regalloc, RISC emit)
-- @docs/cpu3-isa.md — CPU3 registers, full instruction set, assembly syntax
-- @docs/cpu4-isa.md — CPU4 registers, full instruction set, assembly syntax (verified against `cpu4/cpu.py`)
+- @docs/architecture.md — tokeniser, parser (grammar, AST nodes), type system, per-TU compilation
+- @docs/backend.md — IR, both backends (CPU3 stack, CPU4 SSA with IRC register allocation), peephole optimisations
+- @docs/isa/cpu3.md — CPU3 registers, instruction set, assembly syntax
+- @docs/isa/cpu4.md — CPU4 registers, instruction set, assembly syntax
 - @docs/c89-status.md — compliance tables, deliberate deviations, what's implemented/missing
+- @docs/testing.md — test systems and debugging tips
