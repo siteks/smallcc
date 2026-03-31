@@ -17,7 +17,6 @@
  */
 
 #include "smallcc.h"
-#include "ssa.h"
 
 #define IR3_VREG_NONE  (-1)
 #define IR3_VREG_BP    (-2)
@@ -120,8 +119,8 @@ void ir3_optimize(IR3Inst *head, int opt_level);
  * Handles call-site spilling and coalescing of phi-generated moves. */
 void irc_regalloc(IR3Inst *head);
 
-/* Lower IR3Inst list to SSAInst for risc_backend_emit(). */
-SSAInst *ir3_lower(IR3Inst *head);
+/* Emit CPU4 assembly from post-regalloc IR3Inst list. */
+void risc_backend_emit(IR3Inst *head);
 
 /* Release IR3Inst list (all nodes heap-allocated). */
 void free_ir3(IR3Inst *head);

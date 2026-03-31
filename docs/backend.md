@@ -16,8 +16,7 @@ backend_emit_asm()    [backend.c]    stack IR → CPU3 assembly
 braun_ssa()           [braun.c]       stack IR → IR3Inst (fresh vregs)
 ir3_optimize()        [ir3_opt.c]     copy prop, const prop/fold, DCE
 irc_regalloc()        [irc.c]         IRC graph-coloring; vregs → physical r0–r7
-ir3_lower()           [ir3_lower.c]   IR3Inst → SSAInst
-risc_backend_emit()   [risc_backend.c] SSAInst → CPU4 assembly
+risc_backend_emit()   [risc_backend.c] IR3Inst → CPU4 assembly
 ```
 
 The stack IR is identical for both targets; the split happens after `peephole`. The two emitter files (`backend.c` for CPU3, `risc_backend.c` for CPU4) consume the same upstream IR.
@@ -284,7 +283,7 @@ Every `IRInst` carries a `line` field stamped by `ir_append()` from `current_cod
 
 ## CPU4 Backend
 
-After `peephole`, the CPU4 path runs four additional passes (braun_ssa, ir3_optimize, irc_regalloc, ir3_lower) before reaching the unchanged `risc_backend_emit`.
+After `peephole`, the CPU4 path runs three additional passes before `risc_backend_emit`.
 
 ```
 Stack IR (codegen.c, unchanged)
@@ -292,8 +291,7 @@ Stack IR (codegen.c, unchanged)
     ↓  braun_ssa()              [braun.c]        stack IR → IR3Inst (fresh vregs)
     ↓  ir3_optimize()           [ir3_opt.c]      copy prop, const prop/fold, DCE
     ↓  irc_regalloc()           [irc.c]          IRC graph-coloring; vregs → physical r0–r7
-    ↓  ir3_lower()              [ir3_lower.c]    IR3Inst → SSAInst
-    ↓  risc_backend_emit()      [risc_backend.c] SSAInst → CPU4 assembly (unchanged)
+    ↓  risc_backend_emit()      [risc_backend.c] IR3Inst → CPU4 assembly
 ```
 
 **ABI:** All-caller-save. r0–r7 are all caller-saved. No callee-saved infrastructure. r0 is reserved for the accumulator (ACCUM); r1–r7 are all available for allocation.
@@ -472,86 +470,41 @@ Iterated Register Coalescing allocator (Appel & George 1996). Runs per function 
 
 ---
 
-### Pass 2b: `ir3_lower()` (`ir3_lower.c`)
+### Pass 2b: `risc_backend_emit()` (`risc_backend.c`)
 
-Near-1:1 translation from `IR3Inst` (physical registers in `rd`/`rs1`/`rs2`) to `SSAInst` for `risc_backend_emit`. One `IR3Inst` → one `SSAInst` in all cases. Zero-imm `IR3_ADJ` nodes are dropped.
-
-| IR3Op | SSAOp | Notes |
-|---|---|---|
-| `IR3_CONST` (sym==NULL) | `SSA_MOVI` | |
-| `IR3_CONST` (sym!=NULL) | `SSA_MOVSYM` | |
-| `IR3_LOAD` | `SSA_LOAD` | rs1==-2 triggers bp-relative path in backend |
-| `IR3_STORE` | `SSA_STORE` | rd==-2 triggers bp-relative path |
-| `IR3_LEA` | `SSA_LEA` | |
-| `IR3_ALU` | `SSA_ALU` | alu_op forwarded |
-| `IR3_ALU1` | `SSA_ALU1` | alu_op forwarded |
-| `IR3_MOV` | `SSA_MOV` | |
-| `IR3_CALL` | `SSA_CALL` | |
-| `IR3_CALLR` | `SSA_CALLR` | |
-| `IR3_RET` | `SSA_RET` | |
-| `IR3_J` | `SSA_J` | |
-| `IR3_JZ` | `SSA_JZ` | |
-| `IR3_JNZ` | `SSA_JNZ` | |
-| `IR3_ENTER` | `SSA_ENTER` | |
-| `IR3_ADJ` (imm != 0) | `SSA_ADJ` | zero-imm nodes dropped |
-| `IR3_SYMLABEL` | `SSA_SYMLABEL` | |
-| `IR3_LABEL` | `SSA_LABEL` | |
-| `IR3_WORD/BYTE/ALIGN` | `SSA_WORD/BYTE/ALIGN` | |
-| `IR3_PUTCHAR` | `SSA_PUTCHAR` | |
-| `IR3_COMMENT` | `SSA_COMMENT` | |
-
----
-
-### Pass 3: `risc_backend_emit()` (`risc_backend.c`)
-
-Walks the post-lower `SSAInst` list and emits CPU4 assembly text.
-
-#### SSAInst struct
-
-```c
-typedef struct SSAInst {
-    SSAOp       op;
-    IROp        alu_op;   // SSA_ALU/SSA_ALU1: original IR opcode
-    int         rd;       // -2 = bp-relative, -1 = none, 0–7 = physical
-    int         rs1;
-    int         rs2;
-    int         imm;      // immediate / bp offset / label id
-    int         size;     // 1/2/4 for LOAD/STORE
-    const char *sym;
-    int         line;
-    struct SSAInst *next;
-} SSAInst;
-```
+Walks the post-regalloc `IR3Inst` list (all registers physical 0–7) and emits CPU4 assembly text.
+Zero-imm `IR3_ADJ` nodes and dead-phi `IR3_MOV` nodes (`rd == IR3_VREG_NONE`) are skipped.
+Nodes marked dead by the sign-extend peephole (`op < 0`) are also skipped.
 
 #### Instruction selection
 
-| SSAOp | Condition | CPU4 emission |
+| IR3Op | Condition | CPU4 emission |
 |---|---|---|
-| `SSA_MOVI` | imm fits in 16 bits | `immw rd, imm` |
-| `SSA_MOVI` | imm > 0xffff | `immw rd, lo16; immwh rd, hi16` |
-| `SSA_MOVSYM` | — | `immw rd, sym` |
-| `SSA_LEA` | — | `lea rd, imm` (F3c) |
-| `SSA_MOV` | rd != rs1 | `or rd, rs1, rs1` (F1a pseudo-mov) |
-| `SSA_LOAD` | rs1 == -2, in F2 range | `lw/lb/ll rd, [bp+imm7]` (F2, 2 bytes) |
-| `SSA_LOAD` | rs1 == -2, out of F2 range | `lea scratch, imm; llw/llb/lll rd, [scratch+0]` |
-| `SSA_LOAD` | rs1 >= 0 | `llw/llb/lll rd, [rs1+imm]` (F3b, 3 bytes) |
-| `SSA_STORE` | rd == -2, in F2 range | `sw/sb/sl rs1, [bp+imm7]` (F2, 2 bytes) |
-| `SSA_STORE` | rd == -2, out of F2 range | `lea scratch, imm; slw/slb/sll rs1, [scratch+0]` |
-| `SSA_STORE` | rd >= 0 | `slw/slb/sll rs1, [rd+imm]` (F3b, 3 bytes) |
-| `SSA_ALU` | most ops | `add/sub/mul/… rd, rs1, rs2` (F1a, 2 bytes) |
-| `SSA_ALU` | `le`/`ge`/`les`/`ges`/`fle`/`fge` | assembler pseudo-ops (operand swap, single insn) |
-| `SSA_ALU1` | `sxb`/`sxw` | `sxb/sxw rd` (F1b, 2 bytes; in-place) |
-| `SSA_ALU1` | `itof`/`ftoi` | `itof`/`ftoi` (F0; r0 implicit) |
-| `SSA_ENTER` | — | `enter N` (F3a) |
-| `SSA_ADJ` | imm != 0 | `adjw imm` (F3a) |
-| `SSA_RET` | — | `ret` (F0) |
-| `SSA_CALL` | — | `jl sym` (F3a) |
-| `SSA_CALLR` | — | `jlr` (F0; r0 holds target) |
-| `SSA_J/JZ/JNZ` | — | `j/jz/jnz _lN` (F3a) |
-| `SSA_LABEL` | — | `_lN:` |
-| `SSA_SYMLABEL` | — | `sym:` |
-| `SSA_WORD/BYTE/ALIGN` | — | `word`/`byte`/`align` directives |
-| `SSA_PUTCHAR` | — | `putchar` (F0) |
+| `IR3_CONST` | sym==NULL, imm fits in 16 bits | `immw rd, imm` |
+| `IR3_CONST` | sym==NULL, imm > 0xffff | `immw rd, lo16; immwh rd, hi16` |
+| `IR3_CONST` | sym!=NULL | `immw rd, sym` |
+| `IR3_LEA` | — | `lea rd, imm` (F3c) |
+| `IR3_MOV` | rd != rs1 | `or rd, rs1, rs1` (F1a pseudo-mov) |
+| `IR3_LOAD` | rs1 == -2, in F2 range | `lw/lb/ll rd, [bp+imm7]` (F2, 2 bytes) |
+| `IR3_LOAD` | rs1 == -2, out of F2 range | `lea scratch, imm; llw/llb/lll rd, [scratch+0]` |
+| `IR3_LOAD` | rs1 >= 0 | `llw/llb/lll rd, [rs1+imm]` (F3b, 3 bytes) |
+| `IR3_STORE` | rd == -2, in F2 range | `sw/sb/sl rs1, [bp+imm7]` (F2, 2 bytes) |
+| `IR3_STORE` | rd == -2, out of F2 range | `lea scratch, imm; slw/slb/sll rs1, [scratch+0]` |
+| `IR3_STORE` | rd >= 0 | `slw/slb/sll rs1, [rd+imm]` (F3b, 3 bytes) |
+| `IR3_ALU` | most ops | `add/sub/mul/… rd, rs1, rs2` (F1a, 2 bytes) |
+| `IR3_ALU` | `le`/`ge`/`les`/`ges`/`fle`/`fge` | assembler pseudo-ops (operand swap, single insn) |
+| `IR3_ALU1` | `sxb`/`sxw` | `sxb/sxw rd` (F1b, 2 bytes; in-place) |
+| `IR3_ALU1` | `itof`/`ftoi` | `itof`/`ftoi` (F0; r0 implicit) |
+| `IR3_ENTER` | — | `enter N` (F3a) |
+| `IR3_ADJ` | imm != 0 | `adjw imm` (F3a) |
+| `IR3_RET` | — | `ret` (F0) |
+| `IR3_CALL` | — | `jl sym` (F3a) |
+| `IR3_CALLR` | — | `jlr` (F0; r0 holds target) |
+| `IR3_J/JZ/JNZ` | — | `j/jz/jnz _lN` (F3a) |
+| `IR3_LABEL` | — | `_lN:` |
+| `IR3_SYMLABEL` | — | `sym:` |
+| `IR3_WORD/BYTE/ALIGN` | — | `word`/`byte`/`align` directives |
+| `IR3_PUTCHAR` | — | `putchar` (F0) |
 
 #### F2 range checks
 

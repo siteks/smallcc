@@ -1,25 +1,26 @@
-/* risc_backend.c — SSA → CPU4 assembly emitter.
+/* risc_backend.c — IR3 → CPU4 assembly emitter.
  *
- * Walks the SSAInst list produced by ir3_lower() and emits CPU4 assembly
- * text to the output file (set by set_asm_out()).
+ * Walks the post-regalloc IR3Inst list (all registers physical 0-7)
+ * and emits CPU4 assembly text to the output file (set by set_asm_out()).
  *
  * Instruction selection:
- *   SSA_LOAD  rs1==-2            → F2  lw/lb/ll  rx, imm7
- *   SSA_LOAD  rs1>=0             → F3b llw/llb/lll rx, ry, 0
- *   SSA_STORE rd==-2             → F2  sw/sb/sl  rx, imm7
- *   SSA_STORE rd>=0              → F3b slw/slb/sll rx, ry, 0
- *   SSA_ALU   (le/ge/les/ges/…)  → assembler pseudo-ops (operand swap, single insn)
- *   SSA_ALU1  itof/ftoi          → F0  itof / ftoi (r0 implicit)
- *   SSA_ALU1  sxb/sxw            → F1b sxb/sxw rd
- *   SSA_MOVI  32-bit const       → immw rd, lo + immwh rd, hi
- *   SSA_ADJ                      → adjw imm  (always adjw; no 8-bit adj)
+ *   IR3_LOAD  rs1==-2            → F2  lw/lb/ll  rx, imm7
+ *   IR3_LOAD  rs1>=0             → F3b llw/llb/lll rx, ry, 0
+ *   IR3_STORE rd==-2             → F2  sw/sb/sl  rx, imm7
+ *   IR3_STORE rd>=0              → F3b slw/slb/sll rx, ry, 0
+ *   IR3_ALU   (le/ge/les/ges/…)  → assembler pseudo-ops (operand swap, single insn)
+ *   IR3_ALU1  itof/ftoi          → F0  itof / ftoi (r0 implicit)
+ *   IR3_ALU1  sxb/sxw            → F1b sxb/sxw rd
+ *   IR3_CONST sym==NULL          → immw rd, lo [+ immwh rd, hi]
+ *   IR3_CONST sym!=NULL          → immw rd, sym
+ *   IR3_ADJ                      → adjw imm  (always adjw; no 8-bit adj)
  */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "smallcc.h"
-#include "ssa.h"
+#include "ir3.h"
 
 /* Forward declaration */
 static void rb_emit_src_comment(int line);
@@ -27,13 +28,13 @@ static void rb_emit_src_comment(int line);
 /* ----------------------------------------------------------------
  * E4 lookahead helpers
  * ---------------------------------------------------------------- */
-static SSAInst *next_live_rb(SSAInst *p)
+static IR3Inst *next_live_rb(IR3Inst *p)
 {
     for (p = p->next; p && (int)p->op < 0; p = p->next) {}
     return p;
 }
 
-static void rb_mark_dead(SSAInst *p) { p->op = (SSAOp)-1; }
+static void rb_mark_dead(IR3Inst *p) { p->op = (IR3Op)-1; }
 
 /* ----------------------------------------------------------------
  * Helpers: F2 bp-relative address range check
@@ -226,21 +227,21 @@ static void rb_emit_src_comment(int line)
 /* ----------------------------------------------------------------
  * risc_backend_emit — main emission pass
  * ---------------------------------------------------------------- */
-void risc_backend_emit(SSAInst *head)
+void risc_backend_emit(IR3Inst *head)
 {
     if (!asm_out) asm_out = stdout;
 
     int prev_line = 0;
 
-    for (SSAInst *p = head; p; p = p->next)
+    for (IR3Inst *p = head; p; p = p->next)
     {
         /* Skip dead nodes */
         if ((int)p->op < 0) continue;
 
         /* Source annotation */
         if (flag_annotate && p->line && p->line != prev_line &&
-            p->op != SSA_LABEL && p->op != SSA_SYMLABEL &&
-            p->op != SSA_COMMENT)
+            p->op != IR3_LABEL && p->op != IR3_SYMLABEL &&
+            p->op != IR3_COMMENT)
         {
             rb_emit_src_comment(p->line);
             prev_line = p->line;
@@ -249,74 +250,65 @@ void risc_backend_emit(SSAInst *head)
         switch (p->op)
         {
         /* ---- Labels ---- */
-        case SSA_LABEL:
+        case IR3_LABEL:
             fprintf(asm_out, "_l%d:\n", p->imm);
             break;
 
-        case SSA_SYMLABEL:
+        case IR3_SYMLABEL:
             fprintf(asm_out, "%s:\n", p->sym);
             break;
 
-        case SSA_COMMENT:
+        case IR3_COMMENT:
             fprintf(asm_out, ";%s\n", p->sym);
             break;
 
-        /* ---- Immediate loads ---- */
-        case SSA_MOVI:
-        {
-            unsigned u  = (unsigned)p->imm;
-            unsigned lo = u & 0xffff;
-            unsigned hi = (u >> 16) & 0xffff;
-            fprintf(asm_out, "    immw    r%d, 0x%04x\n", p->rd, lo);
-            if (hi)
-                fprintf(asm_out, "    immwh   r%d, 0x%04x\n", p->rd, hi);
-            break;
-        }
-
-        case SSA_MOVSYM:
-            if (p->sym)
+        /* ---- Immediate loads (integer const or symbolic address) ---- */
+        case IR3_CONST:
+            if (p->sym) {
                 fprintf(asm_out, "    immw    r%d, %s\n", p->rd, p->sym);
-            else {
-                /* Numeric immediate stored in imm field (symbolic was NULL) */
-                unsigned u = (unsigned)p->imm;
-                fprintf(asm_out, "    immw    r%d, 0x%04x\n", p->rd, u & 0xffff);
-                if (u >> 16)
-                    fprintf(asm_out, "    immwh   r%d, 0x%04x\n", p->rd, (u >> 16) & 0xffff);
+            } else {
+                unsigned u  = (unsigned)p->imm;
+                unsigned lo = u & 0xffff;
+                unsigned hi = (u >> 16) & 0xffff;
+                fprintf(asm_out, "    immw    r%d, 0x%04x\n", p->rd, lo);
+                if (hi)
+                    fprintf(asm_out, "    immwh   r%d, 0x%04x\n", p->rd, hi);
             }
             break;
 
         /* ---- LEA (address of local) ---- */
-        case SSA_LEA:
+        case IR3_LEA:
             fprintf(asm_out, "    lea     r%d, %d\n", p->rd, p->imm);
             break;
 
         /* ---- Register move ---- */
-        case SSA_MOV:
-            if (p->rd == p->rs1) break;  /* identity move; skip */
+        case IR3_MOV:
+            if (p->rd == IR3_VREG_NONE) continue;  /* dead phi residual: skip */
+            if (p->rd == p->rs1) break;             /* identity move; skip */
             /* Emit as: or rd, rs1, rs1 (CPU4 pseudo: mov rd, rs1) */
             fprintf(asm_out, "    or      r%d, r%d, r%d\n", p->rd, p->rs1, p->rs1);
             break;
 
         /* ---- Loads ---- */
-        case SSA_LOAD:
+        case IR3_LOAD:
         {
             /* E4: LOAD+SXW/SXB → sign-extending LOAD.
              * If the next live node is an in-place sign-extend of the load
              * result, absorb it and use lwx/lbx / llwx/llbx instead. */
-            SSAInst *nxt = next_live_rb(p);
-            int sign_ext = (nxt && nxt->op == SSA_ALU1
+            IR3Inst *nxt = next_live_rb(p);
+            int sign_ext = (nxt && nxt->op == IR3_ALU1
                             && nxt->rd  == p->rd && nxt->rs1 == p->rd
                             && ((nxt->alu_op == IR_SXW && p->size == 2) ||
                                 (nxt->alu_op == IR_SXB && p->size == 1)));
             if (sign_ext) rb_mark_dead(nxt);
 
-            if (p->rs1 == -2) {
+            if (p->rs1 == IR3_VREG_BP) {
                 /* bp-relative (F2) */
                 emit_bp_load(p->rd, p->imm, p->size, sign_ext, p->sym);
             } else {
                 /* Register-relative (F3b): rd = mem[rs1 + imm * scale] */
                 int base = p->rs1;
-                int off  = p->imm;  /* byte offset → scale for F3b */
+                int off  = p->imm;
                 if (p->size == 2) {
                     int w = off / 2;
                     fprintf(asm_out, "    %-7s r%d, r%d, %d\n",
@@ -333,8 +325,8 @@ void risc_backend_emit(SSAInst *head)
         }
 
         /* ---- Stores ---- */
-        case SSA_STORE:
-            if (p->rd == -2) {
+        case IR3_STORE:
+            if (p->rd == IR3_VREG_BP) {
                 /* bp-relative store (F2 or fallback). */
                 emit_bp_store(p->rs1, p->imm, p->size, p->sym);
             } else {
@@ -356,11 +348,11 @@ void risc_backend_emit(SSAInst *head)
             break;
 
         /* ---- 3-address ALU ---- */
-        case SSA_ALU:
+        case IR3_ALU:
         {
             int rd  = p->rd;
-            int rs1 = p->rs1;  /* left operand (from virtual stack) */
-            int rs2 = p->rs2;  /* right operand (r0) */
+            int rs1 = p->rs1;
+            int rs2 = p->rs2;
             const char *mn = alu_mnemonic(p->alu_op);
 
             if (mn) {
@@ -374,7 +366,7 @@ void risc_backend_emit(SSAInst *head)
         }
 
         /* ---- Single-register ops ---- */
-        case SSA_ALU1:
+        case IR3_ALU1:
             switch (p->alu_op) {
             case IR_SXB:  fprintf(asm_out, "    sxb     r%d\n", p->rd); break;
             case IR_SXW:  fprintf(asm_out, "    sxw     r%d\n", p->rd); break;
@@ -387,128 +379,66 @@ void risc_backend_emit(SSAInst *head)
             break;
 
         /* ---- Frame management ---- */
-        case SSA_ENTER:
+        case IR3_ENTER:
             fprintf(asm_out, "    enter   %d\n", p->imm);
             break;
 
-        case SSA_ADJ:
+        case IR3_ADJ:
             if (p->imm != 0)
                 fprintf(asm_out, "    adjw    %d\n", p->imm);
             break;
 
-        case SSA_RET:
+        case IR3_RET:
             fprintf(asm_out, "    ret\n");
             break;
 
         /* ---- Calls ---- */
-        case SSA_CALL:
+        case IR3_CALL:
             fprintf(asm_out, "    jl      %s\n", p->sym);
             break;
 
-        case SSA_CALLR:
+        case IR3_CALLR:
             fprintf(asm_out, "    jlr\n");
             break;
 
         /* ---- Branches ---- */
-        case SSA_J:
+        case IR3_J:
             fprintf(asm_out, "    j       _l%d\n", p->imm);
             break;
 
-        case SSA_JZ:
+        case IR3_JZ:
             fprintf(asm_out, "    jz      _l%d\n", p->imm);
             break;
 
-        case SSA_JNZ:
+        case IR3_JNZ:
             fprintf(asm_out, "    jnz     _l%d\n", p->imm);
             break;
 
-        case SSA_BRANCH:
-        {
-            /* Fused compare-branch (B2): emit as F1a compare + F3a conditional jump.
-             * F3b branch instructions (beq/bne/blt/bgt) have only a ±511-byte
-             * PC-relative range; F3a jz/jnz use a 16-bit absolute address and
-             * can reach anywhere.  The cost is 5 bytes vs 3, but correctness
-             * is required for switch dispatch where case bodies can be far apart.
-             *
-             * Expansion table (alu_op → condition that TRIGGERS the branch):
-             *   IR_EQ  (branch if r1==r2): ne r0,r1,r2 ; jz  _lN  (jump when ne=0)
-             *   IR_NE  (branch if r1!=r2): eq r0,r1,r2 ; jz  _lN  (jump when eq=0)
-             *   IR_LT  (branch if r1<r2):  lt r0,r1,r2 ; jnz _lN
-             *   IR_GT  (branch if r1>r2):  gt r0,r1,r2 ; jnz _lN
-             *   IR_LTS (branch if r1<r2 signed): lts r0,r1,r2 ; jnz _lN
-             *   IR_GTS (branch if r1>r2 signed): gts r0,r1,r2 ; jnz _lN
-             */
-            const char *cmp_mn;
-            const char *jmp_mn;
-            switch (p->alu_op) {
-            case IR_EQ:  cmp_mn = "ne";   jmp_mn = "jz";  break;
-            case IR_NE:  cmp_mn = "eq";   jmp_mn = "jz";  break;
-            case IR_LT:  cmp_mn = "lt";   jmp_mn = "jnz"; break;
-            case IR_GT:  cmp_mn = "gt";   jmp_mn = "jnz"; break;
-            case IR_LTS: cmp_mn = "lts";  jmp_mn = "jnz"; break;
-            case IR_GTS: cmp_mn = "gts";  jmp_mn = "jnz"; break;
-            default:
-                fprintf(stderr, "risc_backend: unhandled BRANCH op %d\n",
-                        (int)p->alu_op);
-                cmp_mn = "ne"; jmp_mn = "jz";
-                break;
-            }
-            fprintf(asm_out, "    %-7s r0, r%d, r%d\n", cmp_mn, p->rs1, p->rs2);
-            fprintf(asm_out, "    %-7s _l%d\n", jmp_mn, p->imm);
-            break;
-        }
-
-        case SSA_ALU_IMM:
-        {
-            /* Add-immediate (D4): rd = rs1 + K.
-             * Emit the most compact form available:
-             *   inc rd        (F1b, 2 bytes) when K=+1 and rd==rs1
-             *   dec rd        (F1b, 2 bytes) when K=-1 and rd==rs1
-             *   addi rd, K   (F2,  2 bytes) when |K|≤63 and rd==rs1
-             *   addli rd,rs1,K (F3b, 3 bytes) otherwise (|K|≤511)
-             * If K is outside addli range, fall back to immw + add. */
-            int rd  = p->rd;
-            int rs1 = p->rs1;
-            int K   = p->imm;
-            if (K == 1 && rd == rs1) {
-                fprintf(asm_out, "    inc     r%d\n", rd);
-            } else if (K == -1 && rd == rs1) {
-                fprintf(asm_out, "    dec     r%d\n", rd);
-            } else if (rd == rs1 && K >= -64 && K <= 63) {
-                fprintf(asm_out, "    addi    r%d, %d\n", rd, K);
-            } else if (K >= -512 && K <= 511) {
-                fprintf(asm_out, "    addli   r%d, r%d, %d\n", rd, rs1, K);
-            } else {
-                /* Fallback: load K into rd, then add rs1 */
-                unsigned u = (unsigned)K;
-                fprintf(asm_out, "    immw    r%d, 0x%04x\n", rd, u & 0xffff);
-                if (u >> 16)
-                    fprintf(asm_out, "    immwh   r%d, 0x%04x\n", rd,
-                            (u >> 16) & 0xffff);
-                fprintf(asm_out, "    add     r%d, r%d, r%d\n", rd, rs1, rd);
-            }
-            break;
-        }
-
         /* ---- Data section ---- */
-        case SSA_WORD:
+        case IR3_WORD:
             if (p->sym)
                 fprintf(asm_out, "    word    %s\n", p->sym);
             else
                 fprintf(asm_out, "    word    0x%04x\n", p->imm & 0xffff);
             break;
 
-        case SSA_BYTE:
+        case IR3_BYTE:
             fprintf(asm_out, "    byte    0x%02x\n", p->imm & 0xff);
             break;
 
-        case SSA_ALIGN:
+        case IR3_ALIGN:
             fprintf(asm_out, "    align\n");
             break;
 
         /* ---- Misc ---- */
-        case SSA_PUTCHAR:
+        case IR3_PUTCHAR:
             fprintf(asm_out, "    putchar\n");
+            break;
+
+        case IR3_PHI:
+            /* Phi nodes must be eliminated before reaching here */
+            if (p->rd != IR3_VREG_NONE)
+                fprintf(stderr, "risc_backend: unexpected live IR3_PHI (rd=%d)\n", p->rd);
             break;
 
         default:

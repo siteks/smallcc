@@ -27,5 +27,5 @@ Type system:  resolve_symbols → derive_types → insert_coercions
 IR gen:       gen_ir → mark_basic_blocks → peephole
 
 CPU3 path:    backend_emit_asm (stack IR → CPU3 assembly)
-CPU4 path:    braun_ssa → ir3_optimize → irc_regalloc → ir3_lower → risc_backend_emit
+CPU4 path:    braun_ssa → ir3_optimize → irc_regalloc → risc_backend_emit
 ```

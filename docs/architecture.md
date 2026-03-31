@@ -665,16 +665,11 @@ no separate call-spill pass needed. Post-coloring MOVs with same-colored operand
 eliminated. Frame expansion mirrors the linscan approach: ENTER imm is patched and
 bp-relative offsets are shifted down.
 
-### `ir3_lower.c` — IR3 → SSA Lowering (CPU4)
-
-`ir3_lower(head)` performs near-1:1 translation from post-regalloc `IR3Inst` (physical
-registers in `rd`/`rs1`/`rs2`) to `SSAInst` for `risc_backend_emit`.
-
 ### `risc_backend.c` — CPU4 Emitter
 
-`risc_backend_emit(head)` walks the post-regalloc SSA list and emits CPU4 assembly text.
+`risc_backend_emit(head)` walks the post-regalloc `IR3Inst` list and emits CPU4 assembly text.
 Selects F2 bp-relative instructions when offsets are in range, falls back to F3b
 register-relative otherwise. Expands `le`/`ge`/`les`/`ges`/`fle`/`fge` into 3-instruction
 sequences (the CPU4 ISA omits these as direct encodings). Skips nodes marked dead by
-`ssa_peephole` (`op < 0`). Also supports `-ann` source comments via the shared `ann_lines[]`
-index.
+the sign-extend peephole (`op < 0`). Also supports `-ann` source comments via the shared
+`ann_lines[]` index.

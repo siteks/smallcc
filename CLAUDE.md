@@ -111,8 +111,7 @@ Per-TU loop [smallcc.c] (lib TUs first, then user TUs):
 | `braun.c` | Braun SSA construction — stack IR → `IR3Inst` with fresh vregs; phi placement; SSA promotion (leaf functions unconditionally, non-leaf with ≤8 promotable vars); phi forwarding table |
 | `irc.c` | Iterated Register Coalescing (Appel & George 1996) — graph-coloring allocator; vregs → physical r0–r7; coalesces phi-generated moves; forces call-site spills via interference edges; spill rewriting with frame expansion |
 | `ir3.c` / `ir3.h` | IR3 infrastructure — `IR3Inst`/`IR3Op` definitions; `build_cfg`; `ir3_new_vreg` |
-| `ir3_lower.c` | IR3 → SSA lowering — near-1:1 `IR3Inst` → `SSAInst` for `risc_backend_emit` |
-| `risc_backend.c` | CPU4 emitter — `SSAInst` → CPU4 assembly; F2 bp-relative selection; all comparisons single-instruction (le/ge via assembler pseudo-ops) |
+| `risc_backend.c` | CPU4 emitter — post-regalloc `IR3Inst` → CPU4 assembly; F2 bp-relative selection; all comparisons single-instruction (le/ge via assembler pseudo-ops) |
 | `sim_c.c` | Primary simulator — self-contained C assembler + CPU3/CPU4 executor; `make sim_c` |
 | `cpu3/cpu.py` | Python CPU3 definition: `ptable` (opcode/format map) + execution handler |
 | `cpu3/assembler.py` | Python two-pass assembler; reads `ptable` from `cpu.py` — no changes needed for new instructions |

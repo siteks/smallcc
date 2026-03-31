@@ -1,6 +1,5 @@
 
 #include "smallcc.h"
-#include "ssa.h"
 #include "ir3.h"
 #include <dirent.h>
 
@@ -486,8 +485,7 @@ int main(int argc, char **argv)
             ir3_optimize(ir3, opt_level);
             if (ssa_out) ir3_dump(ir3, ssa_out);
             irc_regalloc(ir3);
-            SSAInst *ssa = ir3_lower(ir3);
-            risc_backend_emit(ssa);
+            risc_backend_emit(ir3);
         } else {
             backend_emit_asm(codegen_ctx.ir_head);
         }
