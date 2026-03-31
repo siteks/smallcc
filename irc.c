@@ -9,8 +9,10 @@
  *   IR3_VREG_NONE (-1) and IR3_VREG_BP (-2) → pass through unchanged
  *
  * K = 7: r1–r7 are allocatable; r0 is reserved for ACCUM (pre-colored).
- * CALL/CALLR: interfere all live vregs with r0–r7, forcing spill of any
- * vreg whose live range spans a call.  No separate call_spill pass needed.
+ * r0–r3 are caller-saved; r4–r7 are callee-saved.
+ * CALL/CALLR: interfere live vregs with r0–r3 only (caller-saved); r4–r7
+ * survive calls because callees save/restore them (insert_callee_saves).
+ * No separate call_spill pass needed.
  */
 
 #include <stdio.h>
@@ -478,15 +480,17 @@ static void build_interference(IR3Inst *func_head, IR3Inst *func_end)
 
             /* Backward analysis: defs/clobbers before uses.
              *
-             * Step 1 — CALL/CALLR clobbers: r0-r7 are all overwritten by the call.
-             * Interfere each clobbered physical reg with everything live after the
-             * call (current live set), then remove them from live. */
+             * Step 1 — CALL/CALLR clobbers: r0-r3 are caller-saved (overwritten).
+             * r4-r7 are callee-saved: the callee preserves them, so live vregs
+             * allocated to r4-r7 survive the call without interference.
+             * Interfere each caller-saved reg with everything live after the call,
+             * then remove caller-saved regs from live (r4-r7 remain live). */
             if (p->op == IR3_CALL || p->op == IR3_CALLR) {
-                for (int r = 0; r < IRC_PHYS; r++) {
+                for (int r = 0; r < 4; r++) {
                     for (int t = bs_next(live, -1); t >= 0; t = bs_next(live, t))
                         add_irc_edge(r, t);
                 }
-                for (int r = 0; r < IRC_PHYS; r++) bs_clr(live, r);
+                for (int r = 0; r < 4; r++) bs_clr(live, r);
             }
 
             /* Step 2 — implicit uses of r0: CALLR reads r0 as the function pointer;
@@ -1058,6 +1062,119 @@ static void alloc_function(IR3Inst **func_head_ptr, IR3Inst *func_end,
 }
 
 /* ================================================================
+ * insert_callee_saves — post-regalloc callee-save/restore insertion.
+ *
+ * Called after alloc_function() has applied colors.  Scans the function
+ * body for uses of r4-r7; for each used callee-saved register, allocates
+ * a 4-byte frame slot below the current ENTER frame, inserts a STORE
+ * immediately after ENTER (save), and inserts a LOAD immediately before
+ * each RET (restore).  Expands ENTER imm to cover the new slots.
+ *
+ * Frame layout after insertion (grows downward from bp):
+ *   [0 .. -(orig locals)]          original locals (from codegen)
+ *   [-(orig locals) .. -(spill N)] spill slots (from irc iterations)
+ *   [-(enter_node->imm + 4) ...]   callee-save slots (r4, r5, r6, r7)
+ *
+ * Any bp-relative offsets already below the original frame boundary
+ * (call-arg stores, outer-temp spills in the adjw region) are shifted
+ * down by the expansion amount so they don't alias the new save slots.
+ * ================================================================ */
+static void insert_callee_saves(IR3Inst *func_head, IR3Inst *func_end,
+                                IR3Inst *enter_node)
+{
+    if (!enter_node) return;
+
+    /* Collect which of r4-r7 are actually used in this function. */
+    int used = 0;
+    for (IR3Inst *q = func_head; q && q != func_end; q = q->next) {
+        if (q->rd  >= 4 && q->rd  <= 7) used |= (1 << q->rd);
+        if (q->rs1 >= 4 && q->rs1 <= 7) used |= (1 << q->rs1);
+        if (q->rs2 >= 4 && q->rs2 <= 7) used |= (1 << q->rs2);
+    }
+    if (!used) return;
+
+    /* Allocate one 4-byte slot per used callee-saved register, placed
+     * immediately below the current final frame (enter_node->imm). */
+    int save_off[8] = {0};
+    int next = -(enter_node->imm);   /* starts at bottom of existing frame */
+    for (int r = 4; r <= 7; r++) {
+        if (!(used & (1 << r))) continue;
+        next -= 4;
+        save_off[r] = next;          /* bp-relative offset for r's slot */
+    }
+
+    /* Expand ENTER to cover callee-save slots.  'next' is already a
+     * multiple of 4 because enter_node->imm is 4-aligned (expand_frame
+     * enforces this) and we decrement by 4 each step. */
+    int orig_N   = enter_node->imm;
+    int new_N    = -next;
+    int expansion = new_N - orig_N;
+    enter_node->imm = new_N;
+
+    /* Shift all existing bp-relative offsets that fall below the original
+     * frame boundary (imm < -orig_N).  These are call-arg stores and
+     * outer-temp spills placed in the adjw region below sp by
+     * flush_for_call_n.  When enter grows by 'expansion', those slots
+     * must move down by the same amount to avoid overlapping the new
+     * callee-save slots just inserted at the bottom of the frame. */
+    if (expansion > 0) {
+        for (IR3Inst *q = func_head; q && q != func_end; q = q->next) {
+            if (q->op == IR3_LOAD  && q->rs1 == IR3_VREG_BP
+                    && q->imm < -orig_N)
+                q->imm -= expansion;
+            if (q->op == IR3_STORE && q->rd  == IR3_VREG_BP
+                    && q->imm < -orig_N)
+                q->imm -= expansion;
+            if (q->op == IR3_LEA   && q->imm < -orig_N)
+                q->imm -= expansion;
+        }
+    }
+
+    /* Insert STORE instructions immediately after ENTER (save on entry). */
+    IR3Inst *ins = enter_node;
+    for (int r = 4; r <= 7; r++) {
+        if (!save_off[r]) continue;
+        IR3Inst *s = scratch_alloc(sizeof(IR3Inst));
+        memset(s, 0, sizeof(*s));
+        s->op   = IR3_STORE;
+        s->rd   = IR3_VREG_BP;
+        s->rs1  = r;
+        s->imm  = save_off[r];
+        s->size = 4;
+        s->line = enter_node->line;
+        s->next = ins->next;
+        ins->next = s;
+        ins = s;
+    }
+
+    /* Insert LOAD instructions immediately before each RET (restore on exit).
+     * Walk with a trailing 'prev' pointer so we can splice before the RET. */
+    IR3Inst *prev = enter_node;
+    for (IR3Inst *q = enter_node->next; q && q != func_end; q = q->next) {
+        if (q->op == IR3_RET) {
+            IR3Inst *after = prev;
+            for (int r = 4; r <= 7; r++) {
+                if (!save_off[r]) continue;
+                IR3Inst *ld = scratch_alloc(sizeof(IR3Inst));
+                memset(ld, 0, sizeof(*ld));
+                ld->op   = IR3_LOAD;
+                ld->rd   = r;
+                ld->rs1  = IR3_VREG_BP;
+                ld->imm  = save_off[r];
+                ld->size = 4;
+                ld->line = q->line;
+                ld->next = after->next;  /* = q (the RET) */
+                after->next = ld;
+                after = ld;
+            }
+            prev = q;       /* prev tracks the RET (q is unchanged) */
+        } else {
+            prev = q;
+        }
+    }
+}
+
+/* ================================================================
  * Public entry point: irc_regalloc(head)
  * Processes all functions between IR3_SYMLABEL nodes.
  * ================================================================ */
@@ -1087,6 +1204,7 @@ void irc_regalloc(IR3Inst *head)
                  * insertions go after SYMLABEL which is stable. */
                 IR3Inst *fh = func_head;
                 alloc_function(&fh, func_end, enter_node);
+                insert_callee_saves(fh, func_end, enter_node);
                 /* Relink SYMLABEL → possibly new func_head */
                 prev_sym->next = fh;
             }
@@ -1106,6 +1224,7 @@ void irc_regalloc(IR3Inst *head)
         if (func_head && enter_node) {
             IR3Inst *fh = func_head;
             alloc_function(&fh, func_end, enter_node);
+            insert_callee_saves(fh, func_end, enter_node);
             prev_sym->next = fh;
         }
     }

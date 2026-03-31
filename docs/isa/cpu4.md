@@ -10,16 +10,19 @@ reference implementation). The canonical reference is `cpu4/cpu.py`.
 |---|---|---|
 | `r0`–`r7` | 32-bit | General-purpose; r0 is the return value and implicit operand for some F0/F3a ops |
 | `r0` | 32-bit | Accumulator and function return value |
-| `r1`–`r7` | 32-bit | Scratch (caller-saved); all available for register allocation |
+| `r1`–`r3` | 32-bit | Scratch (caller-saved); available for register allocation |
+| `r4`–`r7` | 32-bit | Callee-saved; available for register allocation; saved/restored by callees |
 | `bp` | 16-bit | Frame pointer |
 | `sp` | 16-bit | Stack pointer (grows downward) |
 | `lr` | 16-bit | Link register (return address) |
 | `pc` | 16-bit | Program counter |
 | `H` | 1-bit | Halt flag |
 
-All registers r0–r7 are caller-saved — any call may clobber all of them. The compiler's
-call flushing mechanism ensures all live values are saved to memory before calls and
-restored afterward.
+**Calling convention:** r0–r3 are caller-saved (a call may clobber them). r4–r7 are
+callee-saved — any function that uses them must save them on entry and restore them before
+returning. r0 holds the return value. The compiler enforces this via `insert_callee_saves`
+in `irc.c`, which inserts prologue stores and epilogue loads for r4–r7 when they are
+assigned by the register allocator.
 
 **Alignment Requirements (CPU4 only):** `sp` and `bp` must be 32-bit aligned at all times.
 Any misaligned access (16-bit or 32-bit load/store to an odd address, or 32-bit access to an

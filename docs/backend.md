@@ -294,7 +294,7 @@ Stack IR (codegen.c, unchanged)
     ↓  risc_backend_emit()      [risc_backend.c] IR3Inst → CPU4 assembly
 ```
 
-**ABI:** All-caller-save. r0–r7 are all caller-saved. No callee-saved infrastructure. r0 is reserved for the accumulator (ACCUM); r1–r7 are all available for allocation.
+**ABI:** r0–r3 are caller-saved; r4–r7 are callee-saved. r0 is reserved for the accumulator (ACCUM); r1–r7 are all available for allocation. Callees that use r4–r7 save/restore them via `insert_callee_saves` (see IRC pass below).
 
 ### IR3: the intermediate representation
 
@@ -361,7 +361,7 @@ Converts the flat stack-IR list to IR3Inst with fresh virtual registers. Uses th
 
 **SSA promotion** promotes scalar locals and parameters whose address never escapes (tagged with `ir_promote_sentinel` in `codegen.c`) from memory to SSA virtual registers. The Braun algorithm handles phi placement at control-flow merge points, and trivial phis (all operands identical) are eliminated. Phi deconstruction inserts parallel copies at predecessor block tails.
 
-Promotion is enabled for all leaf functions (no `IR_JL`/`IR_JLI`) unconditionally, and for non-leaf functions with at most `MAX_PROMO_NONLEAF` (8) distinct promotable variables. For non-leaf promoted functions, `irc_regalloc` handles spilling of any promoted vreg whose live range spans a call, by forcing interference edges from all caller-saved registers to every live vreg at each call site.
+Promotion is enabled for all leaf functions (no `IR_JL`/`IR_JLI`) unconditionally, and for non-leaf functions with at most `MAX_PROMO_NONLEAF` (8) distinct promotable variables. For non-leaf promoted functions, `irc_regalloc` handles spilling of any promoted vreg whose live range spans a call, by forcing interference edges from r0–r3 (caller-saved) to every live vreg at each call site; r4–r7 do not need this treatment because callees preserve them.
 
 The 8-variable limit balances promotion benefit against register pressure: with 7 allocatable registers (r1–r7), more than 8 promoted variables in a non-leaf function rarely yields additional gains. Functions exceeding the limit use the unpromoted `IR3_LEA + IR3_LOAD / IR3_STORE` path, which is efficient via F2 bp-relative instructions (2 bytes, 1 cycle).
 
@@ -462,7 +462,9 @@ Iterated Register Coalescing allocator (Appel & George 1996). Runs per function 
 
 **K = 7**: r1–r7 are allocatable; r0 is pre-colored for ACCUM. Main loop: Simplify → Coalesce → Freeze → SelectSpill, repeated until stable. AssignColors pops the select stack; actual spills trigger RewriteProgram and a fresh iteration.
 
-**Call interference**: at each `IR3_CALL`/`IR3_CALLR`, interference edges are added from every live vreg to all physical registers r1–r7. This forces any vreg spanning a call to spill, without a separate pass.
+**Call interference**: at each `IR3_CALL`/`IR3_CALLR`, interference edges are added from every live vreg to the caller-saved registers r0–r3 only. r4–r7 are callee-saved — the callee preserves them — so they are not added to the interference set at call sites, allowing values in r4–r7 to survive calls without spilling.
+
+**Callee-save insertion**: after `alloc_function()` finishes and physical registers are known, `insert_callee_saves()` scans the function for uses of r4–r7. For each used callee-saved register it allocates a 4-byte slot below the final frame, inserts an `IR3_STORE` immediately after `IR3_ENTER` (save on entry) and an `IR3_LOAD` immediately before each `IR3_RET` (restore on exit), and expands the `IR3_ENTER` immediate accordingly. Existing bp-relative offsets that fall below the original frame boundary (call-arg stores and outer-temp spills in the `adjw` region) are shifted down by the expansion amount to avoid aliasing the new save slots. Leaf functions or functions that never use r4–r7 emit no save/restore code.
 
 **Move coalescing**: `IR3_MOV d ← s` nodes are recorded as candidates. George criterion (pre-colored target) and Briggs criterion (both virtual) control when merging is safe. Post-coloring MOVs where both operands received the same color are eliminated.
 

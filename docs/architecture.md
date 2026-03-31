@@ -659,11 +659,13 @@ register IDs.
 `irc_regalloc(head)` implements Iterated Register Coalescing (Appel & George 1996). Runs
 per function. Phases: liveness analysis → interference graph build → Simplify/Coalesce/
 Freeze/SelectSpill loop → AssignColors → RewriteProgram (if spills), then repeats. Maps
-virtual registers to physical r1–r7 (r0 reserved for ACCUM). At each call site, adds
-interference edges from all live vregs to r1–r7, forcing call-spanning vregs to spill —
-no separate call-spill pass needed. Post-coloring MOVs with same-colored operands are
-eliminated. Frame expansion mirrors the linscan approach: ENTER imm is patched and
-bp-relative offsets are shifted down.
+virtual registers to physical r1–r7 (r0 reserved for ACCUM). ABI: r0–r3 are caller-saved;
+r4–r7 are callee-saved. At each call site, interference edges are added from live vregs to
+r0–r3 only — r4–r7 survive calls without spilling because callees preserve them. After
+coloring, `insert_callee_saves` adds prologue stores and epilogue loads for any r4–r7
+actually used, expanding the ENTER frame and shifting call-arg offsets accordingly.
+Post-coloring MOVs with same-colored operands are eliminated. Frame expansion mirrors the
+linscan approach: ENTER imm is patched and bp-relative offsets are shifted down.
 
 ### `risc_backend.c` — CPU4 Emitter
 

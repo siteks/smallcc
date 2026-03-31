@@ -109,7 +109,7 @@ Per-TU loop [smallcc.c] (lib TUs first, then user TUs):
 | `optimise.c` | Peephole optimiser (`peephole`); rules 1–9; constant folding, dead branch elim, store/reload elim |
 | `backend.c` | IR → assembly emission (`backend_emit_asm`); `set_asm_out`; `-ann` annotation mode; retargeting point |
 | `braun.c` | Braun SSA construction — stack IR → `IR3Inst` with fresh vregs; phi placement; SSA promotion (leaf functions unconditionally, non-leaf with ≤8 promotable vars); phi forwarding table |
-| `irc.c` | Iterated Register Coalescing (Appel & George 1996) — graph-coloring allocator; vregs → physical r0–r7; coalesces phi-generated moves; forces call-site spills via interference edges; spill rewriting with frame expansion |
+| `irc.c` | Iterated Register Coalescing (Appel & George 1996) — graph-coloring allocator; vregs → physical r0–r7; r0–r3 caller-saved, r4–r7 callee-saved; coalesces phi-generated moves; call-site interference edges for r0–r3 only; `insert_callee_saves` adds prologue/epilogue save/restore for r4–r7; spill rewriting with frame expansion |
 | `ir3.c` / `ir3.h` | IR3 infrastructure — `IR3Inst`/`IR3Op` definitions; `build_cfg`; `ir3_new_vreg` |
 | `risc_backend.c` | CPU4 emitter — post-regalloc `IR3Inst` → CPU4 assembly; F2 bp-relative selection; all comparisons single-instruction (le/ge via assembler pseudo-ops) |
 | `sim_c.c` | Primary simulator — self-contained C assembler + CPU3/CPU4 executor; `make sim_c` |
