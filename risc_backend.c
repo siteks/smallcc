@@ -30,7 +30,15 @@ static void rb_emit_src_comment(int line);
  * ---------------------------------------------------------------- */
 static IR3Inst *next_live_rb(IR3Inst *p)
 {
-    for (p = p->next; p && (int)p->op < 0; p = p->next) {}
+    for (p = p->next; p; p = p->next) {
+        if ((int)p->op < 0) continue;  /* rb_mark_dead */
+        /* Identity moves (rd == rs1, including rd == NONE dead phi remnants)
+         * are not emitted; skip them so the E4 sign-extend peephole can see
+         * through the MOV ACCUM←vN that braun inserts before every SXW. */
+        if (p->op == IR3_MOV && (p->rd == p->rs1 || p->rd == IR3_VREG_NONE))
+            continue;
+        break;
+    }
     return p;
 }
 
