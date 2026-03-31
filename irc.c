@@ -29,8 +29,8 @@ extern int new_label(void);
  * ================================================================ */
 #define IRC_K            7           /* allocatable: r1-r7                  */
 #define IRC_PHYS         8           /* total physical regs r0-r7            */
-#define IRC_MAX_VREGS    1024        /* max fresh vregs per TU               */
-#define IRC_MAX_NODES    (IRC_PHYS + IRC_MAX_VREGS)   /* 1032               */
+#define IRC_MAX_VREGS    4096        /* max fresh vregs per function+spills  */
+#define IRC_MAX_NODES    (IRC_PHYS + IRC_MAX_VREGS)   /* 4104               */
 #define IRC_WORDS        ((IRC_MAX_NODES + 63) / 64)  /* 17                 */
 #define IRC_MAX_MOVES    2048
 #define IRC_MAX_BB       512         /* was 256; fatal exit if exceeded       */
@@ -420,9 +420,10 @@ static void compute_liveness(IR3Inst *func_head, IR3Inst *func_end)
              * PUTCHAR (char in r0) — not captured by rs1/rs2 fields */
             if (p->op == IR3_CALLR || p->op == IR3_RET || p->op == IR3_PUTCHAR)
                 note_use(g_gen[i], g_kill[i], IR3_VREG_ACCUM);
-            /* CALL/CALLR kills all physical regs (caller-saved ABI) */
+            /* CALL/CALLR kills r0-r3 (caller-saved); r4-r7 are callee-saved
+             * and survive calls — do NOT add them to g_kill. */
             if (p->op == IR3_CALL || p->op == IR3_CALLR)
-                for (int r = 0; r < IRC_PHYS; r++)
+                for (int r = 0; r < 4; r++)
                     bs_set(g_kill[i], r);
             if (p == g_bbs[i].last) break;
         }
