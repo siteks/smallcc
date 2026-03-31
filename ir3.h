@@ -26,7 +26,7 @@
 #define IR3_VREG_IS_VIRT(v)  ((v) >= IR3_VREG_BASE)
 
 /* Basic-block bounds (needed before IR3Inst for phi_ops array size) */
-#define BB_MAX_PREDS 16
+#define BB_MAX_PREDS 64   /* was 16; both BB.preds[] and IR3Inst.phi_ops[] use this */
 #define BB_MAX_SUCCS  2
 
 typedef enum {

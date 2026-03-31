@@ -31,9 +31,8 @@ extern int new_label(void);
 #define IRC_MAX_NODES    (IRC_PHYS + IRC_MAX_VREGS)   /* 1032               */
 #define IRC_WORDS        ((IRC_MAX_NODES + 63) / 64)  /* 17                 */
 #define IRC_MAX_MOVES    2048
-#define IRC_MAX_BB       256
+#define IRC_MAX_BB       512         /* was 256; fatal exit if exceeded       */
 #define IRC_MAX_ITERS    6           /* spill-rewrite restart limit           */
-#define NODE_MOVES_MAX   32          /* max moves per node                    */
 #define BB_INST_MAX      4096        /* max instructions per BB for rev scan  */
 
 /* ================================================================
@@ -119,9 +118,10 @@ typedef struct { int u, v, state; } IRCMove;
 static IRCMove  g_moves[IRC_MAX_MOVES];
 static int      n_moves;
 
-/* Per-node move lists */
-static int node_moves[IRC_MAX_NODES][NODE_MOVES_MAX];
-static int n_node_moves[IRC_MAX_NODES];
+/* Per-node move lists: scratch-allocated linked list per function.
+ * node_move_head[n] = head of the singly-linked list of moves involving node n. */
+typedef struct MoveNode { int mi; struct MoveNode *next; } MoveNode;
+static MoveNode **node_move_head;  /* [IRC_MAX_NODES], scratch-allocated in irc_reset_fn */
 
 /* Worklists (bitsets for membership) */
 static Bitset simplify_wl;
@@ -150,7 +150,7 @@ typedef struct {
     IR3Inst *last;
     int succs[2];
     int n_succs;
-    int preds[16];
+    int preds[BB_MAX_PREDS];  /* was preds[16]; BB_MAX_PREDS from ir3.h */
     int n_preds;
     int label_id;
     Bitset live_in;
@@ -176,7 +176,8 @@ static void irc_reset_fn(void)
     for (int i = 0; i < IRC_MAX_NODES; i++) alias_of[i] = i;
     bs_zero(coalesced_set);
     n_moves = 0;
-    memset(n_node_moves, 0, sizeof(n_node_moves));
+    node_move_head = scratch_alloc(IRC_MAX_NODES * sizeof(MoveNode *));
+    /* zeroed by scratch_alloc, so all heads are NULL */
     bs_zero(simplify_wl);
     bs_zero(freeze_wl);
     bs_zero(spill_wl);
@@ -235,8 +236,8 @@ static void note_node(int n)
  * ================================================================ */
 static bool is_move_related(int n)
 {
-    for (int i = 0; i < n_node_moves[n]; i++) {
-        int s = g_moves[node_moves[n][i]].state;
+    for (MoveNode *mn = node_move_head[n]; mn; mn = mn->next) {
+        int s = g_moves[mn->mi].state;
         if (s == MOVE_WORKLIST || s == MOVE_ACTIVE) return true;
     }
     return false;
@@ -259,26 +260,11 @@ static void record_move(int u, int v)
             (g_moves[i].u == v && g_moves[i].v == u)) return;
     int mi = n_moves++;
     g_moves[mi].u = u; g_moves[mi].v = v; g_moves[mi].state = MOVE_WORKLIST;
-    if (n_node_moves[u] < NODE_MOVES_MAX) {
-        node_moves[u][n_node_moves[u]++] = mi;
-    } else {
-        static bool warned_nm = false;
-        if (!warned_nm) {
-            fprintf(stderr, "irc: warning: NODE_MOVES_MAX=%d exceeded for node %d; coalescing dropped\n",
-                    NODE_MOVES_MAX, u);
-            warned_nm = true;
-        }
-    }
-    if (n_node_moves[v] < NODE_MOVES_MAX) {
-        node_moves[v][n_node_moves[v]++] = mi;
-    } else {
-        static bool warned_nm2 = false;
-        if (!warned_nm2) {
-            fprintf(stderr, "irc: warning: NODE_MOVES_MAX=%d exceeded for node %d; coalescing dropped\n",
-                    NODE_MOVES_MAX, v);
-            warned_nm2 = true;
-        }
-    }
+    /* Prepend to linked list for u and v (O(1), no limit) */
+    MoveNode *mnu = scratch_alloc(sizeof(MoveNode));
+    mnu->mi = mi; mnu->next = node_move_head[u]; node_move_head[u] = mnu;
+    MoveNode *mnv = scratch_alloc(sizeof(MoveNode));
+    mnv->mi = mi; mnv->next = node_move_head[v]; node_move_head[v] = mnv;
 }
 
 /* ================================================================
@@ -617,10 +603,9 @@ static void decrement_degree(int m)
             bs_clr(spill_wl, m);
             bs_set(freeze_wl, m);
             /* Enable any moves */
-            for (int i = 0; i < n_node_moves[m]; i++) {
-                int mi = node_moves[m][i];
-                if (g_moves[mi].state == MOVE_ACTIVE)
-                    g_moves[mi].state = MOVE_WORKLIST;
+            for (MoveNode *mn = node_move_head[m]; mn; mn = mn->next) {
+                if (g_moves[mn->mi].state == MOVE_ACTIVE)
+                    g_moves[mn->mi].state = MOVE_WORKLIST;
             }
         } else {
             bs_clr(spill_wl, m);
@@ -696,14 +681,16 @@ static void combine(int u, int v)
     bs_clr(spill_wl,  v);
     bs_set(coalesced_set, v);
     alias_of[v] = u;
-    /* Merge move lists */
-    for (int i = 0; i < n_node_moves[v]; i++) {
-        int mi = node_moves[v][i];
+    /* Merge v's move list into u: append any move not already in u's list */
+    for (MoveNode *mn = node_move_head[v]; mn; mn = mn->next) {
         bool dup = false;
-        for (int j = 0; j < n_node_moves[u]; j++)
-            if (node_moves[u][j] == mi) { dup = true; break; }
-        if (!dup && n_node_moves[u] < NODE_MOVES_MAX)
-            node_moves[u][n_node_moves[u]++] = mi;
+        for (MoveNode *mu = node_move_head[u]; mu; mu = mu->next)
+            if (mu->mi == mn->mi) { dup = true; break; }
+        if (!dup) {
+            MoveNode *new_mn = scratch_alloc(sizeof(MoveNode));
+            new_mn->mi = mn->mi; new_mn->next = node_move_head[u];
+            node_move_head[u] = new_mn;
+        }
     }
     /* Add v's interference edges to u; decrement neighbor degrees */
     for (int t = bs_next(imat[v], -1); t >= 0; t = bs_next(imat[v], t)) {
@@ -755,8 +742,8 @@ static void coalesce(void)
  * ================================================================ */
 static void freeze_moves(int u)
 {
-    for (int i = 0; i < n_node_moves[u]; i++) {
-        int mi = node_moves[u][i];
+    for (MoveNode *mn = node_move_head[u]; mn; mn = mn->next) {
+        int mi = mn->mi;
         if (g_moves[mi].state != MOVE_WORKLIST && g_moves[mi].state != MOVE_ACTIVE)
             continue;
         g_moves[mi].state = MOVE_FROZEN;
@@ -868,7 +855,7 @@ static void expand_frame(IR3Inst *func_head, IR3Inst *func_end, IR3Inst *enter_n
  * ================================================================ */
 static IR3Inst *new_ir3node(IR3Op op, int line)
 {
-    IR3Inst *n = calloc(1, sizeof(IR3Inst));
+    IR3Inst *n = scratch_alloc(sizeof(IR3Inst));
     n->op  = op;
     n->rd  = IR3_VREG_NONE;
     n->rs1 = IR3_VREG_NONE;

@@ -17,6 +17,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
 #include <assert.h>
 #include "ir3.h"
 
@@ -54,36 +55,39 @@ static int promo_slot_size[PROMOTE_SLOTS];
 static int accum_offset;
 
 /* vreg_lea_offset: tracks which bp-relative variable address a vreg holds
- * (set in IR_PUSH after a promotable LEA). 0 = not tracked. */
-#define VLO_SIZE 8192
-static int vreg_lea_offset[VLO_SIZE];
+ * (set in IR_PUSH after a promotable LEA). 0 = not tracked.
+ * Scratch-allocated per function; size = n_ir_nodes * 4 + 64. */
+static int *vreg_lea_offset;
+static int  vlo_size;
 
 static int vlo_get(int vreg)
 {
     int idx = vreg - IR3_VREG_BASE;
-    if ((unsigned)idx < VLO_SIZE) return vreg_lea_offset[idx];
+    if (vreg_lea_offset && (unsigned)idx < (unsigned)vlo_size)
+        return vreg_lea_offset[idx];
     return 0;
 }
 
 static void vlo_set(int vreg, int val)
 {
     int idx = vreg - IR3_VREG_BASE;
-    if ((unsigned)idx < VLO_SIZE) vreg_lea_offset[idx] = val;
+    if (vreg_lea_offset && (unsigned)idx < (unsigned)vlo_size)
+        vreg_lea_offset[idx] = val;
 }
 
 /* ================================================================
  * Forward-branch vsp fixup
+ * Scratch-allocated per function; size = label span + 1.
  * ================================================================ */
-#define LABEL_VID_MAX 2048
-
-static int  lvsp_base;
-static int  lvsp_val[LABEL_VID_MAX];
-static bool lvsp_set[LABEL_VID_MAX];
+static int   lvsp_base;
+static int  *lvsp_val;
+static bool *lvsp_set;
+static int   lvsp_alloc_size;
 
 static void lvsp_reset(void)
 {
     lvsp_base = -1;
-    memset(lvsp_set, 0, sizeof(lvsp_set));
+    /* lvsp_val/lvsp_set are scratch-allocated; just clear the base */
 }
 
 static void lvsp_record(int label_id, int vsp_val_)
@@ -92,11 +96,7 @@ static void lvsp_record(int label_id, int vsp_val_)
     int idx = label_id - lvsp_base;
     /* Negative idx: back-edge to a label already emitted; no fixup needed. */
     if (idx < 0) return;
-    if (idx >= LABEL_VID_MAX) {
-        fprintf(stderr, "braun: label ID span %d (base %d, id %d) exceeds LABEL_VID_MAX %d\n",
-                idx, lvsp_base, label_id, LABEL_VID_MAX);
-        exit(1);
-    }
+    if (!lvsp_set || idx >= lvsp_alloc_size) return;  /* prescan was conservative */
     if (!lvsp_set[idx]) {
         lvsp_val[idx] = vsp_val_;
         lvsp_set[idx] = true;
@@ -105,9 +105,9 @@ static void lvsp_record(int label_id, int vsp_val_)
 
 static void lvsp_apply(int label_id)
 {
-    if (lvsp_base < 0) return;
+    if (lvsp_base < 0 || !lvsp_set) return;
     int idx = label_id - lvsp_base;
-    if (idx >= 0 && idx < LABEL_VID_MAX && lvsp_set[idx])
+    if (idx >= 0 && idx < lvsp_alloc_size && lvsp_set[idx])
         vsp = lvsp_val[idx];
 }
 
@@ -130,8 +130,7 @@ static IR3Inst  *func_ir3_start; /* first IR3 node of current function */
 
 static IR3Inst *new_ir3(IR3Op op)
 {
-    IR3Inst *s = calloc(1, sizeof(IR3Inst));
-    if (!s) { fprintf(stderr, "braun: out of memory\n"); exit(1); }
+    IR3Inst *s = scratch_alloc(sizeof(IR3Inst));
     s->op  = op;
     s->rd  = IR3_VREG_NONE;
     s->rs1 = IR3_VREG_NONE;
@@ -177,9 +176,9 @@ static int current_bb_id;
  * Returns the actual number of bytes allocated (may be larger than arg_bytes
  * due to alignment padding on CPU4).
  * ================================================================ */
-static int flush_for_call_n(int arg_bytes, int line)
+static int flush_for_call_n(int arg_bytes, int line, int *out_arg_sum)
 {
-    if (vs_depth == 0) return 0;
+    if (vs_depth == 0) { if (out_arg_sum) *out_arg_sum = 0; return 0; }
 
     int n_args  = 0;
     int arg_sum = 0;
@@ -191,10 +190,19 @@ static int flush_for_call_n(int arg_bytes, int line)
 
     int aligned_arg_sum = 0;
     if (arg_sum > 0) {
-        // CPU4: align arg_sum to 4 bytes to maintain stack alignment
-        aligned_arg_sum = arg_sum;
-        if (g_target_arch == 4 && (arg_sum & 3))
-            aligned_arg_sum = (arg_sum + 4) & ~3;
+        if (g_target_arch == 4) {
+            // Two-pass: simulate the store layout to compute actual space needed.
+            // 4-byte args must be at 4-byte aligned offsets; simulate from offset 0.
+            int sim = 0;
+            for (int k = vs_depth - 1; k >= first_arg; k--) {
+                if (vs_size[k] == 4 && (sim & 3))
+                    sim = (sim + 4) & ~3;
+                sim += vs_size[k];
+            }
+            aligned_arg_sum = (sim + 3) & ~3;
+        } else {
+            aligned_arg_sum = arg_sum;
+        }
         IR3Inst *adj = emit_ir3(IR3_ADJ);
         adj->imm  = -aligned_arg_sum;
         adj->line = line;
@@ -220,39 +228,38 @@ static int flush_for_call_n(int arg_bytes, int line)
     /* Outer temps (0..first_arg-1) remain in SSA vregs — IRC handles live ranges.
      * Lower vs_depth to first_arg; outer slots still readable via readVariable. */
     vs_depth = first_arg;
+    if (out_arg_sum) *out_arg_sum = arg_sum;
     return aligned_arg_sum;
 }
 
 /* ================================================================
  * Braun SSA state (per function)
+ * All per-block and per-vreg arrays are scratch-allocated once per function
+ * in init_fn_arrays() and reclaimed by scratch_reset() at TU end.
  * ================================================================ */
-#define MAX_BLOCKS 512
-#define PHI_MAP_SIZE 8192
 
 /* Per-block current definition: block_def[bb_id][slot] = vreg or IR3_VREG_NONE.
  * Slots 0..PROMOTE_SLOTS-1: promoted variable SSA defs (indexed by bp_offset + PROMOTE_BASE).
- * Slots VSTACK_BASE..TOTAL_SLOTS-1: virtual expression stack SSA defs (indexed by depth). */
-static int block_def[MAX_BLOCKS][TOTAL_SLOTS];
-
+ * Slots VSTACK_BASE..TOTAL_SLOTS-1: virtual expression stack SSA defs (indexed by depth).
+ * Pointer to a flat 2-D array; allocated as block_def[n_blocks_max][TOTAL_SLOTS]. */
+static int      (*block_def)[TOTAL_SLOTS];
 
 /* Phi node lookup: phi_node_map[vreg - IR3_VREG_BASE] = IR3Inst* or NULL */
-static IR3Inst *phi_node_map[PHI_MAP_SIZE];
-
-/* Phi forwarding table: when a phi vreg V is simplified to W,
- * phi_fwd[V - IR3_VREG_BASE] = W.  0 means "no forwarding". */
-static int phi_fwd[PHI_MAP_SIZE];
+static IR3Inst **phi_node_map;
+static int      *phi_fwd;       /* phi_fwd[vreg - IR3_VREG_BASE] = simplified vreg, 0 = none */
+static int       phi_map_size;  /* capacity of phi_node_map / phi_fwd */
 
 /* Where to insert new phis at the head of each block */
-static IR3Inst *phi_insert_point[MAX_BLOCKS];
+static IR3Inst **phi_insert_point;
 
 /* Pending phis for unsealed blocks (not yet inserted into IR3 list) */
-static IR3Inst *pending_phis[MAX_BLOCKS];
+static IR3Inst **pending_phis;
 
 /* Last IR3 node emitted for each block */
-static IR3Inst *block_last_ir3[MAX_BLOCKS];
+static IR3Inst **block_last_ir3;
 
 /* Last IR3 node before the terminator for each block (for phi deconstruction) */
-static IR3Inst *block_pretail[MAX_BLOCKS];
+static IR3Inst **block_pretail;
 
 /* Incomplete phis for unsealed blocks */
 typedef struct IncPhi {
@@ -264,16 +271,16 @@ typedef struct IncPhi {
 static IncPhi *inc_phi_list;
 
 /* How many predecessors of each block have been fully translated */
-static int preds_done[MAX_BLOCKS];
+static int *preds_done;
 
 /* n_blocks / blocks for current function */
 static int cur_n_blocks;
 static BB *cur_blocks;
 
 /* RPO state */
-static int rpo_order[MAX_BLOCKS];
-static int rpo_count;
-static bool rpo_visited[MAX_BLOCKS];
+static int  *rpo_order;
+static int   rpo_count;
+static bool *rpo_visited;
 
 /* ================================================================
  * Braun SSA helpers
@@ -332,7 +339,7 @@ static IR3Inst *emit_phi_at(int bb_id, int phi_vreg)
 
     /* Register in map */
     int idx = phi_vreg - IR3_VREG_BASE;
-    if ((unsigned)idx < PHI_MAP_SIZE) phi_node_map[idx] = phi;
+    if ((unsigned)idx < phi_map_size) phi_node_map[idx] = phi;
 
     IR3Inst *after = phi_insert_point[bb_id];
     if (!after) {
@@ -360,7 +367,7 @@ static int resolve_phi_vreg(int vreg)
 {
     for (int depth = 0; depth < 64; depth++) {
         int idx = vreg - IR3_VREG_BASE;
-        if ((unsigned)idx >= PHI_MAP_SIZE) return vreg;
+        if ((unsigned)idx >= phi_map_size) return vreg;
         int fwd = phi_fwd[idx];
         if (fwd == 0 || fwd == vreg) return vreg;
         vreg = fwd;
@@ -371,7 +378,7 @@ static int resolve_phi_vreg(int vreg)
 static int tryRemoveTrivialPhi(int phi_vreg)
 {
     int idx = phi_vreg - IR3_VREG_BASE;
-    if ((unsigned)idx >= PHI_MAP_SIZE) return phi_vreg;
+    if ((unsigned)idx >= phi_map_size) return phi_vreg;
 
     /* If this phi was already simplified, chase the forwarding chain */
     if (phi_fwd[idx] != 0 && phi_fwd[idx] != phi_vreg)
@@ -393,7 +400,7 @@ static int tryRemoveTrivialPhi(int phi_vreg)
     if (unique == phi_vreg) return phi_vreg;  /* not trivial */
 
     /* Replace all uses of phi_vreg with unique in all phi nodes */
-    for (int i = 0; i < PHI_MAP_SIZE; i++) {
+    for (int i = 0; i < phi_map_size; i++) {
         IR3Inst *p = phi_node_map[i];
         if (!p || p->op != IR3_PHI) continue;
         for (int j = 0; j < p->n_phi_ops; j++)
@@ -431,7 +438,7 @@ static int tryRemoveTrivialPhi(int phi_vreg)
     phi_node_map[idx] = NULL;
 
     /* Recursively try to simplify phis that used phi_vreg (now updated to unique) */
-    for (int i = 0; i < PHI_MAP_SIZE; i++) {
+    for (int i = 0; i < phi_map_size; i++) {
         IR3Inst *p = phi_node_map[i];
         if (!p || p->op != IR3_PHI) continue;
         bool used = false;
@@ -454,8 +461,7 @@ static int readVariableRecursive(int bb_id, int var_slot)
         val = ir3_new_vreg();
         emit_phi_at(bb_id, val);
         /* Record as incomplete */
-        IncPhi *ip = malloc(sizeof(IncPhi));
-        if (!ip) { fprintf(stderr, "braun: OOM for IncPhi\n"); exit(1); }
+        IncPhi *ip = scratch_alloc(sizeof(IncPhi));
         ip->bb_id = bb_id; ip->var_slot = var_slot; ip->phi_vreg = val;
         ip->next = inc_phi_list; inc_phi_list = ip;
     } else if (bb->n_preds == 0) {
@@ -478,7 +484,7 @@ static int readVariableRecursive(int bb_id, int var_slot)
         emit_phi_at(bb_id, val);
         /* Fill operands */
         int phi_idx = val - IR3_VREG_BASE;
-        IR3Inst *phi = ((unsigned)phi_idx < PHI_MAP_SIZE) ? phi_node_map[phi_idx] : NULL;
+        IR3Inst *phi = ((unsigned)phi_idx < phi_map_size) ? phi_node_map[phi_idx] : NULL;
         /* Also check pending list */
         if (!phi || phi->op != IR3_PHI) {
             for (IR3Inst *pp = pending_phis[bb_id]; pp; pp = pp->next) {
@@ -533,7 +539,7 @@ static void sealBlock(int bb_id)
     for (IncPhi *ip = inc_phi_list; ip; ip = ip->next) {
         if (ip->bb_id != bb_id) continue;
         int phi_idx = ip->phi_vreg - IR3_VREG_BASE;
-        IR3Inst *phi = ((unsigned)phi_idx < PHI_MAP_SIZE) ? phi_node_map[phi_idx] : NULL;
+        IR3Inst *phi = ((unsigned)phi_idx < phi_map_size) ? phi_node_map[phi_idx] : NULL;
         /* Also check pending list */
         if (!phi || phi->op != IR3_PHI) {
             for (IR3Inst *pp = pending_phis[bb_id]; pp; pp = pp->next) {
@@ -559,24 +565,61 @@ static void sealBlock(int bb_id)
 
 static void reset_braun_state(void)
 {
-    memset(block_def, -1, sizeof(block_def));  /* -1 = IR3_VREG_NONE */
-    memset(phi_node_map, 0, sizeof(phi_node_map));
-    memset(phi_fwd, 0, sizeof(phi_fwd));
-    memset(phi_insert_point, 0, sizeof(phi_insert_point));
-    memset(pending_phis, 0, sizeof(pending_phis));
-    memset(block_last_ir3, 0, sizeof(block_last_ir3));
-    memset(block_pretail, 0, sizeof(block_pretail));
-    memset(preds_done, 0, sizeof(preds_done));
-    memset(vreg_lea_offset, 0, sizeof(vreg_lea_offset));
+    /* Per-block and per-vreg arrays are scratch-allocated per function.
+     * Just null the pointers; memory is reclaimed by scratch_reset at TU end. */
+    block_def        = NULL;
+    phi_node_map     = NULL;
+    phi_fwd          = NULL;
+    phi_map_size     = 0;
+    phi_insert_point = NULL;
+    pending_phis     = NULL;
+    block_last_ir3   = NULL;
+    block_pretail    = NULL;
+    preds_done       = NULL;
+    rpo_order        = NULL;
+    rpo_visited      = NULL;
+    vreg_lea_offset  = NULL;
+    vlo_size         = 0;
+    lvsp_val         = NULL;
+    lvsp_set         = NULL;
+    lvsp_alloc_size  = 0;
     memset(promo_slot_size, 0, sizeof(promo_slot_size));
     current_bb_id = 0;
-    cur_n_blocks = 0;
-    cur_blocks = NULL;
-    accum_offset = 0;
-    /* Free incomplete phi list */
-    IncPhi *ip = inc_phi_list;
-    while (ip) { IncPhi *nx = ip->next; free(ip); ip = nx; }
-    inc_phi_list = NULL;
+    cur_n_blocks  = 0;
+    cur_blocks    = NULL;
+    accum_offset  = 0;
+    inc_phi_list  = NULL;
+}
+
+/* Allocate all per-function scratch arrays.
+ * n          = max number of blocks (n_orig + n_crit critical landing pads)
+ * phi_sz     = capacity for phi_node_map / phi_fwd (upper bound on vregs)
+ * vlo_sz     = capacity for vreg_lea_offset (same bound)
+ * lvsp_sz    = capacity for lvsp arrays (label span + 1)
+ */
+static void init_fn_arrays(int n, int phi_sz, int vlo_sz, int lvsp_sz)
+{
+    block_def        = scratch_alloc((size_t)n * TOTAL_SLOTS * sizeof(int));
+    phi_insert_point = scratch_alloc((size_t)n * sizeof(IR3Inst *));
+    pending_phis     = scratch_alloc((size_t)n * sizeof(IR3Inst *));
+    block_last_ir3   = scratch_alloc((size_t)n * sizeof(IR3Inst *));
+    block_pretail    = scratch_alloc((size_t)n * sizeof(IR3Inst *));
+    preds_done       = scratch_alloc((size_t)n * sizeof(int));
+    rpo_order        = scratch_alloc((size_t)n * sizeof(int));
+    rpo_visited      = scratch_alloc((size_t)n * sizeof(bool));
+    /* block_def must be initialised to IR3_VREG_NONE (-1); others are fine at zero */
+    memset(block_def, -1, (size_t)n * TOTAL_SLOTS * sizeof(int));
+
+    phi_map_size = phi_sz;
+    phi_node_map = scratch_alloc((size_t)phi_sz * sizeof(IR3Inst *));
+    phi_fwd      = scratch_alloc((size_t)phi_sz * sizeof(int));
+
+    vlo_size        = vlo_sz;
+    vreg_lea_offset = scratch_alloc((size_t)vlo_sz * sizeof(int));
+
+    lvsp_alloc_size = lvsp_sz;
+    lvsp_val        = scratch_alloc((size_t)lvsp_sz * sizeof(int));
+    lvsp_set        = scratch_alloc((size_t)lvsp_sz * sizeof(bool));
 }
 
 /* ================================================================
@@ -889,17 +932,26 @@ static void translate_bb(BB *bb, int bb_id)
                 mv->line = p->line;
             }
 
-            int aligned_bytes = flush_for_call_n(arg_bytes, p->line);
-            // Update the cleanup ADJ to use the aligned size for CPU4
-            if (g_target_arch == 4 && aligned_bytes > arg_bytes) {
-                for (IRInst *q = p->next; q; q = q->next) {
-                    if (q->op == IR_NOP || q->op == IR_BB_START) continue;
-                    if (q->op == IR_ADJ && q->operand > 0) {
-                        q->operand = aligned_bytes;
-                        break;
+            int actual_arg_sum = 0;
+            int aligned_bytes = flush_for_call_n(arg_bytes, p->line, &actual_arg_sum);
+            // Update the cleanup ADJ for CPU4: the scanned arg_bytes may include
+            // scope-exit adj bytes merged in by the peephole (e.g. arg_cleanup 2 +
+            // scope_cleanup 4 → 6).  The correct post-call adj is:
+            //   aligned_bytes + (arg_bytes - actual_arg_sum)
+            // where the second term carries the merged-in scope cleanup unchanged.
+            if (g_target_arch == 4) {
+                int extra = arg_bytes - actual_arg_sum;
+                int new_cleanup = aligned_bytes + extra;
+                if (new_cleanup != arg_bytes) {
+                    for (IRInst *q = p->next; q; q = q->next) {
+                        if (q->op == IR_NOP || q->op == IR_BB_START) continue;
+                        if (q->op == IR_ADJ && q->operand > 0) {
+                            q->operand = new_cleanup;
+                            break;
+                        }
+                        if (q->op == IR_JL || q->op == IR_JLI || q->op == IR_RET ||
+                            q->op == IR_J  || q->op == IR_JZ  || q->op == IR_JNZ) break;
                     }
-                    if (q->op == IR_JL || q->op == IR_JLI || q->op == IR_RET ||
-                        q->op == IR_J  || q->op == IR_JZ  || q->op == IR_JNZ) break;
                 }
             }
 
@@ -1008,6 +1060,7 @@ static void translate_bb(BB *bb, int bb_id)
             emit_ir3(IR3_ALIGN)->line = p->line;
             break;
 
+
         case IR_PUTCHAR:
             emit_ir3(IR3_PUTCHAR)->line = p->line;
             break;
@@ -1064,9 +1117,10 @@ static void split_critical_edges(BB **blocks_ptr, int *n_blocks_ptr)
     }
     if (n_crit == 0) return;
 
-    blocks = realloc(blocks, (n_orig + n_crit) * sizeof(BB));
-    if (!blocks) { fprintf(stderr, "braun: split_critical_edges OOM\n"); exit(1); }
-    memset(blocks + n_orig, 0, n_crit * sizeof(BB));
+    BB *new_blocks = scratch_alloc((n_orig + n_crit) * sizeof(BB));
+    memcpy(new_blocks, blocks, n_orig * sizeof(BB));
+    /* new portion already zeroed by scratch_alloc; old blocks abandoned in scratch */
+    blocks = new_blocks;
     *blocks_ptr = blocks;
 
     /* Split each critical edge.  Iterate only original blocks so landing
@@ -1101,10 +1155,13 @@ static void split_critical_edges(BB **blocks_ptr, int *n_blocks_ptr)
             }
 
             /* Retarget pred's JZ/JNZ from succ.label_id → lbl_new.
-             * The terminator is block_pretail[pred]->next, or block_last_ir3
-             * when pretail is NULL (block had only the terminator). */
+             * Start from block_pretail[pred]->next (or block_last_ir3 when
+             * pretail is NULL), then skip any dead phi→MOV remnants
+             * (IR3_MOV with rd==IR3_VREG_NONE) to reach the real terminator. */
             IR3Inst *term = block_pretail[pred] ? block_pretail[pred]->next
                                                  : block_last_ir3[pred];
+            while (term && term->op == IR3_MOV && term->rd == IR3_VREG_NONE)
+                term = term->next;
             if (term && (term->op == IR3_JZ || term->op == IR3_JNZ)
                      && term->imm == blocks[succ].label_id) {
                 term->imm = lbl_new;
@@ -1201,12 +1258,26 @@ static void deconstructPhis(BB *blocks, int n_blocks)
 {
     /* Pass 1: collect all (pred, dst, src) copy pairs and mark phis dead.
      * Using phi->imm as the owner bb_id (stored by emit_phi_at). */
-#define MAX_PHI_COPIES 512
     typedef struct { int pred; int dst; int src; int line; } PhiCopyRec;
-    static PhiCopyRec all_copies[MAX_PHI_COPIES];
+
+    /* Compute upper bound for copy pairs: sum of n_preds over live phi nodes. */
+    int max_copies = 0;
+    for (int i = 0; i < phi_map_size; i++) {
+        IR3Inst *phi = phi_node_map[i];
+        if (!phi || phi->op != IR3_PHI || phi->rd == IR3_VREG_NONE) continue;
+        int ob = phi->imm;
+        if (ob >= 0 && ob < n_blocks) max_copies += blocks[ob].n_preds;
+    }
+    max_copies += n_blocks + 8;  /* slack */
+    PhiCopyRec *all_copies = scratch_alloc((size_t)max_copies * sizeof(PhiCopyRec));
+    int *cps_dst  = scratch_alloc((size_t)max_copies * sizeof(int));
+    int *cps_src  = scratch_alloc((size_t)max_copies * sizeof(int));
+    int *cps_line = scratch_alloc((size_t)max_copies * sizeof(int));
+    int *done     = scratch_alloc((size_t)max_copies * sizeof(int));
+
     int n_all = 0;
 
-    for (int i = 0; i < PHI_MAP_SIZE; i++) {
+    for (int i = 0; i < phi_map_size; i++) {
         IR3Inst *phi = phi_node_map[i];
         if (!phi || phi->op != IR3_PHI) continue;
         if (phi->rd == IR3_VREG_NONE) continue;
@@ -1242,7 +1313,7 @@ static void deconstructPhis(BB *blocks, int n_blocks)
             int pred = bb->preds[pi];
             int src  = phi->phi_ops[pi];
             if (src == IR3_VREG_NONE || dst == src) continue;
-            if (n_all < MAX_PHI_COPIES) {
+            if (n_all < max_copies) {
                 all_copies[n_all].pred = pred;
                 all_copies[n_all].dst  = dst;
                 all_copies[n_all].src  = src;
@@ -1257,7 +1328,6 @@ static void deconstructPhis(BB *blocks, int n_blocks)
     for (int p = 0; p < n_blocks; p++) {
         /* Gather copies sourced from predecessor p */
         int n_cps = 0;
-        int cps_dst[MAX_PHI_COPIES], cps_src[MAX_PHI_COPIES], cps_line[MAX_PHI_COPIES];
         for (int i = 0; i < n_all; i++) {
             if (all_copies[i].pred == p) {
                 cps_dst[n_cps]  = all_copies[i].dst;
@@ -1270,7 +1340,6 @@ static void deconstructPhis(BB *blocks, int n_blocks)
 
         /* Sequentialize: emit copies whose dst is not another undone copy's src.
          * On cycle: save the cycle-entry dst to a fresh vreg and redirect readers. */
-        int done[MAX_PHI_COPIES];
         memset(done, 0, n_cps * sizeof(int));
         int emitted = 0;
 
@@ -1390,6 +1459,38 @@ static void process_function(IRInst *sym_node)
         }
         return;
     }
+    /* Pre-scan to determine sizes for scratch arrays.
+     * We need:
+     *   phi_sz   — upper bound on vreg IDs (per-function; start at IR3_VREG_BASE+1)
+     *   vlo_sz   — same (vreg_lea_offset is indexed the same way)
+     *   lvsp_sz  — label ID span (lbl_max - lbl_min + 2)
+     *   n_crit   — critical edges (landing pads expand block count)
+     */
+    {
+        int n_ir = 0;
+        int lbl_min = INT_MAX, lbl_max = INT_MIN;
+        for (IRInst *pp = sym_node->next; pp && pp->op != IR_SYMLABEL; pp = pp->next) {
+            n_ir++;
+            if (pp->op == IR_J || pp->op == IR_JZ || pp->op == IR_JNZ
+                || pp->op == IR_LABEL) {
+                if (pp->operand < lbl_min) lbl_min = pp->operand;
+                if (pp->operand > lbl_max) lbl_max = pp->operand;
+            }
+        }
+        int phi_sz  = n_ir * 4 + 64;
+        int vlo_sz  = n_ir * 4 + 64;
+        int lvsp_sz = (lbl_min > lbl_max) ? 1 : (lbl_max - lbl_min + 2);
+
+        int n_crit = 0;
+        for (int i = 0; i < n_blocks; i++) {
+            if (blocks[i].n_succs <= 1) continue;
+            for (int si = 0; si < blocks[i].n_succs; si++) {
+                if (blocks[blocks[i].succs[si]].n_preds > 1) n_crit++;
+            }
+        }
+        init_fn_arrays(n_blocks + n_crit, phi_sz, vlo_sz, lvsp_sz);
+    }
+
     cur_blocks = blocks;
     cur_n_blocks = n_blocks;
 
