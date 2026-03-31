@@ -63,8 +63,7 @@ BB *build_cfg(IRInst *ir_head, int *n_blocks_out)
     for (IRInst *p = ir_head->next; p && p->op != IR_SYMLABEL; p = p->next)
         if (p->op == IR_BB_START) n_bb++;
 
-    BB *blocks = calloc(n_bb, sizeof(BB));
-    if (!blocks) { fprintf(stderr, "build_cfg: OOM\n"); exit(1); }
+    BB *blocks = scratch_alloc(n_bb * sizeof(BB));
 
     /* Pass 2: fill BB array.
      * BB 0's ir_first = ir_head (SYMLABEL); subsequent BBs' ir_first = BB_START. */
@@ -140,8 +139,7 @@ BB *build_cfg(IRInst *ir_head, int *n_blocks_out)
 
 void free_cfg(BB *blocks, int n_blocks)
 {
-    (void)n_blocks;
-    free(blocks);
+    (void)blocks; (void)n_blocks;  /* scratch arena reclaimed by scratch_reset() */
 }
 
 /* ----------------------------------------------------------------
@@ -325,9 +323,5 @@ void ir3_dump(IR3Inst *head, FILE *f)
  * ---------------------------------------------------------------- */
 void free_ir3(IR3Inst *head)
 {
-    while (head) {
-        IR3Inst *next = head->next;
-        free(head);
-        head = next;
-    }
+    (void)head;  /* scratch arena reclaimed by scratch_reset() */
 }

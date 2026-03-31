@@ -23,15 +23,12 @@ int                 ann_nlines = 0;
 
 void set_ann_source(const char *src)
 {
-    free(ann_src);
-    free(ann_lines);
     ann_src    = NULL;
     ann_lines  = NULL;
     ann_nlines = 0;
     if (!src) return;
 
-    ann_src = strdup(src);
-    if (!ann_src) return;
+    ann_src = arena_strdup(src);
 
     // Count physical lines to bound the allocation
     int count = 1;
@@ -39,8 +36,7 @@ void set_ann_source(const char *src)
         if (*p == '\n') count++;
 
     // allocate generously; logical line numbers can be at most count
-    ann_lines = calloc(count + 2, sizeof(char *));
-    if (!ann_lines) return;
+    ann_lines = arena_alloc((count + 2) * sizeof(char *));
     ann_nlines = count + 1;
 
     // Walk the preprocessed source tracking logical line numbers via

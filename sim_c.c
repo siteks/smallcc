@@ -646,7 +646,8 @@ static void assemble_cpu4(const char *src)
 
             /* Directives */
             if (strcmp(mnem, "align") == 0) {
-                if (cur & 1) { if (pass == 2) write8((uint16_t)cur, 0); cur++; }
+                /* CPU4: align to 4-byte boundary (matches cpu4/assembler.py behaviour) */
+                while (cur & 3) { if (pass == 2) write8((uint16_t)cur, 0); cur++; }
                 continue;
             }
             if (strcmp(mnem, "allocb") == 0) {

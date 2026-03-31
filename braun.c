@@ -39,7 +39,8 @@ static int vsp;                   /* running (sp - bp) byte offset */
 #define PROMOTE_BASE  128
 #define PROMOTE_SLOTS 256                        /* bp offsets -128..+127 */
 #define VSTACK_BASE   PROMOTE_SLOTS              /* virtual stack slots start here */
-#define TOTAL_SLOTS   (PROMOTE_SLOTS + MAX_VDEPTH) /* promoted vars + vstack */
+#define ACCUM_SLOT    (PROMOTE_SLOTS + MAX_VDEPTH) /* extra slot: accum_vreg across BBs */
+#define TOTAL_SLOTS   (PROMOTE_SLOTS + MAX_VDEPTH + 1) /* promoted vars + vstack + accum */
 
 static bool promote_slot(int offset)
 {
@@ -657,13 +658,24 @@ static void translate_bb(BB *bb, int bb_id)
     int local_accum_offset = 0;
 
     /* For unlabeled fall-through blocks (no IR_LABEL instruction), set the phi
-     * insert point now (to the current ir3_last) and flush any pending phis.
-     * For labeled blocks, phi_insert_point is set (and pending phis flushed)
-     * when the IR_LABEL instruction is emitted below.
+     * insert point BEFORE reading accum_vreg, so any phi created by readVariable
+     * can be inserted immediately rather than queued as pending.
      * Entry block (bb_id==0) has phi_insert_point already set before RPO loop. */
     if (bb_id != 0 && cur_blocks[bb_id].label_id < 0 && !phi_insert_point[bb_id]) {
         /* Unlabeled block: phi insert point = current IR3 tail */
         set_phi_insert_point(bb_id, ir3_last);
+    }
+
+    /* accum_vreg: which vreg currently holds the accumulated expression result.
+     * Read from ACCUM_SLOT so values produced in one BB (e.g., the true or false
+     * arm of &&/||/ternary) flow correctly to the merge block via phi nodes.
+     * ABI boundaries (JZ/JNZ, RET, CALLR, PUTCHAR) move accum_vreg into r0
+     * via IR3_MOV rd=ACCUM, rs1=accum_vreg.
+     * IR3_VREG_NONE means "undefined" (e.g., unreachable block); fall back to ACCUM. */
+    int accum_vreg;
+    {
+        int _raw = readVariable(bb_id, ACCUM_SLOT);
+        accum_vreg = (_raw != IR3_VREG_NONE) ? _raw : IR3_VREG_ACCUM;
     }
 
     IRInst *end = bb->ir_last ? bb->ir_last->next : NULL;
@@ -678,14 +690,17 @@ static void translate_bb(BB *bb, int bb_id)
         case IR_BB_START:
             break;
 
-        case IR_IMM:
+        case IR_IMM: {
+            int fresh = ir3_new_vreg();
             s = emit_ir3(IR3_CONST);
-            s->rd  = IR3_VREG_ACCUM;
+            s->rd  = fresh;
             s->imm = p->operand;
             s->sym = p->sym;
             s->line = p->line;
+            accum_vreg = fresh;
             local_accum_offset = 0;
             break;
+        }
 
         case IR_LEA: {
             /* Promotion: scalars that are not address-taken can be promoted
@@ -715,12 +730,9 @@ static void translate_bb(BB *bb, int bb_id)
                 int val  = IR3_VREG_NONE;
                 if ((unsigned)slot < PROMOTE_SLOTS)
                     val = readVariable(bb_id, slot);
-                if (val != IR3_VREG_NONE && val != IR3_VREG_NONE) {
-                    /* Hit: variable in a register — emit MOV to ACCUM */
-                    IR3Inst *mv = emit_ir3(IR3_MOV);
-                    mv->rd   = IR3_VREG_ACCUM;
-                    mv->rs1  = val;
-                    mv->line = p->line;
+                if (val != IR3_VREG_NONE) {
+                    /* Hit: variable in a register — accum_vreg = val, no MOV */
+                    accum_vreg = val;
                 } else {
                     /* Miss: load from memory, record as SSA def */
                     int fresh = ir3_new_vreg();
@@ -733,10 +745,7 @@ static void translate_bb(BB *bb, int bb_id)
                     ld->line = p->line;
                     if ((unsigned)slot < PROMOTE_SLOTS)
                         writeVariable(bb_id, slot, fresh);
-                    IR3Inst *mv = emit_ir3(IR3_MOV);
-                    mv->rd   = IR3_VREG_ACCUM;
-                    mv->rs1  = fresh;
-                    mv->line = p->line;
+                    accum_vreg = fresh;
                 }
                 local_accum_offset = 0;
                 p = p->next;  /* consume the load */
@@ -746,13 +755,15 @@ static void translate_bb(BB *bb, int bb_id)
 
             if (peek_sz) {
                 /* Non-promotable LEA+LOAD: bp-relative load */
+                int fresh = ir3_new_vreg();
                 s = emit_ir3(IR3_LOAD);
-                s->rd   = IR3_VREG_ACCUM;
+                s->rd   = fresh;
                 s->rs1  = IR3_VREG_BP;
                 s->imm  = p->operand;
                 s->size = peek_sz;
                 s->sym  = p->sym;
                 s->line = p->line;
+                accum_vreg = fresh;
                 local_accum_offset = 0;
                 p = p->next;
                 break;
@@ -765,10 +776,12 @@ static void translate_bb(BB *bb, int bb_id)
                  * Just record the offset for the promoted store path. */
                 local_accum_offset = p->operand;
             } else {
+                int fresh = ir3_new_vreg();
                 s = emit_ir3(IR3_LEA);
-                s->rd   = IR3_VREG_ACCUM;
+                s->rd   = fresh;
                 s->imm  = p->operand;
                 s->line = p->line;
+                accum_vreg = fresh;
                 local_accum_offset = 0;
             }
             break;
@@ -781,10 +794,8 @@ static void translate_bb(BB *bb, int bb_id)
                 int slot = local_accum_offset + PROMOTE_BASE;
                 int val  = readVariable(bb_id, slot);
                 if (val != IR3_VREG_NONE) {
-                    IR3Inst *mv = emit_ir3(IR3_MOV);
-                    mv->rd   = IR3_VREG_ACCUM;
-                    mv->rs1  = val;
-                    mv->line = p->line;
+                    /* Hit: variable in a register — accum_vreg = val, no MOV */
+                    accum_vreg = val;
                 } else {
                     /* No SSA def yet: load from memory, record as def.
                      * Use bp-relative addressing (the LEA was suppressed). */
@@ -796,46 +807,54 @@ static void translate_bb(BB *bb, int bb_id)
                     s->size = sz;
                     s->line = p->line;
                     writeVariable(bb_id, slot, fresh);
-                    IR3Inst *mv = emit_ir3(IR3_MOV);
-                    mv->rd   = IR3_VREG_ACCUM;
-                    mv->rs1  = fresh;
-                    mv->line = p->line;
+                    accum_vreg = fresh;
                 }
                 local_accum_offset = 0;
                 block_last_ir3[bb_id] = ir3_last;
                 break;
             }
 
-            /* Standard load */
-            s = emit_ir3(IR3_LOAD);
-            s->rd   = IR3_VREG_ACCUM;
-            s->rs1  = IR3_VREG_ACCUM;
-            s->imm  = 0;
-            s->size = sz;
-            s->line = p->line;
-            local_accum_offset = 0;
+            /* Standard load: address is in accum_vreg */
+            {
+                int fresh = ir3_new_vreg();
+                s = emit_ir3(IR3_LOAD);
+                s->rd   = fresh;
+                s->rs1  = accum_vreg;
+                s->imm  = 0;
+                s->size = sz;
+                s->line = p->line;
+                accum_vreg = fresh;
+                local_accum_offset = 0;
+            }
             break;
         }
 
         case IR_PUSH: case IR_PUSHW: {
-            int sz    = (p->op == IR_PUSH) ? 4 : 2;
-            int fresh;
+            int sz = (p->op == IR_PUSH) ? 4 : 2;
+            int slot_vreg;
             if (local_accum_offset != 0 && promote_slot(local_accum_offset)) {
-                /* Promoted address push: no IR3_MOV needed — the address is only
-                 * used as a store target.  Use a dummy vreg with vlo tracking. */
-                fresh = ir3_new_vreg();
-                vlo_set(fresh, local_accum_offset);
+                /* Promoted address push: use a dummy vreg for vlo tracking only.
+                 * No IR3_MOV needed — the address is only used as a store target. */
+                slot_vreg = ir3_new_vreg();
+                vlo_set(slot_vreg, local_accum_offset);
+            } else if (accum_vreg > IR3_VREG_ACCUM) {
+                /* Fresh vreg (> IR3_VREG_ACCUM=100): store directly, no MOV needed.
+                 * Fresh vregs are immutable (one definition), so they stay valid. */
+                slot_vreg = accum_vreg;
             } else {
-                fresh = ir3_new_vreg();
+                /* accum_vreg is a physical register (ACCUM/r0 or similar).
+                 * Must snapshot it into a fresh vreg so the slot value isn't
+                 * overwritten if r0 is clobbered later. */
+                slot_vreg = ir3_new_vreg();
                 IR3Inst *mov = emit_ir3(IR3_MOV);
-                mov->rd   = fresh;
-                mov->rs1  = IR3_VREG_ACCUM;
+                mov->rd   = slot_vreg;
+                mov->rs1  = accum_vreg;
                 mov->line = p->line;
             }
-            /* accum_offset preserved through PUSH */
+            /* accum_vreg and local_accum_offset preserved through PUSH */
             if (vs_depth >= MAX_VDEPTH)
                 fprintf(stderr, "braun: virtual stack overflow at depth %d\n", vs_depth);
-            writeVariable(current_bb_id, VSTACK_BASE + vs_depth, fresh);
+            writeVariable(current_bb_id, VSTACK_BASE + vs_depth, slot_vreg);
             vs_size[vs_depth] = sz;
             vs_depth++;
             break;
@@ -844,10 +863,8 @@ static void translate_bb(BB *bb, int bb_id)
         case IR_POP: case IR_POPW:
             if (vs_depth > 0) {
                 vs_depth--;
-                s = emit_ir3(IR3_MOV);
-                s->rd   = IR3_VREG_ACCUM;
-                s->rs1  = readVariable(current_bb_id, VSTACK_BASE + vs_depth);
-                s->line = p->line;
+                /* Restore accum_vreg from vstack — no MOV instruction needed. */
+                accum_vreg = readVariable(current_bb_id, VSTACK_BASE + vs_depth);
                 local_accum_offset = 0;
             }
             break;
@@ -860,31 +877,38 @@ static void translate_bb(BB *bb, int bb_id)
                 int N = vlo_get(addr_vreg);
 
                 if (N != 0 && promote_slot(N)) {
-                    /* Promoted store: update SSA def, do NOT emit IR3_STORE */
+                    /* Promoted store: update SSA def, no IR3_STORE emitted.
+                     * accum_vreg must be a fresh immutable vreg (>= IR3_VREG_BASE+1).
+                     * If it's ACCUM (100 = r0), r0 is mutable and will be overwritten by
+                     * later instructions; snapshot it into a fresh vreg first so the
+                     * promoted slot holds a stable definition. */
                     int slot = N + PROMOTE_BASE;
                     if ((unsigned)slot < PROMOTE_SLOTS)
                         promo_slot_size[slot] = sz;
-                    int fresh = ir3_new_vreg();
-                    IR3Inst *mv = emit_ir3(IR3_MOV);
-                    mv->rd   = fresh;
-                    mv->rs1  = IR3_VREG_ACCUM;
-                    mv->line = p->line;
-                    writeVariable(bb_id, slot, fresh);
+                    int store_vreg = accum_vreg;
+                    if (store_vreg <= IR3_VREG_ACCUM) {
+                        store_vreg = ir3_new_vreg();
+                        IR3Inst *mv = emit_ir3(IR3_MOV);
+                        mv->rd   = store_vreg;
+                        mv->rs1  = accum_vreg;
+                        mv->line = p->line;
+                    }
+                    writeVariable(bb_id, slot, store_vreg);
                 } else {
-                    /* Non-promoted: emit memory store */
+                    /* Non-promoted: emit memory store using accum_vreg */
                     s = emit_ir3(IR3_STORE);
                     s->rd   = addr_vreg;
-                    s->rs1  = IR3_VREG_ACCUM;
+                    s->rs1  = accum_vreg;
                     s->imm  = 0;
                     s->size = sz;
                     s->line = p->line;
                 }
             }
-            /* ACCUM and accum_offset unchanged by store */
+            /* accum_vreg and local_accum_offset unchanged by store */
             break;
         }
 
-        /* Binary ALU ops */
+        /* Binary ALU ops: true 3-address with fresh destination vreg */
         case IR_ADD: case IR_SUB: case IR_MUL: case IR_DIV: case IR_MOD:
         case IR_AND: case IR_OR:  case IR_XOR: case IR_SHL: case IR_SHR:
         case IR_EQ:  case IR_NE:  case IR_LT:  case IR_LE:  case IR_GT:  case IR_GE:
@@ -894,22 +918,33 @@ static void translate_bb(BB *bb, int bb_id)
         case IR_FLT:  case IR_FLE:  case IR_FGT:  case IR_FGE:
             if (vs_depth > 0) {
                 vs_depth--;
+                int fresh = ir3_new_vreg();
                 s = emit_ir3(IR3_ALU);
                 s->alu_op = p->op;
-                s->rd     = IR3_VREG_ACCUM;
+                s->rd     = fresh;
                 s->rs1    = readVariable(current_bb_id, VSTACK_BASE + vs_depth);
-                s->rs2    = IR3_VREG_ACCUM;
+                s->rs2    = accum_vreg;
                 s->line   = p->line;
+                accum_vreg = fresh;
                 local_accum_offset = 0;
             }
             break;
 
         case IR_SXB: case IR_SXW: case IR_ITOF: case IR_FTOI:
+            /* ALU1 is in-place on the physical register; ensure the source is
+             * in ACCUM (r0) first, then emit the in-place operation. */
+            if (accum_vreg != IR3_VREG_ACCUM) {
+                IR3Inst *mv = emit_ir3(IR3_MOV);
+                mv->rd   = IR3_VREG_ACCUM;
+                mv->rs1  = accum_vreg;
+                mv->line = p->line;
+            }
             s = emit_ir3(IR3_ALU1);
             s->alu_op = p->op;
             s->rd     = IR3_VREG_ACCUM;
             s->rs1    = IR3_VREG_ACCUM;
             s->line   = p->line;
+            accum_vreg = IR3_VREG_ACCUM;
             local_accum_offset = 0;
             break;
 
@@ -922,23 +957,19 @@ static void translate_bb(BB *bb, int bb_id)
                     q->op == IR_J  || q->op == IR_JZ  || q->op == IR_JNZ) break;
             }
 
-            bool save_fp = (p->op == IR_JLI && vs_depth > 0);
-            int  fp_vreg = IR3_VREG_NONE;
-            if (save_fp) {
-                fp_vreg = ir3_new_vreg();
-                IR3Inst *mv = emit_ir3(IR3_MOV);
-                mv->rd   = fp_vreg;
-                mv->rs1  = IR3_VREG_ACCUM;
-                mv->line = p->line;
-            }
+            /* For indirect calls (IR_JLI), accum_vreg holds the function pointer.
+             * With virtualized accum, the function pointer is already in a fresh vreg;
+             * no explicit save/restore needed — the allocator keeps it live.
+             * We only need it in r0 (ACCUM) immediately before CALLR. */
+            int fp_vreg = (p->op == IR_JLI) ? accum_vreg : IR3_VREG_NONE;
 
             int actual_arg_sum = 0;
             int aligned_bytes = flush_for_call_n(arg_bytes, p->line, &actual_arg_sum);
-            // Update the cleanup ADJ for CPU4: the scanned arg_bytes may include
-            // scope-exit adj bytes merged in by the peephole (e.g. arg_cleanup 2 +
-            // scope_cleanup 4 → 6).  The correct post-call adj is:
-            //   aligned_bytes + (arg_bytes - actual_arg_sum)
-            // where the second term carries the merged-in scope cleanup unchanged.
+            /* Update the cleanup ADJ for CPU4: the scanned arg_bytes may include
+             * scope-exit adj bytes merged in by the peephole (e.g. arg_cleanup 2 +
+             * scope_cleanup 4 → 6).  The correct post-call adj is:
+             *   aligned_bytes + (arg_bytes - actual_arg_sum)
+             * where the second term carries the merged-in scope cleanup unchanged. */
             if (g_target_arch == 4) {
                 int extra = arg_bytes - actual_arg_sum;
                 int new_cleanup = aligned_bytes + extra;
@@ -955,21 +986,23 @@ static void translate_bb(BB *bb, int bb_id)
                 }
             }
 
-            if (save_fp) {
-                IR3Inst *mv = emit_ir3(IR3_MOV);
-                mv->rd   = IR3_VREG_ACCUM;
-                mv->rs1  = fp_vreg;
-                mv->line = p->line;
-            }
-
             if (p->op == IR_JL) {
                 s = emit_ir3(IR3_CALL);
                 s->sym = p->sym;
             } else {
+                /* CALLR requires function pointer in r0 */
+                if (fp_vreg != IR3_VREG_ACCUM) {
+                    IR3Inst *mv = emit_ir3(IR3_MOV);
+                    mv->rd   = IR3_VREG_ACCUM;
+                    mv->rs1  = fp_vreg;
+                    mv->line = p->line;
+                }
                 s = emit_ir3(IR3_CALLR);
             }
             s->line = p->line;
 
+            /* After any call, return value is in r0 (ACCUM) */
+            accum_vreg = IR3_VREG_ACCUM;
             local_accum_offset = 0;
             break;
         }
@@ -1003,6 +1036,13 @@ static void translate_bb(BB *bb, int bb_id)
             break;
 
         case IR_RET:
+            /* Return value must be in r0 */
+            if (accum_vreg != IR3_VREG_ACCUM) {
+                IR3Inst *mv = emit_ir3(IR3_MOV);
+                mv->rd   = IR3_VREG_ACCUM;
+                mv->rs1  = accum_vreg;
+                mv->line = p->line;
+            }
             block_pretail[bb_id] = ir3_last;
             emit_ir3(IR3_RET)->line = p->line;
             break;
@@ -1019,17 +1059,29 @@ static void translate_bb(BB *bb, int bb_id)
 
         case IR_JZ: case IR_JNZ: {
             lvsp_record(p->operand, vsp);
+            /* Condition must be in r0 (JZ/JNZ are r0-implicit on CPU4) */
+            if (accum_vreg != IR3_VREG_ACCUM) {
+                IR3Inst *mv = emit_ir3(IR3_MOV);
+                mv->rd   = IR3_VREG_ACCUM;
+                mv->rs1  = accum_vreg;
+                mv->line = p->line;
+            }
+            /* Set block_pretail AFTER the pre-JZ MOV but BEFORE the JZ itself,
+             * so split_critical_edges finds JZ/JNZ as the first node after pretail. */
             block_pretail[bb_id] = ir3_last;
             s = emit_ir3(p->op == IR_JZ ? IR3_JZ : IR3_JNZ);
             s->rs1  = IR3_VREG_ACCUM;
             s->imm  = p->operand;
             s->line = p->line;
+            accum_vreg = IR3_VREG_ACCUM;
             local_accum_offset = 0;
             break;
         }
 
         case IR_LABEL: {
             lvsp_apply(p->operand);
+            /* accum_vreg is already set from readVariable(ACCUM_SLOT) at block start;
+             * do NOT reset it here — the phi for accum flows through ACCUM_SLOT. */
             s = emit_ir3(IR3_LABEL);
             s->imm  = p->operand;
             s->line = p->line;
@@ -1062,6 +1114,13 @@ static void translate_bb(BB *bb, int bb_id)
 
 
         case IR_PUTCHAR:
+            /* putchar reads r0 (the character); ensure accum_vreg is in r0 */
+            if (accum_vreg != IR3_VREG_ACCUM) {
+                IR3Inst *mv = emit_ir3(IR3_MOV);
+                mv->rd   = IR3_VREG_ACCUM;
+                mv->rs1  = accum_vreg;
+                mv->line = p->line;
+            }
             emit_ir3(IR3_PUTCHAR)->line = p->line;
             break;
 
@@ -1084,6 +1143,11 @@ static void translate_bb(BB *bb, int bb_id)
      * phi copies destined for empty predecessor blocks. */
     if (!block_last_ir3[bb_id])
         block_last_ir3[bb_id] = ir3_last;
+
+    /* Write accum_vreg to ACCUM_SLOT so successor BBs can read it via readVariable.
+     * This handles both fall-through BBs (no explicit terminator) and BBs that end
+     * with IR_J (accum_vreg = value to carry) or IR_JZ/JNZ (accum_vreg = ACCUM). */
+    writeVariable(bb_id, ACCUM_SLOT, accum_vreg);
 }
 
 /* ================================================================
@@ -1580,6 +1644,9 @@ static void process_function(IRInst *sym_node)
      * Entry block has no label, so phi_insert_point[0] is set to the SYMLABEL node.
      * (Entry block is sealed from the start, so no pending phis will ever be queued.) */
     set_phi_insert_point(0, symlabel_ir3);
+
+    /* Seed ACCUM_SLOT for the entry block: the accumulator starts as r0. */
+    writeVariable(0, ACCUM_SLOT, IR3_VREG_ACCUM);
 
     /* Compute RPO */
     compute_rpo(n_blocks);

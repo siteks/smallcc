@@ -548,10 +548,9 @@ static bool dce(IR3Inst *start, IR3Inst *end)
             if (is_fresh(p->rs2) && vidx_ok(p->rs2))
                 use_count[vidx(p->rs2)]--;
 
-            /* Unlink and free */
+            /* Unlink (node abandoned in scratch arena until scratch_reset) */
             if (prev)
                 prev->next = next;
-            free(p);
             changed = true;
         } else {
             prev = p;
@@ -571,7 +570,7 @@ static void compact_ir3(IR3Inst *head)
         IR3Inst *next = p->next;
         if (p->op == IR3_COMMENT && !p->sym) {
             if (prev) prev->next = next;
-            free(p);
+            /* node abandoned in scratch arena until scratch_reset */
         } else {
             prev = p;
         }

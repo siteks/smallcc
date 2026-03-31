@@ -38,8 +38,7 @@
 
 static SSAInst *new_ssa(SSAOp op)
 {
-    SSAInst *s = calloc(1, sizeof(SSAInst));
-    if (!s) { fprintf(stderr, "ir3_lower: out of memory\n"); exit(1); }
+    SSAInst *s = scratch_alloc(sizeof(SSAInst));
     s->op  = op;
     s->rd  = -1;
     s->rs1 = -1;
@@ -210,9 +209,5 @@ SSAInst *ir3_lower(IR3Inst *head)
  * ---------------------------------------------------------------- */
 void free_ssa(SSAInst *head)
 {
-    while (head) {
-        SSAInst *next = head->next;
-        free(head);
-        head = next;
-    }
+    (void)head;  /* scratch arena reclaimed by scratch_reset() */
 }

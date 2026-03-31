@@ -14,10 +14,15 @@ void src_error(int line, int col, const char *fmt, ...) __attribute__((noreturn)
 // ===============================================================
 // Arena Allocator
 // ===============================================================
-// Single bump-pointer arena; all compiler allocations go here.
-// Pre-zeroed, so arena_alloc has calloc semantics.
-// Never reset: Types survive across TUs and some Symbols are
-// carried between TUs, so a single lifetime is simplest.
+// Two bump-pointer arenas:
+//
+//   arena   — permanent allocations (Types, Symbols, Nodes, IRInst).
+//             Pre-zeroed BSS; never reset.
+//
+//   scratch — backend temporaries (IR3Inst, SSAInst, BB, IncPhi).
+//             scratch_alloc() zeroes its result (safe calloc replacement).
+//             scratch_reset() resets the arena per-TU before the RISC
+//             backend pipeline runs.
 typedef struct
 {
     char   *base;
@@ -27,6 +32,10 @@ typedef struct
 extern Arena arena;
 void  *arena_alloc(size_t size);
 char  *arena_strdup(const char *s);
+
+extern Arena scratch;
+void  *scratch_alloc(size_t size);
+void   scratch_reset(void);
 
 // Target architecture constants
 #define WORD_SIZE      2   // size of int and pointer (16-bit target)

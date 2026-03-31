@@ -11,7 +11,7 @@ int g_target_arch = 3;
 #endif
 
 // ---------------------------------------------------------------
-// Arena allocator
+// Arena allocators
 // ---------------------------------------------------------------
 #define ARENA_SIZE (16 * 1024 * 1024)
 static char arena_storage[ARENA_SIZE];
@@ -35,6 +35,25 @@ char *arena_strdup(const char *s)
     memcpy(p, s, n);
     return p;
 }
+
+// Scratch arena — backend temporaries (IR3, SSA, CFG, IncPhi).
+// Reset per-TU before the RISC backend pipeline.
+#define SCRATCH_SIZE (4 * 1024 * 1024)
+static char scratch_storage[SCRATCH_SIZE];
+Arena scratch = { scratch_storage, 0, sizeof(scratch_storage) };
+
+void *scratch_alloc(size_t size)
+{
+    size = (size + 7) & ~(size_t)7;
+    if (scratch.used + size > scratch.cap)
+        error("scratch arena exhausted (used %zu, requested %zu)", scratch.used, size);
+    void *p = scratch.base + scratch.used;
+    scratch.used += size;
+    memset(p, 0, size);   // zero so stale data from a previous TU can't leak
+    return p;
+}
+
+void scratch_reset(void) { scratch.used = 0; }
 
 
 void error(const char *fmt, ...)
@@ -459,6 +478,7 @@ int main(int argc, char **argv)
         mark_basic_blocks();
         peephole(opt_level);
         if (g_target_arch == 4) {
+            scratch_reset();
             ir3_reset();
             int n_blocks;
             BB *blocks = build_cfg(codegen_ctx.ir_head, &n_blocks);
@@ -468,9 +488,6 @@ int main(int argc, char **argv)
             irc_regalloc(ir3);
             SSAInst *ssa = ir3_lower(ir3);
             risc_backend_emit(ssa);
-            free_ssa(ssa);
-            free_ir3(ir3);
-            free_cfg(blocks, n_blocks);
         } else {
             backend_emit_asm(codegen_ctx.ir_head);
         }

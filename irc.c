@@ -822,9 +822,29 @@ static void alloc_spill_slots(void)
 {
     for (int n = bs_next(actual_spill, -1); n >= 0; n = bs_next(actual_spill, n)) {
         if (!is_virtual(n)) continue;
-        g_spill_next -= 4;
-        g_spill_next &= ~3;
-        spill_slot[n] = g_spill_next;
+
+        /* Try to reuse an existing spill slot from a non-interfering node. */
+        int reuse = 0;
+        for (int m = IRC_PHYS; m < IRC_MAX_NODES && !reuse; m++) {
+            if (!spill_slot[m] || m == n) continue;
+            if (bs_test(imat[n], m)) continue;        /* n and m interfere */
+            /* Verify no other node sharing m's slot also conflicts with n. */
+            int cand = spill_slot[m];
+            bool conflict = false;
+            for (int k = IRC_PHYS; k < IRC_MAX_NODES; k++) {
+                if (spill_slot[k] == cand && k != n && bs_test(imat[n], k))
+                    { conflict = true; break; }
+            }
+            if (!conflict) reuse = cand;
+        }
+
+        if (reuse) {
+            spill_slot[n] = reuse;
+        } else {
+            g_spill_next -= 4;
+            g_spill_next &= ~3;
+            spill_slot[n] = g_spill_next;
+        }
     }
 }
 
