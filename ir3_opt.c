@@ -538,6 +538,21 @@ static bool dce(IR3Inst *start, IR3Inst *end)
     for (IR3Inst *p = start; p && p != end; ) {
         IR3Inst *next = p->next;
 
+        /* Dead phi remnants: tryRemoveTrivialPhi sets rd=NONE, rs1=unique_vreg.
+         * rd=NONE is never "fresh" so the normal dead-def check below misses
+         * these nodes entirely, leaving rs1's use count inflated from Scan 1.
+         * That keeps unique_vreg artificially live through the allocator,
+         * causing a spill and a dead load before every occurrence.  Kill them
+         * here and correct the use count. */
+        if (p->op == IR3_MOV && p->rd == IR3_VREG_NONE) {
+            if (is_fresh(p->rs1) && vidx_ok(p->rs1))
+                use_count[vidx(p->rs1)]--;
+            if (prev) prev->next = next;
+            changed = true;
+            p = next;
+            continue;
+        }
+
         if (is_fresh(p->rd) && vidx_ok(p->rd) &&
             use_count[vidx(p->rd)] == 0 &&
             is_side_effect_free(p->op))
