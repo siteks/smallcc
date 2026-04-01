@@ -1365,16 +1365,21 @@ void gen_whilestmt(Node *node)
     Node *cond = node->ch[0];
     Node *body = node->ch[1];
     int lloop   = new_label();
+    int ltest   = new_label();
     int lbreak  = new_label();
     codegen_ctx.break_labels[codegen_ctx.loop_depth] = lbreak;
-    codegen_ctx.cont_labels[codegen_ctx.loop_depth]  = lloop;
+    codegen_ctx.cont_labels[codegen_ctx.loop_depth]  = ltest;  /* continue → re-test cond */
     codegen_ctx.loop_adj[codegen_ctx.loop_depth]     = codegen_ctx.adj_depth;
     codegen_ctx.loop_depth++;
+    /* Loop rotation: test condition at bottom, body at top.
+     * Saves one backward j per iteration; jnz lloop is a backward branch
+     * eligible for compare+branch fusion on CPU4. */
+    ir_append(IR_J, ltest, NULL);
     ir_append(IR_LABEL, lloop, NULL);
-    gen_expr(cond);
-    ir_append(IR_JZ, lbreak, NULL);
     gen_stmt(body);
-    ir_append(IR_J, lloop, NULL);
+    ir_append(IR_LABEL, ltest, NULL);
+    gen_expr(cond);
+    ir_append(IR_JNZ, lloop, NULL);
     ir_append(IR_LABEL, lbreak, NULL);
     codegen_ctx.loop_depth--;
 }
@@ -1406,16 +1411,29 @@ void gen_forstmt(Node *node)
     codegen_ctx.cont_labels[codegen_ctx.loop_depth]  = lcont;
     codegen_ctx.loop_adj[codegen_ctx.loop_depth]     = codegen_ctx.adj_depth;
     codegen_ctx.loop_depth++;
-    ir_append(IR_LABEL, lloop, NULL);
     if (cond->kind != ND_EMPTY) {
+        /* Loop rotation: j ltest on entry; body; inc; ltest: cond; jnz lloop.
+         * Saves one backward j per iteration; jnz is a backward branch
+         * eligible for compare+branch fusion on CPU4. */
+        int ltest = new_label();
+        ir_append(IR_J, ltest, NULL);
+        ir_append(IR_LABEL, lloop, NULL);
+        gen_stmt(body);
+        ir_append(IR_LABEL, lcont, NULL);
+        if (inc->kind != ND_EMPTY)
+            gen_expr_discard(inc);
+        ir_append(IR_LABEL, ltest, NULL);
         gen_expr(cond);
-        ir_append(IR_JZ, lbreak, NULL);
+        ir_append(IR_JNZ, lloop, NULL);
+    } else {
+        /* Infinite loop (no condition): no rotation needed. */
+        ir_append(IR_LABEL, lloop, NULL);
+        gen_stmt(body);
+        ir_append(IR_LABEL, lcont, NULL);
+        if (inc->kind != ND_EMPTY)
+            gen_expr_discard(inc);
+        ir_append(IR_J, lloop, NULL);
     }
-    gen_stmt(body);
-    ir_append(IR_LABEL, lcont, NULL);
-    if (inc->kind != ND_EMPTY)
-        gen_expr_discard(inc);
-    ir_append(IR_J, lloop, NULL);
     ir_append(IR_LABEL, lbreak, NULL);
     codegen_ctx.loop_depth--;
     if (node->symtable)
