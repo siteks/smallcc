@@ -29,10 +29,11 @@
  * ---------------------------------------------------------------- */
 #define VMAP_SIZE 4096
 
-static int  copy_of[VMAP_SIZE];     /* root vreg, or -1 */
-static bool cval_valid[VMAP_SIZE];  /* true if constant value known */
-static int  cval[VMAP_SIZE];        /* known constant */
-static int  use_count[VMAP_SIZE];   /* reference count for DCE */
+static int       copy_of[VMAP_SIZE];     /* root vreg, or -1 */
+static bool      cval_valid[VMAP_SIZE];  /* true if constant value known */
+static int       cval[VMAP_SIZE];        /* known constant */
+static int       use_count[VMAP_SIZE];   /* reference count for DCE and fold pass */
+static IR3Inst  *def_inst[VMAP_SIZE];    /* defining instruction for each fresh vreg */
 
 static inline bool is_fresh(int v) { return v > IR3_VREG_ACCUM; }
 static inline int  vidx(int v)     { return v - IR3_VREG_BASE; }
@@ -594,6 +595,220 @@ static void compact_ir3(IR3Inst *head)
 }
 
 /* ----------------------------------------------------------------
+ * Helper: find a single-use CONST operand on an ADD/SUB node.
+ * Returns true and sets out_cst, out_base, out_C on success.
+ * For ADD: either operand may be the constant (commutative).
+ * For SUB: only rs2 may be the constant (v_R = v_B - v_C).
+ * ---------------------------------------------------------------- */
+static bool find_add_const_operand(IR3Inst *add,
+                                   IR3Inst **out_cst, int *out_base, int *out_C)
+{
+    if (!add || add->op != IR3_ALU) return false;
+    if (add->alu_op != IR_ADD && add->alu_op != IR_SUB) return false;
+
+    /* Try rs2 as the constant (works for both ADD and SUB) */
+    if (is_fresh(add->rs2) && vidx_ok(add->rs2) &&
+        use_count[vidx(add->rs2)] == 1) {
+        IR3Inst *d = def_inst[vidx(add->rs2)];
+        if (d && d->op == IR3_CONST && !d->sym) {
+            int sign = (add->alu_op == IR_SUB) ? -1 : 1;
+            *out_cst  = d;
+            *out_base = add->rs1;
+            *out_C    = sign * d->imm;
+            return true;
+        }
+    }
+    /* For ADD only: also try rs1 as the constant (commutative) */
+    if (add->alu_op == IR_ADD &&
+        is_fresh(add->rs1) && vidx_ok(add->rs1) &&
+        use_count[vidx(add->rs1)] == 1) {
+        IR3Inst *d = def_inst[vidx(add->rs1)];
+        if (d && d->op == IR3_CONST && !d->sym) {
+            *out_cst  = d;
+            *out_base = add->rs2;
+            *out_C    = d->imm;
+            return true;
+        }
+    }
+    return false;
+}
+
+/* ----------------------------------------------------------------
+ * Pass 4: Fold CONST+ADD patterns (function-global, one shared
+ *          def_inst/use_count build).
+ *
+ * Sub-pass A: LOAD/STORE offset folding
+ *   CONST v_C, imm  (single-use)
+ *   ALU   v_R = v_B + v_C  (v_R single-use, ADD or SUB)
+ *   LOAD  [v_R + 0]   =>   LOAD [v_B + imm]  (similarly for STORE)
+ *
+ * Sub-pass B: arithmetic immediate (rs2=NONE sentinel for backend)
+ *   CONST v_C, imm  (single-use)
+ *   ALU   v_R = v_B + v_C   =>   ALU v_R = v_B + imm  (rs2=NONE)
+ *   risc_backend emits addli/addi/inc/dec for these.
+ *
+ * Sub-pass C: compare-with-zero
+ *   CONST v_Z, 0  (single-use)
+ *   ALU   ACCUM = v_A eq/ne v_Z
+ *   JNZ/JZ L   =>   MOV ACCUM, v_A + adjusted JZ/JNZ L
+ *   Eliminates the immw 0 and the eq/ne; reduces to one branch.
+ *
+ * Runs once per function after the copy/const/DCE iteration loop.
+ * Killed nodes are marked IR3_COMMENT; compact_ir3 removes them.
+ * ---------------------------------------------------------------- */
+static void fold_const_patterns(IR3Inst *start, IR3Inst *end)
+{
+    /* Phase 1: build def_inst[] and use_count[] */
+    memset(def_inst,   0, sizeof(def_inst));
+    memset(use_count,  0, sizeof(use_count));
+
+    for (IR3Inst *p = start; p && p != end; p = p->next) {
+        /* Record the unique definition of each fresh vreg.
+         * IR3_STORE: rd is a read (base address), not a def. */
+        if (p->op != IR3_STORE && is_fresh(p->rd) && vidx_ok(p->rd))
+            def_inst[vidx(p->rd)] = p;
+
+        /* Count uses */
+        if (is_fresh(p->rs1) && vidx_ok(p->rs1))
+            use_count[vidx(p->rs1)]++;
+        if (is_fresh(p->rs2) && vidx_ok(p->rs2))
+            use_count[vidx(p->rs2)]++;
+        if (p->op == IR3_STORE && is_fresh(p->rd) && vidx_ok(p->rd))
+            use_count[vidx(p->rd)]++;
+    }
+
+    /* Sub-pass A: fold CONST+ADD into LOAD/STORE offset */
+    for (IR3Inst *p = start; p && p != end; p = p->next) {
+        int base_v;
+        bool is_load = false, is_store = false;
+
+        if (p->op == IR3_LOAD  && p->rs1 != IR3_VREG_BP &&
+            is_fresh(p->rs1)   && vidx_ok(p->rs1)) {
+            base_v = p->rs1;  is_load = true;
+        } else if (p->op == IR3_STORE && p->rd != IR3_VREG_BP &&
+                   is_fresh(p->rd)    && vidx_ok(p->rd)) {
+            base_v = p->rd;  is_store = true;
+        } else {
+            continue;
+        }
+
+        if (use_count[vidx(base_v)] != 1) continue;
+        IR3Inst *add = def_inst[vidx(base_v)];
+
+        IR3Inst *cst; int real_base, C;
+        if (!find_add_const_operand(add, &cst, &real_base, &C)) continue;
+
+        int new_imm = p->imm + C;
+
+        /* F3b imm10 range check (scaled by access size) */
+        int sz = p->size;
+        bool in_range = false;
+        if      (sz == 1) in_range = (new_imm >= -512  && new_imm <= 511);
+        else if (sz == 2) in_range = (new_imm >= -1024 && new_imm <= 1022 && (new_imm & 1) == 0);
+        else if (sz == 4) in_range = (new_imm >= -2048 && new_imm <= 2044 && (new_imm & 3) == 0);
+        if (!in_range) continue;
+
+        if (is_load)  p->rs1 = real_base;
+        if (is_store) p->rd  = real_base;
+        p->imm = new_imm;
+
+        add->op  = IR3_COMMENT;
+        add->rd  = add->rs1 = add->rs2 = IR3_VREG_NONE;
+        cst->op  = IR3_COMMENT;
+        cst->rd  = IR3_VREG_NONE;
+    }
+
+    /* Sub-pass B: fold CONST+ADD into arithmetic immediate.
+     * Uses rs2=IR3_VREG_NONE as a sentinel; risc_backend emits addli/addi/inc/dec.
+     * Only fold when the CONST is single-use (consumed entirely by this ADD). */
+    for (IR3Inst *p = start; p && p != end; p = p->next) {
+        if (p->op != IR3_ALU) continue;
+        if (p->alu_op != IR_ADD && p->alu_op != IR_SUB) continue;
+        if (p->rs2 == IR3_VREG_NONE) continue;  /* already folded */
+
+        IR3Inst *cst; int base, C;
+        if (!find_add_const_operand(p, &cst, &base, &C)) continue;
+
+        /* addli imm10 range: [-512, 511] */
+        if (C < -512 || C > 511) continue;
+
+        /* Rewrite to immediate form: alu_op=IR_ADD, rs1=base, rs2=NONE, imm=C */
+        p->alu_op = IR_ADD;
+        p->rs1    = base;
+        p->rs2    = IR3_VREG_NONE;
+        p->imm    = C;
+
+        cst->op  = IR3_COMMENT;
+        cst->rd  = IR3_VREG_NONE;
+    }
+
+    /* Sub-pass C: fold CONST(0) + EQ/NE → direct branch test.
+     * Pattern: CONST v_Z, 0 (single-use) + ALU ACCUM = v_A eq/ne v_Z
+     *           + (JNZ or JZ) L
+     * → MOV ACCUM, v_A  (or eliminated if v_A==ACCUM)
+     *   + adjusted JZ/JNZ L
+     * Eliminates the immw 0 and eq/ne; after copy/DCE only a jump remains. */
+    for (IR3Inst *p = start; p && p != end; p = p->next) {
+        if (p->op != IR3_ALU) continue;
+        if (p->rd  != IR3_VREG_ACCUM) continue;
+        if (p->alu_op != IR_EQ && p->alu_op != IR_NE) continue;
+
+        /* One operand must be a single-use CONST 0, other is the value to test */
+        int val_v = IR3_VREG_NONE;
+        IR3Inst *cst = NULL;
+
+        /* Check rs2 */
+        if (is_fresh(p->rs2) && vidx_ok(p->rs2) && use_count[vidx(p->rs2)] == 1) {
+            IR3Inst *d = def_inst[vidx(p->rs2)];
+            if (d && d->op == IR3_CONST && !d->sym && d->imm == 0) {
+                cst = d; val_v = p->rs1;
+            }
+        }
+        /* Check rs1 (commutative for EQ/NE) */
+        if (!cst && is_fresh(p->rs1) && vidx_ok(p->rs1) && use_count[vidx(p->rs1)] == 1) {
+            IR3Inst *d = def_inst[vidx(p->rs1)];
+            if (d && d->op == IR3_CONST && !d->sym && d->imm == 0) {
+                cst = d; val_v = p->rs2;
+            }
+        }
+        if (!cst) continue;
+
+        /* Find the immediately following JNZ or JZ */
+        IR3Inst *br = p->next;
+        while (br && br != end && br->op == IR3_COMMENT) br = br->next;
+        if (!br || br == end) continue;
+        if (br->op != IR3_JNZ && br->op != IR3_JZ) continue;
+
+        bool is_eq  = (p->alu_op == IR_EQ);
+        bool is_jnz = (br->op   == IR3_JNZ);
+
+        /* Kill CONST and replace ALU with MOV ACCUM ← val_v
+         * (or delete it if val_v is already ACCUM). */
+        cst->op = IR3_COMMENT;
+        cst->rd = IR3_VREG_NONE;
+
+        if (val_v == IR3_VREG_ACCUM) {
+            /* ACCUM already holds the value — just kill the ALU */
+            p->op  = IR3_COMMENT;
+            p->rd  = p->rs1 = p->rs2 = IR3_VREG_NONE;
+        } else {
+            p->op   = IR3_MOV;
+            p->rs1  = val_v;
+            p->rs2  = IR3_VREG_NONE;
+            p->alu_op = 0;
+        }
+
+        /* Adjust branch direction for EQ (the condition is inverted by the MOV):
+         * eq(v_A, 0) is true when v_A==0; after MOV, ACCUM = v_A (nonzero = true).
+         * So JNZ (jump when eq=true=ACCUM_old≠0) → JZ (jump when v_A==0). */
+        if (is_eq) {
+            br->op = is_jnz ? IR3_JZ : IR3_JNZ;
+        }
+        /* NE: ne(v_A,0) is true when v_A!=0; after MOV ACCUM=v_A: JNZ keeps JNZ. */
+    }
+}
+
+/* ----------------------------------------------------------------
  * Entry point
  * ---------------------------------------------------------------- */
 void ir3_optimize(IR3Inst *head, int opt_level)
@@ -625,6 +840,7 @@ void ir3_optimize(IR3Inst *head, int opt_level)
                 changed |= dce(func_start, func_end);
                 if (!changed) break;
             }
+            fold_const_patterns(func_start, func_end);
         }
 
         p = func_end;

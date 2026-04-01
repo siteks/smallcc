@@ -240,6 +240,13 @@ void risc_backend_emit(IR3Inst *head)
     if (!asm_out) asm_out = stdout;
 
     int prev_line = 0;
+    /* Track the highest label ID emitted so far in the current function.
+     * Used by compare+branch fusion to detect backward branches: a branch
+     * target with id <= rb_last_label has already been emitted and is a
+     * backward branch, guaranteed to be within the F3b ±511-byte range.
+     * Forward branches (target not yet emitted) are NOT fused because their
+     * distance is unknown and may exceed the 10-bit signed offset limit. */
+    int rb_last_label = -1;
 
     for (IR3Inst *p = head; p; p = p->next)
     {
@@ -260,10 +267,12 @@ void risc_backend_emit(IR3Inst *head)
         /* ---- Labels ---- */
         case IR3_LABEL:
             fprintf(asm_out, "_l%d:\n", p->imm);
+            if (p->imm > rb_last_label) rb_last_label = p->imm;
             break;
 
         case IR3_SYMLABEL:
             fprintf(asm_out, "%s:\n", p->sym);
+            rb_last_label = -1;  /* new function: reset backward-branch tracker */
             break;
 
         case IR3_COMMENT:
@@ -361,8 +370,83 @@ void risc_backend_emit(IR3Inst *head)
             int rd  = p->rd;
             int rs1 = p->rs1;
             int rs2 = p->rs2;
-            const char *mn = alu_mnemonic(p->alu_op);
 
+            /* Immediate ADD: ir3_opt folded CONST+ADD (rs2=NONE sentinel, imm=C).
+             * Emit addli/addi/inc/dec instead of immw+add. */
+            if (rs2 == IR3_VREG_NONE && p->alu_op == IR_ADD) {
+                int C = p->imm;
+                if (rd == rs1 && C == 1)
+                    fprintf(asm_out, "    inc     r%d\n", rd);
+                else if (rd == rs1 && C == -1)
+                    fprintf(asm_out, "    dec     r%d\n", rd);
+                else if (rd == rs1 && C >= -64 && C <= 63)
+                    fprintf(asm_out, "    addi    r%d, %d\n", rd, C);
+                else
+                    fprintf(asm_out, "    addli   r%d, r%d, %d\n", rd, rs1, C);
+                break;
+            }
+
+            /* Compare+branch fusion: if this comparison writes r0 (ACCUM) and
+             * the next live instruction is JNZ or JZ, emit a single fused branch
+             * (beq/bne/blt/ble/blts/bles) instead of the two-instruction sequence.
+             * After apply_colors, ACCUM (IR3_VREG_ACCUM=100) has been rewritten to
+             * physical register 0, so check rd==0 here. */
+            if (rd == 0) {
+                IR3Inst *nxt = next_live_rb(p);
+                /* Only fuse when the branch target is a backward branch
+                 * (label already emitted, rb_last_label >= target id).
+                 * Forward branches have unknown distance and may exceed the
+                 * F3b imm10 ±511-byte range, causing silent truncation. */
+                if (nxt && (nxt->op == IR3_JNZ || nxt->op == IR3_JZ)
+                        && nxt->imm >= 0 && nxt->imm <= rb_last_label) {
+                    bool is_jz = (nxt->op == IR3_JZ);
+                    const char *fmn = NULL;
+                    bool fswap = false;
+                    /* Map (alu_op, jz/jnz) to a branch mnemonic and operand order.
+                     * swap=true means emit "fmn rs2, rs1" (reverse operands). */
+                    if (!is_jz) {
+                        /* JNZ: jump when comparison is true */
+                        switch (p->alu_op) {
+                        case IR_EQ:  fmn="beq";  break;
+                        case IR_NE:  fmn="bne";  break;
+                        case IR_LT:  fmn="blt";  break;
+                        case IR_LE:  fmn="ble";  break;
+                        case IR_GT:  fmn="blt";  fswap=true; break; /* bgt a,b => blt b,a */
+                        case IR_GE:  fmn="ble";  fswap=true; break; /* bge a,b => ble b,a */
+                        case IR_LTS: fmn="blts"; break;
+                        case IR_LES: fmn="bles"; break;
+                        case IR_GTS: fmn="blts"; fswap=true; break;
+                        case IR_GES: fmn="bles"; fswap=true; break;
+                        default: break;
+                        }
+                    } else {
+                        /* JZ: jump when comparison is false (negated condition) */
+                        switch (p->alu_op) {
+                        case IR_EQ:  fmn="bne";  break;
+                        case IR_NE:  fmn="beq";  break;
+                        case IR_LT:  fmn="ble";  fswap=true; break; /* not lt => ge => ble b,a */
+                        case IR_LE:  fmn="blt";  fswap=true; break; /* not le => gt => blt b,a */
+                        case IR_GT:  fmn="ble";  break;              /* not gt => le => ble a,b */
+                        case IR_GE:  fmn="blt";  break;              /* not ge => lt => blt a,b */
+                        case IR_LTS: fmn="bles"; fswap=true; break;
+                        case IR_LES: fmn="blts"; fswap=true; break;
+                        case IR_GTS: fmn="bles"; break;
+                        case IR_GES: fmn="blts"; break;
+                        default: break;
+                        }
+                    }
+                    if (fmn) {
+                        int fa = fswap ? rs2 : rs1;
+                        int fb = fswap ? rs1 : rs2;
+                        fprintf(asm_out, "    %-7s r%d, r%d, _l%d\n",
+                                fmn, fa, fb, nxt->imm);
+                        rb_mark_dead(nxt);
+                        break;
+                    }
+                }
+            }
+
+            const char *mn = alu_mnemonic(p->alu_op);
             if (mn) {
                 /* Direct instruction: rd = rs1 op rs2
                  * le/ge and variants are assembler pseudo-ops (operand swap). */
