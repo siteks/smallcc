@@ -1672,31 +1672,6 @@ static void process_function(IRInst *sym_node)
         current_bb_id = bb_id;
         translate_bb(bb, bb_id);
 
-        /* Bridging jump: if this block's fall-through successor is not the
-         * physically adjacent block in RPO order, emit an explicit IR3_J so
-         * that the fall-through is correctly bridged.
-         *
-         * A block has a fall-through (n_succs==1, last not IR_J) when it ends
-         * with neither an unconditional jump nor IR_RET.  The JZ/JNZ cases
-         * have n_succs==2 and don't need bridging here.
-         *
-         * This can occur with loop-rotated while/for loops: the body block
-         * falls through to the condition block, but RPO places the condition
-         * block before the body block for code-layout efficiency. */
-        {
-            IRInst *last_ir = bb->ir_last;
-            bool is_fallthrough = (bb->n_succs == 1) &&
-                                  (!last_ir || last_ir->op != IR_J);
-            if (is_fallthrough) {
-                int fall_succ = bb->succs[0];
-                int next_rpo  = (ri + 1 < rpo_count) ? rpo_order[ri + 1] : -1;
-                if (fall_succ != next_rpo && blocks[fall_succ].label_id >= 0) {
-                    IR3Inst *jmp = emit_ir3(IR3_J);
-                    jmp->imm = blocks[fall_succ].label_id;
-                }
-            }
-        }
-
         /* Mark successors */
         for (int si = 0; si < bb->n_succs; si++) {
             int succ = bb->succs[si];
