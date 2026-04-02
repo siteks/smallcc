@@ -518,6 +518,7 @@ typedef enum {
     IR_LABEL,
     IR_SYMLABEL,
     IR_SXB, IR_SXW,
+    IR_ZXB, IR_ZXW,   /* zero-extend byte / word (in-place: rd &= 0xff / 0xffff) */
     IR_FADD, IR_FSUB, IR_FMUL, IR_FDIV,
     IR_ITOF, IR_FTOI,
     IR_EQ, IR_NE, IR_LT, IR_LE, IR_GT, IR_GE,

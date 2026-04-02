@@ -441,7 +441,6 @@ int main(int argc, char **argv)
                     fprintf(out, "# %s\n", all_files[tu]);
                 fputs(source, out);
             }
-            free(source);
             reset_preprocessor();
             continue;
         }
@@ -490,7 +489,6 @@ int main(int argc, char **argv)
             backend_emit_asm(codegen_ctx.ir_head);
         }
         harvest_globals();
-        free(source);
 
         if (show_stats)
         {

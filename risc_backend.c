@@ -285,6 +285,22 @@ void risc_backend_emit(IR3Inst *head)
                 fprintf(asm_out, "    immw    r%d, %s\n", p->rd, p->sym);
             } else {
                 unsigned u  = (unsigned)p->imm;
+                /* E5: CONST 0xff/0xffff + AND rd, rd, rX → zxb/zxw rd (in-place).
+                 * Absorb the immw into the following AND when rd==rs1 and rs2==this reg. */
+                if (u == 0xff || u == 0xffff) {
+                    IR3Inst *nxt = next_live_rb(p);
+                    if (nxt && nxt->op == IR3_ALU && nxt->alu_op == IR_AND
+                            && nxt->rd == nxt->rs1   /* in-place AND */
+                            && nxt->rs2 == p->rd)    /* uses our const register */
+                    {
+                        rb_mark_dead(p);             /* suppress immw */
+                        nxt->op     = IR3_ALU1;
+                        nxt->alu_op = (u == 0xff) ? IR_ZXB : IR_ZXW;
+                        nxt->rs1    = nxt->rd;
+                        nxt->rs2    = IR3_VREG_NONE;
+                        break;
+                    }
+                }
                 unsigned lo = u & 0xffff;
                 unsigned hi = (u >> 16) & 0xffff;
                 fprintf(asm_out, "    immw    r%d, 0x%04x\n", p->rd, lo);
@@ -386,6 +402,32 @@ void risc_backend_emit(IR3Inst *head)
                 break;
             }
 
+            /* Immediate AND: andi (F2, in-place rd==rs1, sext(imm7) -64..63).
+             * Fallback to immw+and when rd!=rs1 (rare after IRC coalescing). */
+            if (rs2 == IR3_VREG_NONE && p->alu_op == IR_AND) {
+                int C = p->imm;
+                if (rd == rs1 && C >= -64 && C <= 63)
+                    fprintf(asm_out, "    andi    r%d, %d\n", rd, C);
+                else {
+                    fprintf(asm_out, "    immw    r%d, 0x%04x\n", rd, (unsigned)C & 0xffff);
+                    fprintf(asm_out, "    and     r%d, r%d, r%d\n", rd, rs1, rd);
+                }
+                break;
+            }
+
+            /* Immediate SHL: shli (F2, in-place rd==rs1, imm 0..31).
+             * Fallback to immw+shl when rd!=rs1. */
+            if (rs2 == IR3_VREG_NONE && p->alu_op == IR_SHL) {
+                int C = p->imm;
+                if (rd == rs1 && C >= 0 && C <= 31)
+                    fprintf(asm_out, "    shli    r%d, %d\n", rd, C);
+                else {
+                    fprintf(asm_out, "    immw    r%d, 0x%04x\n", rd, (unsigned)C & 0xffff);
+                    fprintf(asm_out, "    shl     r%d, r%d, r%d\n", rd, rs1, rd);
+                }
+                break;
+            }
+
             /* Compare+branch fusion: if this comparison writes r0 (ACCUM) and
              * the next live instruction is JNZ or JZ, emit a single fused branch
              * (beq/bne/blt/ble/blts/bles) instead of the two-instruction sequence.
@@ -462,6 +504,8 @@ void risc_backend_emit(IR3Inst *head)
             switch (p->alu_op) {
             case IR_SXB:  fprintf(asm_out, "    sxb     r%d\n", p->rd); break;
             case IR_SXW:  fprintf(asm_out, "    sxw     r%d\n", p->rd); break;
+            case IR_ZXB:  fprintf(asm_out, "    zxb     r%d\n", p->rd); break;
+            case IR_ZXW:  fprintf(asm_out, "    zxw     r%d\n", p->rd); break;
             case IR_ITOF: fprintf(asm_out, "    itof\n");                break;
             case IR_FTOI: fprintf(asm_out, "    ftoi\n");                break;
             default:

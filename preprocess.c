@@ -42,6 +42,16 @@ static void buf_appends(Buf *b, const char *s)
     buf_append(b, s, strlen(s));
 }
 
+/* Null-terminate b, copy to arena, free the malloc'd backing store. */
+static char *buf_finish(Buf *b)
+{
+    buf_appendc(b, '\0');
+    char *r = arena_strdup(b->data);
+    free(b->data);
+    b->data = NULL; b->len = b->cap = 0;
+    return r;
+}
+
 /* Emit a GCC-style linemarker: # <line> "<filename>"\n */
 static void buf_emit_linemarker(Buf *b, int line, const char *filename)
 {
@@ -110,8 +120,6 @@ static PPMacro *pp_find(const char *name)
 
 void reset_preprocessor(void)
 {
-    for (int i = 0; i < pp_macro_count; i++)
-        free(pp_macros[i].body);
     pp_macro_count   = 0;
     pp_cond_depth    = 0;
     pp_include_depth = 0;
@@ -126,7 +134,7 @@ void pp_define(const char *name, const char *body)
     m->name[63]  = '\0';
     m->nparams   = -1;   /* object-like */
     m->expanding = false;
-    m->body      = strdup(body);
+    m->body      = arena_strdup(body);
 }
 
 /* ---- File I/O (local copy keeps read_file in smallcc.c static) ---- */
@@ -137,8 +145,7 @@ static char *pp_read_file(const char *path)
     fseek(f, 0, SEEK_END);
     long sz = ftell(f);
     rewind(f);
-    char *buf = malloc(sz + 1);
-    if (!buf) error("preprocess: malloc failed");
+    char *buf = arena_alloc(sz + 1);
     fread(buf, 1, sz, f);
     buf[sz] = '\0';
     fclose(f);
@@ -148,21 +155,20 @@ static char *pp_read_file(const char *path)
 /* Forward declaration */
 static char *resolve_include_path(const char *current_file, const char *inc);
 
-/* Returns malloc'd path if accessible, NULL otherwise. */
+/* Returns arena-allocated path if accessible, NULL otherwise. */
 static char *pp_try_path(const char *path)
 {
     FILE *f = fopen(path, "r");
     if (!f) return NULL;
     fclose(f);
-    return strdup(path);
+    return arena_strdup(path);
 }
 
-/* Build "dir/name" in a malloc'd buffer. */
+/* Build "dir/name" in an arena buffer. */
 static char *pp_join(const char *dir, const char *name)
 {
     size_t dlen = strlen(dir), nlen = strlen(name);
-    char *p = malloc(dlen + 1 + nlen + 1);
-    if (!p) error("preprocess: malloc failed");
+    char *p = arena_alloc(dlen + 1 + nlen + 1);
     memcpy(p, dir, dlen);
     p[dlen] = '/';
     memcpy(p + dlen + 1, name, nlen + 1);
@@ -170,20 +176,18 @@ static char *pp_join(const char *dir, const char *name)
 }
 
 /* Resolve #include "name": file-relative first, then -I dirs.
-   Returns malloc'd resolved path (caller frees), or calls error. */
+   Returns arena-allocated resolved path, or calls error. */
 static char *pp_resolve_quoted(const char *filename, const char *name)
 {
     /* 1. Directory of the including file */
     char *r = resolve_include_path(filename, name);
     char *found = pp_try_path(r);
-    free(r);
     if (found) return found;
 
     /* 2. -I directories */
     for (int i = 0; i < pp_idir_count; i++) {
         r = pp_join(pp_idirs[i], name);
         found = pp_try_path(r);
-        free(r);
         if (found) return found;
     }
 
@@ -194,14 +198,13 @@ static char *pp_resolve_quoted(const char *filename, const char *name)
 }
 
 /* Resolve #include <name>: -I dirs first, then system include dir.
-   Returns malloc'd resolved path, or calls error. */
+   Returns arena-allocated resolved path, or calls error. */
 static char *pp_resolve_angled(const char *name)
 {
     /* 1. -I directories */
     for (int i = 0; i < pp_idir_count; i++) {
         char *r = pp_join(pp_idirs[i], name);
         char *found = pp_try_path(r);
-        free(r);
         if (found) return found;
     }
 
@@ -210,7 +213,6 @@ static char *pp_resolve_angled(const char *name)
         error("preprocess: no system include directory set for <%s>", name);
     char *r = pp_join(pp_sysinclude_dir, name);
     if (pp_try_path(r)) return r;
-    free(r);
     error("Cannot open include file: <%s>", name);
     return NULL; /* unreachable */
 }
@@ -219,10 +221,9 @@ static char *pp_resolve_angled(const char *name)
 static char *resolve_include_path(const char *current_file, const char *inc)
 {
     const char *slash = strrchr(current_file, '/');
-    if (!slash) return strdup(inc);
+    if (!slash) return arena_strdup(inc);
     size_t dir_len = (size_t)(slash - current_file) + 1;
-    char  *result  = malloc(dir_len + strlen(inc) + 1);
-    if (!result) error("preprocess: malloc failed");
+    char  *result  = arena_alloc(dir_len + strlen(inc) + 1);
     memcpy(result, current_file, dir_len);
     strcpy(result + dir_len, inc);
     return result;
@@ -265,7 +266,7 @@ static const char *pp_read_ident(const char *p, char *name, size_t cap)
 /* Forward declaration */
 static char *pp_expand(const char *text);
 
-/* ---- Substitute function-like macro params; returns malloc'd string ---- */
+/* ---- Substitute function-like macro params; returns arena-allocated string ---- */
 static char *substitute_args(PPMacro *m, char **args, int nargs)
 {
     Buf out = {0};
@@ -290,11 +291,10 @@ static char *substitute_args(PPMacro *m, char **args, int nargs)
             buf_appendc(&out, *p++);
         }
     }
-    buf_appendc(&out, '\0');
-    return out.data;
+    return buf_finish(&out);
 }
 
-/* ---- Expand macros in text; returns malloc'd null-terminated string ---- */
+/* ---- Expand macros in text; returns arena-allocated null-terminated string ---- */
 static char *pp_expand(const char *text)
 {
     Buf out = {0};
@@ -346,7 +346,6 @@ static char *pp_expand(const char *text)
                     char *exp = pp_expand(m->body);
                     m->expanding = false;
                     buf_appends(&out, exp);
-                    free(exp);
                     p = after;
                 }
                 else
@@ -382,7 +381,7 @@ static char *pp_expand(const char *text)
                                     arg[--alen] = '\0';
                                 while (*arg == ' ' || *arg == '\t') arg++;
                                 if (nargs < PP_MAX_PARAMS)
-                                    args[nargs++] = strdup(arg);
+                                    args[nargs++] = arena_strdup(arg);
                                 free(arg_buf.data);
                                 if (*q == ')') { q++; break; }
                                 if (*q == ',') q++;
@@ -396,10 +395,7 @@ static char *pp_expand(const char *text)
                         m->expanding = true;
                         char *exp = pp_expand(subst);
                         m->expanding = false;
-                        free(subst);
                         buf_appends(&out, exp);
-                        free(exp);
-                        for (int i = 0; i < nargs; i++) free(args[i]);
                         p = q;
                     }
                     else
@@ -419,8 +415,7 @@ static char *pp_expand(const char *text)
         }
         buf_appendc(&out, *p++);
     }
-    buf_appendc(&out, '\0');
-    return out.data;
+    return buf_finish(&out);
 }
 
 /* ---- Integer constant expression evaluator for #if / #elif ---- */
@@ -641,7 +636,7 @@ static long long pp_eval_expr(void)
 }
 
 /* Replace defined(NAME) / defined NAME with "1" or "0" before macro expansion.
-   Returns a malloc'd string with all defined(...) occurrences substituted. */
+   Returns an arena-allocated string with all defined(...) occurrences substituted. */
 static char *pp_subst_defined(const char *text)
 {
     Buf out = {0};
@@ -673,11 +668,10 @@ static char *pp_subst_defined(const char *text)
         }
         buf_appendc(&out, *p++);
     }
-    buf_appendc(&out, '\0');
-    return out.data;
+    return buf_finish(&out);
 }
 
-/* Strip C block comments from a string; returns malloc'd result. */
+/* Strip C block comments from a string; returns arena-allocated result. */
 static char *pp_strip_block_comments(const char *text)
 {
     Buf out = {0};
@@ -694,8 +688,7 @@ static char *pp_strip_block_comments(const char *text)
         else
             buf_appendc(&out, *p++);
     }
-    buf_appendc(&out, '\0');
-    return out.data;
+    return buf_finish(&out);
 }
 
 /* Macro-expand text then evaluate as a constant integer expression. */
@@ -703,13 +696,9 @@ static long long pp_eval_if_expr(const char *text)
 {
     char *presubst = pp_subst_defined(text);  /* handle defined() first */
     char *expanded = pp_expand(presubst);
-    free(presubst);
     char *stripped = pp_strip_block_comments(expanded);
-    free(expanded);
     eval_p = stripped;
-    long long result = pp_eval_logor();
-    free(stripped);
-    return result;
+    return pp_eval_logor();
 }
 
 /* ------------------------------------------------------------------ */
@@ -861,7 +850,7 @@ char *preprocess(const char *src, const char *filename)
                         m->nparams = -1;
                         lp = pp_skip_ws(after_name);
                     }
-                    m->body = strdup(lp);
+                    m->body = arena_strdup(lp);
                 }
                 else if (strcmp(dir, "undef") == 0)
                 {
@@ -871,7 +860,6 @@ char *preprocess(const char *src, const char *filename)
                     {
                         if (strcmp(pp_macros[i].name, name) == 0)
                         {
-                            free(pp_macros[i].body);
                             pp_macros[i] = pp_macros[--pp_macro_count];
                             break;
                         }
@@ -911,9 +899,6 @@ char *preprocess(const char *src, const char *filename)
                     /* Ensure included content ends with a newline */
                     if (out.len > 0 && out.data[out.len - 1] != '\n')
                         buf_appendc(&out, '\n');
-                    free(expanded);
-                    free(raw);
-                    free(resolved);
                     /* Resync to parent file after the included content */
                     buf_emit_linemarker(&out, pp_lineno + 1, filename);
                 }
@@ -935,12 +920,10 @@ char *preprocess(const char *src, const char *filename)
         {
             char *expanded = pp_expand(line);
             buf_appends(&out, expanded);
-            free(expanded);
             buf_appendc(&out, '\n');
         }
     }
 
     pp_include_depth--;
-    buf_appendc(&out, '\0');
-    return out.data;
+    return buf_finish(&out);
 }

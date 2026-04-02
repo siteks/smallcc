@@ -273,12 +273,15 @@ static const Instr4 itab4[] = {
     {"sxb",    0x7e,1,1,0x00}, {"sxw",   0x7e,1,1,0x01},
     {"inc",    0x7e,1,1,0x02}, {"dec",   0x7e,1,1,0x03},
     {"pushr",  0x7e,1,1,0x04}, {"popr",  0x7e,1,1,0x05},
+    {"zxb",    0x7e,1,1,0x06}, {"zxw",  0x7e,1,1,0x07},
     /* F2 — 2 bytes, rx imm7 (bp-relative; imm scaled by access width) */
     {"lb",     0x80,1,0,0}, {"lw",     0x84,1,0,0},
     {"ll",     0x88,1,0,0}, {"sb",     0x8c,1,0,0},
     {"sw",     0x90,1,0,0}, {"sl",     0x94,1,0,0},
     {"lbx",    0x98,1,0,0}, {"lwx",    0x9c,1,0,0},
     {"addi",   0xa0,1,0,0},
+    {"shli",   0xa4,1,0,0},
+    {"andi",   0xa8,1,0,0},
     /* F3a — 3 bytes, imm16 only */
     {"j",      0xc0,2,0,0}, {"jl",     0xc1,2,0,0},
     {"jz",     0xc2,2,0,0}, {"jnz",    0xc3,2,0,0},
@@ -959,6 +962,8 @@ static void run_cpu4(int verbose)
             else if (subop==0x03) r[rd]=(r[rd]-1)&0xffffffff;                        /* dec */
             else if (subop==0x04) { sp -= 4; write32(sp, r[rd]); }                   /* pushr */
             else if (subop==0x05) { r[rd] = read32(sp); sp += 4; }                   /* popr */
+            else if (subop==0x06) r[rd] = r[rd] & 0xff;                              /* zxb  */
+            else if (subop==0x07) r[rd] = r[rd] & 0xffff;                            /* zxw  */
             break;
         /* F2 — bp-relative (imm is raw 7-bit; scaled by access size) */
         case 0x80: r[rd]=read8 ((uint16_t)((int32_t)bp+sx7(imm)));     break; /* lb  */
@@ -969,7 +974,9 @@ static void run_cpu4(int verbose)
         case 0x94: { uint16_t a = (uint16_t)((int32_t)bp+sx7(imm)*4); check_align32(a, oldpc); write32(a, r[rx]); } break; /* sl  */
         case 0x98: r[rd]=(uint32_t)(int32_t)(int8_t) read8 ((uint16_t)((int32_t)bp+sx7(imm)));   break; /* lbx */
         case 0x9c: { uint16_t a = (uint16_t)((int32_t)bp+sx7(imm)*2); check_align16(a, oldpc); r[rd]=(uint32_t)(int32_t)(int16_t)read16(a); } break; /* lwx */
-        case 0xa0: r[rd]=r[rx]+(uint32_t)sx7(imm); break; /* addi */
+        case 0xa0: r[rd]=r[rx]+(uint32_t)sx7(imm); break;           /* addi */
+        case 0xa4: r[rd]=r[rx]<<(imm&0x1f); break;                /* shli */
+        case 0xa8: r[rd]=r[rx]&(uint32_t)sx7(imm); break;        /* andi */
         /* F3a */
         case 0xc0: pc=(uint16_t)imm; break;  /* j   */
         case 0xc1: lr=pc; pc=(uint16_t)imm; break; /* jl  */

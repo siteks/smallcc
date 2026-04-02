@@ -34,6 +34,7 @@ static bool      cval_valid[VMAP_SIZE];  /* true if constant value known */
 static int       cval[VMAP_SIZE];        /* known constant */
 static int       use_count[VMAP_SIZE];   /* reference count for DCE and fold pass */
 static IR3Inst  *def_inst[VMAP_SIZE];    /* defining instruction for each fresh vreg */
+static bool      multi_def[VMAP_SIZE];   /* true if vreg has >1 definition (phi copies) */
 
 static inline bool is_fresh(int v) { return v > IR3_VREG_ACCUM; }
 static inline int  vidx(int v)     { return v - IR3_VREG_BASE; }
@@ -412,6 +413,18 @@ skip_alu1:
                     changed = true;
                     continue;
                 }
+                /* x & 0xff → zxb rd  (in-place only: rd must already equal rs1) */
+                if (op == IR_AND && k == 0xff && p->rd == p->rs1) {
+                    p->op = IR3_ALU1; p->alu_op = IR_ZXB;
+                    p->rs2 = IR3_VREG_NONE;
+                    changed = true; continue;
+                }
+                /* x & 0xffff → zxw rd  (in-place only) */
+                if (op == IR_AND && k == 0xffff && p->rd == p->rs1) {
+                    p->op = IR3_ALU1; p->alu_op = IR_ZXW;
+                    p->rs2 = IR3_VREG_NONE;
+                    changed = true; continue;
+                }
             }
 
             if (rs1_const) {
@@ -446,6 +459,18 @@ skip_alu1:
                     p->alu_op = 0;
                     changed = true;
                     continue;
+                }
+                /* 0xff & x → zxb rd  (in-place only: rd must equal rs2) */
+                if (op == IR_AND && k == 0xff && p->rd == p->rs2) {
+                    p->op = IR3_ALU1; p->alu_op = IR_ZXB;
+                    p->rs1 = p->rd; p->rs2 = IR3_VREG_NONE;
+                    changed = true; continue;
+                }
+                /* 0xffff & x → zxw rd  (in-place only) */
+                if (op == IR_AND && k == 0xffff && p->rd == p->rs2) {
+                    p->op = IR3_ALU1; p->alu_op = IR_ZXW;
+                    p->rs1 = p->rd; p->rs2 = IR3_VREG_NONE;
+                    changed = true; continue;
                 }
             }
             #undef GET_CONST
@@ -608,7 +633,7 @@ static bool find_add_const_operand(IR3Inst *add,
 
     /* Try rs2 as the constant (works for both ADD and SUB) */
     if (is_fresh(add->rs2) && vidx_ok(add->rs2) &&
-        use_count[vidx(add->rs2)] == 1) {
+        use_count[vidx(add->rs2)] == 1 && !multi_def[vidx(add->rs2)]) {
         IR3Inst *d = def_inst[vidx(add->rs2)];
         if (d && d->op == IR3_CONST && !d->sym) {
             int sign = (add->alu_op == IR_SUB) ? -1 : 1;
@@ -621,7 +646,7 @@ static bool find_add_const_operand(IR3Inst *add,
     /* For ADD only: also try rs1 as the constant (commutative) */
     if (add->alu_op == IR_ADD &&
         is_fresh(add->rs1) && vidx_ok(add->rs1) &&
-        use_count[vidx(add->rs1)] == 1) {
+        use_count[vidx(add->rs1)] == 1 && !multi_def[vidx(add->rs1)]) {
         IR3Inst *d = def_inst[vidx(add->rs1)];
         if (d && d->op == IR3_CONST && !d->sym) {
             *out_cst  = d;
@@ -658,15 +683,24 @@ static bool find_add_const_operand(IR3Inst *add,
  * ---------------------------------------------------------------- */
 static void fold_const_patterns(IR3Inst *start, IR3Inst *end)
 {
-    /* Phase 1: build def_inst[] and use_count[] */
+    /* Phase 1: build def_inst[], use_count[], multi_def[] */
     memset(def_inst,   0, sizeof(def_inst));
     memset(use_count,  0, sizeof(use_count));
+    memset(multi_def,  0, sizeof(multi_def));
 
     for (IR3Inst *p = start; p && p != end; p = p->next) {
         /* Record the unique definition of each fresh vreg.
-         * IR3_STORE: rd is a read (base address), not a def. */
-        if (p->op != IR3_STORE && is_fresh(p->rd) && vidx_ok(p->rd))
-            def_inst[vidx(p->rd)] = p;
+         * IR3_STORE: rd is a read (base address), not a def.
+         * If a vreg is defined more than once (phi-deconstruction copies from
+         * multiple predecessor blocks), mark it multi_def so the fold passes
+         * do not treat one branch's constant as the definitive value. */
+        if (p->op != IR3_STORE && is_fresh(p->rd) && vidx_ok(p->rd)) {
+            int idx = vidx(p->rd);
+            if (def_inst[idx] != NULL)
+                multi_def[idx] = true;
+            else
+                def_inst[idx] = p;
+        }
 
         /* Count uses */
         if (is_fresh(p->rs1) && vidx_ok(p->rs1))
@@ -742,6 +776,46 @@ static void fold_const_patterns(IR3Inst *start, IR3Inst *end)
         cst->rd  = IR3_VREG_NONE;
     }
 
+    /* Sub-pass B2: fold CONST+AND/SHL into immediate form.
+     * AND:  andi rx, sext(imm7)  — range [-64, 63]; rs2=NONE sentinel.
+     * SHL:  shli rx, imm7        — range [0, 31];   rs2=NONE sentinel.
+     * risc_backend emits andi/shli when rd==rs1 (in-place), else immw+op. */
+    for (IR3Inst *p = start; p && p != end; p = p->next) {
+        if (p->op != IR3_ALU) continue;
+        if (p->rs2 == IR3_VREG_NONE) continue;  /* already folded */
+
+        if (p->alu_op == IR_AND) {
+            /* Commutative: constant may be in rs2 or rs1 */
+            IR3Inst *cst = NULL;
+            int base = IR3_VREG_NONE, C = 0;
+            if (is_fresh(p->rs2) && vidx_ok(p->rs2) && use_count[vidx(p->rs2)] == 1 &&
+                !multi_def[vidx(p->rs2)]) {
+                IR3Inst *d = def_inst[vidx(p->rs2)];
+                if (d && d->op == IR3_CONST && !d->sym) { cst=d; base=p->rs1; C=d->imm; }
+            }
+            if (!cst && is_fresh(p->rs1) && vidx_ok(p->rs1) && use_count[vidx(p->rs1)] == 1 &&
+                !multi_def[vidx(p->rs1)]) {
+                IR3Inst *d = def_inst[vidx(p->rs1)];
+                if (d && d->op == IR3_CONST && !d->sym) { cst=d; base=p->rs2; C=d->imm; }
+            }
+            if (!cst) continue;
+            if (C < -64 || C > 63) continue;   /* andi sext(imm7) range */
+            p->rs1 = base; p->rs2 = IR3_VREG_NONE; p->imm = C;
+            cst->op = IR3_COMMENT; cst->rd = IR3_VREG_NONE;
+
+        } else if (p->alu_op == IR_SHL) {
+            /* Non-commutative: only rs2 can be the shift count */
+            if (!is_fresh(p->rs2) || !vidx_ok(p->rs2) || use_count[vidx(p->rs2)] != 1 ||
+                multi_def[vidx(p->rs2)]) continue;
+            IR3Inst *d = def_inst[vidx(p->rs2)];
+            if (!d || d->op != IR3_CONST || d->sym) continue;
+            int C = d->imm;
+            if (C < 0 || C > 31) continue;     /* shli: counts 0-31 */
+            p->rs2 = IR3_VREG_NONE; p->imm = C;
+            d->op = IR3_COMMENT; d->rd = IR3_VREG_NONE;
+        }
+    }
+
     /* Sub-pass C: fold CONST(0) + EQ/NE → direct branch test.
      * Pattern: CONST v_Z, 0 (single-use) + ALU ACCUM = v_A eq/ne v_Z
      *           + (JNZ or JZ) L
@@ -758,14 +832,16 @@ static void fold_const_patterns(IR3Inst *start, IR3Inst *end)
         IR3Inst *cst = NULL;
 
         /* Check rs2 */
-        if (is_fresh(p->rs2) && vidx_ok(p->rs2) && use_count[vidx(p->rs2)] == 1) {
+        if (is_fresh(p->rs2) && vidx_ok(p->rs2) && use_count[vidx(p->rs2)] == 1 &&
+            !multi_def[vidx(p->rs2)]) {
             IR3Inst *d = def_inst[vidx(p->rs2)];
             if (d && d->op == IR3_CONST && !d->sym && d->imm == 0) {
                 cst = d; val_v = p->rs1;
             }
         }
         /* Check rs1 (commutative for EQ/NE) */
-        if (!cst && is_fresh(p->rs1) && vidx_ok(p->rs1) && use_count[vidx(p->rs1)] == 1) {
+        if (!cst && is_fresh(p->rs1) && vidx_ok(p->rs1) && use_count[vidx(p->rs1)] == 1 &&
+            !multi_def[vidx(p->rs1)]) {
             IR3Inst *d = def_inst[vidx(p->rs1)];
             if (d && d->op == IR3_CONST && !d->sym && d->imm == 0) {
                 cst = d; val_v = p->rs2;

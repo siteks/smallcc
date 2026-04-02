@@ -827,29 +827,9 @@ static void alloc_spill_slots(void)
 {
     for (int n = bs_next(actual_spill, -1); n >= 0; n = bs_next(actual_spill, n)) {
         if (!is_virtual(n)) continue;
-
-        /* Try to reuse an existing spill slot from a non-interfering node. */
-        int reuse = 0;
-        for (int m = IRC_PHYS; m < IRC_MAX_NODES && !reuse; m++) {
-            if (!spill_slot[m] || m == n) continue;
-            if (bs_test(imat[n], m)) continue;        /* n and m interfere */
-            /* Verify no other node sharing m's slot also conflicts with n. */
-            int cand = spill_slot[m];
-            bool conflict = false;
-            for (int k = IRC_PHYS; k < IRC_MAX_NODES; k++) {
-                if (spill_slot[k] == cand && k != n && bs_test(imat[n], k))
-                    { conflict = true; break; }
-            }
-            if (!conflict) reuse = cand;
-        }
-
-        if (reuse) {
-            spill_slot[n] = reuse;
-        } else {
-            g_spill_next -= 4;
-            g_spill_next &= ~3;
-            spill_slot[n] = g_spill_next;
-        }
+        g_spill_next -= 4;
+        g_spill_next &= ~3;
+        spill_slot[n] = g_spill_next;
     }
 }
 
@@ -903,6 +883,15 @@ static void rewrite_spills(IR3Inst **func_head_ptr, IR3Inst *func_end)
         /* Helper: check if vreg v is spilled */
 #define SPILLED(v) \
     ((v) > IR3_VREG_ACCUM && vreg_to_node(v) >= 0 && bs_test(actual_spill, vreg_to_node(v)))
+
+        /* Skip dead phi MOV residuals (tryRemoveTrivialPhi sets rd=VREG_NONE, rs1=unique).
+         * Inserting a LOAD for a spilled rs1 here would produce dead loads at loop headers
+         * that clobber live loop-carried register values.  Neutralize rs1 so future
+         * iterations are also unaffected. */
+        if (p->op == IR3_MOV && p->rd == IR3_VREG_NONE) {
+            p->rs1 = IR3_VREG_NONE;
+            prev = p; p = p->next; continue;
+        }
 
         /* --- Insert LOADs before p for spilled uses --- */
 

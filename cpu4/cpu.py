@@ -74,6 +74,8 @@ import sys
 #   dec     rd
 #   pushr   rd
 #   popr    rd
+#   zxb     rd
+#   zxw     rd
 #   
 #   Format 2 - one op + imm7; stack frame access (16 slots)
 #   lb      rx = [bp+sxt(imm7)]   
@@ -85,6 +87,8 @@ import sys
 #   lbx     rx = sxt([bp+sxt(imm7)])
 #   lwx     rx = sxt([bp+sxt(imm7*2)])
 #   addi    rx = rx + sxt(imm7)
+#   shli    rx = rx << imm7
+#   andi    rx = rx & sxt(imm7)
 #
 #   Format 3a - zero op + imm16 (16 slots)
 #   j       pc = imm16
@@ -187,6 +191,8 @@ class G:
         'dec'   :   (0x7e, 1, 1, 0x03),
         'pushr' :   (0x7e, 1, 1, 0x04),
         'popr'  :   (0x7e, 1, 1, 0x05),
+        'zxb'   :   (0x7e, 1, 1, 0x06),
+        'zxw'   :   (0x7e, 1, 1, 0x07),
         # format 2 - one op + imm7      10ooooxxxiiiiiii
         'lb'    :   (0x80, 1, 0, 0),
         'lw'    :   (0x84, 1, 0, 0),
@@ -197,6 +203,8 @@ class G:
         'lbx'   :   (0x98, 1, 0, 0),
         'lwx'   :   (0x9c, 1, 0, 0),
         'addi'  :   (0xa0, 1, 0, 0),
+        'shli'  :   (0xa4, 1, 0, 0),
+        'andi'  :   (0xa8, 1, 0, 0),
         # format 3a - zero op + imm16   1100ooooiiiiiiiiiiiiiiii
         'j'     :   (0xc0, 2, 0, 0),
         'jl'    :   (0xc1, 2, 0, 0),
@@ -471,6 +479,8 @@ class CPU:
         elif    i == 'dec':     s.r[dst] = s.r[src0] - 1
         elif    i == 'pushr':   s.sp -= 4; m.write32(s.sp, s.r[src0])
         elif    i == 'popr':    s.r[dst] = m.read32(s.sp); s.sp += 4
+        elif    i == 'zxb':     s.r[dst] = s.r[src0] & 0xff
+        elif    i == 'zxw':     s.r[dst] = s.r[src0] & 0xffff
         # f2
         elif    i == 'lb':      s.r[dst] = m.read8(s.bp + sext(imm, 7))
         elif    i == 'lw':      s.r[dst] = m.read16(s.bp + sext(imm<<1, 8))
@@ -481,6 +491,8 @@ class CPU:
         elif    i == 'lbx':     s.r[dst] = sext(m.read8(s.bp + sext(imm, 7)), 8)
         elif    i == 'lwx':     s.r[dst] = sext(m.read16(s.bp + sext(imm<<1, 8)), 16)
         elif    i == 'addi':    s.r[dst] = s.r[src0] + sext(imm, 7)
+        elif    i == 'shli':    s.r[dst] = s.r[src0] << (imm & 0x1f)
+        elif    i == 'andi':    s.r[dst] = s.r[src0] & sext(imm, 7)
         # f3a
         elif    i == 'j':       s.pc = imm
         elif    i == 'jl':      s.pc, s.lr = imm, s.pc
