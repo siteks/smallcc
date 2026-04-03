@@ -115,7 +115,7 @@ static void lvsp_apply(int label_id)
 /* ================================================================
  * Promoted parameter pre-seeding (deferred until after ENTER)
  * ================================================================ */
-#define MAX_PARAM_SEEDS 32
+#define MAX_PARAM_SEEDS 64
 static struct { int offset; int size; int vreg; } param_seeds[MAX_PARAM_SEEDS];
 static int n_param_seeds;
 
@@ -852,8 +852,11 @@ static void translate_bb(BB *bb, int bb_id)
                 mov->line = p->line;
             }
             /* accum_vreg and local_accum_offset preserved through PUSH */
-            if (vs_depth >= MAX_VDEPTH)
-                fprintf(stderr, "braun: virtual stack overflow at depth %d\n", vs_depth);
+            if (vs_depth >= MAX_VDEPTH) {
+                fprintf(stderr, "braun: virtual stack overflow (depth %d >= MAX_VDEPTH %d) — aborting\n",
+                        vs_depth, MAX_VDEPTH);
+                exit(1);
+            }
             writeVariable(current_bb_id, VSTACK_BASE + vs_depth, slot_vreg);
             vs_size[vs_depth] = sz;
             vs_depth++;
@@ -1170,10 +1173,12 @@ static void split_critical_edges(BB **blocks_ptr, int *n_blocks_ptr)
     BB  *blocks = *blocks_ptr;
     int  n_orig = *n_blocks_ptr;
 
-    /* Count critical edges first so we can realloc once. */
+    /* Count critical edges first so we can realloc once.
+     * Unreachable pred blocks are skipped in the split loop too. */
     int n_crit = 0;
     for (int p = 0; p < n_orig; p++) {
         if (blocks[p].n_succs <= 1) continue;
+        if (!rpo_visited[p]) continue;
         for (int si = 0; si < blocks[p].n_succs; si++) {
             int s = blocks[p].succs[si];
             if (blocks[s].n_preds > 1) n_crit++;
@@ -1187,11 +1192,29 @@ static void split_critical_edges(BB **blocks_ptr, int *n_blocks_ptr)
     blocks = new_blocks;
     *blocks_ptr = blocks;
 
+    /* Expand block_pretail and block_last_ir3 to cover the new landing-pad
+     * block indices (n_orig .. n_orig+n_crit-1).  Both were originally sized
+     * for n_orig entries; writing beyond that is out-of-bounds into whatever
+     * scratch_alloc placed next and causes corruption / segfault on larger
+     * functions.  Allocate fresh arrays with room for all blocks, copy the
+     * existing per-block pointers, and update the globals. */
+    IR3Inst **new_pretail  = scratch_alloc((n_orig + n_crit) * sizeof(IR3Inst *));
+    IR3Inst **new_last     = scratch_alloc((n_orig + n_crit) * sizeof(IR3Inst *));
+    memcpy(new_pretail, block_pretail,  n_orig * sizeof(IR3Inst *));
+    memcpy(new_last,    block_last_ir3, n_orig * sizeof(IR3Inst *));
+    block_pretail  = new_pretail;   /* new landing-pad slots are zeroed */
+    block_last_ir3 = new_last;
+
     /* Split each critical edge.  Iterate only original blocks so landing
-     * pads (which have n_succs=1) are never re-processed. */
+     * pads (which have n_succs=1) are never re-processed.
+     * Skip unreachable pred blocks (dead text after return, etc.): they have
+     * no live phi nodes to deconstructPhis, so their critical edges need not
+     * be split, and block_last_ir3[pred] may be NULL (translate_bb not yet
+     * called) which would crash the fall-through edge insertion below. */
     int n_blocks = n_orig;
     for (int pred = 0; pred < n_orig; pred++) {
         if (blocks[pred].n_succs <= 1) continue;
+        if (!rpo_visited[pred]) continue;   /* unreachable — skip */
         for (int si = 0; si < blocks[pred].n_succs; si++) {
             int succ = blocks[pred].succs[si];
             if (blocks[succ].n_preds <= 1) continue;
@@ -1232,22 +1255,30 @@ static void split_critical_edges(BB **blocks_ptr, int *n_blocks_ptr)
             } else {
                 /* It's a fall-through edge: the conditional branches to the
                  * OTHER successor, and execution falls through into succ.
-                 * Insert an explicit J to the landing pad immediately after
-                 * the conditional branch so the fall-through is intercepted. */
-                IR3Inst *j_fall = new_ir3(IR3_J);
-                j_fall->imm = lbl_new;
+                 * A bridging jump to succ may already have been inserted by
+                 * translate_bb (for n_succs==2 blocks whose fall-through is
+                 * non-adjacent in RPO).  If so, just retarget that jump to the
+                 * new landing pad; otherwise insert one now. */
+                IR3Inst *last = block_last_ir3[pred];
+                if (last && last->op == IR3_J
+                         && last->imm == blocks[succ].label_id) {
+                    last->imm = lbl_new;
+                } else {
+                    IR3Inst *j_fall = new_ir3(IR3_J);
+                    j_fall->imm = lbl_new;
 
-                IR3Inst *after_this = block_last_ir3[pred];
-                j_fall->next = after_this->next;
-                after_this->next = j_fall;
-                if (ir3_tail == &after_this->next) {
-                    ir3_tail = &j_fall->next;
-                    ir3_last = j_fall;
+                    IR3Inst *after_this = block_last_ir3[pred];
+                    j_fall->next = after_this->next;
+                    after_this->next = j_fall;
+                    if (ir3_tail == &after_this->next) {
+                        ir3_tail = &j_fall->next;
+                        ir3_last = j_fall;
+                    }
+
+                    /* Update trackers so deconstructPhis sees the correct tail. */
+                    block_pretail[pred] = after_this;
+                    block_last_ir3[pred] = j_fall;
                 }
-
-                /* Update trackers so deconstructPhis sees the correct tail. */
-                block_pretail[pred] = after_this;
-                block_last_ir3[pred] = j_fall;
             }
 
             /* Append the landing pad at the END of the function's IR3 list:
@@ -1553,6 +1584,12 @@ static void process_function(IRInst *sym_node)
             }
         }
         init_fn_arrays(n_blocks + n_crit, phi_sz, vlo_sz, lvsp_sz);
+        /* Pre-initialize lvsp_base to the minimum label ID in the function.
+         * Without this, lvsp_base is set lazily to the first *branched-to* label,
+         * which may be higher than the first *emitted* label.  Any block whose
+         * label_id < lvsp_base gets idx<0 in lvsp_record/apply and is silently
+         * ignored, breaking vsp tracking for the fall-through of early-exit paths. */
+        if (lbl_min <= lbl_max) lvsp_base = lbl_min;
     }
 
     cur_blocks = blocks;
@@ -1625,7 +1662,12 @@ static void process_function(IRInst *sym_node)
             for (int i = 0; i < n_param_seeds; i++) {
                 if (param_seeds[i].offset == p->operand) { dup = true; break; }
             }
-            if (!dup && n_param_seeds < MAX_PARAM_SEEDS) {
+            if (!dup && n_param_seeds >= MAX_PARAM_SEEDS) {
+                fprintf(stderr, "braun: too many promoted parameters (> %d) — aborting\n",
+                        MAX_PARAM_SEEDS);
+                exit(1);
+            }
+            if (!dup) {
                 int slot = p->operand + PROMOTE_BASE;
                 if ((unsigned)slot < PROMOTE_SLOTS) {
                     promo_slot_size[slot] = sz;
@@ -1676,23 +1718,37 @@ static void process_function(IRInst *sym_node)
          * physically adjacent block in RPO order, emit an explicit IR3_J so
          * that the fall-through is correctly bridged.
          *
-         * A block has a fall-through (n_succs==1, last not IR_J) when it ends
-         * with neither an unconditional jump nor IR_RET.  The JZ/JNZ cases
-         * have n_succs==2 and don't need bridging here.
+         * Two cases require bridging:
+         * - n_succs==1 (pure fall-through, no explicit IR_J terminator)
+         * - n_succs==2 (conditional JZ/JNZ): the fall-through is succs[0], but
+         *   the RPO layout may place a different block next (e.g. when an early-exit
+         *   path was DFS-visited first).  Without the bridging jump, execution
+         *   falls through into the wrong block.
          *
-         * This can occur with loop-rotated while/for loops: the body block
-         * falls through to the condition block, but RPO places the condition
-         * block before the body block for code-layout efficiency. */
+         * In both cases we also call lvsp_record so that the target block's
+         * vsp is correctly restored when it is translated later in RPO order. */
         {
             IRInst *last_ir = bb->ir_last;
             bool is_fallthrough = (bb->n_succs == 1) &&
                                   (!last_ir || last_ir->op != IR_J);
-            if (is_fallthrough) {
+            bool is_cond_fallthrough = (bb->n_succs == 2);
+            if (is_fallthrough || is_cond_fallthrough) {
                 int fall_succ = bb->succs[0];
                 int next_rpo  = (ri + 1 < rpo_count) ? rpo_order[ri + 1] : -1;
                 if (fall_succ != next_rpo && blocks[fall_succ].label_id >= 0) {
+                    lvsp_record(blocks[fall_succ].label_id, vsp);
                     IR3Inst *jmp = emit_ir3(IR3_J);
                     jmp->imm = blocks[fall_succ].label_id;
+                    /* For n_succs==2 (conditional), update block_last_ir3 so that
+                     * split_critical_edges can find and retarget this bridging jump
+                     * when the fall-through edge is a critical edge.
+                     *
+                     * For n_succs==1 (pure fall-through), do NOT update block_last_ir3:
+                     * deconstructPhis uses block_last_ir3 as the phi-copy insertion
+                     * point, and inserting phi copies AFTER the bridging jump would
+                     * make them dead code. */
+                    if (is_cond_fallthrough)
+                        block_last_ir3[bb_id] = jmp;
                 }
             }
         }
@@ -1710,11 +1766,25 @@ static void process_function(IRInst *sym_node)
     for (int i = 0; i < n_blocks; i++)
         if (!blocks[i].sealed) sealBlock(i);
 
+    /* Critical-edge splitting MUST happen before the unreachable-block loop.
+     * split_critical_edges appends landing pads at ir3_tail; if data-section
+     * blocks (string literals, alignment directives) have already been emitted,
+     * those landing pads would land in the data section and misalign data labels.
+     * By splitting here, landing pads are appended to the end of the text section.
+     * Save the pre-split block count so the unreachable loop skips the new
+     * landing-pad blocks (which were already emitted by split_critical_edges). */
+    int n_blocks_pre_split = n_blocks;
+    split_critical_edges(&blocks, &n_blocks);
+    cur_blocks   = blocks;     /* split_critical_edges may have reallocated blocks */
+    cur_n_blocks = n_blocks;
+
     /* Emit unreachable blocks (e.g. data-section blocks appended to the function
      * by mark_basic_blocks — string literals, alignment directives).
      * These blocks have no predecessors in the CFG and are skipped by RPO, but
-     * their IR nodes (IR_LABEL, IR_BYTE, IR_ALIGN) must still be emitted. */
-    for (int i = 0; i < n_blocks; i++) {
+     * their IR nodes (IR_LABEL, IR_BYTE, IR_ALIGN) must still be emitted.
+     * Only iterate the original range; landing pads (indices >= n_blocks_pre_split)
+     * were already emitted by split_critical_edges above. */
+    for (int i = 0; i < n_blocks_pre_split; i++) {
         if (!rpo_visited[i]) {
             /* Unreachable block: emit its nodes without SSA logic */
             current_bb_id = i;
@@ -1722,10 +1792,6 @@ static void process_function(IRInst *sym_node)
             translate_bb(&blocks[i], i);
         }
     }
-
-    /* Critical-edge splitting: insert landing pads so phi copies don't
-     * corrupt paths to the other successor of a multi-way branch. */
-    split_critical_edges(&blocks, &n_blocks);
 
     /* Phi deconstruction: convert phi nodes to parallel copies */
     deconstructPhis(blocks, n_blocks);

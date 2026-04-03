@@ -1212,11 +1212,43 @@ void gen_expr(Node *node)
     else if (node->kind == ND_MEMBER && node->u.member.is_function)
     {
         // Call through a function-pointer struct member: s.fp(args) or s->fp(args)
-        int param_size = push_args_list(node->ch[1], NULL, false);   // args list (fn-ptr member: param types unknown)
+        // Resolve the full function type from the member field's fn-ptr type.
+        Type *struct_type = node->ch[0]->type;
+        if (node->op_kind == TK_ARROW && struct_type && istype_ptr(struct_type))
+            struct_type = struct_type->u.ptr.pointee;
+        Type *field_type = NULL;
+        if (struct_type) find_offset(struct_type, node->u.member.field_name, &field_type);
+        Type *fn_type  = (field_type && istype_ptr(field_type)) ? field_type->u.ptr.pointee : NULL;
+        Type *ret_type = (fn_type && istype_function(fn_type))  ? fn_type->u.fn.ret         : NULL;
+        bool struct_ret = (ret_type && ret_type->base == TB_STRUCT);
+        int retbuf_bp_off = 0;
+        if (struct_ret) {
+            int sz = ret_type->size;
+            if (g_target_arch == 4 && (sz & 3)) sz = (sz + 4) & ~3;
+            retbuf_bp_off = -(codegen_ctx.adj_depth + sz);
+            codegen_ctx.adj_depth += sz;
+            ir_append(IR_ADJ, -sz, NULL);
+        }
+        int adj_before_args = codegen_ctx.adj_depth;
+        Param *params   = (fn_type && istype_function(fn_type)) ? fn_type->u.fn.params      : NULL;
+        bool variadic   = (fn_type && istype_function(fn_type)) ? fn_type->u.fn.is_variadic : false;
+        int param_size = push_args_list(node->ch[1], params, variadic);
+        if (struct_ret) {
+            ir_append(IR_LEA, retbuf_bp_off, NULL);
+            if (g_target_arch == 4) { ir_append(IR_PUSH,  0, NULL); param_size += 4; }
+            else                    { ir_append(IR_PUSHW, 0, NULL); param_size += WORD_SIZE; }
+        }
         gen_addr(node);
         gen_ld(WORD_SIZE);  // load function pointer (pointer-sized)
         ir_append(IR_JLI,   0, NULL);
         ir_append(IR_ADJ, param_size, NULL);
+        int copybuf_sz = codegen_ctx.adj_depth - adj_before_args;
+        if (copybuf_sz > 0) {
+            ir_append(IR_ADJ, copybuf_sz, NULL);
+            codegen_ctx.adj_depth -= copybuf_sz;
+        }
+        if (struct_ret)
+            ir_append(IR_LEA, retbuf_bp_off, NULL);
     }
     else if (node->kind == ND_MEMBER)
     {
@@ -1747,9 +1779,18 @@ static void collect_sym_fields(Node *n, Type *st, int base,
 {
     Field *f = st->u.composite.members;
     for (Node *child = n->ch[0]; child && f; child = child->next, f = f->next) {
-        if (child->kind == ND_INITLIST && f->type->base == TB_STRUCT)
+        if (child->kind == ND_INITLIST && f->type->base == TB_STRUCT) {
             collect_sym_fields(child, f->type, base + f->offset, out, count);
-        else {
+        } else if (child->kind == ND_INITLIST && f->type->base == TB_ARRAY
+                   && f->type->u.arr.elem->base == TB_STRUCT) {
+            /* Array-of-struct field: recurse into each element's initializer. */
+            Type *elem_t  = f->type->u.arr.elem;
+            int   elem_sz = elem_t->size;
+            int   elem_off = base + f->offset;
+            for (Node *elem = child->ch[0]; elem; elem = elem->next, elem_off += elem_sz)
+                if (elem->kind == ND_INITLIST)
+                    collect_sym_fields(elem, elem_t, elem_off, out, count);
+        } else {
             const char *label = get_addr_of_label(child);
             if (label && *count < MAX_SYM_FIELDS) {
                 out[*count].offset = base + f->offset;
