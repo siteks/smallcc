@@ -137,8 +137,9 @@ static void emit_bp_store(int val_reg, int byte_off, int size,
          * If val_reg != 7: save r7 to r0, lea r7, byte_off, store val_reg via r7,
          *   restore r7 from r0. */
         if (val_reg == 7) {
-            /* val is in r7. Save r0, move val to r0, compute addr in r7, store, restore r0.
-             * r7 is caller-saved so we don't need to restore it. */
+            /* val is in r7. Save r0, move val to r0, compute addr in r7, store.
+             * r0 still holds val after the store (store does not modify r0),
+             * so restore r7 from r0 before restoring r0 from the stack. */
             fprintf(asm_out, "    push\n");                  /* save r0 */
             fprintf(asm_out, "    or      r0, r7, r7\n");   /* r0 = r7 (val) */
             fprintf(asm_out, "    lea     r7, %d\n", byte_off); /* r7 = address */
@@ -147,6 +148,7 @@ static void emit_bp_store(int val_reg, int byte_off, int size,
             else                fprintf(asm_out, "    sll     r0, r7, 0");
             if (ann) fprintf(asm_out, "  ; %s", ann);
             fputc('\n', asm_out);
+            fprintf(asm_out, "    or      r7, r0, r0\n");  /* restore r7 (r0 still has val) */
             fprintf(asm_out, "    pop\n");                  /* restore r0 */
         } else if (val_reg == 0) {
             /* val_reg is 0. Value is in r0. Use pushr/popr to save/restore r7:
