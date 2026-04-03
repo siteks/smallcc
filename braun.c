@@ -366,14 +366,24 @@ static IR3Inst *emit_phi_at(int bb_id, int phi_vreg)
  * If vreg V was simplified to W, and W was simplified to X, resolve(V) = X. */
 static int resolve_phi_vreg(int vreg)
 {
-    for (int depth = 0; depth < 64; depth++) {
-        int idx = vreg - IR3_VREG_BASE;
-        if ((unsigned)idx >= phi_map_size) return vreg;
+    /* Chase forwarding chain to its root (no depth limit). */
+    int root = vreg;
+    for (;;) {
+        int idx = root - IR3_VREG_BASE;
+        if ((unsigned)idx >= phi_map_size) break;
         int fwd = phi_fwd[idx];
-        if (fwd == 0 || fwd == vreg) return vreg;
-        vreg = fwd;
+        if (fwd == 0 || fwd == root) break;
+        root = fwd;
     }
-    return vreg;  /* safety: chain too long */
+    /* Path compression: point each intermediate node directly at root. */
+    while (vreg != root) {
+        int idx = vreg - IR3_VREG_BASE;
+        if ((unsigned)idx >= phi_map_size) break;
+        int next = phi_fwd[idx];
+        phi_fwd[idx] = root;
+        vreg = next;
+    }
+    return root;
 }
 
 static int tryRemoveTrivialPhi(int phi_vreg)
