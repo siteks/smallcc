@@ -1404,6 +1404,27 @@ void ir3_optimize(IR3Inst *head, int opt_level)
                 changed |= dce(func_start, func_end);
                 if (!changed) break;
             }
+            /* Sub-pass G: redirect LOAD(rd=ACCUM) → MOV(v_fresh, ACCUM) pairs to
+             * LOAD(rd=v_fresh) directly.  braun_ssa emits all loads through ACCUM;
+             * the following MOV (from IR_PUSH) is normally eliminated by local copy_prop
+             * within a BB.  This sub-pass handles cross-BB survivors where the LOAD ends
+             * one BB and the MOV starts the next. */
+            for (IR3Inst *q = func_start; q && q != func_end; q = q->next) {
+                if (q->op != IR3_LOAD || q->rd != IR3_VREG_ACCUM) continue;
+                /* Skip dead/comment nodes to find the immediate successor */
+                IR3Inst *nxt = q->next;
+                while (nxt && nxt != func_end &&
+                       ((int)nxt->op < 0 || nxt->op == IR3_COMMENT ||
+                        nxt->op == IR3_LABEL)) {
+                    nxt = nxt->next;
+                }
+                if (!nxt || nxt == func_end) continue;
+                if (nxt->op != IR3_MOV || nxt->rs1 != IR3_VREG_ACCUM) continue;
+                if (!IR3_VREG_IS_VIRT(nxt->rd)) continue;
+                q->rd      = nxt->rd;
+                nxt->op    = IR3_COMMENT;
+                nxt->rd    = IR3_VREG_NONE;
+            }
             fold_const_patterns(func_start, func_end);
             /* Sub-pass D: eliminate redundant SXW/SXB chains.
              * fold_const_patterns Phase 1 built def_inst[] so this can run
