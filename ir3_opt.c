@@ -414,13 +414,13 @@ skip_alu1:
                     continue;
                 }
                 /* x & 0xff → zxb rd  (in-place only: rd must already equal rs1) */
-                if (op == IR_AND && k == 0xff && p->rd == p->rs1) {
+                if (!flag_no_newinsns && op == IR_AND && k == 0xff && p->rd == p->rs1) {
                     p->op = IR3_ALU1; p->alu_op = IR_ZXB;
                     p->rs2 = IR3_VREG_NONE;
                     changed = true; continue;
                 }
                 /* x & 0xffff → zxw rd  (in-place only) */
-                if (op == IR_AND && k == 0xffff && p->rd == p->rs1) {
+                if (!flag_no_newinsns && op == IR_AND && k == 0xffff && p->rd == p->rs1) {
                     p->op = IR3_ALU1; p->alu_op = IR_ZXW;
                     p->rs2 = IR3_VREG_NONE;
                     changed = true; continue;
@@ -461,13 +461,13 @@ skip_alu1:
                     continue;
                 }
                 /* 0xff & x → zxb rd  (in-place only: rd must equal rs2) */
-                if (op == IR_AND && k == 0xff && p->rd == p->rs2) {
+                if (!flag_no_newinsns && op == IR_AND && k == 0xff && p->rd == p->rs2) {
                     p->op = IR3_ALU1; p->alu_op = IR_ZXB;
                     p->rs1 = p->rd; p->rs2 = IR3_VREG_NONE;
                     changed = true; continue;
                 }
                 /* 0xffff & x → zxw rd  (in-place only) */
-                if (op == IR_AND && k == 0xffff && p->rd == p->rs2) {
+                if (!flag_no_newinsns && op == IR_AND && k == 0xffff && p->rd == p->rs2) {
                     p->op = IR3_ALU1; p->alu_op = IR_ZXW;
                     p->rs1 = p->rd; p->rs2 = IR3_VREG_NONE;
                     changed = true; continue;
@@ -776,10 +776,15 @@ static void fold_const_patterns(IR3Inst *start, IR3Inst *end)
         cst->rd  = IR3_VREG_NONE;
     }
 
-    /* Sub-pass B2: fold CONST+AND/SHL into immediate form.
-     * AND:  andi rx, sext(imm7)  — range [-64, 63]; rs2=NONE sentinel.
-     * SHL:  shli rx, imm7        — range [0, 31];   rs2=NONE sentinel.
-     * risc_backend emits andi/shli when rd==rs1 (in-place), else immw+op. */
+    /* Sub-pass B2: fold CONST+AND/SHL/SHR/SHRS into immediate form.
+     * AND:  andi  rx, sext(imm7)  — range [-64, 63]; rs2=NONE sentinel.
+     * SHL:  shli  rx, imm7        — range [0, 31];   rs2=NONE sentinel.
+     * SHR:  shri  rx, imm7        — range [0, 31];   rs2=NONE sentinel.
+     * SHRS: shrsi rx, imm7        — range [0, 31];   rs2=NONE sentinel.
+     * risc_backend emits andi/shli in-place (F2) when rd==rs1, else F3b 0xdf.
+     * shri/shrsi always use F3b 0xdf (no F2 in-place form exists).
+     * Disabled by -no-newinsns. */
+    if (flag_no_newinsns) goto skip_b2;
     for (IR3Inst *p = start; p && p != end; p = p->next) {
         if (p->op != IR3_ALU) continue;
         if (p->rs2 == IR3_VREG_NONE) continue;  /* already folded */
@@ -803,18 +808,19 @@ static void fold_const_patterns(IR3Inst *start, IR3Inst *end)
             p->rs1 = base; p->rs2 = IR3_VREG_NONE; p->imm = C;
             cst->op = IR3_COMMENT; cst->rd = IR3_VREG_NONE;
 
-        } else if (p->alu_op == IR_SHL) {
+        } else if (p->alu_op == IR_SHL || p->alu_op == IR_SHR || p->alu_op == IR_SHRS) {
             /* Non-commutative: only rs2 can be the shift count */
             if (!is_fresh(p->rs2) || !vidx_ok(p->rs2) || use_count[vidx(p->rs2)] != 1 ||
                 multi_def[vidx(p->rs2)]) continue;
             IR3Inst *d = def_inst[vidx(p->rs2)];
             if (!d || d->op != IR3_CONST || d->sym) continue;
             int C = d->imm;
-            if (C < 0 || C > 31) continue;     /* shli: counts 0-31 */
+            if (C < 0 || C > 31) continue;     /* shift counts 0-31 */
             p->rs2 = IR3_VREG_NONE; p->imm = C;
             d->op = IR3_COMMENT; d->rd = IR3_VREG_NONE;
         }
     }
+    skip_b2:;
 
     /* Sub-pass C: fold CONST(0) + EQ/NE → direct branch test.
      * Pattern: CONST v_Z, 0 (single-use) + ALU ACCUM = v_A eq/ne v_Z
@@ -885,6 +891,360 @@ static void fold_const_patterns(IR3Inst *start, IR3Inst *end)
 }
 
 /* ----------------------------------------------------------------
+ * Sub-pass D: redundant sign-extend elimination.
+ *
+ * Removes SXW/SXB that is applied to a value that is already
+ * sign-extended by a prior SXW/SXB:
+ *   SXW(SXW(x)) == SXW(x)
+ *   SXW(SXB(x)) == SXB(x)  (SXB extends further; SXW is then a no-op)
+ *   SXB(SXB(x)) == SXB(x)
+ *   SXB(SXW(x)) ≠ SXW(x)   (may narrow; do NOT eliminate)
+ *
+ * Handles two cases:
+ *   Fresh vregs: use def_inst[] (built by fold_const_patterns Phase 1).
+ *   ACCUM (multi-def): forward scan tracking running sign-extend state.
+ *
+ * Redundant ALU1 nodes are replaced by IR3_MOV rd, rs1.
+ * A copy_propagate + dce pass after this function cleans them up.
+ * ---------------------------------------------------------------- */
+static void elim_redundant_sxt(IR3Inst *start, IR3Inst *end)
+{
+    /* def_inst[] / multi_def[] are already valid from fold_const_patterns */
+
+    bool   accum_sxt  = false;   /* ACCUM currently holds a sign-extended value */
+    IROp   accum_sop  = (IROp)0; /* the SXT op that produced the current ACCUM */
+
+    for (IR3Inst *p = start; p && p != end; p = p->next) {
+        /* Reset ACCUM sign-ext state at any BB boundary */
+        if (is_bb_leader_or_term(p->op)) {
+            accum_sxt = false;
+            continue;
+        }
+
+        if (p->op != IR3_ALU1) {
+            /* Any write to ACCUM (except SXT itself) resets its state */
+            if (p->rd == IR3_VREG_ACCUM)
+                accum_sxt = false;
+            continue;
+        }
+
+        bool is_sxw = (p->alu_op == IR_SXW);
+        bool is_sxb = (p->alu_op == IR_SXB);
+        if (!is_sxw && !is_sxb) {
+            if (p->rd == IR3_VREG_ACCUM) accum_sxt = false;
+            continue;
+        }
+
+        /* Determine if rs1 is already sign-extended */
+        bool redundant = false;
+
+        if (p->rs1 == IR3_VREG_ACCUM) {
+            /* ACCUM path: use running state */
+            if (accum_sxt) {
+                /* SXW after any SXT: redundant.
+                 * SXB after SXB: redundant.
+                 * SXB after SXW: not redundant (may narrow). */
+                if (is_sxw || (is_sxb && accum_sop == IR_SXB))
+                    redundant = true;
+            }
+        } else if (is_fresh(p->rs1) && vidx_ok(p->rs1) && !multi_def[vidx(p->rs1)]) {
+            /* Fresh-vreg path: check the unique definition */
+            IR3Inst *d = def_inst[vidx(p->rs1)];
+            if (d && d->op == IR3_ALU1 &&
+                (d->alu_op == IR_SXW || d->alu_op == IR_SXB)) {
+                if (is_sxw || (is_sxb && d->alu_op == IR_SXB))
+                    redundant = true;
+            }
+        }
+
+        if (redundant) {
+            /* Convert to identity MOV; copy_propagate + DCE will remove it */
+            p->op     = IR3_MOV;
+            p->alu_op = (IROp)0;
+            /* rd == rs1 for ACCUM case → identity MOV, killed by DCE */
+        } else {
+            /* Update ACCUM state */
+            if (p->rd == IR3_VREG_ACCUM) {
+                accum_sxt = true;
+                accum_sop = p->alu_op;
+            }
+        }
+    }
+}
+
+/* ----------------------------------------------------------------
+ * Helper: detect a STORE to a known bp-relative slot.
+ *
+ * braun_ssa emits two kinds of bp-relative stores:
+ *   1. rd == IR3_VREG_BP (-2) — only used for call-argument flushing.
+ *   2. rd == fresh vreg whose defining instruction is IR3_LEA — the
+ *      normal case for all local-variable writes.
+ *
+ * Returns true and sets *out_imm to the effective bp offset
+ * (lea_imm + p->imm) when either form is detected.
+ * Requires def_inst[] to be populated (call only after fold_const_patterns
+ * has run for the current function).
+ * ---------------------------------------------------------------- */
+static bool store_get_bp_imm(const IR3Inst *p, int *out_imm)
+{
+    if (!p || p->op != IR3_STORE) return false;
+    if (p->rd == IR3_VREG_BP) { *out_imm = p->imm; return true; }
+    if (is_fresh(p->rd) && vidx_ok(p->rd) && !multi_def[vidx(p->rd)]) {
+        IR3Inst *d = def_inst[vidx(p->rd)];
+        if (d && d->op == IR3_LEA) { *out_imm = d->imm + p->imm; return true; }
+    }
+    return false;
+}
+
+/* ----------------------------------------------------------------
+ * Sub-pass E: within-BB local load CSE for bp-relative loads.
+ *
+ * Within each basic block, if [BP+imm] of size S was already loaded into
+ * vreg V and there has been no intervening store to [BP+imm], a second
+ * load of the same slot is replaced with IR3_MOV rd, V.  The resulting
+ * MOV is then eliminated by copy_propagate + dce in the caller.
+ *
+ * Reset at every BB leader/terminator (LABEL, J, JZ, JNZ, RET, SYMLABEL)
+ * and at CALL/CALLR (callee may clobber stack through pointers).
+ * Invalidate the matching entry on STORE to the same bp slot.
+ *
+ * Note: does not catch cross-BB repeated loads (e.g. loop-invariant loads
+ * that appear in a check BB and again in the body BB); that requires LICM.
+ * ---------------------------------------------------------------- */
+static void local_load_cse(IR3Inst *start, IR3Inst *end)
+{
+#define LCSE_SLOTS 16
+    struct lcse_entry { int imm; int size; int vreg; };
+    struct lcse_entry cse[LCSE_SLOTS];
+    int n = 0;
+
+    for (IR3Inst *p = start; p && p != end; p = p->next) {
+        if ((int)p->op < 0) continue;
+
+        /* Reset at BB boundaries and calls */
+        if (is_bb_leader_or_term(p->op) ||
+                p->op == IR3_CALL || p->op == IR3_CALLR) {
+            n = 0;
+            continue;
+        }
+
+        if (p->op == IR3_LOAD && p->rs1 == IR3_VREG_BP && is_fresh(p->rd)) {
+            /* Search for a previous load of the same slot */
+            bool hit = false;
+            for (int i = 0; i < n; i++) {
+                if (cse[i].imm == p->imm && cse[i].size == p->size) {
+                    p->op  = IR3_MOV;
+                    p->rs1 = cse[i].vreg;
+                    hit    = true;
+                    break;
+                }
+            }
+            /* No hit: record this load as the canonical value for this slot */
+            if (!hit && n < LCSE_SLOTS) {
+                cse[n].imm  = p->imm;
+                cse[n].size = p->size;
+                cse[n].vreg = p->rd;
+                n++;
+            }
+        } else if (p->op == IR3_STORE) {
+            int bp_imm;
+            if (store_get_bp_imm(p, &bp_imm)) {
+                /* Invalidate any CSE entry for this bp slot */
+                for (int i = 0; i < n; ) {
+                    if (cse[i].imm == bp_imm)
+                        cse[i] = cse[--n];
+                    else
+                        i++;
+                }
+            }
+        }
+    }
+}
+
+/* ----------------------------------------------------------------
+ * Sub-pass F: Loop-Invariant Code Motion for bp-relative loads.
+ *
+ * Algorithm:
+ *   1. Scan the function to build a label-ID → IR3Inst* table.
+ *   2. Find backward unconditional jumps (IR3_J whose target label was
+ *      already seen) — each is a loop back edge.
+ *   3. For each loop [header..backedge]:
+ *      a. Collect all bp-relative store offsets and detect calls.
+ *      b. Find bp-relative loads whose slot is never stored in the loop.
+ *         The first occurrence of each (imm,size) pair is spliced out and
+ *         inserted immediately before the loop header.  Subsequent identical
+ *         loads become IR3_MOV from the hoisted vreg (cleaned up by the
+ *         copy_propagate + dce that follows).
+ *
+ * Limitations: bp-relative loads only (phase 1); any call in the loop
+ * disables all load hoisting for that loop (conservative); conditional
+ * stores block hoisting for their slot.
+ * ---------------------------------------------------------------- */
+
+#define LICM_LABEL_MAX 2048
+#define LICM_LOOP_MAX   16
+#define LICM_SLOT_MAX   64   /* max distinct bp-store slots tracked per loop */
+#define LICM_HOIST_MAX  16   /* max hoisted (imm,size) pairs per loop */
+
+static void licm_bp_loads(IR3Inst *start, IR3Inst *end)
+{
+    /* Pre-check: skip functions that contain any direct or indirect calls.
+     * LICM is only safe in call-free functions (e.g. matrix_sum inner loops)
+     * because complex control flow from call-containing functions may place
+     * loop-body stores or calls outside the linear [hdr, backedge] range. */
+    for (IR3Inst *p = start; p && p != end; p = p->next)
+        if (p->op == IR3_CALL || p->op == IR3_CALLR) return;
+
+    /* Pass 1: record position of every IR3_LABEL in the function. */
+    static IR3Inst *lpos[LICM_LABEL_MAX];
+    memset(lpos, 0, sizeof(lpos));
+    for (IR3Inst *p = start; p && p != end; p = p->next) {
+        if (p->op == IR3_LABEL && (unsigned)p->imm < LICM_LABEL_MAX)
+            lpos[p->imm] = p;
+    }
+
+    /* Pass 2: find backward jumps → loop descriptors. */
+    struct { int hdr_id; IR3Inst *hdr; IR3Inst *backedge; } loops[LICM_LOOP_MAX];
+    int n_loops = 0;
+
+    /* Track which labels have been "passed" as we scan forward. */
+    static bool label_seen[LICM_LABEL_MAX];
+    memset(label_seen, 0, sizeof(label_seen));
+
+    for (IR3Inst *p = start; p && p != end; p = p->next) {
+        if (p->op == IR3_LABEL && (unsigned)p->imm < LICM_LABEL_MAX)
+            label_seen[p->imm] = true;
+        if (p->op == IR3_J && (unsigned)p->imm < LICM_LABEL_MAX
+                && label_seen[p->imm] && lpos[p->imm] != NULL) {
+            if (n_loops < LICM_LOOP_MAX) {
+                loops[n_loops].hdr_id   = p->imm;
+                loops[n_loops].hdr      = lpos[p->imm];
+                loops[n_loops].backedge = p;
+                n_loops++;
+            }
+        }
+    }
+
+    /* Pass 3: hoist invariant bp-loads for each loop.
+     * Process innermost first (later loops in discovery order = inner). */
+    for (int li = n_loops - 1; li >= 0; li--) {
+        IR3Inst *hdr      = loops[li].hdr;
+        IR3Inst *backedge = loops[li].backedge;
+
+        /* Step A: collect bp-store offsets and detect calls in the loop. */
+        struct { int imm; int size; } bpstore[LICM_SLOT_MAX];
+        int n_store = 0;
+        bool has_call = false;
+
+        /* Scan from hdr to function end for store collection.
+         * We already know has_call=false for the whole function (checked above).
+         * Scanning to end (not just backedge) catches stores in out-of-line
+         * loop-body code that appears after the backedge due to loop rotation. */
+        for (IR3Inst *p = hdr; p && p != end; p = p->next) {
+            if ((int)p->op < 0) continue;
+            if (p->op == IR3_CALL || p->op == IR3_CALLR) { has_call = true; break; }
+            if (p->op == IR3_STORE) {
+                int bp_imm;
+                if (store_get_bp_imm(p, &bp_imm)) {
+                    bool dup = false;
+                    for (int i = 0; i < n_store; i++)
+                        if (bpstore[i].imm == bp_imm)
+                            { dup = true; break; }
+                    if (!dup && n_store < LICM_SLOT_MAX) {
+                        bpstore[n_store].imm  = bp_imm;
+                        bpstore[n_store].size = p->size;
+                        n_store++;
+                    }
+                }
+            }
+        }
+        if (has_call) continue;
+
+        /* Step B+C: find invariant loads and hoist them.
+         * hoisted[]: (imm,size) pairs already moved to preheader → vreg. */
+        struct { int imm; int size; int vreg; } hoisted[LICM_HOIST_MAX];
+        int n_hoisted = 0;
+
+        /* Find the insertion point for hoisted instructions.
+         *
+         * For typical for/while loops there is a forward unconditional jump
+         * to the loop header (e.g. "j _l3" from the loop initialisation
+         * block) that appears in the IR3 list BEFORE the header label.
+         * Inserting hoisted code between that jump and the label creates
+         * unreachable dead code (the jump skips straight to the label).
+         * Instead we must insert BEFORE that forward entry jump.
+         *
+         * Strategy: scan forward from func_start up to hdr; record the
+         * node *preceding* the last IR3_J that targets hdr_id — that is
+         * our insertion anchor.  Fall back to the node just before hdr if
+         * no such forward entry jump exists.
+         */
+        IR3Inst *insert_after = NULL;   /* splice hoisted nodes after this */
+        {
+            IR3Inst *prev = start;
+            for (IR3Inst *q = start->next; q && q != hdr; prev = q, q = q->next) {
+                /* Track fallback: node immediately before hdr */
+                if (q->next == hdr)
+                    insert_after = q;   /* may be overwritten below */
+                /* Forward entry jump: insert before it (after its predecessor) */
+                if (q->op == IR3_J && (unsigned)q->imm < LICM_LABEL_MAX
+                        && q->imm == loops[li].hdr_id)
+                    insert_after = prev;
+            }
+        }
+        if (!insert_after) continue;
+
+        /* Scan the loop body for invariant bp-loads.
+         * We walk with a prev pointer so we can splice. */
+        IR3Inst *prev = hdr;
+        IR3Inst *p    = hdr->next;
+        while (p && p != backedge->next && p != end) {
+            IR3Inst *next = p->next;
+            if (p->op == IR3_LOAD && p->rs1 == IR3_VREG_BP && is_fresh(p->rd)) {
+                /* Check slot is not in store set */
+                bool stored = false;
+                for (int i = 0; i < n_store; i++)
+                    if (bpstore[i].imm == p->imm && bpstore[i].size == p->size)
+                        { stored = true; break; }
+
+                if (!stored) {
+                    /* Check if this (imm,size) was already hoisted */
+                    int hv = -1;
+                    for (int i = 0; i < n_hoisted; i++)
+                        if (hoisted[i].imm == p->imm && hoisted[i].size == p->size)
+                            { hv = hoisted[i].vreg; break; }
+
+                    if (hv >= 0) {
+                        /* Duplicate: convert to MOV; copy_propagate removes it */
+                        p->op  = IR3_MOV;
+                        p->rs1 = hv;
+                    } else if (n_hoisted < LICM_HOIST_MAX) {
+                        /* First occurrence: splice out of loop body */
+                        prev->next = next;   /* unlink p */
+
+                        /* Insert into preheader (before the forward entry jump) */
+                        p->next          = insert_after->next;
+                        insert_after->next = p;
+                        insert_after     = p;  /* chain subsequent hoists here */
+
+                        hoisted[n_hoisted].imm  = p->imm;
+                        hoisted[n_hoisted].size = p->size;
+                        hoisted[n_hoisted].vreg = p->rd;
+                        n_hoisted++;
+
+                        /* Don't advance prev (prev->next already = next) */
+                        p = next;
+                        continue;
+                    }
+                }
+            }
+            prev = p;
+            p    = next;
+        }
+    }
+}
+
+/* ----------------------------------------------------------------
  * Entry point
  * ---------------------------------------------------------------- */
 void ir3_optimize(IR3Inst *head, int opt_level)
@@ -917,6 +1277,17 @@ void ir3_optimize(IR3Inst *head, int opt_level)
                 if (!changed) break;
             }
             fold_const_patterns(func_start, func_end);
+            /* Sub-pass D: eliminate redundant SXW/SXB chains.
+             * fold_const_patterns Phase 1 built def_inst[] so this can run
+             * immediately after; the resulting MOV nodes are cleaned up
+             * by one more copy_propagate + dce round. */
+            elim_redundant_sxt(func_start, func_end);
+            /* Sub-pass E: within-BB bp-relative load CSE. */
+            local_load_cse(func_start, func_end);
+            /* Sub-pass F: LICM for bp-relative loads. */
+            licm_bp_loads(func_start, func_end);
+            copy_propagate(func_start, func_end);
+            dce(func_start, func_end);
         }
 
         p = func_end;
