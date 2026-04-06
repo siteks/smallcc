@@ -822,6 +822,78 @@ static void fold_const_patterns(IR3Inst *start, IR3Inst *end)
     }
     skip_b2:;
 
+    /* Sub-pass B3: AND-chain constant folding.
+     * Folds (rx AND C1) AND C2  →  rx AND (C1 & C2)  when C1 is a constant.
+     * Catches the common case where C1 is out of B2's imm7 range (e.g. 0xff)
+     * so the inner AND was left unfused, but the outer andi has been B2-folded.
+     *
+     * Requires:
+     *   - outer AND in B2 sentinel form: alu_op=IR_AND, rs2=NONE, imm=C2, rs1=inner_vreg
+     *   - inner_vreg is single-use (use_count==1, so this outer AND is the sole user)
+     *   - inner_vreg is defined by ALU alu_op=IR_AND with a known CONST operand C1
+     *     (handled both for un-B2-folded inner and already-B2-folded inner)
+     * Kills the intermediate AND and CONST when they become dead. */
+    if (flag_no_newinsns) goto skip_b3;
+    for (IR3Inst *p = start; p && p != end; p = p->next) {
+        if ((int)p->op < 0 || p->op != IR3_ALU || p->alu_op != IR_AND) continue;
+        if (p->rs2 != IR3_VREG_NONE) continue;   /* must be B2-folded (sentinel form) */
+        int C2 = p->imm;
+        int inner = p->rs1;
+        if (!is_fresh(inner) || !vidx_ok(inner) || multi_def[vidx(inner)]) continue;
+        if (use_count[vidx(inner)] != 1) continue;  /* inner must have sole use here */
+        IR3Inst *d_inner = def_inst[vidx(inner)];
+        if (!d_inner || d_inner->op != IR3_ALU || d_inner->alu_op != IR_AND) continue;
+
+        int C1 = 0, rx = IR3_VREG_NONE;
+        IR3Inst *d_const = NULL;  /* CONST node to kill, or NULL if inner was B2-folded */
+        int      const_vreg = IR3_VREG_NONE; /* the vreg holding C1, for use_count check */
+
+        if (d_inner->rs2 == IR3_VREG_NONE) {
+            /* Inner was already B2-folded: andi(rx, C1) */
+            C1 = d_inner->imm;
+            rx = d_inner->rs1;
+        } else {
+            /* Inner not B2-folded: find CONST operand in rs2 or rs1 (commutative) */
+            if (is_fresh(d_inner->rs2) && vidx_ok(d_inner->rs2) &&
+                !multi_def[vidx(d_inner->rs2)]) {
+                IR3Inst *dc = def_inst[vidx(d_inner->rs2)];
+                if (dc && dc->op == IR3_CONST && !dc->sym) {
+                    d_const = dc; C1 = dc->imm;
+                    rx = d_inner->rs1; const_vreg = d_inner->rs2;
+                }
+            }
+            if (!d_const && is_fresh(d_inner->rs1) && vidx_ok(d_inner->rs1) &&
+                !multi_def[vidx(d_inner->rs1)]) {
+                IR3Inst *dc = def_inst[vidx(d_inner->rs1)];
+                if (dc && dc->op == IR3_CONST && !dc->sym) {
+                    d_const = dc; C1 = dc->imm;
+                    rx = d_inner->rs2; const_vreg = d_inner->rs1;
+                }
+            }
+            if (!d_const) continue;
+        }
+
+        uint32_t new_mask = (uint32_t)C1 & (uint32_t)C2;
+        /* Always fold: eliminates the inner AND (and its CONST) regardless of
+         * whether new_mask equals C1 or C2.  Even if the mask value is unchanged,
+         * removing the intermediate AND + CONST reduces instruction count. */
+
+        /* Fold: outer andi now reads rx directly with the combined mask */
+        p->rs1 = rx;
+        p->imm = (int)new_mask;
+
+        /* Kill the intermediate AND (sole-use confirmed above) */
+        d_inner->op = IR3_COMMENT;
+        d_inner->rd = IR3_VREG_NONE;
+
+        /* Kill the CONST if it was the sole user of that vreg */
+        if (d_const && vidx_ok(const_vreg) && use_count[vidx(const_vreg)] == 1) {
+            d_const->op = IR3_COMMENT;
+            d_const->rd = IR3_VREG_NONE;
+        }
+    }
+    skip_b3:;
+
     /* Sub-pass C: fold CONST(0) + EQ/NE → direct branch test.
      * Pattern: CONST v_Z, 0 (single-use) + ALU ACCUM = v_A eq/ne v_Z
      *           + (JNZ or JZ) L
@@ -891,6 +963,39 @@ static void fold_const_patterns(IR3Inst *start, IR3Inst *end)
 }
 
 /* ----------------------------------------------------------------
+ * Helper for Sub-pass D: check if a vreg's value is provably byte-bounded.
+ * Returns true when bits [31:8] are known zero — meaning a ZXB on this vreg
+ * would be a no-op.  Uses def_inst[] populated by fold_const_patterns Phase 1.
+ * ---------------------------------------------------------------- */
+static bool fits_in_byte(int vreg)
+{
+    if (!is_fresh(vreg) || !vidx_ok(vreg) || multi_def[vidx(vreg)]) return false;
+    IR3Inst *d = def_inst[vidx(vreg)];
+    if (!d) return false;
+    if (d->op == IR3_CONST && !d->sym)
+        return (uint32_t)(unsigned)d->imm <= 0xff;
+    if (d->op == IR3_ALU && d->alu_op == IR_AND) {
+        /* B2/B3-folded form: rs2=NONE, imm holds the mask */
+        if (d->rs2 == IR3_VREG_NONE)
+            return (uint32_t)(unsigned)d->imm <= 0xff;
+        /* Unfused: constant may be in rs2 */
+        if (is_fresh(d->rs2) && vidx_ok(d->rs2) && !multi_def[vidx(d->rs2)]) {
+            IR3Inst *c = def_inst[vidx(d->rs2)];
+            if (c && c->op == IR3_CONST && !c->sym)
+                return (uint32_t)(unsigned)c->imm <= 0xff;
+        }
+        /* Commutative AND: constant may be in rs1 */
+        if (is_fresh(d->rs1) && vidx_ok(d->rs1) && !multi_def[vidx(d->rs1)]) {
+            IR3Inst *c = def_inst[vidx(d->rs1)];
+            if (c && c->op == IR3_CONST && !c->sym)
+                return (uint32_t)(unsigned)c->imm <= 0xff;
+        }
+    }
+    if (d->op == IR3_ALU1 && d->alu_op == IR_ZXB) return true;
+    return false;
+}
+
+/* ----------------------------------------------------------------
  * Sub-pass D: redundant sign-extend elimination.
  *
  * Removes SXW/SXB that is applied to a value that is already
@@ -930,7 +1035,30 @@ static void elim_redundant_sxt(IR3Inst *start, IR3Inst *end)
 
         bool is_sxw = (p->alu_op == IR_SXW);
         bool is_sxb = (p->alu_op == IR_SXB);
-        if (!is_sxw && !is_sxb) {
+        bool is_zxb = (p->alu_op == IR_ZXB);
+        if (!is_sxw && !is_sxb && !is_zxb) {
+            if (p->rd == IR3_VREG_ACCUM) accum_sxt = false;
+            continue;
+        }
+
+        /* ZXB elimination: redundant when input is provably byte-bounded. */
+        if (is_zxb) {
+            bool elim = fits_in_byte(p->rs1);
+            /* Also catch ZXB(XOR(a, b)) where both a and b are byte-bounded:
+             * (0|1) XOR (0|1) == (0|1), so ZXB is a no-op. */
+            if (!elim && is_fresh(p->rs1) && vidx_ok(p->rs1) &&
+                !multi_def[vidx(p->rs1)]) {
+                IR3Inst *d = def_inst[vidx(p->rs1)];
+                if (d && d->op == IR3_ALU && d->alu_op == IR_XOR &&
+                    fits_in_byte(d->rs1) && fits_in_byte(d->rs2))
+                    elim = true;
+            }
+            if (elim) {
+                p->op     = IR3_MOV;
+                p->alu_op = (IROp)0;
+                /* ZXB is always in-place (rd==rs1) → identity MOV → copy_prop removes it */
+            }
+            /* ZXB never contributes to sign-extend state */
             if (p->rd == IR3_VREG_ACCUM) accum_sxt = false;
             continue;
         }
