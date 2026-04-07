@@ -237,8 +237,22 @@ Memory accesses are register-relative (ry is the base; rx is source/destination)
 | 0xdc | `blts rx, ry, imm10` | if signed(rx) < signed(ry): pc += sext10(imm10) |
 | 0xdd | `bles rx, ry, imm10` | if signed(rx) <= signed(ry): pc += sext10(imm10) |
 | 0xde | `addli rx, ry, imm10` | rx = ry + sext10(imm10) (separate source and destination) |
+| 0xdf | `andi`/`shli`/`shri`/`shrsi rd, rs, imm7` | 2-register + 7-bit immediate escape; bits [9:7] = sub-opcode, bits [6:0] = imm7 |
 
-*(1 slot available: 0xdf.)*
+*(0 slots available.)*
+
+**F3b 0xdf escape — 2-register immediate ops:**
+
+The 10-bit immediate field is split: bits [9:7] = 3-bit sub-opcode, bits [6:0] = 7-bit signed immediate.
+
+| Sub-op | Mnemonic | Semantics |
+|--------|----------|-----------|
+| 0 | `andi rd, rs, imm7` | rd = rs & zext16(sext7(imm7)) |
+| 1 | `shli rd, rs, imm7` | rd = rs << (imm7 & 0x1f) |
+| 2 | `shri rd, rs, imm7` | rd = rs >> (imm7 & 0x1f) (logical) |
+| 3 | `shrsi rd, rs, imm7` | rd = signed(rs) >> (imm7 & 0x1f) (arithmetic) |
+
+Assembly syntax overloads by operand count: 2-operand `andi`/`shli` → F2 in-place; 3-operand → F3b 0xdf. `shri`/`shrsi` are always 3-operand.
 
 Branch offsets are **PC-relative** — the offset is added to `pc` (which has already been
 advanced past the current instruction). `llbx`/`llwx` make F3b symmetric with F2: both

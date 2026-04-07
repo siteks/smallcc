@@ -22,8 +22,14 @@
 #include "smallcc.h"
 #include "ir3.h"
 
-/* Forward declaration */
+/* Forward declarations */
 static void rb_emit_src_comment(int line);
+static int f2_word_ok(int byte_off);
+static int f2_byte_ok(int byte_off);
+static int f2_long_ok(int byte_off);
+
+/* Label-bitset dimensions (must be defined before the rb_fwd_label_off table) */
+#define RB_LABEL_MAX 16384
 
 /* ----------------------------------------------------------------
  * E4 lookahead helpers
@@ -43,6 +49,96 @@ static IR3Inst *next_live_rb(IR3Inst *p)
 }
 
 static void rb_mark_dead(IR3Inst *p) { p->op = (IR3Op)-1; }
+
+/* ----------------------------------------------------------------
+ * rb_instr_size — conservative upper-bound byte size of one IR3Inst.
+ * Used by the forward-branch fusion pre-pass to estimate label offsets.
+ * Returns 0 for dead nodes and structural pseudo-nodes that emit no bytes.
+ * ---------------------------------------------------------------- */
+static int rb_instr_size(IR3Inst *p)
+{
+    if (!p || (int)p->op < 0) return 0;
+    switch (p->op) {
+    case IR3_LABEL:
+    case IR3_SYMLABEL:
+    case IR3_COMMENT:
+    case IR3_PHI:
+        return 0;
+    case IR3_RET:
+    case IR3_CALLR:
+    case IR3_PUTCHAR:
+        return 1;  /* F0 */
+    case IR3_ALU1:
+        if (p->alu_op == IR_ITOF || p->alu_op == IR_FTOI) return 1; /* F0 */
+        return 2;  /* F1b: sxb/sxw/zxb/zxw */
+    case IR3_MOV:
+        if (p->rd == p->rs1 || p->rd == IR3_VREG_NONE) return 0; /* elided */
+        return 2;  /* F1a */
+    case IR3_ALU:
+        if (p->rs2 == IR3_VREG_NONE) {
+            int C = p->imm;
+            if (!flag_no_newinsns) {
+                if ((p->alu_op == IR_AND || p->alu_op == IR_SHL)
+                        && C >= -64 && C <= 63)
+                    return 2; /* F2 in-place andi/shli */
+                if (p->alu_op == IR_AND && p->rd != p->rs1)
+                    return 3; /* F3b andi3 */
+                if ((p->alu_op == IR_SHR || p->alu_op == IR_SHRS)
+                        && C >= 0 && C <= 31)
+                    return 3; /* F3b shri/shrsi */
+            }
+            return 5; /* immw + reg-reg op fallback */
+        }
+        return 2; /* F1a */
+    case IR3_LOAD:
+        if (p->rs1 == IR3_VREG_BP) {
+            if ((p->size == 2 && f2_word_ok(p->imm)) ||
+                (p->size == 1 && f2_byte_ok(p->imm)) ||
+                (p->size == 4 && f2_long_ok(p->imm)))
+                return 2; /* F2 */
+            return 6; /* lea + lll/llw/llb fallback */
+        }
+        return 3; /* F3b */
+    case IR3_STORE:
+        if (p->rd == IR3_VREG_BP) {
+            if ((p->size == 2 && f2_word_ok(p->imm)) ||
+                (p->size == 1 && f2_byte_ok(p->imm)) ||
+                (p->size == 4 && f2_long_ok(p->imm)))
+                return 2; /* F2 */
+            return 9; /* worst-case fallback (save/restore scratch reg) */
+        }
+        return 3; /* F3b */
+    case IR3_CONST:
+        if (p->sym) return 3; /* immw sym (F3c) */
+        if ((unsigned)p->imm <= 0xffff) return 3; /* immw (F3c) */
+        return 6; /* immw + immwh */
+    case IR3_LEA:
+        return 3; /* F3c */
+    case IR3_J:
+    case IR3_JZ:
+    case IR3_JNZ:
+        return 3; /* F3a */
+    case IR3_CALL:
+        return 3; /* F3a jl */
+    case IR3_ENTER:
+        return 3; /* F3a enter */
+    case IR3_ADJ:
+        return (p->imm != 0) ? 3 : 0; /* F3a adjw or elided */
+    case IR3_WORD:
+        return 2;
+    case IR3_BYTE:
+        return 1;
+    case IR3_ALIGN:
+        return 0; /* conservative: ignore alignment padding in estimates */
+    default:
+        return 3; /* conservative upper bound */
+    }
+}
+
+/* Static table: estimated byte offset of each numeric label in the current
+ * risc_backend_emit call.  Built by the forward-branch pre-pass at the top
+ * of risc_backend_emit.  Indexed by label id; -1 = unknown / unseen. */
+static int rb_fwd_label_off[RB_LABEL_MAX];
 
 /* ----------------------------------------------------------------
  * Helpers: F2 bp-relative address range check
@@ -242,13 +338,42 @@ void risc_backend_emit(IR3Inst *head)
     if (!asm_out) asm_out = stdout;
 
     int prev_line = 0;
-    /* Track the highest label ID emitted so far in the current function.
-     * Used by compare+branch fusion to detect backward branches: a branch
-     * target with id <= rb_last_label has already been emitted and is a
-     * backward branch, guaranteed to be within the F3b ±511-byte range.
-     * Forward branches (target not yet emitted) are NOT fused because their
-     * distance is unknown and may exceed the 10-bit signed offset limit. */
-    int rb_last_label = -1;
+    /* Backward-branch tracker for compare+branch fusion.
+     * Track exactly which numeric label IDs have been emitted in the current
+     * function.  A branch is a backward branch iff its target is in this set.
+     * Using a bitset rather than "highest ID seen" to correctly handle
+     * loop-rotated code where labels are emitted out of numeric order.
+     * (The old "highest ID" check fired incorrectly when loop rotation emitted
+     * the check label before the body label, causing fused forward branches
+     * whose large offsets silently overflow the F3b imm10 field.) */
+    uint64_t rb_seen[(RB_LABEL_MAX + 63) / 64];
+    memset(rb_seen, 0, sizeof(rb_seen));
+
+    /* Byte-boundedness tracker: rb_byte_bnd[r] is true when physical register r
+     * is known to hold a value with bits [31:8] == 0.  Used by E5 to skip ZXB
+     * when the AND-0xff target is already bounded (e.g. andi rX,_,1 then xor).
+     * Reset at every BB boundary (LABEL / SYMLABEL). */
+    bool rb_byte_bnd[8];
+    memset(rb_byte_bnd, 0, sizeof(rb_byte_bnd));
+#define RB_MARK(id) do { if ((id)>=0&&(id)<RB_LABEL_MAX) rb_seen[(id)>>6] |= 1ULL<<((id)&63); } while(0)
+#define RB_TEST(id) ((id)>=0 && (id)<RB_LABEL_MAX && ((rb_seen[(id)>>6]>>((id)&63))&1))
+
+    /* Forward-branch pre-pass: scan the full list and record the estimated byte
+     * offset of each IR3_LABEL.  Used by the compare+branch fusion below to
+     * allow forward branches when the target is provably within the F3b imm10
+     * ±511-byte range.  The estimate uses rb_instr_size() as an upper bound,
+     * so if the check says "in range" the actual offset is guaranteed to fit. */
+    memset(rb_fwd_label_off, -1, sizeof(rb_fwd_label_off));
+    {
+        int off = 0;
+        for (IR3Inst *q = head; q; q = q->next) {
+            if (q->op == IR3_LABEL && q->imm >= 0 && q->imm < RB_LABEL_MAX)
+                rb_fwd_label_off[q->imm] = off;
+            off += rb_instr_size(q);
+        }
+    }
+
+    int emit_offset = 0;  /* running estimated byte offset; tracks rb_fwd_label_off */
 
     for (IR3Inst *p = head; p; p = p->next)
     {
@@ -269,12 +394,14 @@ void risc_backend_emit(IR3Inst *head)
         /* ---- Labels ---- */
         case IR3_LABEL:
             fprintf(asm_out, "_l%d:\n", p->imm);
-            if (p->imm > rb_last_label) rb_last_label = p->imm;
+            RB_MARK(p->imm);
+            memset(rb_byte_bnd, 0, sizeof(rb_byte_bnd));
             break;
 
         case IR3_SYMLABEL:
             fprintf(asm_out, "%s:\n", p->sym);
-            rb_last_label = -1;  /* new function: reset backward-branch tracker */
+            memset(rb_seen, 0, sizeof(rb_seen));  /* new function: reset backward-branch tracker */
+            memset(rb_byte_bnd, 0, sizeof(rb_byte_bnd));
             break;
 
         case IR3_COMMENT:
@@ -288,13 +415,22 @@ void risc_backend_emit(IR3Inst *head)
             } else {
                 unsigned u  = (unsigned)p->imm;
                 /* E5: CONST 0xff/0xffff + AND rd, rd, rX → zxb/zxw rd (in-place).
-                 * Absorb the immw into the following AND when rd==rs1 and rs2==this reg. */
-                if (u == 0xff || u == 0xffff) {
+                 * Absorb the immw into the following AND when rd==rs1 and rs2==this reg.
+                 * Disabled by -no-newinsns. */
+                if (!flag_no_newinsns && (u == 0xff || u == 0xffff)) {
                     IR3Inst *nxt = next_live_rb(p);
                     if (nxt && nxt->op == IR3_ALU && nxt->alu_op == IR_AND
                             && nxt->rd == nxt->rs1   /* in-place AND */
                             && nxt->rs2 == p->rd)    /* uses our const register */
                     {
+                        /* If the AND target is already byte-bounded (e.g. the XOR
+                         * of two andi-1 results), the ZXB is redundant: kill both. */
+                        if (u == 0xff && nxt->rs1 >= 0 && nxt->rs1 < 8
+                                && rb_byte_bnd[nxt->rs1]) {
+                            rb_mark_dead(p);
+                            rb_mark_dead(nxt);
+                            break;
+                        }
                         rb_mark_dead(p);             /* suppress immw */
                         nxt->op     = IR3_ALU1;
                         nxt->alu_op = (u == 0xff) ? IR_ZXB : IR_ZXW;
@@ -308,6 +444,8 @@ void risc_backend_emit(IR3Inst *head)
                 fprintf(asm_out, "    immw    r%d, 0x%04x\n", p->rd, lo);
                 if (hi)
                     fprintf(asm_out, "    immwh   r%d, 0x%04x\n", p->rd, hi);
+                if (p->rd >= 0 && p->rd < 8)
+                    rb_byte_bnd[p->rd] = (u <= 0xff);
             }
             break;
 
@@ -322,6 +460,8 @@ void risc_backend_emit(IR3Inst *head)
             if (p->rd == p->rs1) break;             /* identity move; skip */
             /* Emit as: or rd, rs1, rs1 (CPU4 pseudo: mov rd, rs1) */
             fprintf(asm_out, "    or      r%d, r%d, r%d\n", p->rd, p->rs1, p->rs1);
+            if (p->rd >= 0 && p->rd < 8)
+                rb_byte_bnd[p->rd] = (p->rs1 >= 0 && p->rs1 < 8 && rb_byte_bnd[p->rs1]);
             break;
 
         /* ---- Loads ---- */
@@ -356,6 +496,7 @@ void risc_backend_emit(IR3Inst *head)
                     fprintf(asm_out, "    lll     r%d, r%d, %d\n", p->rd, base, l);
                 }
             }
+            if (p->rd >= 0 && p->rd < 8) rb_byte_bnd[p->rd] = false;
             break;
         }
 
@@ -390,9 +531,56 @@ void risc_backend_emit(IR3Inst *head)
             int rs2 = p->rs2;
 
             /* Immediate ADD: ir3_opt folded CONST+ADD (rs2=NONE sentinel, imm=C).
-             * Emit addli/addi/inc/dec instead of immw+add. */
+             * Emit addli/addi/inc/dec instead of immw+add.
+             * Look-ahead: addli rD,rS,K + MOV rS←rD → in-place addi/inc/dec rS,K. */
             if (rs2 == IR3_VREG_NONE && p->alu_op == IR_ADD) {
                 int C = p->imm;
+                if (rd != rs1) {
+                    /* Find the copy-back: scan forward skipping dead, identity
+                     * moves, and IR3_ADJ (adjw doesn't affect registers). */
+                    IR3Inst *nxt = NULL;
+                    for (IR3Inst *q = p->next; q; q = q->next) {
+                        if ((int)q->op < 0) continue;
+                        if (q->op == IR3_MOV && (q->rd == q->rs1 ||
+                                q->rd == IR3_VREG_NONE)) continue;
+                        if (q->op == IR3_ADJ) continue; /* sp-only, skip */
+                        if (q->op == IR3_MOV && q->rd == rs1 && q->rs1 == rd)
+                            nxt = q;
+                        break;
+                    }
+                    if (nxt) {
+                        /* Safety: rd must not be live after the copy-back MOV.
+                         * Scan forward; be conservative at labels and jumps. */
+                        bool rd_live = false;
+                        for (IR3Inst *q = nxt->next; q; q = q->next) {
+                            if ((int)q->op < 0) continue;
+                            /* Unconditional jump: done with this BB; rd not used */
+                            if (q->op == IR3_J) break;
+                            /* Labels, conditional branches, calls: conservative stop */
+                            if (q->op == IR3_LABEL || q->op == IR3_SYMLABEL ||
+                                    q->op == IR3_JZ || q->op == IR3_JNZ ||
+                                    q->op == IR3_CALL || q->op == IR3_CALLR) {
+                                rd_live = true; break;
+                            }
+                            /* STORE: rd field is a base-address read, not a def */
+                            if (q->op == IR3_STORE && q->rd == rd)
+                                { rd_live = true; break; }
+                            if (q->rs1 == rd || q->rs2 == rd) { rd_live = true; break; }
+                            if (q->rd == rd) break; /* rd redefined: dead above */
+                        }
+                        if (rd_live) goto skip_fold;
+                        /* Fold: kill the copy-back MOV, emit in-place op on rs1 */
+                        rb_mark_dead(nxt);
+                        if (C == 1)             fprintf(asm_out, "    inc     r%d\n", rs1);
+                        else if (C == -1)       fprintf(asm_out, "    dec     r%d\n", rs1);
+                        else if (C >= -64 && C <= 63)
+                                                fprintf(asm_out, "    addi    r%d, %d\n", rs1, C);
+                        else                    fprintf(asm_out, "    addli   r%d, r%d, %d\n", rs1, rs1, C);
+                        if (rs1 >= 0 && rs1 < 8) rb_byte_bnd[rs1] = false;
+                        break;
+                    }
+                }
+                skip_fold:;
                 if (rd == rs1 && C == 1)
                     fprintf(asm_out, "    inc     r%d\n", rd);
                 else if (rd == rs1 && C == -1)
@@ -401,32 +589,69 @@ void risc_backend_emit(IR3Inst *head)
                     fprintf(asm_out, "    addi    r%d, %d\n", rd, C);
                 else
                     fprintf(asm_out, "    addli   r%d, r%d, %d\n", rd, rs1, C);
+                if (rd >= 0 && rd < 8) rb_byte_bnd[rd] = false;
                 break;
             }
 
-            /* Immediate AND: andi (F2, in-place rd==rs1, sext(imm7) -64..63).
-             * Fallback to immw+and when rd!=rs1 (rare after IRC coalescing). */
+            /* Immediate AND: andi (F2 in-place when rd==rs1, F3b 0xdf when rd!=rs1).
+             * Fallback to immw+and when -no-newinsns is set or imm out of range. */
             if (rs2 == IR3_VREG_NONE && p->alu_op == IR_AND) {
                 int C = p->imm;
-                if (rd == rs1 && C >= -64 && C <= 63)
-                    fprintf(asm_out, "    andi    r%d, %d\n", rd, C);
-                else {
+                if (!flag_no_newinsns && C >= -64 && C <= 63) {
+                    if (rd == rs1)
+                        fprintf(asm_out, "    andi    r%d, %d\n", rd, C);
+                    else
+                        fprintf(asm_out, "    andi    r%d, r%d, %d\n", rd, rs1, C);
+                } else {
                     fprintf(asm_out, "    immw    r%d, 0x%04x\n", rd, (unsigned)C & 0xffff);
                     fprintf(asm_out, "    and     r%d, r%d, r%d\n", rd, rs1, rd);
                 }
+                if (rd >= 0 && rd < 8) rb_byte_bnd[rd] = ((uint32_t)(unsigned)C <= 0xff);
                 break;
             }
 
-            /* Immediate SHL: shli (F2, in-place rd==rs1, imm 0..31).
-             * Fallback to immw+shl when rd!=rs1. */
+            /* Immediate SHL: shli (F2 in-place when rd==rs1, F3b 0xdf when rd!=rs1).
+             * Fallback to immw+shl when -no-newinsns is set or imm out of range. */
             if (rs2 == IR3_VREG_NONE && p->alu_op == IR_SHL) {
                 int C = p->imm;
-                if (rd == rs1 && C >= 0 && C <= 31)
-                    fprintf(asm_out, "    shli    r%d, %d\n", rd, C);
-                else {
+                if (!flag_no_newinsns && C >= 0 && C <= 31) {
+                    if (rd == rs1)
+                        fprintf(asm_out, "    shli    r%d, %d\n", rd, C);
+                    else
+                        fprintf(asm_out, "    shli    r%d, r%d, %d\n", rd, rs1, C);
+                } else {
                     fprintf(asm_out, "    immw    r%d, 0x%04x\n", rd, (unsigned)C & 0xffff);
                     fprintf(asm_out, "    shl     r%d, r%d, r%d\n", rd, rs1, rd);
                 }
+                if (rd >= 0 && rd < 8) rb_byte_bnd[rd] = false;
+                break;
+            }
+
+            /* Immediate SHR (logical): shri (F3b 0xdf sub-op 2, always 3-operand).
+             * Fallback to immw+shr when -no-newinsns is set or imm out of range. */
+            if (rs2 == IR3_VREG_NONE && p->alu_op == IR_SHR) {
+                int C = p->imm;
+                if (!flag_no_newinsns && C >= 0 && C <= 31)
+                    fprintf(asm_out, "    shri    r%d, r%d, %d\n", rd, rs1, C);
+                else {
+                    fprintf(asm_out, "    immw    r%d, 0x%04x\n", rd, (unsigned)C & 0xffff);
+                    fprintf(asm_out, "    shr     r%d, r%d, r%d\n", rd, rs1, rd);
+                }
+                if (rd >= 0 && rd < 8) rb_byte_bnd[rd] = false;
+                break;
+            }
+
+            /* Immediate SHRS (arithmetic): shrsi (F3b 0xdf sub-op 3, always 3-operand).
+             * Fallback to immw+shrs when -no-newinsns is set or imm out of range. */
+            if (rs2 == IR3_VREG_NONE && p->alu_op == IR_SHRS) {
+                int C = p->imm;
+                if (!flag_no_newinsns && C >= 0 && C <= 31)
+                    fprintf(asm_out, "    shrsi   r%d, r%d, %d\n", rd, rs1, C);
+                else {
+                    fprintf(asm_out, "    immw    r%d, 0x%04x\n", rd, (unsigned)C & 0xffff);
+                    fprintf(asm_out, "    shrs    r%d, r%d, r%d\n", rd, rs1, rd);
+                }
+                if (rd >= 0 && rd < 8) rb_byte_bnd[rd] = false;
                 break;
             }
 
@@ -437,12 +662,25 @@ void risc_backend_emit(IR3Inst *head)
              * physical register 0, so check rd==0 here. */
             if (rd == 0) {
                 IR3Inst *nxt = next_live_rb(p);
-                /* Only fuse when the branch target is a backward branch
-                 * (label already emitted, rb_last_label >= target id).
-                 * Forward branches have unknown distance and may exceed the
-                 * F3b imm10 ±511-byte range, causing silent truncation. */
-                if (nxt && (nxt->op == IR3_JNZ || nxt->op == IR3_JZ)
-                        && nxt->imm >= 0 && nxt->imm <= rb_last_label) {
+                /* Fuse when the branch target is:
+                 * (a) a backward branch (label already emitted — RB_TEST), or
+                 * (b) a forward branch whose estimated offset fits the F3b
+                 *     imm10 signed ±511-byte range (pre-pass guaranteed to be
+                 *     an upper bound, so "fits" → definitely fits at assemble time). */
+                bool fuse_ok = false;
+                if (nxt && (nxt->op == IR3_JNZ || nxt->op == IR3_JZ)) {
+                    if (RB_TEST(nxt->imm)) {
+                        fuse_ok = true; /* backward branch — always short */
+                    } else if (nxt->imm >= 0 && nxt->imm < RB_LABEL_MAX
+                               && rb_fwd_label_off[nxt->imm] >= 0) {
+                        /* Forward branch: check estimated offset fits imm10.
+                         * emit_offset is the address of the compare; the fused
+                         * branch will be 3 bytes (F3b), so pc-after = emit_offset+3. */
+                        int rel = rb_fwd_label_off[nxt->imm] - (emit_offset + 3);
+                        fuse_ok = (rel >= -512 && rel <= 511);
+                    }
+                }
+                if (fuse_ok) {
                     bool is_jz = (nxt->op == IR3_JZ);
                     const char *fmn = NULL;
                     bool fswap = false;
@@ -498,18 +736,42 @@ void risc_backend_emit(IR3Inst *head)
             } else {
                 fprintf(stderr, "risc_backend: unhandled ALU op %d\n", (int)p->alu_op);
             }
+            /* XOR of two byte-bounded values is itself byte-bounded; all else clear. */
+            if (rd >= 0 && rd < 8) {
+                rb_byte_bnd[rd] = (p->alu_op == IR_XOR
+                                   && rs1 >= 0 && rs1 < 8 && rs2 >= 0 && rs2 < 8
+                                   && rb_byte_bnd[rs1] && rb_byte_bnd[rs2]);
+            }
             break;
         }
 
         /* ---- Single-register ops ---- */
         case IR3_ALU1:
             switch (p->alu_op) {
-            case IR_SXB:  fprintf(asm_out, "    sxb     r%d\n", p->rd); break;
-            case IR_SXW:  fprintf(asm_out, "    sxw     r%d\n", p->rd); break;
-            case IR_ZXB:  fprintf(asm_out, "    zxb     r%d\n", p->rd); break;
-            case IR_ZXW:  fprintf(asm_out, "    zxw     r%d\n", p->rd); break;
-            case IR_ITOF: fprintf(asm_out, "    itof\n");                break;
-            case IR_FTOI: fprintf(asm_out, "    ftoi\n");                break;
+            case IR_SXB:
+                fprintf(asm_out, "    sxb     r%d\n", p->rd);
+                if (p->rd >= 0 && p->rd < 8) rb_byte_bnd[p->rd] = false;
+                break;
+            case IR_SXW:
+                fprintf(asm_out, "    sxw     r%d\n", p->rd);
+                if (p->rd >= 0 && p->rd < 8) rb_byte_bnd[p->rd] = false;
+                break;
+            case IR_ZXB:
+                fprintf(asm_out, "    zxb     r%d\n", p->rd);
+                if (p->rd >= 0 && p->rd < 8) rb_byte_bnd[p->rd] = true;
+                break;
+            case IR_ZXW:
+                fprintf(asm_out, "    zxw     r%d\n", p->rd);
+                if (p->rd >= 0 && p->rd < 8) rb_byte_bnd[p->rd] = false;
+                break;
+            case IR_ITOF:
+                fprintf(asm_out, "    itof\n");
+                rb_byte_bnd[0] = false;  /* r0 implicit */
+                break;
+            case IR_FTOI:
+                fprintf(asm_out, "    ftoi\n");
+                rb_byte_bnd[0] = false;  /* r0 implicit */
+                break;
             default:
                 fprintf(stderr, "risc_backend: unhandled ALU1 op %d\n", (int)p->alu_op);
                 break;
@@ -583,5 +845,7 @@ void risc_backend_emit(IR3Inst *head)
             /* Unknown or dead op — skip */
             break;
         }
+
+        emit_offset += rb_instr_size(p);
     }
 }

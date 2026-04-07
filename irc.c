@@ -137,6 +137,12 @@ static int    select_sp;
 static Bitset actual_spill;
 static int    spill_slot[IRC_MAX_NODES];  /* bp-relative offset, 0 = no spill */
 
+/* Rematerialization: if remat_def[n] != NULL, clone this instruction at each
+ * use instead of inserting a LOAD from the spill slot.  Only set for spilled
+ * nodes whose unique definition is IR3_CONST or IR3_LEA — both are
+ * single-instruction, register-input-free, and safe to clone anywhere. */
+static IR3Inst *remat_def[IRC_MAX_NODES];
+
 /* Frame state for spill slot allocation */
 static int g_enter_N;       /* original ENTER imm (frame size)           */
 static int g_spill_next;    /* next slot offset (grows negative)         */
@@ -827,6 +833,7 @@ static void alloc_spill_slots(void)
 {
     for (int n = bs_next(actual_spill, -1); n >= 0; n = bs_next(actual_spill, n)) {
         if (!is_virtual(n)) continue;
+        if (remat_def[n]) continue;   /* rematerialise at use; no frame slot needed */
         g_spill_next -= 4;
         g_spill_next &= ~3;
         spill_slot[n] = g_spill_next;
@@ -853,6 +860,38 @@ static void expand_frame(IR3Inst *func_head, IR3Inst *func_end, IR3Inst *enter_n
         if (p->op == IR3_LEA   && p->imm < -orig_N)
             p->imm -= expansion;
     }
+}
+
+/* ================================================================
+ * Rematerialization support
+ * ================================================================ */
+static IR3Inst *new_ir3node(IR3Op op, int line);  /* forward declaration */
+
+/* Populate remat_def[] for the current function.  Called after assign_colors()
+ * has marked actual_spill, before alloc_spill_slots(). */
+static void build_remat_table(IR3Inst *func_head, IR3Inst *func_end)
+{
+    memset(remat_def, 0, sizeof(remat_def));
+    for (IR3Inst *p = func_head; p && p != func_end; p = p->next) {
+        if (p->op != IR3_CONST && p->op != IR3_LEA) continue;
+        if (p->rd == IR3_VREG_NONE) continue;
+        int n = vreg_to_node(p->rd);
+        if (n < 0 || !is_virtual(n) || !bs_test(actual_spill, n)) continue;
+        /* Conservative: two defs for the same node → disable rematerialization. */
+        remat_def[n] = remat_def[n] ? NULL : p;
+    }
+}
+
+/* Clone a rematerializable def instruction with a fresh destination register. */
+static IR3Inst *clone_remat_inst(IR3Inst *def, int new_rd, int line)
+{
+    IR3Inst *c = new_ir3node(def->op, line);
+    c->rd  = new_rd;
+    c->imm = def->imm;
+    c->sym = def->sym;
+    /* rs1, rs2, size, alu_op intentionally left at zero/NONE: correct for
+     * IR3_CONST (no register inputs) and IR3_LEA (bp implicit, not in rs1). */
+    return c;
 }
 
 /* ================================================================
@@ -893,65 +932,57 @@ static void rewrite_spills(IR3Inst **func_head_ptr, IR3Inst *func_end)
             prev = p; p = p->next; continue;
         }
 
-        /* --- Insert LOADs before p for spilled uses --- */
+        /* --- Insert LOADs (or rematerialised clones) before p for spilled uses --- */
 
-        /* rs1 use */
-        if (p->rs1 != IR3_VREG_NONE && p->rs1 != IR3_VREG_BP && SPILLED(p->rs1)) {
-            int sn  = vreg_to_node(p->rs1);
-            int tmp = ir3_new_vreg();
-            IR3Inst *ld = new_ir3node(IR3_LOAD, p->line);
-            ld->rd = tmp; ld->rs1 = IR3_VREG_BP;
-            ld->imm = spill_slot[sn]; ld->size = 4;
-            ld->next = p;
-            if (prev) prev->next = ld; else *func_head_ptr = ld;
-            prev = ld;
-            p->rs1 = tmp;
-        }
+#define SPILL_USE(field) do {                                               \
+        if ((field) != IR3_VREG_NONE && (field) != IR3_VREG_BP             \
+                && SPILLED(field)) {                                        \
+            int sn  = vreg_to_node(field);                                 \
+            int tmp = ir3_new_vreg();                                      \
+            IR3Inst *ins;                                                   \
+            if (remat_def[sn]) {                                           \
+                ins = clone_remat_inst(remat_def[sn], tmp, p->line);       \
+            } else {                                                        \
+                ins = new_ir3node(IR3_LOAD, p->line);                      \
+                ins->rd = tmp; ins->rs1 = IR3_VREG_BP;                     \
+                ins->imm = spill_slot[sn]; ins->size = 4;                  \
+            }                                                               \
+            ins->next = p;                                                  \
+            if (prev) prev->next = ins; else *func_head_ptr = ins;         \
+            prev = ins;                                                     \
+            (field) = tmp;                                                  \
+        }                                                                   \
+    } while (0)
 
-        /* rs2 use */
-        if (p->rs2 != IR3_VREG_NONE && p->rs2 != IR3_VREG_BP && SPILLED(p->rs2)) {
-            int sn  = vreg_to_node(p->rs2);
-            int tmp = ir3_new_vreg();
-            IR3Inst *ld = new_ir3node(IR3_LOAD, p->line);
-            ld->rd = tmp; ld->rs1 = IR3_VREG_BP;
-            ld->imm = spill_slot[sn]; ld->size = 4;
-            ld->next = p;
-            if (prev) prev->next = ld; else *func_head_ptr = ld;
-            prev = ld;
-            p->rs2 = tmp;
-        }
+        SPILL_USE(p->rs1);
+        SPILL_USE(p->rs2);
+        /* STORE: rd is the base address — a read, not a def */
+        if (p->op == IR3_STORE) SPILL_USE(p->rd);
+#undef SPILL_USE
 
-        /* STORE base (rd used as address source) */
-        if (p->op == IR3_STORE &&
-            p->rd != IR3_VREG_NONE && p->rd != IR3_VREG_BP && SPILLED(p->rd)) {
-            int sn  = vreg_to_node(p->rd);
-            int tmp = ir3_new_vreg();
-            IR3Inst *ld = new_ir3node(IR3_LOAD, p->line);
-            ld->rd = tmp; ld->rs1 = IR3_VREG_BP;
-            ld->imm = spill_slot[sn]; ld->size = 4;
-            ld->next = p;
-            if (prev) prev->next = ld; else *func_head_ptr = ld;
-            prev = ld;
-            p->rd = tmp;
-        }
-
-        /* --- Replace def with fresh tmp and insert STORE after p --- */
+        /* --- Replace def with fresh tmp and insert STORE after p ---
+         * For rematerialisable defs (IR3_CONST / IR3_LEA): no STORE is needed.
+         * Leave rd unchanged; in the next iteration this def will have zero uses
+         * (all replaced by clones at the use sites above) → coloured trivially. */
         if (p->op != IR3_STORE &&
             p->rd != IR3_VREG_NONE && p->rd != IR3_VREG_BP && SPILLED(p->rd)) {
             int sn  = vreg_to_node(p->rd);
-            int tmp = ir3_new_vreg();
-            p->rd = tmp;
-            IR3Inst *st = new_ir3node(IR3_STORE, p->line);
-            st->rd  = IR3_VREG_BP;
-            st->rs1 = tmp;
-            st->imm  = spill_slot[sn];
-            st->size = 4;
-            st->next = p->next;
-            p->next  = st;
-            /* advance past the store (it contains no spilled vregs) */
-            prev = st;
-            p = st->next;
-            continue;
+            if (!remat_def[sn]) {
+                int tmp = ir3_new_vreg();
+                p->rd = tmp;
+                IR3Inst *st = new_ir3node(IR3_STORE, p->line);
+                st->rd  = IR3_VREG_BP;
+                st->rs1 = tmp;
+                st->imm  = spill_slot[sn];
+                st->size = 4;
+                st->next = p->next;
+                p->next  = st;
+                /* advance past the store (it contains no spilled vregs) */
+                prev = st;
+                p = st->next;
+                continue;
+            }
+            /* Rematerialisable: rd stays as the spilled vreg; no STORE emitted. */
         }
 #undef SPILLED
 
@@ -1000,6 +1031,22 @@ static void alloc_function(IR3Inst **func_head_ptr, IR3Inst *func_end,
     int orig_N = enter_node ? enter_node->imm : 0;
     int spill_floor = -orig_N;
 
+    /* braun.c resets the vreg counter (ir3_reset) per function, so functions
+     * processed earlier by braun may have vreg IDs that exceed next_vreg (which
+     * reflects only the last function braun processed).  Scan this function's IR
+     * to find the maximum vreg ID, then bump next_vreg above it so that
+     * ir3_new_vreg() in rewrite_spills never returns an ID that already exists
+     * in this function's instruction stream. */
+    {
+        int max_vreg = IR3_VREG_BASE; /* 100 = ACCUM */
+        for (IR3Inst *p = *func_head_ptr; p && p != func_end; p = p->next) {
+            if (p->rd  > max_vreg) max_vreg = p->rd;
+            if (p->rs1 > max_vreg) max_vreg = p->rs1;
+            if (p->rs2 > max_vreg) max_vreg = p->rs2;
+        }
+        ir3_bump_vreg(max_vreg + 1);
+    }
+
     memset(spill_slot, 0, sizeof(spill_slot));
     for (int iter = 0; iter < IRC_MAX_ITERS; iter++) {
         irc_reset_fn();
@@ -1031,9 +1078,11 @@ static void alloc_function(IR3Inst **func_head_ptr, IR3Inst *func_end,
 
         /* Assign colors */
         bool need_spill = assign_colors();
+
         if (!need_spill) break;
 
         /* Actual spills: allocate slots, expand frame, rewrite IR */
+        build_remat_table(*func_head_ptr, func_end);
         alloc_spill_slots();
         expand_frame(*func_head_ptr, func_end, enter_node);
         rewrite_spills(func_head_ptr, func_end);

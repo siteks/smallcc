@@ -16,6 +16,7 @@ void set_asm_out(FILE *f)
 // Annotation mode (-ann)
 // ---------------------------------------------------------------------------
 int flag_annotate = 0;
+int flag_no_newinsns = 0;
 
 static char       *ann_src  = NULL;   // strdup of the preprocessed source
 const  char      **ann_lines  = NULL; // ann_lines[i] points to start of line i+1

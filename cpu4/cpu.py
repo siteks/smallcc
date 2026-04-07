@@ -88,7 +88,7 @@ import sys
 #   lwx     rx = sxt([bp+sxt(imm7*2)])
 #   addi    rx = rx + sxt(imm7)
 #   shli    rx = rx << imm7
-#   andi    rx = rx & sxt(imm7)
+#   andi    rx = rx & zext16(sxt7(imm7))   ; sext7→16-bit, zero-extend to 32
 #
 #   Format 3a - zero op + imm16 (16 slots)
 #   j       pc = imm16
@@ -115,6 +115,11 @@ import sys
 #   blts    pc = rx<ry ? (pc + sxt(imm10)) : pc
 #   bgts    pc = rx>ry ? (pc + sxt(imm10)) : pc
 #   addli   rx = ry + sxt(imm10)
+#   0xdf escape (imm10 = sub-op[9:7] | imm7[6:0])
+#   andi    rx = ry & zext16(sxt7(imm7))           sub-op 0
+#   shli    rx = ry << (imm7 & 0x1f)               sub-op 1
+#   shri    rx = ry >> (imm7 & 0x1f) logical        sub-op 2
+#   shrsi   rx = signed(ry) >> (imm7 & 0x1f) arith  sub-op 3
 
 #   Format 3c - one op + imm16 (4 slots)
 #   immw    rd = imm16
@@ -229,6 +234,11 @@ class G:
         'blts'  :   (0xdc, 2, 1, 0),
         'bles'  :   (0xdd, 2, 1, 0),
         'addli' :   (0xde, 2, 1, 0),
+        # format 3b 0xdf escape - rd rs imm7; sub-opcode in imm10[9:7]
+        'andi3' :   (0xdf, 2, 1, 0),   # sub-op 0: rd = rs & zext16(sext7(imm7))
+        'shli3' :   (0xdf, 2, 1, 1),   # sub-op 1: rd = rs << (imm7 & 0x1f)
+        'shri'  :   (0xdf, 2, 1, 2),   # sub-op 2: rd = rs >> (imm7 & 0x1f) logical
+        'shrsi' :   (0xdf, 2, 1, 3),   # sub-op 3: rd = signed(rs) >> (imm7 & 0x1f)
         # format 3c - one op + imm16    111ooxxxiiiiiiiiiiiiiiii
         'immw'  :   (0xe8, 2, 2, 0),
         'immwh' :   (0xf0, 2, 2, 0),
@@ -403,6 +413,10 @@ class CPU:
             # This is a f1b instruction
             subop = ins & 0x3f
             i, _, _ = G.rptable[(lookupins, subop)]
+        elif lookupins == 0xdf:
+            # 0xdf escape: sub-opcode is in bits [9:7] of imm10 field
+            subop_df = (ins >> 7) & 0x7
+            i, _, _ = G.rptable[(lookupins, subop_df)]
 
 
         imm     = 0
@@ -492,7 +506,7 @@ class CPU:
         elif    i == 'lwx':     s.r[dst] = sext(m.read16(s.bp + sext(imm<<1, 8)), 16)
         elif    i == 'addi':    s.r[dst] = s.r[src0] + sext(imm, 7)
         elif    i == 'shli':    s.r[dst] = s.r[src0] << (imm & 0x1f)
-        elif    i == 'andi':    s.r[dst] = s.r[src0] & sext(imm, 7)
+        elif    i == 'andi':    s.r[dst] = s.r[src0] & (sext(imm, 7) & 0xffff)
         # f3a
         elif    i == 'j':       s.pc = imm
         elif    i == 'jl':      s.pc, s.lr = imm, s.pc
@@ -517,6 +531,11 @@ class CPU:
         elif    i == 'blts':    s.pc = s.pc + sext(imm, 10) if sext(s.r[src0], 32) < sext(s.r[src1], 32) else s.pc
         elif    i == 'bles':    s.pc = s.pc + sext(imm, 10) if sext(s.r[src0], 32) <= sext(s.r[src1], 32) else s.pc
         elif    i == 'addli':   s.r[dst] = s.r[src1] + sext(imm, 10)
+        # 0xdf escape: imm7 is in low 7 bits of imm10; sub-opcode consumed above
+        elif    i == 'andi3':   s.r[dst] = s.r[src1] & (sext(imm & 0x7f, 7) & 0xffff)
+        elif    i == 'shli3':   s.r[dst] = s.r[src1] << ((imm & 0x7f) & 0x1f)
+        elif    i == 'shri':    s.r[dst] = s.r[src1] >> ((imm & 0x7f) & 0x1f)
+        elif    i == 'shrsi':   s.r[dst] = sext(s.r[src1], 32) >> ((imm & 0x7f) & 0x1f)
         # f3c
         elif    i == 'immw':    s.r[dst] = imm
         elif    i == 'immwh':   s.r[dst] = (s.r[dst] & 0xffff) | (imm << 16)

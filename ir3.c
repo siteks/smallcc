@@ -22,6 +22,14 @@ void ir3_reset(void)
     next_vreg = IR3_VREG_BASE + 1;
 }
 
+/* Ensure next_vreg >= min_next.  Called by irc_regalloc before rewrite_spills
+ * to prevent fresh spill-temp IDs from colliding with existing vregs in a
+ * function that braun processed before ir3_reset() was last called. */
+void ir3_bump_vreg(int min_next)
+{
+    if (min_next > next_vreg) next_vreg = min_next;
+}
+
 /* ----------------------------------------------------------------
  * build_cfg — build a basic-block CFG from a stack-IR list.
  *
