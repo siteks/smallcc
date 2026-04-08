@@ -247,6 +247,7 @@ int main(int argc, char **argv)
     bool preprocess_only = false;
     int opt_level = 0;
     int target_cpu4 = 0;  // 0 = CPU3, 1 = CPU4 (new nanopass pipeline)
+    int flag_dump_ssa = 0; // -ssa: print Braun SSA IR to stderr after braun_function
     const char *cmdline_defines[256];
     int num_defines = 0;
 
@@ -305,6 +306,11 @@ int main(int argc, char **argv)
             else { fprintf(stderr, "smallcc: unknown arch: %s\n", arch); return 1; }
             file_start += 2;
         }
+        else if (strcmp(argv[file_start], "-ssa") == 0)
+        {
+            flag_dump_ssa = 1;
+            file_start++;
+        }
         else
         {
             fprintf(stderr, "smallcc: unknown option: %s\n", argv[file_start]);
@@ -314,7 +320,7 @@ int main(int argc, char **argv)
 
     if (argc <= file_start)
     {
-        fprintf(stderr, "Usage: smallcc [-o outfile] [-E] [-stats] [-ann] [-DNAME[=VAL]] [-Idir] <source.c> [source2.c ...]\n");
+        fprintf(stderr, "Usage: smallcc [-o outfile] [-E] [-stats] [-ann] [-ssa] [-DNAME[=VAL]] [-Idir] <source.c> [source2.c ...]\n");
         return 1;
     }
 
@@ -462,6 +468,7 @@ int main(int argc, char **argv)
                     strcmp(item->car->s, "func") == 0) {
                     Function *f = braun_function(item, tm);
                     if (f) {
+                        if (flag_dump_ssa) { fprintf(stderr, "=== SSA: %s ===\n", f->name); print_function(f, stderr); }
                         compute_dominators(f);
                         out_of_ssa(f);
                         if (getenv("DUMP_IR")) { fprintf(stderr, "=== after oos ===\n"); print_function(f, stderr); }

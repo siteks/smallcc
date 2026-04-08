@@ -1,6 +1,11 @@
 # Backend Documentation
 
-This document describes the compiler backend — the path from annotated AST to assembly emission. The compiler supports two target architectures: CPU3 (stack machine) and CPU4 (RISC-like with register allocation).
+This document describes the **CPU3 stack-machine backend** — the path from annotated AST
+to CPU3 assembly emission (`codegen.c`, `optimise.c`, `backend.c`).
+
+> **CPU4 path:** The `-arch cpu4` flag uses a completely different nanopass pipeline
+> (`lower.c` → `braun.c` → `dom.c` → `oos.c` → `alloc.c` → `emit.c`). That pipeline
+> is documented in `docs/compiler-pipeline.md`.
 
 ## Pipeline Overview
 
@@ -8,18 +13,8 @@ This document describes the compiler backend — the path from annotated AST to 
 gen_ir()              [codegen.c]    AST → stack IR list
 mark_basic_blocks()   [codegen.c]    insert IR_BB_START sentinels
 peephole(opt_level)   [optimise.c]   constant fold, dead branch, adj merge, store/reload elim
-
-── CPU3 ──────────────────────────────────────────────────────────────────────
 backend_emit_asm()    [backend.c]    stack IR → CPU3 assembly
-
-── CPU4 ──────────────────────────────────────────────────────────────────────
-braun_ssa()           [braun.c]       stack IR → IR3Inst (fresh vregs)
-ir3_optimize()        [ir3_opt.c]     copy prop, const prop/fold, DCE
-irc_regalloc()        [irc.c]         IRC graph-coloring; vregs → physical r0–r7
-risc_backend_emit()   [risc_backend.c] IR3Inst → CPU4 assembly
 ```
-
-The stack IR is identical for both targets; the split happens after `peephole`. The two emitter files (`backend.c` for CPU3, `risc_backend.c` for CPU4) consume the same upstream IR.
 
 ---
 
@@ -283,243 +278,8 @@ Every `IRInst` carries a `line` field stamped by `ir_append()` from `current_cod
 
 ## CPU4 Backend
 
-After `peephole`, the CPU4 path runs three additional passes before `risc_backend_emit`.
+> **Note:** The `nanopass` branch replaces the old CPU4 stack-IR→IR3→risc_backend pipeline
+> with a new pipeline: `lower.c` → `braun.c` → `dom.c` → `oos.c` → `alloc.c` → `emit.c`.
+> The old `braun_ssa`, `ir3_opt`, `irc_regalloc`, and `risc_backend_emit` files no longer
+> exist. See `docs/compiler-pipeline.md` for the current CPU4 architecture.
 
-```
-Stack IR (codegen.c, unchanged)
-    ↓  peephole(opt_level)      [optimise.c]    — unchanged
-    ↓  braun_ssa()              [braun.c]        stack IR → IR3Inst (fresh vregs)
-    ↓  ir3_optimize()           [ir3_opt.c]      copy prop, const prop/fold, DCE
-    ↓  irc_regalloc()           [irc.c]          IRC graph-coloring; vregs → physical r0–r7
-    ↓  risc_backend_emit()      [risc_backend.c] IR3Inst → CPU4 assembly
-```
-
-**ABI:** r0–r3 are caller-saved; r4–r7 are callee-saved. r0 is reserved for the accumulator (ACCUM); r1–r7 are all available for allocation. Callees that use r4–r7 save/restore them via `insert_callee_saves` (see IRC pass below).
-
-### IR3: the intermediate representation
-
-#### `IR3Inst` struct (`ir3.h`)
-
-```c
-typedef struct IR3Inst {
-    IR3Op        op;      /* operation kind                                    */
-    IROp         alu_op;  /* IR3_ALU / IR3_ALU1: original stack-IR opcode      */
-    int          rd;      /* dest vreg  (IR3_VREG_NONE = no destination)       */
-    int          rs1;     /* source vreg 1                                     */
-    int          rs2;     /* source vreg 2                                     */
-    int          imm;     /* integer immediate, bp-relative byte offset, or
-                             numeric label id                                  */
-    int          size;    /* 1 / 2 / 4 bytes (IR3_LOAD / IR3_STORE)            */
-    const char  *sym;     /* call target name, symbolic label, or NULL         */
-    int          line;    /* source line for -ann annotation                   */
-    struct IR3Inst *next;
-} IR3Inst;
-```
-
-#### `IR3Op` enum
-
-| Op | Description |
-|---|---|
-| `IR3_CONST` | `rd = imm` (integer); or `rd = &sym` (symbolic) when `sym != NULL` |
-| `IR3_LOAD` | `rd = mem[rs1 + imm]`, `size` bytes; `rs1 = IR3_VREG_BP` → bp-relative |
-| `IR3_STORE` | `mem[rd + imm] = rs1`, `size` bytes; `rd = IR3_VREG_BP` → bp-relative |
-| `IR3_LEA` | `rd = bp + imm` — non-promoted local address, no load |
-| `IR3_ALU` | `rd = rs1 alu_op rs2` |
-| `IR3_ALU1` | `rd = alu_op(rs1)` — in-place sign-extend or float convert |
-| `IR3_MOV` | `rd = rs1` — register copy |
-| `IR3_CALL` | `jl sym` — direct call; result in ACCUM (r0) |
-| `IR3_CALLR` | `jlr` — indirect call via r0 |
-| `IR3_RET` | `ret` |
-| `IR3_J` | unconditional jump to numeric label `imm` |
-| `IR3_JZ` | jump if r0 == 0 |
-| `IR3_JNZ` | jump if r0 != 0 |
-| `IR3_ENTER` | `enter N` |
-| `IR3_ADJ` | `sp += imm` |
-| `IR3_PHI` | `rd = phi(phi_ops[0..n_phi_ops-1])`; eliminated before irc_regalloc |
-| `IR3_SYMLABEL` | named label (function entry or data label) |
-| `IR3_LABEL` | numeric label |
-| `IR3_WORD / IR3_BYTE / IR3_ALIGN` | data directives (pass-through) |
-| `IR3_PUTCHAR / IR3_COMMENT` | special pass-throughs |
-
-#### Virtual register encoding
-
-| Value | Meaning |
-|---|---|
-| `-2` (`IR3_VREG_BP`) | bp-relative addressing sentinel (not a real register) |
-| `-1` (`IR3_VREG_NONE`) | no destination / unused operand |
-| `0–7` | physical registers (only after `irc_regalloc`) |
-| `100` (`IR3_VREG_ACCUM`) | accumulator — always maps to physical r0; never allocated |
-| `101, 102, …` | fresh scratch vregs, allocated by `ir3_new_vreg()` |
-
-The fresh-vreg scheme replaces the old depth-indexed scheme (`VREG_START + depth`). Every expression result gets a unique ID, so the IRC allocator can assign physical registers based on actual live ranges rather than expression depth.
-
----
-
-### Pass 1: `braun_ssa()` (`braun.c`)
-
-Converts the flat stack-IR list to IR3Inst with fresh virtual registers. Uses the Braun et al. (2013) SSA construction algorithm with `readVariable`/`writeVariable`/`readVariableRecursive` to place phi nodes on demand.
-
-**SSA promotion** promotes scalar locals and parameters whose address never escapes (tagged with `ir_promote_sentinel` in `codegen.c`) from memory to SSA virtual registers. The Braun algorithm handles phi placement at control-flow merge points, and trivial phis (all operands identical) are eliminated. Phi deconstruction inserts parallel copies at predecessor block tails.
-
-Promotion is enabled for all leaf functions (no `IR_JL`/`IR_JLI`) unconditionally, and for non-leaf functions with at most `MAX_PROMO_NONLEAF` (8) distinct promotable variables. For non-leaf promoted functions, `irc_regalloc` handles spilling of any promoted vreg whose live range spans a call, by forcing interference edges from r0–r3 (caller-saved) to every live vreg at each call site; r4–r7 do not need this treatment because callees preserve them.
-
-The 8-variable limit balances promotion benefit against register pressure: with 7 allocatable registers (r1–r7), more than 8 promoted variables in a non-leaf function rarely yields additional gains. Functions exceeding the limit use the unpromoted `IR3_LEA + IR3_LOAD / IR3_STORE` path, which is efficient via F2 bp-relative instructions (2 bytes, 1 cycle).
-
-#### Promoted variable handling
-
-Promoted variables use a slot index (`bp_offset + PROMOTE_BASE`) into per-function tables:
-
-- `writeVariable(bb_id, slot, vreg)` records the SSA definition.
-- `readVariable(bb_id, slot)` returns the current vreg, or calls `readVariableRecursive` to search predecessor blocks and insert phi nodes.
-- Promoted `IR_LEA` is suppressed (no IR3 emitted); the offset is tracked in `local_accum_offset`.
-- Promoted `IR_LEA + IR_LOAD` reads the SSA value directly via `readVariable`.
-- Promoted `PUSH + STORE` writes via `writeVariable` (no IR3 store emitted).
-
-**Parameter pre-seeding**: promoted parameters are loaded from their stack slots immediately after `IR3_ENTER` and registered via `writeVariable` in block 0. This ensures `readVariableRecursive` always finds a definition when tracing back to the entry block.
-
-**Empty predecessor blocks**: `block_last_ir3[bb_id]` is set at the end of `translate_bb` even for empty blocks (no instructions), ensuring phi copy insertion works correctly for fall-through predecessors.
-
-**Phi forwarding**: When `tryRemoveTrivialPhi` simplifies a phi vreg V to another vreg W, it records the mapping in a forwarding table (`phi_fwd[V] = W`). `readVariable` applies `resolve_phi_vreg()` to chase forwarding chains in both the cached-definition and `readVariableRecursive` paths, ensuring that simplified phi vregs are never emitted in IR3 instructions. Without this, a multi-step simplification chain (V→W→X) could leave stale vreg references that survive to assembly as unrewritten virtual registers.
-
-#### Virtual stack model
-
-Identical to the old `lift_to_ssa`, except virtual register IDs are fresh instead of depth-indexed:
-
-```c
-static int vs_reg[MAX_VDEPTH];   // fresh vreg at each depth slot
-static int vs_size[MAX_VDEPTH];  // push size (2 or 4 bytes) per slot
-static int vs_depth;             // current virtual stack depth
-static int vsp;                  // running (sp - bp) byte offset for scope-adj tracking
-```
-
-`vs_reg[0]` is always `IR3_VREG_ACCUM` (100, physical r0). `IR_PUSH` saves the accumulator into a fresh vreg; `IR_POP` restores a previously saved vreg to the accumulator.
-
-#### Stack IR → IR3 mapping
-
-| Stack IR | IR3 output | Notes |
-|---|---|---|
-| `IR_IMM K` (integer) | `IR3_CONST rd=ACCUM, imm=K` | |
-| `IR_IMM S` (symbolic) | `IR3_CONST rd=ACCUM, sym=S` | |
-| `IR_LEA N; IR_LW/LB/LL` | `IR3_LOAD rd=ACCUM, rs1=BP, imm=N, size` | peek-ahead collapses pair; promoted → `readVariable` (no IR3) |
-| `IR_LEA N` (standalone) | `IR3_LEA rd=ACCUM, imm=N` | non-promotable local address; promoted → suppressed |
-| `IR_LW/LB/LL` | `IR3_LOAD rd=ACCUM, rs1=ACCUM, imm=0, size` | reg-relative deref |
-| `IR_SW/SB/SL` | `IR3_STORE rd=vs_reg[top], rs1=ACCUM, imm=0, size` | addr from vstack |
-| `IR_PUSH/PUSHW` | `IR3_MOV rd=fresh, rs1=ACCUM`; push fresh onto vstack | |
-| `IR_POP/POPW` | `IR3_MOV rd=ACCUM, rs1=vs_reg[top]`; pop vstack | |
-| `IR_ADD` … `IR_FGE` | `IR3_ALU rd=ACCUM, rs1=vs_reg[top], rs2=ACCUM`; pop vstack | result directly to r0 |
-| `IR_SXB/SXW/ITOF/FTOI` | `IR3_ALU1 rd=ACCUM, rs1=ACCUM, alu_op` | in-place on r0 |
-| `IR_JL sym` | flush args + `IR3_CALL sym` | see call flushing below |
-| `IR_JLI` | save fp → fresh, flush args, restore → ACCUM, `IR3_CALLR` | |
-| `IR_JZ L` | `IR3_JZ imm=L` | condition implicit in r0 |
-| `IR_JNZ L` | `IR3_JNZ imm=L` | |
-| `IR_J L` | `IR3_J imm=L` | |
-| `IR_ENTER N` | `IR3_ENTER imm=N`; reset vsp | |
-| `IR_ADJ N` | `IR3_ADJ imm=N`; update vsp; trigger post-call restore if pending | |
-| `IR_RET` | `IR3_RET` | |
-| `IR_SYMLABEL S` | `IR3_SYMLABEL sym=S`; reset all vstack / vsp / spill state | function boundary |
-| `IR_LABEL L` | `IR3_LABEL imm=L`; apply any saved vsp from forward-branch table | |
-| data ops | pass-through | |
-
-**ALU result directly to ACCUM**: Binary ALU ops write their result directly to `IR3_VREG_ACCUM` (`rd = ACCUM, rs1 = vs_reg[top], rs2 = ACCUM`). CPU4's 3-address F1a instructions allow `rd == rs2` (both sources are read before the destination is written), so `add r0, r1, r0` is architecturally valid. This eliminates the extra `IR3_MOV` that a fresh-vreg-then-copy approach would require.
-
-**ALU1 in-place on r0**: `sxb`, `sxw`, `itof`, `ftoi` are encoded as F1b / F0 instructions that operate in-place on a single register. `braun_ssa` models this as `IR3_ALU1 rd=ACCUM, rs1=ACCUM`; `risc_backend_emit` emits the in-place instruction using only `rd`.
-
-#### Call flushing (`flush_for_call_n`)
-
-Before every `IR_JL` / `IR_JLI`, `braun_ssa` must partition the virtual stack into argument slots (bottom of the stack, pushed by the caller) and outer expression temporaries (above the args, live across the call). The key difference from the old `ssa.c` implementation: after the call, outer temps are restored into **fresh vregs** (not the same vreg IDs). This ensures no vreg's live range spans a call instruction, so `irc_regalloc` can assign physical registers without any call-clobber awareness.
-
-1. **Detect the arg boundary**: scan ahead for the post-call `IR_ADJ +N` to determine `arg_bytes`; bottom `n_args` vstack slots are args.
-2. **Spill outer temps** to memory (`IR3_STORE rd=BP, rs1=vs_reg[k], imm=vsp+k*sz`), preceded by `IR3_ADJ -outer_bytes` to allocate the spill area. Promoted dummy slots (tracked via `vlo_get`) are skipped — they have no memory footprint.
-3. **Flush args** to the machine stack (`IR3_STORE` per arg) with `IR3_ADJ -arg_bytes`.
-4. **Emit the call** (`IR3_CALL` or `IR3_CALLR`).
-5. **Post-call restore** (triggered by the arg-cleanup `IR3_ADJ +arg_bytes`): reload each spilled temp into a **fresh vreg** via `IR3_LOAD`, update the vstack, then emit `IR3_ADJ +outer_bytes` to free the spill area. Promoted dummy slots are restored by re-reading the SSA variable (`readVariable`) into a fresh vreg rather than loading from memory.
-
-For indirect calls, the function pointer lives in ACCUM and must survive `flush_for_call_n`. It is saved to a fresh vreg before the flush and moved back to ACCUM immediately before `IR3_CALLR`.
-
-#### Forward-branch vsp fixup
-
-Same mechanism as the old `lift_to_ssa`: when a branch (`IR_J/JZ/JNZ`) is emitted, the current `vsp` is recorded in a table keyed by label id. When the target `IR_LABEL` is processed, `vsp` is restored from the table. This prevents scope-exit `adj` instructions from one branch arm from corrupting the sp model seen by the merge point.
-
----
-
-### Pass 1b: `ir3_optimize()` (`ir3_opt.c`)
-
-IR3-level optimizations gated on `opt_level >= 1`. Three passes run per function (delimited by `IR3_SYMLABEL` with `IR3_ENTER`), iterated up to 4 times until stable:
-
-1. **Copy propagation** — local (per BB). Tracks `copy_of[vreg]` chains for fresh vregs and a shadow `accum_copy` for ACCUM so that copies flowing through ACCUM (the dominant pattern from `braun_ssa`: `MOV ACCUM, v101; MOV v102, ACCUM` → `copy_of[v102] = v101`) propagate correctly. Replaces `rs1`/`rs2` with root sources, also propagates into `IR3_STORE`'s `rd` (which is a read, not a definition). Reset at BB boundaries; calls do not reset fresh-vreg maps (see `braun_ssa` call flushing). CALL/CALLR invalidate ACCUM tracking (return value overwrites r0).
-
-2. **Constant propagation and folding** — local (per BB). Tracks `cval[vreg]` for fresh vregs and `accum_cval` for ACCUM. Rewrites `MOV X ← Y` to `CONST X, val` when Y has a known constant. Folds `IR3_ALU` when both operands are constant (`ir3_fold`). Simplifies identity operations: `x+0 → MOV`, `x*0 → CONST 0`, `x*1 → MOV`, etc. Folds `IR3_ALU1` sign-extensions of known constants.
-
-3. **Dead code elimination** — per function (global use count). Two scans: count uses of each fresh vreg through `rs1`, `rs2`, and `IR3_STORE`'s `rd`; then kill instructions with `rd > 100`, `use_count == 0`, and side-effect-free ops. Dead ACCUM store elimination: if ACCUM is written by a side-effect-free op and the next instruction also writes ACCUM without reading it, the first write is dead.
-
-**`IR3_STORE` semantics note**: `IR3_STORE`'s `rd` field holds the base address register (a read, not a definition). All three passes treat it accordingly: copy prop propagates into it, const prop does not invalidate it, and DCE counts it as a use.
-
----
-
-### Pass 2: `irc_regalloc()` (`irc.c`)
-
-Iterated Register Coalescing allocator (Appel & George 1996). Runs per function (between `IR3_SYMLABEL` nodes). Rewrites `rd`/`rs1`/`rs2` in-place. Handles call-site spilling and coalescing of phi-generated moves — replaces both `call_spill_insert` and the old linear-scan allocator.
-
-**K = 7**: r1–r7 are allocatable; r0 is pre-colored for ACCUM. Main loop: Simplify → Coalesce → Freeze → SelectSpill, repeated until stable. AssignColors pops the select stack; actual spills trigger RewriteProgram and a fresh iteration.
-
-**Call interference**: at each `IR3_CALL`/`IR3_CALLR`, interference edges are added from every live vreg to the caller-saved registers r0–r3 only. r4–r7 are callee-saved — the callee preserves them — so they are not added to the interference set at call sites, allowing values in r4–r7 to survive calls without spilling.
-
-**Callee-save insertion**: after `alloc_function()` finishes and physical registers are known, `insert_callee_saves()` scans the function for uses of r4–r7. For each used callee-saved register it allocates a 4-byte slot below the final frame, inserts an `IR3_STORE` immediately after `IR3_ENTER` (save on entry) and an `IR3_LOAD` immediately before each `IR3_RET` (restore on exit), and expands the `IR3_ENTER` immediate accordingly. Existing bp-relative offsets that fall below the original frame boundary (call-arg stores and outer-temp spills in the `adjw` region) are shifted down by the expansion amount to avoid aliasing the new save slots. Leaf functions or functions that never use r4–r7 emit no save/restore code.
-
-**Move coalescing**: `IR3_MOV d ← s` nodes are recorded as candidates. George criterion (pre-colored target) and Briggs criterion (both virtual) control when merging is safe. Post-coloring MOVs where both operands received the same color are eliminated.
-
-**Spill rewriting**: each spilled vreg is replaced by fresh tmps at every def (+ STORE) and use (+ LOAD). The ENTER frame is expanded and all bp-relative offsets below the original boundary are shifted down to accommodate the new spill slots.
-
----
-
-### Pass 2b: `risc_backend_emit()` (`risc_backend.c`)
-
-Walks the post-regalloc `IR3Inst` list (all registers physical 0–7) and emits CPU4 assembly text.
-Zero-imm `IR3_ADJ` nodes and dead-phi `IR3_MOV` nodes (`rd == IR3_VREG_NONE`) are skipped.
-Nodes marked dead by the sign-extend peephole (`op < 0`) are also skipped.
-
-#### Instruction selection
-
-| IR3Op | Condition | CPU4 emission |
-|---|---|---|
-| `IR3_CONST` | sym==NULL, imm fits in 16 bits | `immw rd, imm` |
-| `IR3_CONST` | sym==NULL, imm > 0xffff | `immw rd, lo16; immwh rd, hi16` |
-| `IR3_CONST` | sym!=NULL | `immw rd, sym` |
-| `IR3_LEA` | — | `lea rd, imm` (F3c) |
-| `IR3_MOV` | rd != rs1 | `or rd, rs1, rs1` (F1a pseudo-mov) |
-| `IR3_LOAD` | rs1 == -2, in F2 range | `lw/lb/ll rd, [bp+imm7]` (F2, 2 bytes) |
-| `IR3_LOAD` | rs1 == -2, out of F2 range | `lea scratch, imm; llw/llb/lll rd, [scratch+0]` |
-| `IR3_LOAD` | rs1 >= 0 | `llw/llb/lll rd, [rs1+imm]` (F3b, 3 bytes) |
-| `IR3_STORE` | rd == -2, in F2 range | `sw/sb/sl rs1, [bp+imm7]` (F2, 2 bytes) |
-| `IR3_STORE` | rd == -2, out of F2 range | `lea scratch, imm; slw/slb/sll rs1, [scratch+0]` |
-| `IR3_STORE` | rd >= 0 | `slw/slb/sll rs1, [rd+imm]` (F3b, 3 bytes) |
-| `IR3_ALU` | most ops | `add/sub/mul/… rd, rs1, rs2` (F1a, 2 bytes) |
-| `IR3_ALU` | `le`/`ge`/`les`/`ges`/`fle`/`fge` | assembler pseudo-ops (operand swap, single insn) |
-| `IR3_ALU1` | `sxb`/`sxw` | `sxb/sxw rd` (F1b, 2 bytes; in-place) |
-| `IR3_ALU1` | `itof`/`ftoi` | `itof`/`ftoi` (F0; r0 implicit) |
-| `IR3_ENTER` | — | `enter N` (F3a) |
-| `IR3_ADJ` | imm != 0 | `adjw imm` (F3a) |
-| `IR3_RET` | — | `ret` (F0) |
-| `IR3_CALL` | — | `jl sym` (F3a) |
-| `IR3_CALLR` | — | `jlr` (F0; r0 holds target) |
-| `IR3_J/JZ/JNZ` | — | `j/jz/jnz _lN` (F3a) |
-| `IR3_LABEL` | — | `_lN:` |
-| `IR3_SYMLABEL` | — | `sym:` |
-| `IR3_WORD/BYTE/ALIGN` | — | `word`/`byte`/`align` directives |
-| `IR3_PUTCHAR` | — | `putchar` (F0) |
-
-#### F2 range checks
-
-F2 bp-relative instructions use a scaled 7-bit signed immediate:
-
-| Access size | Scale | F2 byte-offset range |
-|---|---|---|
-| byte (`lb`/`sb`) | ×1 | −64 … +63 bytes from bp |
-| word (`lw`/`sw`) | ×2 | −128 … +126 bytes from bp (even offsets) |
-| long (`ll`/`sl`) | ×4 | −256 … +252 bytes from bp (multiples of 4) |
-
-Outside F2 range: `lea rd, imm` (F3c, 3 bytes) + `llw/slw rd, [rd+0]` (F3b, 3 bytes) = 6 bytes.
-
-#### Annotation (`-ann`)
-
-`rb_emit_src_comment(line)` emits a `; source text` comment before the first instruction from each new source line, using the `ann_lines[]` index built by `set_ann_source()` in `smallcc.c`. Comments are suppressed at label nodes.

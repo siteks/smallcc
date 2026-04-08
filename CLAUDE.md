@@ -15,10 +15,13 @@ make clean          # Remove binaries and temp files
 Run the compiler directly:
 ```bash
 echo 'int main(){return 5+3;}' > t.c
-./smallcc t.c > out.s && ./sim_c out.s          # output to stdout
-./smallcc -o out.s t.c && ./sim_c out.s          # output to file
-./smallcc -o out.s file1.c file2.c && ./sim_c out.s  # multi-TU
-./smallcc -ann -O1 -o out.s t.c                  # annotated output with source comments
+./smallcc t.c > out.s && ./sim_c out.s                    # CPU3 (default)
+./smallcc -arch cpu4 -o out.s t.c && ./sim_c -arch cpu4 out.s  # CPU4 nanopass pipeline
+./smallcc -o out.s t.c && ./sim_c out.s                   # output to file
+./smallcc -o out.s file1.c file2.c && ./sim_c out.s       # multi-TU
+./smallcc -ann -O1 -o out.s t.c                           # annotated output with source comments
+./smallcc -arch cpu4 -ssa -o out.s t.c                    # dump Braun SSA IR to stderr
+DUMP_IR=1 ./smallcc -arch cpu4 -o out.s t.c               # dump post-OOS and post-IRC IR to stderr
 ```
 
 Tests use `sim_c` (the C simulator) to execute generated assembly and check the value left in register `r0`. On test failure, verbose output is written to `error.log`. The test harness is in `test.sh`; individual suites are in `tests/`.
@@ -64,7 +67,7 @@ For CPU3: same command without `-arch cpu4`, output to `coremark.s`, run with `.
 
 ## Compiler Architecture
 
-C89 subset compiler. Input is one or more `.c` files; assembly is written to stdout or a file specified with `-o`. Usage: `smallcc [-o outfile] [-stats] [-ann] [-O[N]] <source.c> [source2.c ...]`.
+C89 subset compiler. Input is one or more `.c` files; assembly is written to stdout or a file specified with `-o`. Usage: `smallcc [-o outfile] [-stats] [-ann] [-ssa] [-arch cpu3|cpu4] [-O[N]] <source.c> [source2.c ...]`.
 
 ### Compilation Pipeline
 
@@ -72,7 +75,7 @@ C89 subset compiler. Input is one or more `.c` files; assembly is written to std
 Startup [smallcc.c]:
   get_compiler_dir(argv[0])                 Locate compiler binary directory
   set_include_dir("$bindir/include")        Set header search path
-  scan_lib_files("$bindir/lib")             Collect lib/*.c — prepended before user files
+  collect_needed_libs()                     Collect required lib/*.c files
 
 Preamble (ssp / jl main / halt) emitted once before per-TU loop.
 
@@ -88,10 +91,23 @@ Per-TU loop [smallcc.c] (lib TUs first, then user TUs):
   insert_coercions()        [parser.c]      Insert casts and stride-scaling
   label_su()                [parser.c]      Sethi-Ullman labelling
   finalize_local_offsets()  [types.c]       Compute bp-relative offsets
-  gen_ir()                  [codegen.c]     Build IR instruction list
+
+  ── CPU3 path (default) ────────────────────────────────────────────────────────
+  gen_ir()                  [codegen.c]     Build stack IR instruction list
   mark_basic_blocks()       [codegen.c]     Insert BB sentinels
   peephole()                [optimise.c]    Constant fold, dead branch elim
-  backend_emit_asm()        [backend.c]     Emit assembly text
+  backend_emit_asm()        [backend.c]     Stack IR → CPU3 assembly
+
+  ── CPU4 path (-arch cpu4) — nanopass pipeline ─────────────────────────────────
+  lower_program()           [lower.c]       Node* → Sexp AST + TypeMap
+  emit_globals()            [emit.c]        Data section (globals, string literals)
+  per function:
+    braun_function()        [braun.c]       Sexp → SSA IR (Braun 2013)
+    compute_dominators()    [dom.c]         Dominator tree + loop depth
+    out_of_ssa()            [oos.c]         φ elimination (Boissinot 2009)
+    irc_allocate()          [alloc.c]       IRC register allocation (Appel & George)
+    emit_function()         [emit.c]        Physical-reg IR → CPU4 assembly
+
   harvest_globals()         [smallcc.c]     Carry globals to next TU
 ```
 
@@ -100,18 +116,22 @@ Per-TU loop [smallcc.c] (lib TUs first, then user TUs):
 | File | Role |
 |---|---|
 | `smallcc.h` | All shared structs, enums, and function prototypes |
-| `smallcc.c` | Entry point; flag parsing (`-o`, `-stats`); lib scanning; include-dir setup; per-TU loop; `harvest_globals` |
+| `smallcc.c` | Entry point; flag parsing; lib scanning; include-dir setup; per-TU loop; `harvest_globals`; CPU4 nanopass dispatch |
 | `preprocess.c` | Preprocessor — `#define`/`#undef`, `#ifdef`/`#ifndef`/`#else`/`#endif`, `#include "f"`/`#include <f>`; `set_include_dir()` |
 | `tokeniser.c` | Lexer — produces a `Token` linked list |
 | `parser.c` | Recursive-descent parser — builds AST; `resolve_symbols`, `derive_types`, `insert_coercions` |
 | `types.c` | Type table, symbol table, struct layout, `add_types_and_symbols`, `reset_types_state`, `insert_extern_sym` |
-| `codegen.c` | AST walk; builds flat IR instruction list (`gen_ir`); `reset_codegen`; static label mangling; `mark_basic_blocks` |
-| `optimise.c` | Peephole optimiser (`peephole`); rules 1–9; constant folding, dead branch elim, store/reload elim |
-| `backend.c` | IR → assembly emission (`backend_emit_asm`); `set_asm_out`; `-ann` annotation mode; retargeting point |
-| `braun.c` | Braun SSA construction — stack IR → `IR3Inst` with fresh vregs; phi placement; SSA promotion (leaf functions unconditionally, non-leaf with ≤8 promotable vars); phi forwarding table |
-| `irc.c` | Iterated Register Coalescing (Appel & George 1996) — graph-coloring allocator; vregs → physical r0–r7; r0–r3 caller-saved, r4–r7 callee-saved; coalesces phi-generated moves; call-site interference edges for r0–r3 only; `insert_callee_saves` adds prologue/epilogue save/restore for r4–r7; spill rewriting with frame expansion |
-| `ir3.c` / `ir3.h` | IR3 infrastructure — `IR3Inst`/`IR3Op` definitions; `build_cfg`; `ir3_new_vreg` |
-| `risc_backend.c` | CPU4 emitter — post-regalloc `IR3Inst` → CPU4 assembly; F2 bp-relative selection; all comparisons single-instruction (le/ge via assembler pseudo-ops) |
+| `codegen.c` | AST walk; builds flat stack IR list (`gen_ir`); `reset_codegen`; static label mangling; `mark_basic_blocks` — CPU3 path only |
+| `optimise.c` | Peephole optimiser (`peephole`); rules 1–9; constant folding, dead branch elim, store/reload elim — CPU3 path only |
+| `backend.c` | Stack IR → CPU3 assembly (`backend_emit_asm`); `set_asm_out`; `-ann` annotation mode — CPU3 path only |
+| `sx.h` / `sx.c` | Sexp AST: `Sx` cons-cell tree with `SX_PAIR/SX_SYM/SX_STR/SX_INT` kinds; constructors; printer; TypeMap (`uint32_t id → {ValType, CallDesc*}`) |
+| `lower.h` / `lower.c` | Lowering pass: Node* → Sexp AST + TypeMap; alpha-renaming; ++/-- handling; switch desugaring; static local vars; struct-return rewriting |
+| `ssa.h` / `ssa.c` | SSA IR types (`Value`, `Inst`, `Block`, `Function`); `InstKind` opcodes; constructors; IR printer (`print_function`) |
+| `braun.h` / `braun.c` | Braun SSA construction from Sexp AST; handles for/do/while/goto/label; call result landing+copy pattern |
+| `dom.h` / `dom.c` | Dominator tree (Cooper 2001); loop depth; `compute_dominators`; `dominates` query |
+| `oos.h` / `oos.c` | Out-of-SSA: Boissinot 2009 parallel-copy insertion; swap cycle detection |
+| `alloc.h` / `alloc.c` | Liveness analysis + IRC register allocation (Appel & George 1996); K=8; spill support |
+| `emit.h` / `emit.c` | CPU4 emission: `emit_globals` (data section) + `emit_function` (text section); F2 bp-rel selection; callee-save prologue/epilogue |
 | `sim_c.c` | Primary simulator — self-contained C assembler + CPU3/CPU4 executor; `make sim_c` |
 | `cpu3/cpu.py` | Python CPU3 definition: `ptable` (opcode/format map) + execution handler |
 | `cpu3/assembler.py` | Python two-pass assembler; reads `ptable` from `cpu.py` — no changes needed for new instructions |
@@ -143,7 +163,8 @@ Per-TU loop [smallcc.c] (lib TUs first, then user TUs):
 ## Detailed Reference
 
 - @docs/architecture.md — tokeniser, parser (grammar, AST nodes), type system, per-TU compilation
-- @docs/backend.md — IR, both backends (CPU3 stack, CPU4 SSA with IRC register allocation), peephole optimisations
+- @docs/backend.md — stack IR, CPU3 backend, CPU3 peephole optimisations
+- @docs/compiler-pipeline.md — CPU4 nanopass pipeline: lowering, Braun SSA, IRC, emission
 - @docs/isa/cpu3.md — CPU3 registers, instruction set, assembly syntax
 - @docs/isa/cpu4.md — CPU4 registers, instruction set, assembly syntax
 - @docs/c89-status.md — compliance tables, deliberate deviations, what's implemented/missing
