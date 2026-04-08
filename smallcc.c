@@ -1,10 +1,6 @@
 
 #include "smallcc.h"
-#include "ir3.h"
 #include <dirent.h>
-
-/* Target architecture: 3 = cpu3 (default), 4 = cpu4 */
-int g_target_arch = 3;
 #ifdef __APPLE__
 #  include <mach-o/dyld.h>
 #endif
@@ -34,25 +30,6 @@ char *arena_strdup(const char *s)
     memcpy(p, s, n);
     return p;
 }
-
-// Scratch arena — backend temporaries (IR3, SSA, CFG, IncPhi).
-// Reset per-TU before the RISC backend pipeline.
-#define SCRATCH_SIZE (4 * 1024 * 1024)
-static char scratch_storage[SCRATCH_SIZE];
-Arena scratch = { scratch_storage, 0, sizeof(scratch_storage) };
-
-void *scratch_alloc(size_t size)
-{
-    size = (size + 7) & ~(size_t)7;
-    if (scratch.used + size > scratch.cap)
-        error("scratch arena exhausted (used %zu, requested %zu)", scratch.used, size);
-    void *p = scratch.base + scratch.used;
-    scratch.used += size;
-    memset(p, 0, size);   // zero so stale data from a previous TU can't leak
-    return p;
-}
-
-void scratch_reset(void) { scratch.used = 0; }
 
 
 void error(const char *fmt, ...)
@@ -264,7 +241,6 @@ int main(int argc, char **argv)
     int opt_level = 0;
     const char *cmdline_defines[256];
     int num_defines = 0;
-    const char *ssa_dump_path = NULL;
 
     while (file_start < argc && argv[file_start][0] == '-')
     {
@@ -313,22 +289,6 @@ int main(int argc, char **argv)
             add_include_dir(dir);
             file_start++;
         }
-        else if (strcmp(argv[file_start], "-ssa") == 0 && file_start + 1 < argc)
-        {
-            ssa_dump_path = argv[file_start + 1];
-            file_start += 2;
-        }
-        else if (strcmp(argv[file_start], "-arch") == 0 && file_start + 1 < argc)
-        {
-            const char *a = argv[file_start + 1];
-            if (strcmp(a, "cpu4") == 0)      g_target_arch = 4;
-            else if (strcmp(a, "cpu3") == 0) g_target_arch = 3;
-            else {
-                fprintf(stderr, "smallcc: unknown arch: %s (use cpu3 or cpu4)\n", a);
-                return 1;
-            }
-            file_start += 2;
-        }
         else
         {
             fprintf(stderr, "smallcc: unknown option: %s\n", argv[file_start]);
@@ -338,17 +298,11 @@ int main(int argc, char **argv)
 
     if (argc <= file_start)
     {
-        fprintf(stderr, "Usage: smallcc [-o outfile] [-E] [-stats] [-ann] [-arch cpu3|cpu4] [-ssa file] [-DNAME[=VAL]] [-Idir] <source.c> [source2.c ...]\n");
+        fprintf(stderr, "Usage: smallcc [-o outfile] [-E] [-stats] [-ann] [-DNAME[=VAL]] [-Idir] <source.c> [source2.c ...]\n");
         return 1;
     }
 
     set_asm_out(out);
-
-    FILE *ssa_out = NULL;
-    if (ssa_dump_path) {
-        ssa_out = fopen(ssa_dump_path, "w");
-        if (!ssa_out) { perror(ssa_dump_path); return 1; }
-    }
 
     // Determine compiler binary directory for include/ and lib/ resolution
     char compiler_dir[4096];
@@ -376,9 +330,9 @@ int main(int argc, char **argv)
     for (int i = 0; i < user_count; i++) all_files[lib_count + i] = argv[file_start + i];
 
     if (!preprocess_only) {
-        // Preamble: emit arch-specific crt0 if present, then plain crt0.s, else built-in default
+        // Preamble: emit crt0.s if present, else built-in default
         char crt0_path[4096];
-        snprintf(crt0_path, sizeof(crt0_path), "%s/lib/crt0_cpu%d.s", compiler_dir, g_target_arch);
+        snprintf(crt0_path, sizeof(crt0_path), "%s/lib/crt0.s", compiler_dir);
         FILE *crt0 = fopen(crt0_path, "r");
         if (!crt0) {
             snprintf(crt0_path, sizeof(crt0_path), "%s/lib/crt0.s", compiler_dir);
@@ -475,19 +429,7 @@ int main(int argc, char **argv)
         gen_ir(node, tu);
         mark_basic_blocks();
         peephole(opt_level);
-        if (g_target_arch == 4) {
-            scratch_reset();
-            ir3_reset();
-            int n_blocks;
-            BB *blocks = build_cfg(codegen_ctx.ir_head, &n_blocks);
-            IR3Inst *ir3 = braun_ssa(blocks, n_blocks, codegen_ctx.ir_head);
-            ir3_optimize(ir3, opt_level);
-            if (ssa_out) ir3_dump(ir3, ssa_out);
-            irc_regalloc(ir3);
-            risc_backend_emit(ir3);
-        } else {
-            backend_emit_asm(codegen_ctx.ir_head);
-        }
+        backend_emit_asm(codegen_ctx.ir_head);
         harvest_globals();
 
         if (show_stats)
@@ -504,7 +446,6 @@ int main(int argc, char **argv)
                 100.0 * (double)arena.used / (double)arena.cap);
 
     if (out != stdout) fclose(out);
-    if (ssa_out) fclose(ssa_out);
     return 0;
 }
 

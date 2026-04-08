@@ -1055,10 +1055,6 @@ static Symbol *insert_local_ident(Symbol_table *st, Type *type, const char *iden
         if (type->base == TB_STRUCT)    slot_size = WORD_SIZE;
         else if (type->size >= 4)       slot_size = type->size;
         else                            slot_size = WORD_SIZE;
-        // CPU4: 4-byte params must be at 4-byte aligned offsets to match flush_for_call_n layout.
-        // Align param_offset BEFORE creating the symbol so the symbol gets the right offset.
-        if (g_target_arch == 4 && slot_size == 4 && (st->param_offset & 3))
-            st->param_offset = (st->param_offset + 3) & ~3;
         n        = new_symbol(type, ident, st->param_offset);
         n->kind  = SYM_PARAM;
         st->param_offset += slot_size;
@@ -1119,9 +1115,8 @@ void finalize_local_offsets(void)
 // is recognised.
 void shift_param_offsets_for_struct_ret(Symbol_table *param_scope)
 {
-    // Hidden retbuf pointer occupies one slot before the declared params.
-    // CPU4: pointer is 2 bytes but slot is 4 bytes (keeps stack 4-byte aligned).
-    int hidden_slot = (g_target_arch == 4) ? 4 : WORD_SIZE;
+    // Hidden retbuf pointer occupies one WORD_SIZE slot before the declared params.
+    int hidden_slot = WORD_SIZE;
     for (Symbol *s = param_scope->symbols; s; s = s->next)
     {
         if (s->ns == NS_IDENT && s->kind == SYM_PARAM)

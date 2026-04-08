@@ -14,15 +14,10 @@ void src_error(int line, int col, const char *fmt, ...) __attribute__((noreturn)
 // ===============================================================
 // Arena Allocator
 // ===============================================================
-// Two bump-pointer arenas:
+// One bump-pointer arena:
 //
 //   arena   — permanent allocations (Types, Symbols, Nodes, IRInst).
 //             Pre-zeroed BSS; never reset.
-//
-//   scratch — backend temporaries (IR3Inst, SSAInst, BB, IncPhi).
-//             scratch_alloc() zeroes its result (safe calloc replacement).
-//             scratch_reset() resets the arena per-TU before the RISC
-//             backend pipeline runs.
 typedef struct
 {
     char   *base;
@@ -32,10 +27,6 @@ typedef struct
 extern Arena arena;
 void  *arena_alloc(size_t size);
 char  *arena_strdup(const char *s);
-
-extern Arena scratch;
-void  *scratch_alloc(size_t size);
-void   scratch_reset(void);
 
 // Target architecture constants
 #define WORD_SIZE      2   // size of int and pointer (16-bit target)
@@ -653,8 +644,6 @@ extern CodegenContext codegen_ctx;
 // ---------------------------------------------------------------
 // Target architecture
 // ---------------------------------------------------------------
-// g_target_arch: 3 = cpu3 (default stack machine), 4 = cpu4 (RISC)
-extern int g_target_arch;
 
 // ---------------------------------------------------------------
 // Backend (IR → assembly)

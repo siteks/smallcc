@@ -1,13 +1,5 @@
 
 #include "smallcc.h"
-#include "ir3.h"
-
-/* Sentinel sym pointer for promotable-variable IR_LEA instructions.
- * braun_ssa() identifies promotable LEAs by pointer identity:
- *   p->sym == ir_promote_sentinel  → promotable scalar local / param
- *   p->sym == NULL                 → structural LEA (array fill, copy buffer)
- *   p->sym = other non-NULL ptr    → address-taken or aggregate variable */
-const char ir_promote_sentinel[] = "";
 
 // Codegen context instance
 CodegenContext codegen_ctx;
@@ -326,14 +318,7 @@ void gen_varaddr_from_ident(Node *node, const char *name)
     else
     {
         Symbol *sym = find_symbol_st(node->st, name, NS_IDENT);
-        /* A scalar local/param is promotable if its address never escapes.
-         * Aggregates and function types are never promoted. */
-        bool scalar = sym &&
-                      !istype_array(sym->type) &&
-                      sym->type->base != TB_STRUCT &&
-                      sym->type->base != TB_FUNCTION;
-        bool promote = scalar && sym && !sym->address_taken;
-        const char *lea_sym = promote ? ir_promote_sentinel : name;
+        const char *lea_sym = name;
 
         if (la.is_param)
         {
@@ -406,8 +391,6 @@ static int push_args_list(Node *first_arg, Param *params, bool is_variadic)
         if (arg->type && arg->type->base == TB_STRUCT)
         {
             int sz = arg->type->size;
-            // CPU4: align copy buffer size to 4 bytes to maintain stack alignment
-            if (g_target_arch == 4 && (sz & 3)) sz = (sz + 4) & ~3;
             copybuf_leas[i] = -(codegen_ctx.adj_depth + sz);
             ir_append(IR_ADJ, -sz, NULL);
             codegen_ctx.adj_depth += sz;
@@ -603,7 +586,6 @@ void gen_callfunction_via_ptr(Node *node)
     if (struct_ret)
     {
         int sz = ret_type->size;
-        if (g_target_arch == 4 && (sz & 3)) sz = (sz + 4) & ~3;
         retbuf_bp_off = -(codegen_ctx.adj_depth + sz);
         codegen_ctx.adj_depth += sz;
         ir_append(IR_ADJ, -sz, NULL);
@@ -613,8 +595,7 @@ void gen_callfunction_via_ptr(Node *node)
     if (struct_ret)
     {
         ir_append(IR_LEA, retbuf_bp_off, NULL);
-        if (g_target_arch == 4) { ir_append(IR_PUSH,  0, NULL); param_size += 4; }
-        else                    { ir_append(IR_PUSHW, 0, NULL); param_size += WORD_SIZE; }
+        ir_append(IR_PUSHW, 0, NULL); param_size += WORD_SIZE;
     }
     gen_varaddr(node);
     gen_ld(node->symbol->type->size);
@@ -643,7 +624,6 @@ void gen_callfunction_via_deref(Node *node)
     if (struct_ret)
     {
         int sz = ret_type->size;
-        if (g_target_arch == 4 && (sz & 3)) sz = (sz + 4) & ~3;
         retbuf_bp_off = -(codegen_ctx.adj_depth + sz);
         codegen_ctx.adj_depth += sz;
         ir_append(IR_ADJ, -sz, NULL);
@@ -655,8 +635,7 @@ void gen_callfunction_via_deref(Node *node)
     if (struct_ret)
     {
         ir_append(IR_LEA, retbuf_bp_off, NULL);
-        if (g_target_arch == 4) { ir_append(IR_PUSH,  0, NULL); param_size += 4; }
-        else                    { ir_append(IR_PUSHW, 0, NULL); param_size += WORD_SIZE; }
+        ir_append(IR_PUSHW, 0, NULL); param_size += WORD_SIZE;
     }
     gen_expr(node->ch[0]);                           // operand: function pointer value or address
     // For (*fp)(args): gen_expr(ND_IDENT "fp") already loads the 2-byte fp value.
@@ -696,7 +675,6 @@ void gen_callfunction(Node *node)
     {
         // Allocate retbuf on the caller's stack frame.
         int sz = ret_type->size;
-        if (g_target_arch == 4 && (sz & 3)) sz = (sz + 4) & ~3;
         retbuf_bp_off = -(codegen_ctx.adj_depth + sz);
         codegen_ctx.adj_depth += sz;
         ir_append(IR_ADJ, -sz, NULL);
@@ -708,10 +686,8 @@ void gen_callfunction(Node *node)
     {
         // Push hidden retbuf pointer as the implicit first argument (pushed last,
         // so it occupies bp+FRAME_OVERHEAD in the callee's frame).
-        // CPU4: use a 4-byte slot to keep the stack 4-byte aligned.
         ir_append(IR_LEA, retbuf_bp_off, NULL);
-        if (g_target_arch == 4) { ir_append(IR_PUSH,  0, NULL); param_size += 4; }
-        else                    { ir_append(IR_PUSHW, 0, NULL); param_size += WORD_SIZE; }
+        ir_append(IR_PUSHW, 0, NULL); param_size += WORD_SIZE;
     }
     if (node->symbol->kind == SYM_STATIC_GLOBAL)
     {
@@ -1111,55 +1087,30 @@ void gen_expr(Node *node)
         {
             int adj_before = codegen_ctx.adj_depth;
             int src_slot, dst_slot;
-            if (g_target_arch != 4)
-            {
-                // CPU3: evaluate rhs FIRST so any retbuf lands below our pointer slots,
-                // avoiding overlap with a pre-call push.
-                gen_expr(rhs);    // r0 = addr of source struct; adj_depth may grow
+            // Evaluate rhs FIRST so any retbuf lands below our pointer slots,
+            // avoiding overlap with a pre-call push.
+            gen_expr(rhs);    // r0 = addr of source struct; adj_depth may grow
 
-                // Save src_addr with an untracked 4-byte push.  After adj -8 it will
-                // sit exactly at src_slot.
-                ir_append(IR_PUSH, 0, NULL);  // sp -= 4; mem32[sp] = src_addr
+            // Save src_addr with an untracked 4-byte push.  After adj -8 it will
+            // sit exactly at src_slot.
+            ir_append(IR_PUSH, 0, NULL);  // sp -= 4; mem32[sp] = src_addr
 
-                ir_append(IR_ADJ, -8, NULL);
-                codegen_ctx.adj_depth += 8;
-                src_slot = -(codegen_ctx.adj_depth - 4);  // aligns with the push
-                dst_slot = -(codegen_ctx.adj_depth);
+            ir_append(IR_ADJ, -8, NULL);
+            codegen_ctx.adj_depth += 8;
+            src_slot = -(codegen_ctx.adj_depth - 4);  // aligns with the push
+            dst_slot = -(codegen_ctx.adj_depth);
 
-                ir_append(IR_LEA, dst_slot, NULL);
-                ir_append(IR_PUSH, 0, NULL);
-                gen_addr(lhs);
-                ir_append(IR_SW, 0, NULL);
+            ir_append(IR_LEA, dst_slot, NULL);
+            ir_append(IR_PUSH, 0, NULL);
+            gen_addr(lhs);
+            ir_append(IR_SW, 0, NULL);
 
-                gen_struct_copy(src_slot, dst_slot, lhs->type);
-                ir_append(IR_ADJ, 8, NULL);
-                codegen_ctx.adj_depth -= 8;
+            gen_struct_copy(src_slot, dst_slot, lhs->type);
+            ir_append(IR_ADJ, 8, NULL);
+            codegen_ctx.adj_depth -= 8;
 
-                // Reclaim the untracked 4-byte push
-                ir_append(IR_ADJ, 4, NULL);
-            }
-            else
-            {
-                // CPU4: IR_PUSH is virtual; use original lea/push/gen_expr/sw ordering.
-                ir_append(IR_ADJ, -8, NULL);
-                codegen_ctx.adj_depth += 8;
-                src_slot = -(codegen_ctx.adj_depth - 4);
-                dst_slot = -(codegen_ctx.adj_depth);
-
-                ir_append(IR_LEA, src_slot, NULL);
-                ir_append(IR_PUSH, 0, NULL);
-                gen_expr(rhs);
-                ir_append(IR_SW, 0, NULL);
-
-                ir_append(IR_LEA, dst_slot, NULL);
-                ir_append(IR_PUSH, 0, NULL);
-                gen_addr(lhs);
-                ir_append(IR_SW, 0, NULL);
-
-                gen_struct_copy(src_slot, dst_slot, lhs->type);
-                ir_append(IR_ADJ, 8, NULL);
-                codegen_ctx.adj_depth -= 8;
-            }
+            // Reclaim the untracked 4-byte push
+            ir_append(IR_ADJ, 4, NULL);
 
             // Free any retbuf allocated by gen_expr(rhs)
             int retbuf_sz = codegen_ctx.adj_depth - adj_before;
@@ -1224,7 +1175,6 @@ void gen_expr(Node *node)
         int retbuf_bp_off = 0;
         if (struct_ret) {
             int sz = ret_type->size;
-            if (g_target_arch == 4 && (sz & 3)) sz = (sz + 4) & ~3;
             retbuf_bp_off = -(codegen_ctx.adj_depth + sz);
             codegen_ctx.adj_depth += sz;
             ir_append(IR_ADJ, -sz, NULL);
@@ -1235,8 +1185,7 @@ void gen_expr(Node *node)
         int param_size = push_args_list(node->ch[1], params, variadic);
         if (struct_ret) {
             ir_append(IR_LEA, retbuf_bp_off, NULL);
-            if (g_target_arch == 4) { ir_append(IR_PUSH,  0, NULL); param_size += 4; }
-            else                    { ir_append(IR_PUSHW, 0, NULL); param_size += WORD_SIZE; }
+            ir_append(IR_PUSHW, 0, NULL); param_size += WORD_SIZE;
         }
         gen_addr(node);
         gen_ld(WORD_SIZE);  // load function pointer (pointer-sized)
@@ -1285,9 +1234,6 @@ void gen_expr(Node *node)
         else if (last_sym->type->size >= 4)       slot_size = last_sym->type->size;
         else                                       slot_size = WORD_SIZE;
         int first_vararg_off = last_sym->offset + slot_size;
-        // On CPU4, variadic args always use 4-byte slots, so the first one must be 4-aligned
-        if (g_target_arch == 4 && (first_vararg_off & 3))
-            first_vararg_off = (first_vararg_off + 3) & ~3;
         gen_addr(ap_node);                       // r0 = &ap
         ir_append(IR_PUSH,  0, NULL);            // stack: [&ap]
         ir_append(IR_LEA, first_vararg_off, NULL); // r0 = bp + first_vararg_offset
@@ -1424,9 +1370,7 @@ void gen_forstmt(Node *node)
     Node *inc  = node->ch[2];
     Node *body = node->ch[3];
     // If the init was a declaration, node->symtable holds the for-init scope.
-    // CPU4: round up to multiple of 4 to keep sp 4-byte aligned.
     int for_init_sz = node->symtable ? node->symtable->size : 0;
-    if (g_target_arch == 4 && (for_init_sz & 3)) for_init_sz = (for_init_sz + 4) & ~3;
     if (node->symtable)
     {
         codegen_ctx.adj_depth += for_init_sz;
@@ -1991,54 +1935,25 @@ void gen_decl(Node *node)
                     // Struct initializer from expression (e.g. struct P p = make(3, 7))
                     int adj_before = codegen_ctx.adj_depth;
                     int src_slot, dst_slot;
-                    if (g_target_arch != 4)
-                    {
-                        // CPU3: evaluate init FIRST so the retbuf (allocated inside
-                        // gen_callfunction via adj) lands below our pointer slots and does
-                        // not overlap with the pre-call push of &src_slot.
-                        // A 4-byte PUSH then saves src_addr at exactly src_slot because
-                        // after adj -8: src_slot = -(new_adj_depth - 4) = sp.
-                        gen_expr(init);    // r0 = src_addr; adj_depth may grow
-                        ir_append(IR_PUSH, 0, NULL);  // sp -= 4; mem32[sp] = src_addr
-                        ir_append(IR_ADJ, -8, NULL);
-                        codegen_ctx.adj_depth += 8;
-                        src_slot = -(codegen_ctx.adj_depth - 4);  // aligns with the push
-                        dst_slot = -(codegen_ctx.adj_depth);
+                    // Evaluate init FIRST so the retbuf (allocated inside
+                    // gen_callfunction via adj) lands below our pointer slots and does
+                    // not overlap with the pre-call push of &src_slot.
+                    gen_expr(init);    // r0 = src_addr; adj_depth may grow
+                    ir_append(IR_PUSH, 0, NULL);  // sp -= 4; mem32[sp] = src_addr
+                    ir_append(IR_ADJ, -8, NULL);
+                    codegen_ctx.adj_depth += 8;
+                    src_slot = -(codegen_ctx.adj_depth - 4);  // aligns with the push
+                    dst_slot = -(codegen_ctx.adj_depth);
 
-                        ir_append(IR_LEA, dst_slot, NULL);
-                        ir_append(IR_PUSH, 0, NULL);
-                        gen_varaddr_from_ident(n, n->symbol->name);
-                        ir_append(IR_SW, 0, NULL);
+                    ir_append(IR_LEA, dst_slot, NULL);
+                    ir_append(IR_PUSH, 0, NULL);
+                    gen_varaddr_from_ident(n, n->symbol->name);
+                    ir_append(IR_SW, 0, NULL);
 
-                        gen_struct_copy(src_slot, dst_slot, n->symbol->type);
-                        ir_append(IR_ADJ, 8, NULL);
-                        codegen_ctx.adj_depth -= 8;
-                        ir_append(IR_ADJ, 4, NULL);  // reclaim untracked push
-                    }
-                    else
-                    {
-                        // CPU4: IR_PUSH is virtual (braun.c virtual stack), so the pre-call
-                        // push of &src_slot does not write to memory; no overlap with the
-                        // retbuf.  Use the original lea/push/gen_expr/sw ordering.
-                        ir_append(IR_ADJ, -8, NULL);
-                        codegen_ctx.adj_depth += 8;
-                        src_slot = -(codegen_ctx.adj_depth - 4);
-                        dst_slot = -(codegen_ctx.adj_depth);
-
-                        ir_append(IR_LEA, src_slot, NULL);
-                        ir_append(IR_PUSH, 0, NULL);
-                        gen_expr(init);
-                        ir_append(IR_SW, 0, NULL);
-
-                        ir_append(IR_LEA, dst_slot, NULL);
-                        ir_append(IR_PUSH, 0, NULL);
-                        gen_varaddr_from_ident(n, n->symbol->name);
-                        ir_append(IR_SW, 0, NULL);
-
-                        gen_struct_copy(src_slot, dst_slot, n->symbol->type);
-                        ir_append(IR_ADJ, 8, NULL);
-                        codegen_ctx.adj_depth -= 8;
-                    }
+                    gen_struct_copy(src_slot, dst_slot, n->symbol->type);
+                    ir_append(IR_ADJ, 8, NULL);
+                    codegen_ctx.adj_depth -= 8;
+                    ir_append(IR_ADJ, 4, NULL);  // reclaim untracked push
 
                     // Free any retbuf allocated by gen_expr(init)
                     int retbuf_sz = codegen_ctx.adj_depth - adj_before;
@@ -2120,10 +2035,7 @@ void gen_decl(Node *node)
 void gen_compstmt(Node *node)
 {
     // Make space on stack for this scope's locals.
-    // CPU4: round up to multiple of 4 so sp stays 4-byte aligned (enter instruction
-    // does 4-byte writes at sp-4 and sp-8; misaligned sp causes bus error).
     int sz = node->symtable->size;
-    if (g_target_arch == 4 && (sz & 3)) sz = (sz + 4) & ~3;
     codegen_ctx.adj_depth += sz;
     ir_append(IR_ADJ, -sz, NULL);
     for (Node *n = node->ch[0]; n; n = n->next)   // stmts list
@@ -2186,9 +2098,7 @@ void gen_switchstmt(Node *node)
     codegen_ctx.cont_labels[codegen_ctx.loop_depth]  = -1;
     codegen_ctx.loop_adj[codegen_ctx.loop_depth]     = codegen_ctx.adj_depth;
     codegen_ctx.loop_depth++;
-    // CPU4: round up to multiple of 4 to keep sp 4-byte aligned.
     int sw_sz = body->symtable->size;
-    if (g_target_arch == 4 && (sw_sz & 3)) sw_sz = (sw_sz + 4) & ~3;
     codegen_ctx.adj_depth += sw_sz;
     ir_append(IR_ADJ, -sw_sz, NULL);
     for (Node *ch = body->ch[0]; ch; ch = ch->next)   // stmts list

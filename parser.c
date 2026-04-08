@@ -951,9 +951,6 @@ static Node *param_type_list()
             {
                 expect(TK_ELLIPSIS);
                 node->u.ptype_list.is_variadic = true;
-                // CPU4: align param_offset to 4 bytes so variadic args start aligned
-                if (g_target_arch == 4 && (node->symtable->param_offset & 3))
-                    node->symtable->param_offset = (node->symtable->param_offset + 4) & ~3;
                 break;
             }
         }
