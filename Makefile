@@ -1,7 +1,11 @@
 
 CFLAGS=-std=c11 -g
 
-smallcc: smallcc.c tokeniser.c parser.c types.c codegen.c backend.c preprocess.c optimise.c
+SRCS_COMMON = smallcc.c tokeniser.c parser.c types.c preprocess.c
+SRCS_CPU3   = codegen.c backend.c optimise.c
+SRCS_NEW    = sx.c lower.c ssa.c braun.c dom.c oos.c alloc.c emit.c
+
+smallcc: $(SRCS_COMMON) $(SRCS_CPU3) $(SRCS_NEW)
 sim_c: sim_c.c
 	$(CC) $(CFLAGS) -o sim_c sim_c.c -lm
 

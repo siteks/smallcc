@@ -1,5 +1,12 @@
 
 #include "smallcc.h"
+#include "sx.h"
+#include "lower.h"
+#include "braun.h"
+#include "dom.h"
+#include "oos.h"
+#include "alloc.h"
+#include "emit.h"
 #include <dirent.h>
 #ifdef __APPLE__
 #  include <mach-o/dyld.h>
@@ -239,6 +246,7 @@ int main(int argc, char **argv)
     bool show_stats = false;
     bool preprocess_only = false;
     int opt_level = 0;
+    int target_cpu4 = 0;  // 0 = CPU3, 1 = CPU4 (new nanopass pipeline)
     const char *cmdline_defines[256];
     int num_defines = 0;
 
@@ -288,6 +296,14 @@ int main(int argc, char **argv)
             }
             add_include_dir(dir);
             file_start++;
+        }
+        else if (strcmp(argv[file_start], "-arch") == 0 && file_start + 1 < argc)
+        {
+            const char *arch = argv[file_start + 1];
+            if (strcmp(arch, "cpu4") == 0) target_cpu4 = 1;
+            else if (strcmp(arch, "cpu3") == 0) target_cpu4 = 0;
+            else { fprintf(stderr, "smallcc: unknown arch: %s\n", arch); return 1; }
+            file_start += 2;
         }
         else
         {
@@ -343,6 +359,12 @@ int main(int argc, char **argv)
             while (fgets(buf, sizeof(buf), crt0))
                 fputs(buf, out);
             fclose(crt0);
+        } else if (target_cpu4) {
+            fprintf(out, ".text=0\n");
+            fprintf(out, "    ssp     0x1000\n");
+            fprintf(out, "    jl      main\n");
+            fprintf(out, "    halt\n");
+            fprintf(out, ".data=0x4000\n");
         } else {
             fprintf(out, ".text=0\n");
             fprintf(out, "    ssp     0x8000\n");
@@ -354,6 +376,7 @@ int main(int argc, char **argv)
             fprintf(stderr, "%-4s  %-10s  %8s  %8s\n", "TU", "file", "arena_before", "arena_used");
     }
 
+    int cpu4_strlit_id = 0;  // monotonically increasing string literal ID across TUs
     for (int tu = 0; tu < tu_count; tu++)
     {
         size_t arena_before = arena.used;
@@ -424,12 +447,40 @@ int main(int argc, char **argv)
         print_type_table();
 #endif
 
-        if (flag_annotate)
-            set_ann_source(source);
-        gen_ir(node, tu);
-        mark_basic_blocks();
-        peephole(opt_level);
-        backend_emit_asm(codegen_ctx.ir_head);
+        if (target_cpu4) {
+            // New nanopass pipeline: Node* → Sexp → SSA → IRC → CPU4
+            TypeMap *tm = typemap_new();
+            Sx *sx_prog = lower_program(node, tm, tu, &cpu4_strlit_id);
+            // Emit data section (globals and string literals)
+            emit_globals(sx_prog, out);
+            // Compile each function
+            Sx *items = sx_prog ? sx_prog->cdr : NULL;
+            while (items && items->kind == SX_PAIR) {
+                Sx *item = items->car;
+                if (item && item->kind == SX_PAIR &&
+                    item->car && item->car->kind == SX_SYM &&
+                    strcmp(item->car->s, "func") == 0) {
+                    Function *f = braun_function(item, tm);
+                    if (f) {
+                        compute_dominators(f);
+                        out_of_ssa(f);
+                        if (getenv("DUMP_IR")) { fprintf(stderr, "=== after oos ===\n"); print_function(f, stderr); }
+                        irc_allocate(f);
+                        if (getenv("DUMP_IR")) { fprintf(stderr, "=== after irc ===\n"); print_function(f, stderr); }
+                        emit_function(f, out);
+                    }
+                }
+                items = items->cdr;
+            }
+            typemap_free(tm);
+        } else {
+            if (flag_annotate)
+                set_ann_source(source);
+            gen_ir(node, tu);
+            mark_basic_blocks();
+            peephole(opt_level);
+            backend_emit_asm(codegen_ctx.ir_head);
+        }
         harvest_globals();
 
         if (show_stats)

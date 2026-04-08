@@ -1062,8 +1062,8 @@ static Symbol *insert_local_ident(Symbol_table *st, Type *type, const char *iden
     else
     {
         int old_off = st->local_offset;
-        if (type->align == 4)
-            st->local_offset = do_align(st->local_offset, 4);
+        if (type->align >= 2)
+            st->local_offset = do_align(st->local_offset, type->align);
         st->local_offset += type->size;
         n        = new_symbol(type, ident, st->local_offset);
         n->kind  = SYM_LOCAL;
