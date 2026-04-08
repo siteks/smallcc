@@ -98,7 +98,6 @@ extern const char ir_promote_sentinel[];
 /* Global fresh-vreg counter (reset per TU by ir3_reset()). */
 int  ir3_new_vreg(void);
 void ir3_reset(void);
-void ir3_bump_vreg(int min_next); /* ensure next_vreg >= min_next */
 
 /* Build CFG from a stack-IR list.  Returns NULL and sets *n_blocks=0
  * for this implementation (blocks are created internally by braun_ssa). */
@@ -109,23 +108,6 @@ void free_cfg(BB *blocks, int n_blocks);
  * braun_ssa consumes the stack-IR list and produces an IR3Inst list.
  * blocks / n_blocks may be NULL / 0 — they are ignored in this version. */
 IR3Inst *braun_ssa(BB *blocks, int n_blocks, IRInst *ir_head);
-
-/* Per-function incremental API (use instead of braun_ssa for large TUs):
- *
- * braun_emit_data: emit pass-through IR3 for data/preamble nodes from *pp
- *   until the next function SYMLABEL (or end).  Advances *pp.
- *   Returns the IR3 head (NULL if no nodes).
- *
- * braun_emit_function: process the function starting at the function
- *   SYMLABEL *pp points to.  Caller must scratch_reset() beforehand.
- *   Advances *pp to the next SYMLABEL (or NULL).
- *   Returns the IR3 head for the function. */
-IR3Inst *braun_emit_data(IRInst **pp);
-IR3Inst *braun_emit_function(IRInst **pp);
-/* braun_decon_phis: run phi deconstruction for the last function processed
- * by braun_emit_function().  Must be called after ir3_optimize() and before
- * irc_regalloc().  cur_blocks remains valid in the scratch arena. */
-void braun_decon_phis(void);
 
 /* IR3-level optimizations: copy prop, constant prop/fold, DCE.
  * Runs after braun_ssa() and before irc_regalloc().

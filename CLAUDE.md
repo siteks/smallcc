@@ -25,11 +25,11 @@ Tests use `sim_c` (the C simulator) to execute generated assembly and check the 
 
 ### Simulators
 
-`sim_c` (`sim_c.c`) is the primary simulator — a self-contained C program that assembles and executes CPU3 and CPU4 assembly. Build with `make sim_c`. It is faster than the Python simulator and is what the test harness and `make test_all` use.
+`sim_c` (`sim_c.c`) is the primary simulator — a self-contained C program that assembles and executes CPU3 assembly. Build with `make sim_c`. It is faster than the Python simulator and is what the test harness and `make test_all` use.
 
 **`sim_c` usage:**
 ```
-./sim_c [-arch cpu3|cpu4] [-v] [-profile] file.s
+./sim_c [-v] file.s
 ```
 
 **`sim_c` debug facilities:**
@@ -42,21 +42,21 @@ Tests use `sim_c` (the C simulator) to execute generated assembly and check the 
 | Crash trace | On unknown opcode, dumps the last 32 executed instructions (pc, opcode, r0, sp, bp) to help locate the crash |
 | MMIO cycle counter | A 32-bit read-only cycle counter at address `0xFF00` incremented once per instruction; used by `core_portme.c` for timing |
 
-`cpu3/sim.py` and `cpu4/sim.py` (Python) are kept as a reference implementation and to support any legacy uses. They import `cpu*/cpu.py` (instruction definitions, execution) and `cpu*/assembler.py` (two-pass assembler). The assembler picks up new instructions automatically from `cpu.py`'s `ptable`, so `cpu*/assembler.py` rarely needs changes.
+`cpu3/sim.py` (Python) is kept as a reference implementation and to support any legacy uses. It imports `cpu3/cpu.py` (instruction definitions, execution) and `cpu3/assembler.py` (two-pass assembler). The assembler picks up new instructions automatically from `cpu.py`'s `ptable`, so `cpu3/assembler.py` rarely needs changes.
 
 ### CoreMark Benchmark
 
-CoreMark lives in `../coremark_single_file` (relative to this repo). To rebuild `coremark4.s` (CPU4):
+CoreMark lives in `../coremark` (relative to this repo). To rebuild `coremark4.s` (CPU4):
 
 ```bash
-cd ../coremark_single_file
-../smallcc/smallcc -arch cpu4 -ann \
-  -ssa cm4.s \
+cd ../coremark
+../smallcc/smallcc -Icpu3 -I. -arch cpu4 -ann \
+  -DFLAGS_STR=\""-O2 -DPERFORMANCE_RUN=1  "\" \
+  -DITERATIONS=8 -DPERFORMANCE_RUN=1 -O2 \
   -o ./coremark4.s \
-  coremark_single.c
-../smallcc/sim_c -arch cpu4 coremark4.s
+  core_list_join.c core_main.c core_matrix.c core_state.c core_util.c cpu3/core_portme.c
+python3 ../smallcc/cpu4/sim.py coremark4.s
 ```
-The `-ssa` flag outputs the SSA form.
 
 For CPU3: same command without `-arch cpu4`, output to `coremark.s`, run with `../smallcc/sim_c coremark.s`.
 
@@ -116,15 +116,11 @@ Per-TU loop [smallcc.c] (lib TUs first, then user TUs):
 | `cpu3/cpu.py` | Python CPU3 definition: `ptable` (opcode/format map) + execution handler |
 | `cpu3/assembler.py` | Python two-pass assembler; reads `ptable` from `cpu.py` — no changes needed for new instructions |
 | `cpu3/sim.py` | Python simulator (reference / legacy); imports `cpu.py` and `assembler.py` |
-| `cpu4/cpu.py` | Python CPU4 definition: `ptable` (opcode/format map) + execution handler |
-| `cpu4/assembler.py` | Python two-pass assembler; reads `ptable` from `cpu.py` — no changes needed for new instructions |
-| `cpu4/sim.py` | Python simulator (reference / legacy); imports `cpu.py` and `assembler.py` |
 | `lib/stdio.c` | `printf` (`%d %s %c %%`), `puts` — compiled as TU 0 automatically |
 | `lib/stdlib.c` | `abs` — compiled as TU 1 automatically |
 | `lib/string.c` | `strlen`, `strcmp`, `strcpy`, `strcat` — compiled as TU 2 automatically |
 | `lib/math.c` | `modf` — compiled as TU 3 automatically |
-| `lib/crt0_cpu3.s` | Optional C runtime startup for CPU3|
-| `lib/crt0_cpu4.s` | Optional C runtime startup for CPU4|
+| `lib/crt0.s` | Optional C runtime startup (not auto-compiled; available for manual use) |
 | `include/stdio.h` | Declarations for `putchar`, `puts`, `printf` |
 | `include/stdlib.h` | Declaration for `abs`; `#define NULL 0` |
 | `include/string.h` | Declarations for `strlen`, `strcmp`, `strcpy`, `strcat` |
@@ -139,7 +135,7 @@ Per-TU loop [smallcc.c] (lib TUs first, then user TUs):
 - 16-bit address space: `int` and pointers are **2 bytes**, `long`/`float`/`double` are **4 bytes**
 - `new_node()` initializes `node->type = t_void` (not NULL) — type-propagation guards use `== t_void`
 - Type singletons (`t_int`, `t_void`, etc.) are interned — use pointer equality for comparison
-- Stack starts at `sp = 0xF000`; grows downward; `enter N` saves lr+bp and allocates N bytes
+- Stack starts at `sp = 0x1000`; grows downward; `enter N` saves lr+bp and allocates N bytes
 - `adj imm8` (opcode 0x41) adjusts `sp` by a signed 8-bit value (−128..127); `adjw imm16` (opcode 0x89) adjusts by a signed 16-bit value — used by the backend for locals larger than 127 bytes
 
 ---

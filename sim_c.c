@@ -296,11 +296,6 @@ static const Instr4 itab4[] = {
     {"blt",    0xda,2,1,0}, {"ble",    0xdb,2,1,0},
     {"blts",   0xdc,2,1,0}, {"bles",   0xdd,2,1,0},
     {"addli",  0xde,2,1,0},
-    /* F3b 0xdf escape — 3 bytes, rd rs imm7; sub-opcode in imm10[9:7] */
-    {"andi3",  0xdf,2,1,0}, /* sub-op 0: rd = rs & zext16(sext7(imm7)) */
-    {"shli3",  0xdf,2,1,1}, /* sub-op 1: rd = rs << (imm7 & 0x1f) */
-    {"shri",   0xdf,2,1,2}, /* sub-op 2: rd = rs >> (imm7 & 0x1f) logical */
-    {"shrsi",  0xdf,2,1,3}, /* sub-op 3: rd = signed(rs) >> (imm7 & 0x1f) arith */
     /* F3c — 3 bytes, rd imm16 */
     {"immw",   0xe8,2,2,0}, {"immwh",  0xf0,2,2,0},
     {"lea",    0xf8,2,2,0},
@@ -713,10 +708,6 @@ static void assemble_cpu4(const char *src)
                 else if (strcmp(mnem,"ges")==0) strcpy(real_mnem,"les");
                 else if (strcmp(mnem,"fgt")==0) strcpy(real_mnem,"flt");
                 else                            strcpy(real_mnem,"fle");
-            } else if (nops == 3 && (strcmp(mnem,"andi")==0)) {
-                strcpy(real_mnem, "andi3"); /* 3-operand form → F3b 0xdf sub-op 0 */
-            } else if (nops == 3 && (strcmp(mnem,"shli")==0)) {
-                strcpy(real_mnem, "shli3"); /* 3-operand form → F3b 0xdf sub-op 1 */
             } else if (nops >= 3 && (strcmp(mnem,"bgt")==0 || strcmp(mnem,"bge")==0 ||
                                      strcmp(mnem,"bgts")==0 || strcmp(mnem,"bges")==0)) {
                 /* F3b: swap rx,ry (ops[0],ops[1]) and pick opposite branch */
@@ -782,11 +773,7 @@ static void assemble_cpu4(const char *src)
                 int rx2 = (nops > 0) ? parse_reg4(ops[0]) : 0;
                 int ry2 = (nops > 1) ? parse_reg4(ops[1]) : 0;
                 int32_t imm10;
-                if (instr->first_byte == 0xdf) {
-                    /* 0xdf escape: imm10 = (sub-opcode << 7) | (imm7 & 0x7f) */
-                    int32_t imm7v = (nops > 2) ? (int32_t)strtol(ops[2], NULL, 0) : 0;
-                    imm10 = (instr->subop << 7) | (imm7v & 0x7f);
-                } else if (is_branch4(real_mnem)) {
+                if (is_branch4(real_mnem)) {
                     uint16_t tgt = (pass == 2 && nops > 2) ? (uint16_t)parse_tok(ops[2], pass) : 0;
                     imm10 = (int32_t)tgt - (instr_addr + instr_len);
                 } else {
@@ -989,7 +976,7 @@ static void run_cpu4(int verbose)
         case 0x9c: { uint16_t a = (uint16_t)((int32_t)bp+sx7(imm)*2); check_align16(a, oldpc); r[rd]=(uint32_t)(int32_t)(int16_t)read16(a); } break; /* lwx */
         case 0xa0: r[rd]=r[rx]+(uint32_t)sx7(imm); break;           /* addi */
         case 0xa4: r[rd]=r[rx]<<(imm&0x1f); break;                /* shli */
-        case 0xa8: r[rd]=r[rx]&(uint32_t)(uint16_t)(int16_t)sx7(imm); break; /* andi: sext7→16, zext→32 */
+        case 0xa8: r[rd]=r[rx]&(uint32_t)sx7(imm); break;        /* andi */
         /* F3a */
         case 0xc0: pc=(uint16_t)imm; break;  /* j   */
         case 0xc1: lr=pc; pc=(uint16_t)imm; break; /* jl  */
@@ -1017,16 +1004,6 @@ static void run_cpu4(int verbose)
         case 0xdc: if((int32_t)r[rx]<(int32_t)r[ry]) pc=(uint16_t)(pc+sx10(imm)); break; /* blts */
         case 0xdd: if((int32_t)r[rx]<=(int32_t)r[ry]) pc=(uint16_t)(pc+sx10(imm)); break; /* bles */
         case 0xde: r[rx]=r[ry]+(uint32_t)sx10(imm); break; /* addli */
-        case 0xdf: { /* 0xdf escape: rd rs imm7; sub-opcode in imm[9:7] */
-            int32_t e7 = sx7(imm & 0x7f);
-            switch ((imm >> 7) & 0x7) {
-                case 0: r[rx]=r[ry]&(uint32_t)(uint16_t)(int16_t)e7; break; /* andi */
-                case 1: r[rx]=r[ry]<<((uint32_t)e7&0x1f);            break; /* shli */
-                case 2: r[rx]=r[ry]>>((uint32_t)e7&0x1f);            break; /* shri */
-                case 3: r[rx]=(uint32_t)((int32_t)r[ry]>>((uint32_t)e7&0x1f)); break; /* shrsi */
-            }
-            break;
-        }
         /* F3c */
         case 0xe8: r[rd]=(uint32_t)(uint16_t)imm; break; /* immw  */
         case 0xf0: r[rd]=(r[rd]&0xffff)|((uint32_t)(uint16_t)imm<<16); break; /* immwh */

@@ -1803,16 +1803,11 @@ static void process_function(IRInst *sym_node)
         }
     }
 
-    /* Phi deconstruction is deferred: braun_decon_phis() must be called
-     * after ir3_optimize() so that the optimizer sees true SSA phi nodes.
-     * cur_blocks / cur_n_blocks (updated above by split_critical_edges)
-     * remain valid in the scratch arena until the next scratch_reset(). */
+    /* Phi deconstruction: convert phi nodes to parallel copies */
+    deconstructPhis(blocks, n_blocks);
+
     free_cfg(blocks, n_blocks);
 }
-
-
-/* Forward declaration: defined after braun_emit_function */
-void braun_decon_phis(void);
 
 /* ================================================================
  * braun_ssa — public entry point
@@ -1835,7 +1830,6 @@ IR3Inst *braun_ssa(BB *blocks_ignored, int n_blocks_ignored, IRInst *ir_head)
         if (p->op == IR_SYMLABEL) {
             if (is_function_symlabel(p)) {
                 process_function(p);
-                braun_decon_phis();
                 /* Advance to next SYMLABEL or data section */
                 p = p->next;
                 while (p && p->op != IR_SYMLABEL) p = p->next;
@@ -1852,77 +1846,4 @@ IR3Inst *braun_ssa(BB *blocks_ignored, int n_blocks_ignored, IRInst *ir_head)
     }
 
     return ir3_head;
-}
-
-/* ================================================================
- * braun_emit_data — per-function incremental API, step 1
- *
- * Emit pass-through IR3 for non-function IR nodes (preamble, data
- * labels, word/byte/align directives) from *pp until the next
- * function SYMLABEL or end of the stack-IR chain.  Advances *pp.
- * Returns the IR3 head of the emitted nodes (NULL if none).
- * ================================================================ */
-IR3Inst *braun_emit_data(IRInst **pp)
-{
-    ir3_head = NULL;
-    ir3_tail = &ir3_head;
-    ir3_last = NULL;
-
-    IRInst *p = *pp;
-    while (p) {
-        if (p->op == IR_SYMLABEL) {
-            if (is_function_symlabel(p))
-                break;                      /* stop at function boundary */
-            IR3Inst *s = emit_ir3(IR3_SYMLABEL);
-            s->sym  = p->sym;
-            s->line = p->line;
-            p = p->next;
-        } else {
-            p = emit_data_node(p);
-        }
-    }
-    *pp = p;
-    return ir3_head;
-}
-
-/* ================================================================
- * braun_emit_function — per-function incremental API, step 2
- *
- * Process the function whose stack-IR SYMLABEL *pp points to.
- * Caller must call scratch_reset() before this so the scratch arena
- * is clean for this function's per-function arrays and IR3 nodes.
- * Advances *pp to the next SYMLABEL (or NULL).
- * Returns the IR3 head for the processed function.
- * ================================================================ */
-IR3Inst *braun_emit_function(IRInst **pp)
-{
-    ir3_head = NULL;
-    ir3_tail = &ir3_head;
-    ir3_last = NULL;
-
-    /* process_function resets all per-function state (vs_depth, vsp,
-     * braun arrays) and calls ir3_reset() internally. */
-    process_function(*pp);
-
-    /* Advance past this function's stack-IR body to the next SYMLABEL */
-    IRInst *p = (*pp)->next;
-    while (p && p->op != IR_SYMLABEL) p = p->next;
-    *pp = p;
-
-    return ir3_head;
-}
-
-/* ================================================================
- * braun_decon_phis — deferred phi deconstruction
- *
- * Called from smallcc.c after ir3_optimize() so the optimizer runs
- * on true SSA phi nodes rather than post-deconstruction parallel
- * copies.  cur_blocks / cur_n_blocks remain valid in the scratch
- * arena until the next scratch_reset() at the start of the next
- * function iteration.
- * ================================================================ */
-void braun_decon_phis(void)
-{
-    if (cur_blocks && cur_n_blocks > 0)
-        deconstructPhis(cur_blocks, cur_n_blocks);
 }

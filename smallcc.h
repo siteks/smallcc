@@ -666,7 +666,6 @@ void backend_emit_asm(IRInst *ir);
 // Annotation mode (-ann): call with the preprocessed source before backend_emit_asm.
 // Enables source-line and basic-block comments in the assembly output.
 extern int          flag_annotate;
-extern int          flag_no_newinsns;  /* disable zxb/zxw/shli/andi selection */
 extern const char **ann_lines;
 extern int          ann_nlines;
 void set_ann_source(const char *src);

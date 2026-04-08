@@ -232,12 +232,6 @@ class Assembler:
                             self.assembly.append(i)
                         continue
 
-                # 0xdf escape: 3-operand andi/shli → internal 3-operand variants
-                if mnemonic == 'andi' and len(operands) == 3:
-                    mnemonic = 'andi3'
-                elif mnemonic == 'shli' and len(operands) == 3:
-                    mnemonic = 'shli3'
-
                 # Real instruction: look up ptable
                 if mnemonic not in G.ptable:
                     print('Error line %d: unrecognised instruction %r' % (lineno, mnemonic),
@@ -295,14 +289,10 @@ class Assembler:
                     # F3b: two registers + 10-bit immediate
                     # Branches: imm10 is PC-relative (target - PC_after_instruction)
                     # Memory: imm10 is byte/word/long offset
-                    # 0xdf escape: imm10 = (subop_val << 7) | (imm7 & 0x7f)
                     # Encoding: byte1 = (rx<<5)|(ry<<2)|((imm10>>8)&3); byte2 = imm10&0xff
                     rx = reg_num(operands[0])
                     ry = reg_num(operands[1])
-                    if first_byte == 0xdf:
-                        imm7 = resolve(operands[2]) & 0x7f
-                        imm10 = ((subop_val << 7) | imm7) & 0x3ff
-                    elif mnemonic in BRANCHES:
+                    if mnemonic in BRANCHES:
                         imm10 = resolve(operands[2], instr_addr, instr_len, pc_rel=True) & 0x3ff
                     else:
                         imm10 = resolve(operands[2]) & 0x3ff

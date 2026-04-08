@@ -143,13 +143,13 @@ static int resolve_copy(int v)
 static bool copy_propagate(IR3Inst *start, IR3Inst *end)
 {
     bool changed = false;
-    for (int i = 0; i < VMAP_SIZE; i++) { if (multi_def[i]) copy_of[i] = -1; }
+    memset(copy_of, -1, sizeof(copy_of));
     int accum_copy = -1;     /* fresh vreg that ACCUM is a copy of, or -1 */
 
     for (IR3Inst *p = start; p && p != end; p = p->next) {
         /* Reset at BB boundaries */
         if (is_bb_leader_or_term(p->op)) {
-            for (int i = 0; i < VMAP_SIZE; i++) { if (multi_def[i]) copy_of[i] = -1; }
+            memset(copy_of, -1, sizeof(copy_of));
             accum_copy = -1;
             continue;
         }
@@ -211,7 +211,7 @@ static bool copy_propagate(IR3Inst *start, IR3Inst *end)
          * across calls unnecessarily; irc_regalloc will spill as needed. */
         if (p->op == IR3_CALL || p->op == IR3_CALLR) {
             accum_copy = -1;
-            for (int i = 0; i < VMAP_SIZE; i++) { if (multi_def[i]) copy_of[i] = -1; }
+            memset(copy_of, -1, sizeof(copy_of));
         }
 
         /* Invalidate fresh vreg if redefined (STORE reads rd, doesn't define it) */
@@ -228,14 +228,14 @@ static bool copy_propagate(IR3Inst *start, IR3Inst *end)
 static bool const_prop_fold(IR3Inst *start, IR3Inst *end)
 {
     bool changed = false;
-    for (int i = 0; i < VMAP_SIZE; i++) { if (multi_def[i]) cval_valid[i] = false; }
+    memset(cval_valid, 0, sizeof(cval_valid));
     bool accum_cval_valid = false;
     int  accum_cval = 0;
 
     for (IR3Inst *p = start; p && p != end; p = p->next) {
         /* Reset at BB boundaries */
         if (is_bb_leader_or_term(p->op)) {
-            for (int i = 0; i < VMAP_SIZE; i++) { if (multi_def[i]) cval_valid[i] = false; }
+            memset(cval_valid, 0, sizeof(cval_valid));
             accum_cval_valid = false;
             continue;
         }
@@ -513,21 +513,6 @@ static bool reads_accum(IR3Inst *p)
         return true;
     default:
         return false;
-    }
-}
-
-static void compute_multi_def(IR3Inst *start, IR3Inst *end)
-{
-    memset(multi_def, 0, sizeof(multi_def));
-    memset(def_inst, 0, sizeof(def_inst));
-    for (IR3Inst *p = start; p && p != end; p = p->next) {
-        if (p->op != IR3_STORE && is_fresh(p->rd) && vidx_ok(p->rd)) {
-            int idx = vidx(p->rd);
-            if (def_inst[idx] != NULL)
-                multi_def[idx] = true;
-            else
-                def_inst[idx] = p;
-        }
     }
 }
 
@@ -1412,7 +1397,6 @@ void ir3_optimize(IR3Inst *head, int opt_level)
         }
 
         if (is_func) {
-            compute_multi_def(func_start, func_end);
             for (int iter = 0; iter < 4; iter++) {
                 bool changed = false;
                 changed |= copy_propagate(func_start, func_end);

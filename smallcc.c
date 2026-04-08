@@ -295,11 +295,6 @@ int main(int argc, char **argv)
             flag_annotate = 1;
             file_start++;
         }
-        else if (strcmp(argv[file_start], "-no-newinsns") == 0)
-        {
-            flag_no_newinsns = 1;
-            file_start++;
-        }
         else if (strncmp(argv[file_start], "-D", 2) == 0)
         {
             if (num_defines < 256)
@@ -481,31 +476,15 @@ int main(int argc, char **argv)
         mark_basic_blocks();
         peephole(opt_level);
         if (g_target_arch == 4) {
-            /* Per-function pipeline: scratch_reset() before each function so
-             * the 4 MB arena is reused rather than accumulated across functions.
-             * Preamble and data-section nodes are passed through immediately. */
+            scratch_reset();
             ir3_reset();
-            IRInst *p = codegen_ctx.ir_head;
-
-            /* Preamble (ssp / jl / halt) and any leading data nodes */
-            IR3Inst *data = braun_emit_data(&p);
-            if (data) risc_backend_emit(data);
-
-            while (p) {
-                /* p is at a function SYMLABEL */
-                scratch_reset();
-                IR3Inst *fn = braun_emit_function(&p);
-                if (fn) {
-                    ir3_optimize(fn, opt_level);
-                    if (ssa_out) ir3_dump(fn, ssa_out);  /* dump true SSA before deconstruction */
-                    braun_decon_phis();
-                    irc_regalloc(fn);
-                    risc_backend_emit(fn);
-                }
-                /* Inter-function or trailing data/global-var/string-literal nodes */
-                data = braun_emit_data(&p);
-                if (data) risc_backend_emit(data);
-            }
+            int n_blocks;
+            BB *blocks = build_cfg(codegen_ctx.ir_head, &n_blocks);
+            IR3Inst *ir3 = braun_ssa(blocks, n_blocks, codegen_ctx.ir_head);
+            ir3_optimize(ir3, opt_level);
+            if (ssa_out) ir3_dump(ir3, ssa_out);
+            irc_regalloc(ir3);
+            risc_backend_emit(ir3);
         } else {
             backend_emit_asm(codegen_ctx.ir_head);
         }
