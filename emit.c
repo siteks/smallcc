@@ -319,15 +319,21 @@ static void emit_inst(Inst *inst, FILE *out) {
     case IK_NEG: {
         if (!dst || inst->nops < 1) break;
         int r1 = get_val_reg(out, inst->ops[0], rd);
-        // neg rd = sub rd, zero, r1. Need a zero register.
+        int is_float_neg = (dst->vtype == VT_F32);
         // Pick a scratch not equal to rd or r1, save/restore via pushr/popr.
         unsigned avoid = (1u << rd) | (1u << r1);
         int tmp = -1;
         for (int r = 0; r < 8; r++) if (!(avoid & (1u << r))) { tmp = r; break; }
         if (tmp < 0) tmp = (rd + 1) & 7;
         fprintf(out, "    pushr %s\n", regname(tmp));
-        emit_imm(out, tmp, 0);
-        fprintf(out, "    sub %s, %s, %s\n", regname(rd), regname(tmp), regname(r1));
+        if (is_float_neg) {
+            // Float negation: load 0.0f into tmp, then fsub rd, tmp, r1
+            emit_imm(out, tmp, 0);  // 0 as raw bits = 0.0f
+            fprintf(out, "    fsub %s, %s, %s\n", regname(rd), regname(tmp), regname(r1));
+        } else {
+            emit_imm(out, tmp, 0);
+            fprintf(out, "    sub %s, %s, %s\n", regname(rd), regname(tmp), regname(r1));
+        }
         fprintf(out, "    popr %s\n", regname(tmp));
         break;
     }
@@ -351,7 +357,13 @@ static void emit_inst(Inst *inst, FILE *out) {
         if (!dst || inst->nops < 1) break;
         int r1 = get_val_reg(out, inst->ops[0], rd);
         if (r1 != rd) fprintf(out, "    or %s, %s, %s\n", regname(rd), regname(r1), regname(r1));
-        fprintf(out, "    sxw %s\n", regname(rd));
+        // Sign-extend only for sub-32-bit integer operands; 32-bit values need no sign-extension.
+        {
+            ValType ovt = inst->ops[0] ? inst->ops[0]->vtype : VT_I16;
+            if (ovt == VT_I8)  fprintf(out, "    sxb %s\n", regname(rd));
+            else if (ovt != VT_I32 && ovt != VT_U32 && ovt != VT_F32)
+                fprintf(out, "    sxw %s\n", regname(rd));
+        }
         fprintf(out, "    itof %s\n", regname(rd));
         break;
     }
@@ -425,7 +437,12 @@ static void emit_inst(Inst *inst, FILE *out) {
                 // Using rd as both the address temp and the destination avoids
                 // clobbering any other live register (e.g. a phi-copy just
                 // computed above this instruction in the same block).
-                fprintf(out, "    lea %s, %d\n", regname(rd), off);
+                // The new CPU4 'lea' only represents multiples of 4; correct
+                // non-aligned offsets with addi.
+                int adj_l  = off % 4;
+                int base_l = off - adj_l;
+                fprintf(out, "    lea %s, %d\n", regname(rd), base_l);
+                if (adj_l) fprintf(out, "    addi %s, %d\n", regname(rd), adj_l);
                 fprintf(out, "    %s %s, %s, 0\n",
                         load_f3b(size, is_s), regname(rd), regname(rd));
             }
@@ -474,9 +491,14 @@ static void emit_inst(Inst *inst, FILE *out) {
                 fprintf(out, "    %s %s, %d\n", store_f2(size), regname(rv), scaled);
             } else {
                 // Out of F2 range: lea + F3b store
+                // The new CPU4 'lea' only represents multiples of 4; correct
+                // non-aligned offsets with addi.
                 int tmp = (rv == 0) ? 1 : 0;
                 if (tmp == rv) tmp = 2;
-                fprintf(out, "    lea %s, %d\n", regname(tmp), off);
+                int adj_s  = off % 4;
+                int base_s = off - adj_s;
+                fprintf(out, "    lea %s, %d\n", regname(tmp), base_s);
+                if (adj_s) fprintf(out, "    addi %s, %d\n", regname(tmp), adj_s);
                 fprintf(out, "    %s %s, %s, 0\n", store_f3b(size), regname(rv), regname(tmp));
             }
         } else {
@@ -489,8 +511,19 @@ static void emit_inst(Inst *inst, FILE *out) {
 
     case IK_ADDR: {
         // dst = &frame_slot[imm]  (bp-relative address)
+        // The new CPU4 'lea' encodes the offset as imm14*4, so only 4-byte-aligned
+        // offsets are represented exactly. For 2-byte-aligned locals, use lea to the
+        // nearest 4-byte-aligned address and correct with addi (imm7, range -64..63).
         if (!dst) break;
-        fprintf(out, "    lea %s, %d\n", regname(rd), inst->imm);
+        int off = inst->imm;
+        int adj = off % 4;   // in C: result has sign of dividend; 0, ±1, ±2, ±3
+        if (adj == 0) {
+            fprintf(out, "    lea %s, %d\n", regname(rd), off);
+        } else {
+            int base = off - adj;   // 4-byte-aligned
+            fprintf(out, "    lea %s, %d\n", regname(rd), base);
+            fprintf(out, "    addi %s, %d\n", regname(rd), adj);
+        }
         break;
     }
 

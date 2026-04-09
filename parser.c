@@ -1890,7 +1890,7 @@ static void derive_types_step(Node *n)
                 n->type = n->type->u.fn.ret;
         }
     }
-    if (n->kind == ND_COMPOUND_ASSIGN)
+    if (n->kind == ND_ASSIGN || n->kind == ND_COMPOUND_ASSIGN)
         n->type = n->ch[0]->type;   // lhs
     if (n->kind == ND_RETURNSTMT && n->ch[0])   // expr
     {

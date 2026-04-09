@@ -457,9 +457,11 @@ static void rewrite_spills(Function *f, IGraph *g) {
         Value *v = f->values[i];
         int sz = (v->vtype == VT_F32 || v->vtype == VT_I32 || v->vtype == VT_U32) ? 4 : 2;
         f->frame_size += sz;
-        // Align
+        // Align: 4-byte spills need 4-byte alignment, 2-byte spills need 2-byte alignment
         if (sz == 4 && (f->frame_size % 4) != 0)
             f->frame_size += 2;
+        if (sz == 2 && (f->frame_size % 2) != 0)
+            f->frame_size += 1;
         spill_offset[i] = -(f->frame_size);  // negative = below bp
         v->spill_slot = spill_offset[i];
     }
