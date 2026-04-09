@@ -112,8 +112,11 @@ static Value *read_var_recursive(BraunCtx *ctx, Block *b, const char *name) {
         return dst;
     }
     if (b->npreds == 0) {
-        // Entry block or disconnected: undef
-        Value *u = new_value(ctx->f, VAL_UNDEF, VT_I16);
+        // Entry block or disconnected: treat as zero (matches zero-initialized stack/memory).
+        // Returning VAL_UNDEF would leave the register holding a stale value from prior
+        // computations, causing subtle bugs when C code uses uninitialized local variables.
+        Value *u = new_value(ctx->f, VAL_CONST, VT_I16);
+        u->iconst = 0;
         write_var(b, name, u);
         return u;
     }
@@ -419,7 +422,11 @@ static Value *cg_expr(BraunCtx *ctx, Block **cur, Sx *node) {
         const char *name = (name_sx && name_sx->kind == SX_STR) ? name_sx->s : "";
         Value *v = cg_expr(ctx, cur, val_sx);
         b = *cur;
-        if (vt != VT_VOID) v->vtype = vt;
+        // assign nodes are never registered in the TypeMap (lval_store doesn't call
+        // reg_type), so vt_of returns VT_I16 as the default — do NOT clobber the rhs
+        // value's vtype with that default.  Only override if there's an explicit entry.
+        { ValType explicit_vt = typemap_vtype(ctx->tm, node->id);
+          if (explicit_vt != VT_VOID) v->vtype = explicit_vt; }
         write_var(b, name, v);
         return v;
     }
@@ -1192,7 +1199,11 @@ Function *braun_function(Sx *func_sx, TypeMap *tm) {
         !strcmp(sx_car_sym(params_sx), "params")) {
         int idx = 0;
         Sx *plist = sx_cdr(params_sx);  // skip "params"
-        int stack_slot = 0;  // extra params beyond 7 go on the stack
+        int stack_slot = 0;  // stack params beyond the 3 register slots
+        // NREG_PARAMS: number of params passed in registers (r1..r3).
+        // Using only caller-saved registers avoids conflict between callee-save
+        // restore and the caller's own live values in r4-r7.
+        enum { NREG_PARAMS = 3 };
         while (plist && plist->kind == SX_PAIR) {
             Sx *pname_sx = plist->car;
             if (pname_sx && pname_sx->kind == SX_STR) {
@@ -1208,9 +1219,9 @@ Function *braun_function(Sx *func_sx, TypeMap *tm) {
                     inst_add_op(li, NULL);  // NULL base = bp-relative load
                     inst_append(entry, li);
                     write_var(entry, pname_sx->s, pv);
-                } else if (idx < 7) {
+                } else if (idx < NREG_PARAMS) {
                     // Register param: "Landing + copy" scheme.
-                    // Landing is pre-colored to r{idx+1} (r1..r7, r0 reserved for return/jlr).
+                    // Landing is pre-colored to r{idx+1} (r1..r3, caller-saved).
                     // Working copy is freely allocated by IRC.
                     Value *landing = new_value(f, VAL_INST, VT_I16);
                     landing->phys_reg = idx + 1;
@@ -1228,7 +1239,7 @@ Function *braun_function(Sx *func_sx, TypeMap *tm) {
                     inst_append(entry, copy);
                     write_var(entry, pname_sx->s, pv);
                 } else {
-                    // Stack param: beyond 7 register slots, passed on stack.
+                    // Stack param: beyond NREG_PARAMS register slots, passed on stack.
                     // CPU4 push is 4 bytes; caller uses pushr, so slot = 4 bytes.
                     // Layout after callee enter: bp+8 = first stack param, bp+12 = second, ...
                     int bp_off = 8 + stack_slot * 4;
