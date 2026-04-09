@@ -344,12 +344,10 @@ static void emit_br(Function *f, Block *cond_blk, Value *cond_val,
                     Block *then_blk, Block *else_blk) {
     block_add_succ(cond_blk, then_blk); block_add_pred(then_blk, cond_blk);
     block_add_succ(cond_blk, else_blk); block_add_pred(else_blk, cond_blk);
-    // If condition is a compile-time constant, materialise it as a real instruction
-    // so that IRC sees r0 as live here and won't assign r0 to phi copies placed just
-    // before this branch (which would be clobbered by the materialisation).
+    // If condition is a compile-time constant, materialise it as a real instruction.
+    // jnz now takes any register, so no pre-coloring to r0 is needed.
     if (cond_val && cond_val->kind == VAL_CONST) {
         Value *dst = new_value(f, VAL_INST, cond_val->vtype);
-        dst->phys_reg = 0;  // pre-color to r0 (branch condition register)
         Inst *ci  = new_inst(f, cond_blk, IK_CONST, dst);
         ci->imm   = cond_val->iconst;
         inst_append(cond_blk, ci);
@@ -553,6 +551,16 @@ static Value *cg_expr(BraunCtx *ctx, Block **cur, Sx *node) {
         // Truncate 32-bit to 16-bit integer
         else if ((vt == VT_I16 || vt == VT_U16) &&
                  (v->vtype == VT_I32 || v->vtype == VT_U32)) kind = IK_TRUNC;
+        // Same-width signedness reinterpretation
+        // signed→unsigned: mask off any sign-extension bits (TRUNC to same width)
+        else if (vt == VT_U8  && v->vtype == VT_I8)   kind = IK_TRUNC;
+        else if (vt == VT_U16 && v->vtype == VT_I16)  kind = IK_TRUNC;
+        // unsigned→signed: sign-extend so irsim vreg holds canonical signed form
+        else if (vt == VT_I8  && v->vtype == VT_U8)   kind = IK_SEXT8;
+        else if (vt == VT_I16 && v->vtype == VT_U16)  kind = IK_SEXT16;
+        // 32-bit signedness change: all bits used, no conversion needed
+        else if ((vt == VT_U32 && v->vtype == VT_I32) || (vt == VT_I32 && v->vtype == VT_U32))
+                                                       kind = IK_COPY;
         // Sign-extend signed narrow types to wider types
         else if (v->vtype == VT_I8)                    kind = IK_SEXT8;
         else if (v->vtype == VT_I16)                   kind = IK_SEXT16;
@@ -1193,7 +1201,7 @@ Function *braun_function(Sx *func_sx, TypeMap *tm) {
 
     // Emit param setup for each parameter.
     // For variadic functions: all params come from the stack (old stack ABI).
-    //   Layout: param 0 at bp+8, param 1 at bp+10, ..., variadic args continue after.
+    //   Layout: param 0 at bp+4, param 1 at bp+8, ..., variadic args continue after.
     // For non-variadic functions: first 7 params in r1..r7; extras on stack (4-byte slots).
     if (params_sx && sx_car_sym(params_sx) &&
         !strcmp(sx_car_sym(params_sx), "params")) {
@@ -1210,8 +1218,8 @@ Function *braun_function(Sx *func_sx, TypeMap *tm) {
                 if (is_variadic) {
                     // Variadic function: all params come from the stack.
                     // Caller uses stack ABI (push all args right-to-left, 4-byte slots).
-                    // Layout: param 0 at bp+8, param 1 at bp+12 (4-byte CPU4 push slots).
-                    int bp_off = 8 + idx * 4;  // 4-byte slots (CPU4 push is 32-bit)
+                    // Layout: param 0 at bp+4, param 1 at bp+8 (4-byte CPU4 push slots).
+                    int bp_off = 4 + idx * 4;  // 4-byte slots (CPU4 push is 32-bit)
                     Value *pv = new_value(f, VAL_INST, VT_I16);
                     Inst *li = new_inst(f, entry, IK_LOAD, pv);
                     li->imm  = bp_off;
@@ -1241,8 +1249,8 @@ Function *braun_function(Sx *func_sx, TypeMap *tm) {
                 } else {
                     // Stack param: beyond NREG_PARAMS register slots, passed on stack.
                     // CPU4 push is 4 bytes; caller uses pushr, so slot = 4 bytes.
-                    // Layout after callee enter: bp+8 = first stack param, bp+12 = second, ...
-                    int bp_off = 8 + stack_slot * 4;
+                    // Layout after callee enter: bp+4 = first stack param, bp+8 = second, ...
+                    int bp_off = 4 + stack_slot * 4;
                     Value *pv = new_value(f, VAL_INST, VT_I16);
                     Inst *li = new_inst(f, entry, IK_LOAD, pv);
                     li->imm  = bp_off;

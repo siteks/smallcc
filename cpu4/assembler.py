@@ -286,7 +286,27 @@ class Assembler:
                     i.length = 3
 
                 elif extra_bytes == 2 and subfmt == 1:
-                    # F3b: two registers + 10-bit immediate
+                    # Shared F3b/subfmt=1 handler for enter, adjw, lea
+                    # enter N: rd=0, imm14=N (frame size in bytes, stored directly)
+                    # adjw N: rd=0, imm14=N>>2 (byte offset / 4)
+                    # lea rd, N: rd=register, imm14=N>>2 (bp-relative byte offset / 4)
+                    if mnemonic == 'enter':
+                        rd = 0
+                        imm14 = resolve(operands[0]) & 0x3fff
+                    elif mnemonic == 'adjw':
+                        rd = 0
+                        imm14 = (resolve(operands[0]) >> 2) & 0x3fff
+                    else:  # lea
+                        rd = reg_num(operands[0])
+                        imm14 = (resolve(operands[1]) >> 2) & 0x3fff
+                    byte0 = first_byte | (rd >> 2)
+                    byte1 = ((rd & 3) << 6) | ((imm14 >> 8) & 0x3f)
+                    byte2 = imm14 & 0xff
+                    i.ins = [byte0, byte1, byte2]
+                    i.length = 3
+
+                elif extra_bytes == 2 and subfmt == 2:
+                    # F3c: two registers + 10-bit immediate
                     # Branches: imm10 is PC-relative (target - PC_after_instruction)
                     # Memory: imm10 is byte/word/long offset
                     # Encoding: byte1 = (rx<<5)|(ry<<2)|((imm10>>8)&3); byte2 = imm10&0xff
@@ -302,8 +322,19 @@ class Assembler:
                     i.ins = [byte0, byte1, byte2]
                     i.length = 3
 
-                elif extra_bytes == 2 and subfmt == 2:
-                    # F3c: single register + 16-bit immediate
+                elif extra_bytes == 2 and subfmt == 3:
+                    # F3d: one register + PC-relative 10-bit immediate (beqz, bnez)
+                    # Encoding: byte0=0xdf; byte1=(rx<<5)|(subop<<2)|((imm10>>8)&3); byte2=imm10&0xff
+                    rx = reg_num(operands[0])
+                    imm10 = resolve(operands[1], instr_addr, instr_len, pc_rel=True) & 0x3ff
+                    byte0 = 0xdf
+                    byte1 = (rx << 5) | (subop_val << 2) | ((imm10 >> 8) & 0x3)
+                    byte2 = imm10 & 0xff
+                    i.ins = [byte0, byte1, byte2]
+                    i.length = 3
+
+                elif extra_bytes == 2 and subfmt == 4:
+                    # F3e: single register + 16-bit immediate (immw, immwh, jz, jnz)
                     # Encoding: byte0 = first_byte|(rd&7); byte1,2 = imm16 big-endian
                     rd = reg_num(operands[0])
                     imm16 = resolve(operands[1]) & 0xffff

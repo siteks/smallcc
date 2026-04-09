@@ -7,6 +7,7 @@
 #include "oos.h"
 #include "alloc.h"
 #include "emit.h"
+#include "irsim.h"
 #include <dirent.h>
 #ifdef __APPLE__
 #  include <mach-o/dyld.h>
@@ -250,12 +251,54 @@ int main(int argc, char **argv)
     FILE *ssa_out = NULL;  // -ssa file: write Braun SSA IR to this file after braun_function
     FILE *oos_out = NULL;  // -oos file: write post-OOS IR to this file
     FILE *irc_out = NULL;  // -irc file: write post-IRC IR to this file
+    int run_oos = 0;       // -runoos: interpret post-OOS IR
+    int run_irc = 0;       // -runirc: interpret post-IRC IR
+    IrSim *irsim = NULL;
     const char *cmdline_defines[256];
     int num_defines = 0;
 
     while (file_start < argc && argv[file_start][0] == '-')
     {
-        if (strcmp(argv[file_start], "-o") == 0 && file_start + 1 < argc)
+        if (strcmp(argv[file_start], "-h") == 0 || strcmp(argv[file_start], "--help") == 0)
+        {
+            printf(
+                "Usage: smallcc [options] <source.c> [source2.c ...]\n"
+                "\n"
+                "Output:\n"
+                "  -o <file>          Write assembly to <file> (default: stdout)\n"
+                "  -E                 Preprocess only; write preprocessed source to stdout\n"
+                "\n"
+                "Target:\n"
+                "  -arch cpu3         Generate CPU3 assembly (default)\n"
+                "  -arch cpu4         Generate CPU4 assembly (nanopass pipeline)\n"
+                "\n"
+                "Optimisation:\n"
+                "  -O, -O1            Enable peephole optimisation (CPU3 only)\n"
+                "  -O2                Enable additional strength-reduction rules\n"
+                "\n"
+                "Preprocessor:\n"
+                "  -DNAME[=VALUE]     Define preprocessor macro\n"
+                "  -I<dir>            Add directory to #include <...> search path\n"
+                "\n"
+                "IR dumps (CPU4 only):\n"
+                "  -ssa <file>        Write Braun SSA IR to <file> after braun_function\n"
+                "  -oos <file>        Write post-OOS IR to <file> after out_of_ssa\n"
+                "  -irc <file>        Write post-IRC IR to <file> after irc_allocate\n"
+                "\n"
+                "IR interpretation (CPU4 only, prints r0:XXXXXXXX to stdout):\n"
+                "  -runoos            Interpret post-OOS IR (skips register allocation)\n"
+                "  -runirc            Interpret post-IRC IR (after register allocation)\n"
+                "\n"
+                "Annotation:\n"
+                "  -ann               Annotate assembly output with source comments\n"
+                "\n"
+                "Diagnostics:\n"
+                "  -stats             Print per-TU arena usage to stderr\n"
+                "  -h, --help         Show this help\n"
+            );
+            return 0;
+        }
+        else if (strcmp(argv[file_start], "-o") == 0 && file_start + 1 < argc)
         {
             out = fopen(argv[file_start + 1], "w");
             if (!out) { perror(argv[file_start + 1]); return 1; }
@@ -326,6 +369,16 @@ int main(int argc, char **argv)
             if (!irc_out) { perror(argv[file_start + 1]); return 1; }
             file_start += 2;
         }
+        else if (strcmp(argv[file_start], "-runoos") == 0)
+        {
+            run_oos = 1;
+            file_start++;
+        }
+        else if (strcmp(argv[file_start], "-runirc") == 0)
+        {
+            run_irc = 1;
+            file_start++;
+        }
         else
         {
             fprintf(stderr, "smallcc: unknown option: %s\n", argv[file_start]);
@@ -335,7 +388,8 @@ int main(int argc, char **argv)
 
     if (argc <= file_start)
     {
-        fprintf(stderr, "Usage: smallcc [-o outfile] [-E] [-stats] [-ann] [-ssa ssafile] [-oos oosfile] [-irc ircfile] [-DNAME[=VAL]] [-Idir] <source.c> [source2.c ...]\n");
+        fprintf(stderr, "Usage: smallcc [options] <source.c> [source2.c ...]\n"
+                        "Run 'smallcc -h' for full option list.\n");
         return 1;
     }
 
@@ -366,6 +420,13 @@ int main(int argc, char **argv)
     for (int i = 0; i < lib_count; i++)  all_files[i] = lib_files[i];
     for (int i = 0; i < user_count; i++) all_files[lib_count + i] = argv[file_start + i];
 
+    if (run_oos || run_irc) {
+        irsim = irsim_new();
+        // In sim mode, suppress assembly output
+        out = fopen("/dev/null", "w");
+        if (!out) { perror("/dev/null"); return 1; }
+    }
+
     if (!preprocess_only) {
         // Preamble: emit arch-specific crt0_cpuN.s if present, else built-in default
         char crt0_path[4096];
@@ -379,13 +440,14 @@ int main(int argc, char **argv)
             fclose(crt0);
         } else if (target_cpu4) {
             fprintf(out, ".text=0\n");
-            fprintf(out, "    ssp     0x1000\n");
+            fprintf(out, "    immw     r0, 0xF000\n");
+            fprintf(out, "    ssp     r0\n");
             fprintf(out, "    jl      main\n");
             fprintf(out, "    halt\n");
             fprintf(out, ".data=0x4000\n");
         } else {
             fprintf(out, ".text=0\n");
-            fprintf(out, "    ssp     0x8000\n");
+            fprintf(out, "    ssp     0xF000\n");
             fprintf(out, "    jl      main\n");
             fprintf(out, "    halt\n");
         }
@@ -471,6 +533,7 @@ int main(int argc, char **argv)
             Sx *sx_prog = lower_program(node, tm, tu, &cpu4_strlit_id);
             // Emit data section (globals and string literals)
             emit_globals(sx_prog, out);
+            if (irsim) irsim_populate_globals(irsim, sx_prog);
             // Compile each function
             Sx *items = sx_prog ? sx_prog->cdr : NULL;
             while (items && items->kind == SX_PAIR) {
@@ -485,10 +548,13 @@ int main(int argc, char **argv)
                         out_of_ssa(f);
                         if (oos_out) { fprintf(oos_out, "=== OOS: %s ===\n", f->name); print_function(f, oos_out); }
                         if (getenv("DUMP_IR")) { fprintf(stderr, "=== after oos ===\n"); print_function(f, stderr); }
+                        if (run_oos && irsim) { irsim_add_function(irsim, f); goto done_irc; }
                         irc_allocate(f);
                         if (irc_out) { fprintf(irc_out, "=== IRC: %s ===\n", f->name); print_function(f, irc_out); }
                         if (getenv("DUMP_IR")) { fprintf(stderr, "=== after irc ===\n"); print_function(f, stderr); }
+                        if (run_irc && irsim) { irsim_add_function(irsim, f); goto done_irc; }
                         emit_function(f, out);
+                        done_irc:;
                     }
                 }
                 items = items->cdr;
@@ -516,6 +582,12 @@ int main(int argc, char **argv)
         fprintf(stderr, "arena total: %zu / %zu bytes (%.1f%%)\n",
                 arena.used, arena.cap,
                 100.0 * (double)arena.used / (double)arena.cap);
+
+    if (irsim) {
+        uint32_t result = irsim_call_main(irsim);
+        printf("r0:%08x\n", result);
+        irsim_free(irsim);
+    }
 
     if (out != stdout) fclose(out);
     if (ssa_out) fclose(ssa_out);

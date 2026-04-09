@@ -73,6 +73,21 @@ typedef struct {
     Sx     **static_gvars;
     int      n_static_gvars;
     int      static_gvars_cap;
+    // Param homing: address-taken SYM_PARAMs in non-variadic functions need local
+    // stack slots because register-ABI params are NOT on the stack.
+    // Maps Symbol* → negative bp offset of the home slot.
+    Symbol **param_home_syms;
+    int     *param_home_offs;  // negative bp offsets for home slots
+    int      n_param_homes;
+    int      param_home_cap;
+    // CPU4 stack-ABI param offsets for variadic functions.
+    // sym->offset from types.c uses CPU3 frame layout (FRAME_OVERHEAD=8, WORD_SIZE=2 slots).
+    // CPU4 uses 4-byte slots and 4-byte frame overhead.
+    // Maps Symbol* → positive bp offset using CPU4 layout (4 + idx*4).
+    Symbol **vparam_syms;
+    int     *vparam_offsets;
+    int      n_vparams;
+    int      vparam_cap;
 } LowerCtx;
 
 // ============================================================
@@ -194,6 +209,25 @@ static bool sym_is_addr_taken(LowerCtx *ctx, Symbol *sym) {
     return false;
 }
 
+// Return the CPU4 bp offset for a variadic-function param (positive).
+// Returns -1 if not found (non-variadic param or sym not in vparam table).
+static int get_vparam_offset(LowerCtx *ctx, Symbol *sym) {
+    for (int i = 0; i < ctx->n_vparams; i++)
+        if (ctx->vparam_syms[i] == sym) return ctx->vparam_offsets[i];
+    return -1;
+}
+
+// Return the negative bp offset of the local home slot for an address-taken param.
+// Falls back to CPU4 variadic offset if available, else sym->offset.
+static int get_param_home_off(LowerCtx *ctx, Symbol *sym) {
+    for (int i = 0; i < ctx->n_param_homes; i++)
+        if (ctx->param_home_syms[i] == sym) return ctx->param_home_offs[i];
+    // For variadic params, use precomputed CPU4 offset
+    int voff = get_vparam_offset(ctx, sym);
+    if (voff >= 0) return voff;
+    return sym->offset;  // fallback
+}
+
 // Pre-scan a function body to find all variables whose address is taken (&x).
 static void scan_addr_taken(LowerCtx *ctx, Node *node) {
     if (!node) return;
@@ -244,8 +278,42 @@ static Sx *lower_lval_addr(LowerCtx *ctx, Node *node) {
             reg_type(ctx, s, get_pointer_type(node->type));
             return s;
         }
-        // Include the bp-relative offset (negative for SYM_LOCAL) for IK_ADDR
-        int bpoff = (sym->kind == SYM_PARAM) ? sym->offset : -(sym->offset);
+        // Include the bp-relative offset (negative for SYM_LOCAL) for IK_ADDR.
+        // For address-taken SYM_PARAM in non-variadic functions, use the home slot
+        // (negative) rather than the stack-ABI offset (positive) because register-ABI
+        // params are not on the stack.
+        // For variadic params, use the precomputed CPU4 offset (4 + idx*4).
+        //
+        // Special case: struct-type params in non-variadic register ABI.
+        // The caller passes a pointer to the struct in r1 (not the struct itself).
+        // The SSA variable "p@N" holds that pointer value — so (var "p@N") IS the
+        // struct address. Return it directly rather than (addr "p@N" offset) which
+        // would incorrectly compute bp+offset pointing at an uninitialized frame slot.
+        if (sym->kind == SYM_PARAM &&
+            sym->type && sym->type->base == TB_STRUCT) {
+            int voff = get_vparam_offset(ctx, sym);
+            if (voff < 0) {
+                // Non-variadic: param holds the pointer; return SSA var as the address.
+                Sx *s = sx_list(2, sx_sym("var"), sx_str(sym_alpha(ctx, sym)));
+                reg_type(ctx, s, get_pointer_type(node->type));
+                return s;
+            }
+            // Variadic: struct pushed on stack at known bp offset.
+            Sx *s = sx_list(3, sx_sym("addr"), sx_str(sym_alpha(ctx, sym)), sx_int(voff));
+            reg_type(ctx, s, get_pointer_type(node->type));
+            return s;
+        }
+        int bpoff;
+        if (sym->kind == SYM_PARAM) {
+            if (sym_is_addr_taken(ctx, sym)) {
+                bpoff = get_param_home_off(ctx, sym);
+            } else {
+                int voff = get_vparam_offset(ctx, sym);
+                bpoff = (voff >= 0) ? voff : sym->offset;
+            }
+        } else {
+            bpoff = -(sym->offset);
+        }
         Sx *s = sx_list(3, sx_sym("addr"), sx_str(sym_alpha(ctx, sym)), sx_int(bpoff));
         reg_type(ctx, s, get_pointer_type(node->type));
         return s;
@@ -434,9 +502,14 @@ static Sx *lower_expr(LowerCtx *ctx, Node *node) {
             Sx *s = sx_list(2, sx_sym("var"), sx_str(sym_alpha(ctx, sym)));
             return reg_type(ctx, s, node->type);
         }
-        // Address-taken: must load from memory
+        // Address-taken: must load from memory via home slot (for non-variadic params)
+        // or via stack-ABI offset (for variadic params / locals).
         {
-            int bpoff = (sym->kind == SYM_PARAM) ? sym->offset : -(sym->offset);
+            int bpoff;
+            if (sym->kind == SYM_PARAM)
+                bpoff = get_param_home_off(ctx, sym);
+            else
+                bpoff = -(sym->offset);
             Sx *addr = sx_list(3, sx_sym("addr"), sx_str(sym_alpha(ctx, sym)), sx_int(bpoff));
             Sx *s    = sx_list(3, sx_sym("load"), sx_int(sz(sym->type)), addr);
             return reg_type(ctx, s, node->type);
@@ -490,7 +563,14 @@ static Sx *lower_expr(LowerCtx *ctx, Node *node) {
         if (op == TK_INC || op == TK_DEC) {
             const char *bop = (op == TK_INC) ? "+" : "-";
             LVal lv = lower_lval(ctx, node->ch[0]);
-            Sx *one = sx_list(2, sx_sym("int"), sx_int(1));
+            // Step size: 1 for scalars, sizeof(pointee) for pointers/arrays.
+            int step = 1;
+            Type *ot = node->ch[0]->type;
+            if (ot && ot->base == TB_POINTER && ot->u.ptr.pointee)
+                step = ot->u.ptr.pointee->size;
+            else if (ot && ot->base == TB_ARRAY && ot->u.arr.elem)
+                step = ot->u.arr.elem->size;
+            Sx *one = sx_list(2, sx_sym("int"), sx_int(step));
             reg_type(ctx, one, node->type);
             Sx *old = lval_load(ctx, lv, node->type);
             Sx *nw  = sx_list(4, sx_sym("binop"), sx_str(bop), old, one);
@@ -509,7 +589,14 @@ static Sx *lower_expr(LowerCtx *ctx, Node *node) {
             ctx_push_stmt(ctx, sx_list(3, sx_sym("assign"), sx_str(tmp), old));
             Sx *tmp_var = sx_list(2, sx_sym("var"), sx_str(tmp));
             reg_type(ctx, tmp_var, node->type);
-            Sx *one = sx_list(2, sx_sym("int"), sx_int(1));
+            // Step size: 1 for scalars, sizeof(pointee) for pointers/arrays.
+            int step = 1;
+            Type *ot = node->ch[0]->type;
+            if (ot && ot->base == TB_POINTER && ot->u.ptr.pointee)
+                step = ot->u.ptr.pointee->size;
+            else if (ot && ot->base == TB_ARRAY && ot->u.arr.elem)
+                step = ot->u.arr.elem->size;
+            Sx *one = sx_list(2, sx_sym("int"), sx_int(step));
             reg_type(ctx, one, node->type);
             Sx *nw = sx_list(4, sx_sym("binop"), sx_str(bop), tmp_var, one);
             reg_type(ctx, nw, node->type);
@@ -573,6 +660,16 @@ static Sx *lower_expr(LowerCtx *ctx, Node *node) {
             return src;
         }
         LVal lv = lower_lval(ctx, node->ch[0]);
+        // For memory-based lvals (e.g. buf[len++]), lv.addr may contain a (seq ...)
+        // expression with side effects. Evaluating lv.addr multiple times re-runs
+        // those side effects (e.g. len++ fires again on each use). Save the address
+        // to a temp variable once so both the store and the reload use the stable pointer.
+        if (!lv.is_var && lv.addr) {
+            const char *addr_tmp = fresh_temp(ctx);
+            ctx_push_stmt(ctx, sx_list(3, sx_sym("assign"), sx_str(addr_tmp), lv.addr));
+            lv.addr = sx_list(2, sx_sym("var"), sx_str(addr_tmp));
+            typemap_set_vtype(ctx->tm, lv.addr->id, VT_PTR);
+        }
         ctx_push_stmt(ctx, lval_store(ctx, lv, rhs, node->ch[0]->type));
         return lval_load(ctx, lv, node->type);
     }
@@ -641,8 +738,8 @@ static Sx *lower_expr(LowerCtx *ctx, Node *node) {
             return reg_type(ctx, call, node->type);
         }
         Sx *addr = lower_lval_addr(ctx, node);
-        if (node->type && node->type->base == TB_STRUCT)
-            return addr; // struct member address, no load
+        if (node->type && (node->type->base == TB_STRUCT || node->type->base == TB_ARRAY))
+            return addr; // struct/array member address, no load (arrays decay to pointer)
         Sx *s = sx_list(3, sx_sym("load"), sx_int(sz(node->type)), addr);
         return reg_type(ctx, s, node->type);
     }
@@ -1225,7 +1322,94 @@ static Sx *lower_function(LowerCtx *ctx, Node *decl) {
     ctx->n_addr_taken = 0;
     scan_addr_taken(ctx, body_node);
 
+    // For variadic functions, build a mapping from Symbol* → CPU4 bp offset.
+    // CPU4 uses 4-byte push slots and 4-byte frame overhead (vs CPU3's 2-byte slots
+    // and 8-byte overhead). sym->offset reflects CPU3 layout; we correct it here.
+    ctx->n_vparams = 0;
+    if (is_variadic && body_node->symtable) {
+        // param_syms[] is already sorted by offset above; re-collect here
+        Symbol *vps[64]; int nvps = 0;
+        for (Symbol *s = body_node->symtable->symbols; s; s = s->next)
+            if (s->kind == SYM_PARAM && s->ns == NS_IDENT && nvps < 64)
+                vps[nvps++] = s;
+        // Sort by offset ascending (same order as param_syms[])
+        for (int i = 0; i < nvps-1; i++)
+            for (int j = i+1; j < nvps; j++)
+                if (vps[i]->offset > vps[j]->offset) {
+                    Symbol *tmp = vps[i]; vps[i] = vps[j]; vps[j] = tmp;
+                }
+        for (int i = 0; i < nvps; i++) {
+            int cpu4_off = 4 + i * 4;  // 4-byte frame overhead + 4-byte slot * idx
+            if (ctx->n_vparams >= ctx->vparam_cap) {
+                ctx->vparam_cap = ctx->vparam_cap ? ctx->vparam_cap * 2 : 8;
+                ctx->vparam_syms    = realloc(ctx->vparam_syms,
+                                              ctx->vparam_cap * sizeof(Symbol *));
+                ctx->vparam_offsets = realloc(ctx->vparam_offsets,
+                                              ctx->vparam_cap * sizeof(int));
+            }
+            ctx->vparam_syms[ctx->n_vparams]    = vps[i];
+            ctx->vparam_offsets[ctx->n_vparams]  = cpu4_off;
+            ctx->n_vparams++;
+        }
+    }
+
+    // For non-variadic functions, address-taken SYM_PARAMs must be homed to local
+    // stack slots because register-ABI params are not on the stack.
+    // Collect them, allocate frame space, and record home offsets in ctx.
+    ctx->n_param_homes = 0;
+    if (!is_variadic && body_node->symtable) {
+        // Collect address-taken param symbols
+        Symbol *at_params[64]; int n_at = 0;
+        for (Symbol *s = body_node->symtable->symbols; s && n_at < 64; s = s->next)
+            if (s->kind == SYM_PARAM && s->ns == NS_IDENT && sym_is_addr_taken(ctx, s))
+                at_params[n_at++] = s;
+        // Sort by offset for deterministic layout
+        for (int i = 0; i < n_at - 1; i++)
+            for (int j = i + 1; j < n_at; j++)
+                if (at_params[i]->offset > at_params[j]->offset) {
+                    Symbol *tmp = at_params[i]; at_params[i] = at_params[j]; at_params[j] = tmp;
+                }
+        for (int i = 0; i < n_at; i++) {
+            Symbol *ps = at_params[i];
+            int psz = ps->type ? ps->type->size : 2;
+            if (psz == 4 && (frame_size % 4) != 0) frame_size += 2; // align to 4
+            frame_size += psz;
+            int home_off = -frame_size;  // negative = below bp
+            if (ctx->n_param_homes >= ctx->param_home_cap) {
+                ctx->param_home_cap = ctx->param_home_cap ? ctx->param_home_cap * 2 : 8;
+                ctx->param_home_syms = realloc(ctx->param_home_syms,
+                                               ctx->param_home_cap * sizeof(Symbol *));
+                ctx->param_home_offs = realloc(ctx->param_home_offs,
+                                               ctx->param_home_cap * sizeof(int));
+            }
+            ctx->param_home_syms[ctx->n_param_homes] = ps;
+            ctx->param_home_offs[ctx->n_param_homes] = home_off;
+            ctx->n_param_homes++;
+        }
+    }
+
     Sx *body = lower_stmt(ctx, body_node);
+
+    // If any params were homed, prepend stores to copy register values to home slots.
+    // The (var "p@N") on the RHS resolves to the IK_PARAM value in Braun SSA.
+    if (ctx->n_param_homes > 0) {
+        Sx *block = sx_list(1, sx_sym("block"));
+        Sx **tail = &block->cdr;
+        for (int i = 0; i < ctx->n_param_homes; i++) {
+            Symbol *ps = ctx->param_home_syms[i];
+            int home_off = ctx->param_home_offs[i];
+            int psz = ps->type ? ps->type->size : 2;
+            const char *pname = sym_alpha(ctx, ps);  // already registered above
+            Sx *addr = sx_list(3, sx_sym("addr"), sx_str(pname), sx_int(home_off));
+            Sx *var  = sx_list(2, sx_sym("var"),  sx_str(pname));
+            Sx *st   = sx_list(4, sx_sym("store"), sx_int(psz), addr, var);
+            *tail = sx_cons(st, NULL);
+            tail = &(*tail)->cdr;
+        }
+        *tail = sx_cons(body, NULL);
+        body = block;
+    }
+
     // (func "name" frame_size is_variadic (params ...) body)
     return sx_list(6, sx_sym("func"), sx_str(fname), sx_int(frame_size),
                    sx_int(is_variadic), params, body);
@@ -1317,7 +1501,7 @@ static Sx *lower_global(LowerCtx *ctx, Node *decl, Symbol *sym) {
             }
         } else {
             // char *p = "hello" → pointer reference to string literal label
-            char buf[32]; snprintf(buf, sizeof(buf), "_l%d", g_strlit_id);
+            char buf[32]; snprintf(buf, sizeof(buf), "_l%d", g_strlit_id++);
             *tail = sx_cons(sx_list(2, sx_sym("strref"), sx_str(arena_strdup(buf))), NULL);
         }
         return gv;
@@ -1360,14 +1544,22 @@ static Sx *lower_global(LowerCtx *ctx, Node *decl, Symbol *sym) {
                     neg = -1; r = r->ch[0];
                 }
                 while (r && r->kind == ND_CAST) r = r->ch[1];
-                int v = (r && r->kind == ND_LITERAL) ? (int)r->u.literal.ival * neg : 0;
-                // For float elements
-                if (etype && (etype->base == TB_FLOAT || etype->base == TB_DOUBLE)) {
-                    double fv = (r && r->kind == ND_LITERAL) ? r->u.literal.fval * neg : 0.0;
-                    float fv32 = (float)fv;
-                    uint32_t bits; memcpy(&bits, &fv32, 4); v = (int)bits;
+                // String literal element in pointer array: char *arr[] = {"a", "b"}
+                if (r && r->kind == ND_LITERAL && r->u.literal.strval &&
+                    etype && etype->base == TB_POINTER) {
+                    char buf[32]; snprintf(buf, sizeof(buf), "_l%d", g_strlit_id++);
+                    *gt = sx_cons(sx_list(2, sx_sym("strref"), sx_str(arena_strdup(buf))), NULL);
+                    gt = &(*gt)->cdr;
+                } else {
+                    int v = (r && r->kind == ND_LITERAL) ? (int)r->u.literal.ival * neg : 0;
+                    // For float elements
+                    if (etype && (etype->base == TB_FLOAT || etype->base == TB_DOUBLE)) {
+                        double fv = (r && r->kind == ND_LITERAL) ? r->u.literal.fval * neg : 0.0;
+                        float fv32 = (float)fv;
+                        uint32_t bits; memcpy(&bits, &fv32, 4); v = (int)bits;
+                    }
+                    *gt = sx_cons(sx_int(v), NULL); gt = &(*gt)->cdr;
                 }
-                *gt = sx_cons(sx_int(v), NULL); gt = &(*gt)->cdr;
             }
         }
         *tail = sx_cons(gi, NULL);

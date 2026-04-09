@@ -365,18 +365,13 @@ static int assign_colors(IGraph *g, Function *f, int K,
         }
 
         // Values live at a call site must avoid r0-r3 (caller-saved).
-        // Try callee-saved (r4-r7) first; fall back to r0-r3 only if needed.
+        // Use callee-saved (r4-r7) only; if none available, spill — do not
+        // fall back to caller-saved registers (they get clobbered by callees).
         if (call_site_live_any && call_site_live_any[v]) {
-            // First try callee-saved registers
             for (int r = 4; r < K; r++) {
                 if (!forbidden[r]) { g->color[v] = r; break; }
             }
-            // Fall back to caller-saved if all callee-saved are taken
-            if (g->color[v] < 0) {
-                for (int r = 0; r < 4; r++) {
-                    if (!forbidden[r]) { g->color[v] = r; break; }
-                }
-            }
+            // If no callee-saved available: leave uncolored so spill fires
         } else {
             for (int r = 0; r < K; r++) {
                 if (!forbidden[r]) { g->color[v] = r; break; }
@@ -479,7 +474,18 @@ static void rewrite_spills(Function *f, IGraph *g) {
                 Value *v = val_resolve(inst->ops[oi]);
                 if (!v || v->id >= nv) continue;
                 if (g->spilled[v->id]) {
-                    Value *tmp = insert_spill_load(f, b, inst, v, spill_offset[v->id]);
+                    // When the use is inside a run of IK_COPY instructions
+                    // (OOS phi copies), insert the spill load before the entire
+                    // run.  Otherwise the emit-time scratch register for the lea
+                    // in an out-of-F2-range load can clobber an earlier phi-copy
+                    // destination that happens to share the same physical register.
+                    Inst *insert_before = inst;
+                    if (inst->kind == IK_COPY) {
+                        while (insert_before->prev &&
+                               insert_before->prev->kind == IK_COPY)
+                            insert_before = insert_before->prev;
+                    }
+                    Value *tmp = insert_spill_load(f, b, insert_before, v, spill_offset[v->id]);
                     inst->ops[oi] = tmp;
                 }
             }
@@ -504,6 +510,71 @@ static void rewrite_spills(Function *f, IGraph *g) {
 }
 
 // ============================================================
+// ============================================================
+// Simple DCE: remove pure instructions with no uses
+// ============================================================
+
+static int is_pure_inst(Inst *inst) {
+    switch (inst->kind) {
+        case IK_STORE: case IK_CALL: case IK_ICALL:
+        case IK_BR: case IK_JMP: case IK_RET:
+        case IK_PUTCHAR: case IK_MEMCPY:
+            return 0;
+        default:
+            return inst->dst != NULL;
+    }
+}
+
+static void dce_pass(Function *f) {
+    int nv = f->nvalues;
+
+    // Recompute use_count from scratch
+    for (int i = 0; i < nv; i++)
+        f->values[i]->use_count = 0;
+    for (int bi = 0; bi < f->nblocks; bi++) {
+        Block *b = f->blocks[bi];
+        for (Inst *inst = b->head; inst; inst = inst->next) {
+            for (int oi = 0; oi < inst->nops; oi++) {
+                Value *v = val_resolve(inst->ops[oi]);
+                if (v && v->kind == VAL_INST)
+                    v->use_count++;
+            }
+        }
+    }
+
+    // Iteratively remove dead pure instructions
+    int changed = 1;
+    while (changed) {
+        changed = 0;
+        for (int bi = 0; bi < f->nblocks; bi++) {
+            Block *b = f->blocks[bi];
+            Inst *inst = b->head;
+            while (inst) {
+                Inst *next = inst->next;
+                if (!inst->is_dead && is_pure_inst(inst) &&
+                    inst->dst && inst->dst->use_count == 0) {
+                    // Remove this instruction
+                    inst->is_dead = 1;
+                    // Decrement operand use counts
+                    for (int oi = 0; oi < inst->nops; oi++) {
+                        Value *v = val_resolve(inst->ops[oi]);
+                        if (v && v->kind == VAL_INST && v->use_count > 0)
+                            v->use_count--;
+                    }
+                    // Unlink from block
+                    if (inst->prev) inst->prev->next = inst->next;
+                    else            b->head = inst->next;
+                    if (inst->next) inst->next->prev = inst->prev;
+                    else            b->tail = inst->prev;
+                    changed = 1;
+                }
+                inst = next;
+            }
+        }
+    }
+}
+
+// ============================================================
 // Main IRC entry point
 // ============================================================
 
@@ -524,17 +595,16 @@ void irc_allocate(Function *f) {
     for (int bi = 0; bi < f->nblocks; bi++) {
         Block *b = f->blocks[bi];
         for (Inst *inst = b->head; inst; inst = inst->next) {
-            if (inst->kind == IK_BR && inst->nops > 0) {
-                Value *v = val_resolve(inst->ops[0]);
-                if (v && v->kind == VAL_INST && v->phys_reg < 0)
-                    v->phys_reg = 0;
-            }
+            // IK_BR condition: jnz now takes any register; no pre-coloring needed.
             if ((inst->kind == IK_CALL || inst->kind == IK_ICALL) && inst->dst) {
                 if (inst->dst->kind == VAL_INST && inst->dst->phys_reg < 0)
                     inst->dst->phys_reg = 0;  // call result always in r0
             }
         }
     }
+
+    // Remove dead pure instructions before liveness (eliminates dead readbacks)
+    dce_pass(f);
 
     // Need liveness first
     compute_liveness(f);

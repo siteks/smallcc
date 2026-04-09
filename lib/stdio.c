@@ -47,20 +47,37 @@ static void _print_long_dec(long n)
     putchar('0' + (int)(n % 10));
 }
 
-static void _print_float(double f)
+static int _count_long_digits(long n)
 {
-    if (f < 0.0) { putchar('-'); f = -f; }
+    int d = 1;
+    while (n >= 10) { d++; n /= 10; }
+    return d;
+}
+
+static void _print_float_wp(double f, int width, int prec)
+{
+    int neg = 0;
+    if (f < 0.0) { neg = 1; f = -f; }
     long ipart = (long)f;
     double fpart = f - (double)ipart;
+    /* Compute total character count for padding */
+    int total = (neg ? 1 : 0) + _count_long_digits(ipart) + 1 + prec;
+    int i;
+    for (i = total; i < width; i++) putchar(' ');
+    if (neg) putchar('-');
     _print_long_dec(ipart);
     putchar('.');
-    int i;
-    for (i = 0; i < 6; i++) {
+    for (i = 0; i < prec; i++) {
         fpart *= 10.0;
         int d = (int)fpart;
         putchar('0' + d);
         fpart -= (double)d;
     }
+}
+
+static void _print_float(double f)
+{
+    _print_float_wp(f, 0, 6);
 }
 
 int puts(const char *s)
@@ -90,6 +107,14 @@ int printf(const char *fmt, ...)
         int width = 0;
         if (*fmt == '0') fmt++;
         while (*fmt >= '0' && *fmt <= '9') { width = width * 10 + (*fmt - '0'); fmt++; }
+
+        /* Optional precision */
+        int prec = 6;
+        if (*fmt == '.') {
+            fmt++;
+            prec = 0;
+            while (*fmt >= '0' && *fmt <= '9') { prec = prec * 10 + (*fmt - '0'); fmt++; }
+        }
 
         /* Optional length modifier */
         int is_long = 0;
@@ -146,7 +171,7 @@ int printf(const char *fmt, ...)
             case 102:   /* 'f' */
             {
                 double v = va_arg(ap, double);
-                _print_float(v);
+                _print_float_wp(v, width, prec);
                 break;
             }
             case 37:    /* '%' */

@@ -19,25 +19,21 @@ import sys
 #   bp
 #   lr
 #   h
-#   r0-r7, r0 implicit accumulator for some ops
+#   r0-r7
 #
 #   F0  00oooooo
 #   F1a 01ooooodddxxxyyy
 #   F1b 0111111dddoooooo
 #   F2  10ooooxxxiiiiiii
-#   F3a 1100ooooiiiiiiiiiiiiiiii
-#   F3b 1101ooooxxxyyyiiiiiiiiii
-#   F3c 111ooxxxiiiiiiiiiiiiiiii
+#   F3a 11000oooiiiiiiiiiiiiiiii
+#   F3b 11001oodddiiiiiiiiiiiiii
+#   F3c 1101ooooxxxyyyiiiiiiiiii
+#   F3d 11011111xxxoooiiiiiiiiii
+#   F3e 111ooxxxiiiiiiiiiiiiiiii
 #
-#   Format 0 - r0 or special registers (64 slots)
+#   Format 0 implicit or special hotspot (64 slots)
 #   halt
-#   ret     sp = bp; bp = *sp++; pc = *sp++
-#   itof
-#   ftoi
-#   jlr     lr = pc; pc = r0 & 0xffff
-#   push    sp-=4; *sp = r0
-#   pop     r0 = *sp; sp += 4
-#   __putchar
+#   ret     sp = bp; bp = [sp]&0xffff; pc = [sp]>>16; sp += 4
 #
 #   Format 1a - three op (31 slots)
 #   add     rd = rx op ry
@@ -65,7 +61,7 @@ import sys
 #   fdiv
 #   flt
 #   fgt
-#   (4 left)
+#   (6 left)
 #
 #   Format 1b - single op, (64 slots)
 #   sxb     rd
@@ -76,6 +72,12 @@ import sys
 #   popr    rd
 #   zxb     rd
 #   zxw     rd
+#   itof    rd
+#   ftoi    rd
+#   jlr     lr = pc; pc = rd & 0xffff
+#   jr      pc = rd & 0xffff
+#   ssp     sp = rd & 0xffff
+#   __putchar   rd
 #   
 #   Format 2 - one op + imm7; stack frame access (16 slots)
 #   lb      rx = [bp+sxt(imm7)]   
@@ -90,16 +92,16 @@ import sys
 #   shli    rx = rx << imm7
 #   andi    rx = rx & sxt(imm7)
 #
-#   Format 3a - zero op + imm16 (16 slots)
+#   Format 3a - zero op + imm16 (8 slots, could cut to 2 and make two more 1op+imm14)
 #   j       pc = imm16
 #   jl      lr = pc; pc = imm16
-#   jz      pc = r0==0 ? imm16 : pc
-#   jnz     pc = r0!=0 ? imm16 : pc
-#   enter   [sp-4] = lr; [sp-8] = bp; bp = sp-8; sp -= imm16+8
-#   ssp     sp = imm16
-#   adjw    sp += sxt(imm16)
-
-#   Format 3b - two op + imm10 (16 slots)
+#   enter   [sp-4] = (lr << 16) | bp; bp = sp - 4; sp -= imm16 + 4
+#
+#   Format 3b - one op + imm14 (4 slots)
+#   adjw    sp += (imm14 << 2)
+#   lea     rx = bp + (imm14 << 2)
+#
+#   Format 3c - two op + imm10 (15 slots)
 #   llb     rx = [ry+sxt(imm10)]   
 #   llw     rx = [ry+sxt(imm10*2)]   
 #   lll     rx = [ry+sxt(imm10*4)]   
@@ -115,13 +117,16 @@ import sys
 #   blts    pc = rx<ry ? (pc + sxt(imm10)) : pc
 #   bgts    pc = rx>ry ? (pc + sxt(imm10)) : pc
 #   addli   rx = ry + sxt(imm10)
-
-#   Format 3c - one op + imm16 (4 slots)
+#
+#   Format 3d - one op + imm10 (8 slots)
+#   beqz    pc = rx==0 ? (pc + sxt(imm10)) : pc
+#   bnez    pc = rx!=0 ? (pc + sxt(imm10)) : pc
+#
+#   Format 3e - one op + imm16 (4 slots)
 #   immw    rd = imm16
 #   immwh   rd = (rd & 0xffff) | (imm16 << 16)
-#   lea     rx = bp + imm16
-
-
+#   jz      pc = rd==0 ? imm16 : pc
+#   jnz     pc = rd!=0 ? imm16 : pc
 
 
 def f2b(f):
@@ -151,12 +156,6 @@ class G:
         # This space will be used for hot code ops after analysis
         'halt'  :   (0x00, 0, 0, 0),
         'ret'   :   (0x01, 0, 0, 0),
-        'itof'  :   (0x02, 0, 0, 0),
-        'ftoi'  :   (0x03, 0, 0, 0),
-        'jlr'   :   (0x04, 0, 0, 0),
-        'push'  :   (0x05, 0, 0, 0),
-        'pop'   :   (0x06, 0, 0, 0),
-        'putchar':  (0x1e, 0, 0, 0),
         # format 1a - three op, 16 bits 01ooooodddxxxyyy
         'add'   :   (0x40, 1, 0, 0),
         'sub'   :   (0x42, 1, 0, 0),
@@ -193,6 +192,12 @@ class G:
         'popr'  :   (0x7e, 1, 1, 0x05),
         'zxb'   :   (0x7e, 1, 1, 0x06),
         'zxw'   :   (0x7e, 1, 1, 0x07),
+        'itof'  :   (0x7e, 1, 1, 0x08),
+        'ftoi'  :   (0x7e, 1, 1, 0x09),
+        'jlr'   :   (0x7e, 1, 1, 0x0a),
+        'jr'    :   (0x7e, 1, 1, 0x0b),
+        'ssp'   :   (0x7e, 1, 1, 0x0c),
+        'putchar':  (0x7e, 1, 1, 0x3f),
         # format 2 - one op + imm7      10ooooxxxiiiiiii
         'lb'    :   (0x80, 1, 0, 0),
         'lw'    :   (0x84, 1, 0, 0),
@@ -205,34 +210,37 @@ class G:
         'addi'  :   (0xa0, 1, 0, 0),
         'shli'  :   (0xa4, 1, 0, 0),
         'andi'  :   (0xa8, 1, 0, 0),
-        # format 3a - zero op + imm16   1100ooooiiiiiiiiiiiiiiii
+        # format 3a - zero op + imm16   11000oooiiiiiiiiiiiiiiii
         'j'     :   (0xc0, 2, 0, 0),
         'jl'    :   (0xc1, 2, 0, 0),
-        'jz'    :   (0xc2, 2, 0, 0),
-        'jnz'   :   (0xc3, 2, 0, 0),
-        'enter' :   (0xc4, 2, 0, 0),
-        'ssp'   :   (0xc5, 2, 0, 0),
-        'adjw'  :   (0xc6, 2, 0, 0),
-        # format 3b - two op + imm10    1101ooooxxxyyyiiiiiiiiii
-        'llb'   :   (0xd0, 2, 1, 0),
-        'llw'   :   (0xd1, 2, 1, 0),
-        'lll'   :   (0xd2, 2, 1, 0),
-        'slb'   :   (0xd3, 2, 1, 0),
-        'slw'   :   (0xd4, 2, 1, 0),
-        'sll'   :   (0xd5, 2, 1, 0),
-        'llbx'  :   (0xd6, 2, 1, 0),
-        'llwx'  :   (0xd7, 2, 1, 0),
-        'beq'   :   (0xd8, 2, 1, 0),
-        'bne'   :   (0xd9, 2, 1, 0),
-        'blt'   :   (0xda, 2, 1, 0),
-        'ble'   :   (0xdb, 2, 1, 0),
-        'blts'  :   (0xdc, 2, 1, 0),
-        'bles'  :   (0xdd, 2, 1, 0),
-        'addli' :   (0xde, 2, 1, 0),
-        # format 3c - one op + imm16    111ooxxxiiiiiiiiiiiiiiii
-        'immw'  :   (0xe8, 2, 2, 0),
-        'immwh' :   (0xf0, 2, 2, 0),
-        'lea'   :   (0xf8, 2, 2, 0),
+        'enter' :   (0xc2, 2, 1, 0),
+        # format 3b - one op + imm14    11001oodddiiiiiiiiiiiiii
+        'adjw'  :   (0xc8, 2, 1, 0),
+        'lea'   :   (0xca, 2, 1, 0),
+        # format 3c - two op + imm10    1101ooooxxxyyyiiiiiiiiii
+        'llb'   :   (0xd0, 2, 2, 0),
+        'llw'   :   (0xd1, 2, 2, 0),
+        'lll'   :   (0xd2, 2, 2, 0),
+        'slb'   :   (0xd3, 2, 2, 0),
+        'slw'   :   (0xd4, 2, 2, 0),
+        'sll'   :   (0xd5, 2, 2, 0),
+        'llbx'  :   (0xd6, 2, 2, 0),
+        'llwx'  :   (0xd7, 2, 2, 0),
+        'beq'   :   (0xd8, 2, 2, 0),
+        'bne'   :   (0xd9, 2, 2, 0),
+        'blt'   :   (0xda, 2, 2, 0),
+        'ble'   :   (0xdb, 2, 2, 0),
+        'blts'  :   (0xdc, 2, 2, 0),
+        'bles'  :   (0xdd, 2, 2, 0),
+        'addli' :   (0xde, 2, 2, 0),
+        # format 3d - one op + imm10    11011111xxxoooiiiiiiiiii
+        'beqz'  :   (0xdf, 2, 3, 0x00),
+        'bnez'  :   (0xdf, 2, 3, 0x01),
+        # format 3e - one op + imm16    111ooxxxiiiiiiiiiiiiiiii
+        'immw'  :   (0xe0, 2, 4, 0),
+        'immwh' :   (0xe8, 2, 4, 0),
+        'jz'    :   (0xf0, 2, 4, 0),
+        'jnz'   :   (0xf8, 2, 4, 0),
     }
 
     # The key becomes (first byte, subop). the value is (instr, length, subfmt, subopcode)
@@ -390,9 +398,12 @@ class CPU:
 
         # get format, length, subformat, we need to read more to get subop if it exists
         # formats f1a, f1b, f2, f3c need bits masking
-        lookupins = ins & (0xfe if ins & 0xc0 == 0x40 else 0xfc if ins & 0xc0 == 0x80 else 0xf8 if ins & 0xe0 == 0xe0 else 0xff)
+        lookupins = ins & (     0xfe if ins & 0xc0 == 0x40  # f1a, f1b
+                           else 0xfc if ins & 0xc0 == 0x80  # f2
+                           else 0xfe if ins & 0xf8 == 0xc8  # f3b
+                           else 0xf8 if ins & 0xe0 == 0xe0  # f3e
+                           else 0xff)                       # f3a, f3c, f3d
         i, ilen, subfmt = G.rptable[(lookupins, 0)]
-        insbyte0 = ins
         fmt     = (ins & 0xc0) >> 6
         # fetch rest of instruction
         if ilen > 0: ins = (ins << 8) | self.mem.read8(s.pc + 1, trace=False)
@@ -402,6 +413,10 @@ class CPU:
         if lookupins == 0x7e:
             # This is a f1b instruction
             subop = ins & 0x3f
+            i, _, _ = G.rptable[(lookupins, subop)]
+        if lookupins == 0xdf:
+            # This is a f3d instruction
+            subop = (ins & 0x1c00) >> 10
             i, _, _ = G.rptable[(lookupins, subop)]
 
 
@@ -426,10 +441,16 @@ class CPU:
         elif fmt == 3 and subfmt == 0:
             imm = ins & 0xffff
         elif fmt == 3 and subfmt == 1:
+            dst = src0 = (ins & 0x1c000) >> 14
+            imm = ins & 0x3fff
+        elif fmt == 3 and subfmt == 2:
             dst = src0 = (ins & 0xe000) >> 13
             src1 = (ins & 0x1c00) >> 10
             imm = ins & 0x3ff
-        elif fmt == 3 and subfmt == 2:
+        elif fmt == 3 and subfmt == 3:
+            dst = src0 = (ins & 0xe000) >> 13
+            imm = ins & 0x3ff
+        elif fmt == 3 and subfmt == 4:
             dst = src0 = (ins & 0x70000) >> 16
             imm = ins & 0xffff
 
@@ -439,13 +460,7 @@ class CPU:
         p = ''
         # f0
         if      i == 'halt':    s.H = 1
-        elif    i == 'ret':     s.sp = s.bp; s.bp = m.read32(s.sp); s.pc = m.read32(s.sp + 4); s.sp += 8
-        elif    i == 'itof':    iv = s.r[0] if s.r[0] < 0x80000000 else s.r[0] - 0x100000000; s.r[0] = f2b(float(iv))
-        elif    i == 'ftoi':    s.r[0] = int(b2f(s.r[0])) & 0xffffffff
-        elif    i == 'jlr':     s.pc, s.lr = s.r[0], s.pc
-        elif    i == 'push':    s.sp -= 4; m.write32(s.sp, s.r[0])
-        elif    i == 'pop':     s.r[0] = m.read32(s.sp); s.sp += 4
-        elif    i == 'putchar': sys.stderr.write(chr(s.r[0] & 0xff)); sys.stderr.flush()
+        elif    i == 'ret':     s.sp = s.bp; s.bp = m.read32(s.sp) & 0xffff; s.pc = m.read32(s.sp) >> 16; s.sp += 4
         # f1a
         elif    i == 'add':     s.r[dst] = s.r[src0] + s.r[src1]
         elif    i == 'sub':     s.r[dst] = s.r[src0] - s.r[src1]
@@ -481,6 +496,12 @@ class CPU:
         elif    i == 'popr':    s.r[dst] = m.read32(s.sp); s.sp += 4
         elif    i == 'zxb':     s.r[dst] = s.r[src0] & 0xff
         elif    i == 'zxw':     s.r[dst] = s.r[src0] & 0xffff
+        elif    i == 'itof':    iv = s.r[src0] if s.r[src0] < 0x80000000 else s.r[src0] - 0x100000000; s.r[dst] = f2b(float(iv))
+        elif    i == 'ftoi':    s.r[dst] = int(b2f(s.r[src0])) & 0xffffffff
+        elif    i == 'jlr':     s.pc, s.lr = s.r[src0], s.pc
+        elif    i == 'jr':      s.pc = s.r[src0]
+        elif    i == 'ssp':     s.sp = s.r[src0]
+        elif    i == 'putchar': sys.stderr.write(chr(s.r[src0] & 0xff)); sys.stderr.flush()
         # f2
         elif    i == 'lb':      s.r[dst] = m.read8(s.bp + sext(imm, 7))
         elif    i == 'lw':      s.r[dst] = m.read16(s.bp + sext(imm<<1, 8))
@@ -496,12 +517,11 @@ class CPU:
         # f3a
         elif    i == 'j':       s.pc = imm
         elif    i == 'jl':      s.pc, s.lr = imm, s.pc
-        elif    i == 'jz':      s.pc = imm if s.r[0] == 0 else s.pc
-        elif    i == 'jnz':     s.pc = imm if s.r[0] != 0 else s.pc
-        elif    i == 'enter':   m.write32(s.sp - 4, s.lr); m.write32(s.sp - 8, s.bp); s.bp = s.sp - 8; s.sp -= imm + 8
-        elif    i == 'ssp':     s.sp = imm
-        elif    i == 'adjw':    s.sp += sext(imm, 16)
+        elif    i == 'enter':   m.write32(s.sp - 4, (s.lr << 16) | s.bp); s.bp = s.sp - 4; s.sp -= imm + 4
         # f3b
+        elif    i == 'adjw':    s.sp += sext((imm << 2), 16)
+        elif    i == 'lea':     s.r[dst] = s.bp + sext((imm << 2), 16)
+        # f3c
         elif    i == 'llb':     s.r[dst] = m.read8(s.r[src1] + sext(imm, 10))
         elif    i == 'llw':     s.r[dst] = m.read16(s.r[src1] + sext(imm<<1, 11))
         elif    i == 'lll':     s.r[dst] = m.read32(s.r[src1] + sext(imm<<2, 12))
@@ -517,11 +537,14 @@ class CPU:
         elif    i == 'blts':    s.pc = s.pc + sext(imm, 10) if sext(s.r[src0], 32) < sext(s.r[src1], 32) else s.pc
         elif    i == 'bles':    s.pc = s.pc + sext(imm, 10) if sext(s.r[src0], 32) <= sext(s.r[src1], 32) else s.pc
         elif    i == 'addli':   s.r[dst] = s.r[src1] + sext(imm, 10)
-        # f3c
+        # f3d
+        elif    i == 'beqz':    s.pc = s.pc + sext(imm, 10) if s.r[src0] == 0 else s.pc
+        elif    i == 'bnez':    s.pc = s.pc + sext(imm, 10) if s.r[src0] != 0 else s.pc
+        # f3e
         elif    i == 'immw':    s.r[dst] = imm
         elif    i == 'immwh':   s.r[dst] = (s.r[dst] & 0xffff) | (imm << 16)
-        elif    i == 'lea':     s.r[dst] = s.bp + sext(imm, 16)
-
+        elif    i == 'jz':      s.pc = imm if s.r[src0] == 0 else s.pc
+        elif    i == 'jnz':     s.pc = imm if s.r[src0] != 0 else s.pc
 
         # clean up state
         for i in range(8): s.r[i] &= 0xffffffff

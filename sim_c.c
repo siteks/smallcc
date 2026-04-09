@@ -252,9 +252,6 @@ typedef struct {
 static const Instr4 itab4[] = {
     /* F0 — 1 byte, no operands */
     {"halt",   0x00,0,0,0}, {"ret",    0x01,0,0,0},
-    {"itof",   0x02,0,0,0}, {"ftoi",   0x03,0,0,0},
-    {"jlr",    0x04,0,0,0}, {"push",   0x05,0,0,0}, {"pop",    0x06,0,0,0},
-    {"putchar",0x1e,0,0,0},
     /* F1a — 2 bytes, rd rx ry */
     {"add",    0x40,1,0,0}, {"sub",    0x42,1,0,0},
     {"mul",    0x44,1,0,0}, {"div",    0x46,1,0,0},
@@ -270,10 +267,13 @@ static const Instr4 itab4[] = {
     {"fdiv",   0x6c,1,0,0}, {"flt",    0x6e,1,0,0},
     {"fle",    0x70,1,0,0},
     /* F1b — 2 bytes, rd only; subop distinguishes the operation */
-    {"sxb",    0x7e,1,1,0x00}, {"sxw",   0x7e,1,1,0x01},
-    {"inc",    0x7e,1,1,0x02}, {"dec",   0x7e,1,1,0x03},
-    {"pushr",  0x7e,1,1,0x04}, {"popr",  0x7e,1,1,0x05},
-    {"zxb",    0x7e,1,1,0x06}, {"zxw",  0x7e,1,1,0x07},
+    {"sxb",    0x7e,1,1,0x00}, {"sxw",    0x7e,1,1,0x01},
+    {"inc",    0x7e,1,1,0x02}, {"dec",    0x7e,1,1,0x03},
+    {"pushr",  0x7e,1,1,0x04}, {"popr",   0x7e,1,1,0x05},
+    {"zxb",    0x7e,1,1,0x06}, {"zxw",    0x7e,1,1,0x07},
+    {"itof",   0x7e,1,1,0x08}, {"ftoi",   0x7e,1,1,0x09},
+    {"jlr",    0x7e,1,1,0x0a}, {"jr",     0x7e,1,1,0x0b},
+    {"ssp",    0x7e,1,1,0x0c}, {"putchar",0x7e,1,1,0x3f},
     /* F2 — 2 bytes, rx imm7 (bp-relative; imm scaled by access width) */
     {"lb",     0x80,1,0,0}, {"lw",     0x84,1,0,0},
     {"ll",     0x88,1,0,0}, {"sb",     0x8c,1,0,0},
@@ -284,9 +284,9 @@ static const Instr4 itab4[] = {
     {"andi",   0xa8,1,0,0},
     /* F3a — 3 bytes, imm16 only */
     {"j",      0xc0,2,0,0}, {"jl",     0xc1,2,0,0},
-    {"jz",     0xc2,2,0,0}, {"jnz",    0xc3,2,0,0},
-    {"enter",  0xc4,2,0,0}, {"ssp",    0xc5,2,0,0},
-    {"adjw",   0xc6,2,0,0},
+    {"enter",  0xc2,2,0,0},
+    /* new F3b — 3 bytes, rd + imm14 (byte offset / 4); subfmt=3 */
+    {"adjw",   0xc8,2,3,0}, {"lea",    0xca,2,3,0},
     /* F3b — 3 bytes, rx ry imm10 */
     {"llb",    0xd0,2,1,0}, {"llw",    0xd1,2,1,0},
     {"lll",    0xd2,2,1,0}, {"slb",    0xd3,2,1,0},
@@ -296,9 +296,11 @@ static const Instr4 itab4[] = {
     {"blt",    0xda,2,1,0}, {"ble",    0xdb,2,1,0},
     {"blts",   0xdc,2,1,0}, {"bles",   0xdd,2,1,0},
     {"addli",  0xde,2,1,0},
-    /* F3c — 3 bytes, rd imm16 */
-    {"immw",   0xe8,2,2,0}, {"immwh",  0xf0,2,2,0},
-    {"lea",    0xf8,2,2,0},
+    /* F3d — 3 bytes, rx + PC-relative imm10; subfmt=4 */
+    {"beqz",   0xdf,2,4,0x00}, {"bnez",  0xdf,2,4,0x01},
+    /* F3e — 3 bytes, rd imm16 */
+    {"immw",   0xe0,2,2,0}, {"immwh",  0xe8,2,2,0},
+    {"jz",     0xf0,2,2,0}, {"jnz",    0xf8,2,2,0},
     {NULL,0,0,0,0}
 };
 
@@ -790,7 +792,7 @@ static void assemble_cpu4(const char *src)
                 }
                 cur += 3;
             } else if (instr->extra == 2 && instr->subfmt == 2) {
-                /* F3c: rd, imm16 */
+                /* F3e: rd, imm16 */
                 int rd2 = (nops > 0) ? parse_reg4(ops[0]) : 0;
                 uint16_t imm16 = (nops > 1) ? (uint16_t)parse_tok(ops[1], pass) : 0;
                 uint8_t b0 = (instr->first_byte & 0xf8u) | (uint8_t)(rd2 & 7);
@@ -798,6 +800,41 @@ static void assemble_cpu4(const char *src)
                     write8((uint16_t)cur,   b0);
                     write8((uint16_t)(cur+1), (uint8_t)(imm16 >> 8));
                     write8((uint16_t)(cur+2), (uint8_t)(imm16 & 0xff));
+                }
+                cur += 3;
+            } else if (instr->extra == 2 && instr->subfmt == 3) {
+                /* new F3b: rd + imm14 (byte offset / 4); adjw has no reg (rd=0) */
+                int rd2 = 0;
+                int32_t byte_off = 0;
+                if (strcmp(real_mnem, "adjw") == 0) {
+                    byte_off = (nops > 0) ? (int32_t)strtol(ops[0], NULL, 0) : 0;
+                } else { /* lea */
+                    rd2 = (nops > 0) ? parse_reg4(ops[0]) : 0;
+                    byte_off = (nops > 1) ? (int32_t)strtol(ops[1], NULL, 0) : 0;
+                }
+                int32_t imm14 = (byte_off >> 2) & 0x3fff;
+                uint8_t b0 = (instr->first_byte & 0xfe) | (uint8_t)((rd2 >> 2) & 1);
+                uint8_t b1 = (uint8_t)(((rd2 & 3) << 6) | ((imm14 >> 8) & 0x3f));
+                uint8_t b2 = (uint8_t)(imm14 & 0xff);
+                if (pass == 2) {
+                    write8((uint16_t)cur,   b0);
+                    write8((uint16_t)(cur+1), b1);
+                    write8((uint16_t)(cur+2), b2);
+                }
+                cur += 3;
+            } else if (instr->extra == 2 && instr->subfmt == 4) {
+                /* F3d: rx + PC-relative imm10 (beqz, bnez) */
+                int rx2 = (nops > 0) ? parse_reg4(ops[0]) : 0;
+                uint16_t tgt = (pass == 2 && nops > 1) ? (uint16_t)parse_tok(ops[1], pass) : 0;
+                int32_t imm10 = (int32_t)tgt - (instr_addr + instr_len);
+                imm10 &= 0x3ff;
+                uint8_t b0 = 0xdf;
+                uint8_t b1 = (uint8_t)((rx2 << 5) | (instr->subop << 2) | ((imm10 >> 8) & 3));
+                uint8_t b2 = (uint8_t)(imm10 & 0xff);
+                if (pass == 2) {
+                    write8((uint16_t)cur,   b0);
+                    write8((uint16_t)(cur+1), b1);
+                    write8((uint16_t)(cur+2), b2);
                 }
                 cur += 3;
             } else {
@@ -816,8 +853,9 @@ static void assemble_cpu4(const char *src)
 #define MAX_STEPS 100000000
 static int g_max_steps = MAX_STEPS;
 
-static int32_t sx7 (int32_t v) { v &= 0x7f;  return (v >= 64)  ? v - 128  : v; }
-static int32_t sx10(int32_t v) { v &= 0x3ff; return (v >= 512) ? v - 1024 : v; }
+static int32_t sx7 (int32_t v) { v &= 0x7f;   return (v >= 64)   ? v - 128   : v; }
+static int32_t sx10(int32_t v) { v &= 0x3ff;  return (v >= 512)  ? v - 1024  : v; }
+static int32_t sx14(int32_t v) { v &= 0x3fff; return (v >= 8192) ? v - 16384 : v; }
 static int32_t sx16(int32_t v) { return (int32_t)(int16_t)(v & 0xffff); }
 
 /* ------------------------------------------------------------------ */
@@ -875,24 +913,35 @@ static void run_cpu4(int verbose)
             rd = rx  = (ins16 >> 7) & 0x7;
             imm      =  ins16       & 0x7f;  /* raw 7-bit; scaled per instruction */
         } else {
-            /* F3a / F3b / F3c: 3 bytes */
+            /* F3a / new-F3b / F3b / F3d / F3e: 3 bytes */
             b1 = read8(pc); pc++;
             b2 = read8(pc); pc++;
             uint32_t ins24 = ((uint32_t)b0 << 16) | ((uint32_t)b1 << 8) | b2;
-            if ((b0 & 0xf0) == 0xc0) {
-                /* F3a */
+            if ((b0 & 0xf8) == 0xc0) {
+                /* F3a: j, jl, enter (0xc0–0xc7) */
                 lookupop = b0;
                 imm      = (int32_t)(uint32_t)(((uint16_t)b1 << 8) | b2);
+            } else if ((b0 & 0xf8) == 0xc8) {
+                /* new F3b: adjw, lea (0xc8–0xcf); rd + imm14 */
+                lookupop = b0 & 0xfe;
+                rd = rx  = (int)((ins24 >> 14) & 0x7);
+                imm      = (int32_t)(ins24 & 0x3fff);  /* raw imm14 */
+            } else if (b0 == 0xdf) {
+                /* F3d: beqz, bnez */
+                lookupop = 0xdf;
+                rd = rx  = (int)((ins24 >> 13) & 0x7);
+                subop    = (int)((ins24 >> 10) & 0x7);
+                imm      = (int32_t)(ins24 & 0x3ff);
             } else if ((b0 & 0xf0) == 0xd0) {
-                /* F3b */
+                /* F3b: two-reg + imm10 (0xd0–0xde) */
                 lookupop = b0;
-                rd = rx  = (ins24 >> 13) & 0x7;
-                ry       = (ins24 >> 10) & 0x7;
+                rd = rx  = (int)((ins24 >> 13) & 0x7);
+                ry       = (int)((ins24 >> 10) & 0x7);
                 imm      = (int32_t)(ins24 & 0x3ff);
             } else {
-                /* F3c (0xe0-0xff) */
+                /* F3e: one-reg + imm16 (0xe0–0xff) */
                 lookupop = b0 & 0xf8;
-                rd       =  b0 & 0x7;
+                rd       = b0 & 0x7;
                 imm      = (int32_t)(uint32_t)(((uint16_t)b1 << 8) | b2);
             }
         }
@@ -910,24 +959,12 @@ static void run_cpu4(int verbose)
         switch (lookupop) {
         /* F0 */
         case 0x00: H = 1; break;  /* halt */
-        case 0x01:                /* ret */
+        case 0x01:                /* ret: unpack lr+bp from one 32-bit word */
             sp = bp;
-            bp = (uint16_t)read32(sp);
-            pc = (uint16_t)read32((uint16_t)(sp+4));
-            sp = (uint16_t)(sp + 8);
-            break;
-        case 0x02: { int32_t iv=(r[0]<0x80000000u)?(int32_t)r[0]:(int32_t)(r[0]-0x100000000ull); r[0]=float2bits((float)iv); } break; /* itof */
-        case 0x03: { float f=bits2float(r[0]); r[0]=(uint32_t)(int32_t)f; } break; /* ftoi */
-        case 0x04: { uint16_t t=pc; pc=(uint16_t)(r[0]&0xffff); lr=t; } break; /* jlr */
-        case 0x05:                /* push */
-            sp = (uint16_t)(sp - 4);
-            write32(sp, r[0]);
-            break;
-        case 0x06:                /* pop */
-            r[0] = read32(sp);
+            bp = (uint16_t)(read32(sp) & 0xffff);
+            pc = (uint16_t)(read32(sp) >> 16);
             sp = (uint16_t)(sp + 4);
             break;
-        case 0x1e: fputc((int)(r[0]&0xff),stderr); fflush(stderr); break; /* putchar */
         /* F1a */
         case 0x40: r[rd]=r[rx]+r[ry]; break;  /* add */
         case 0x42: r[rd]=r[rx]-r[ry]; break;  /* sub */
@@ -956,14 +993,20 @@ static void run_cpu4(int verbose)
         case 0x70: r[rd]=(bits2float(r[rx])<=bits2float(r[ry]))?1:0; break; /* fle */
         /* F1b */
         case 0x7e:
-            if      (subop==0x00) r[rd]=(uint32_t)(int32_t)(int8_t) (r[rd]&0xff);   /* sxb */
-            else if (subop==0x01) r[rd]=(uint32_t)(int32_t)(int16_t)(r[rd]&0xffff); /* sxw */
-            else if (subop==0x02) r[rd]=(r[rd]+1)&0xffffffff;                        /* inc */
-            else if (subop==0x03) r[rd]=(r[rd]-1)&0xffffffff;                        /* dec */
-            else if (subop==0x04) { sp -= 4; write32(sp, r[rd]); }                   /* pushr */
-            else if (subop==0x05) { r[rd] = read32(sp); sp += 4; }                   /* popr */
-            else if (subop==0x06) r[rd] = r[rd] & 0xff;                              /* zxb  */
-            else if (subop==0x07) r[rd] = r[rd] & 0xffff;                            /* zxw  */
+            if      (subop==0x00) r[rd]=(uint32_t)(int32_t)(int8_t) (r[rd]&0xff);   /* sxb    */
+            else if (subop==0x01) r[rd]=(uint32_t)(int32_t)(int16_t)(r[rd]&0xffff); /* sxw    */
+            else if (subop==0x02) r[rd]=(r[rd]+1)&0xffffffff;                        /* inc    */
+            else if (subop==0x03) r[rd]=(r[rd]-1)&0xffffffff;                        /* dec    */
+            else if (subop==0x04) { sp -= 4; write32(sp, r[rd]); }                   /* pushr  */
+            else if (subop==0x05) { r[rd] = read32(sp); sp += 4; }                   /* popr   */
+            else if (subop==0x06) r[rd] = r[rd] & 0xff;                              /* zxb    */
+            else if (subop==0x07) r[rd] = r[rd] & 0xffff;                            /* zxw    */
+            else if (subop==0x08) { int32_t iv=(r[rd]<0x80000000u)?(int32_t)r[rd]:(int32_t)(r[rd]-0x100000000ull); r[rd]=float2bits((float)iv); } /* itof */
+            else if (subop==0x09) { float f=bits2float(r[rd]); r[rd]=(uint32_t)(int32_t)f; }  /* ftoi */
+            else if (subop==0x0a) { uint16_t t=pc; pc=(uint16_t)(r[rd]&0xffff); lr=t; }       /* jlr  */
+            else if (subop==0x0b) { pc=(uint16_t)(r[rd]&0xffff); }                             /* jr   */
+            else if (subop==0x0c) { sp=(uint16_t)(r[rd]&0xffff); }                             /* ssp  */
+            else if (subop==0x3f) { fputc((int)(r[rd]&0xff),stderr); fflush(stderr); }         /* putchar */
             break;
         /* F2 — bp-relative (imm is raw 7-bit; scaled by access size) */
         case 0x80: r[rd]=read8 ((uint16_t)((int32_t)bp+sx7(imm)));     break; /* lb  */
@@ -980,14 +1023,13 @@ static void run_cpu4(int verbose)
         /* F3a */
         case 0xc0: pc=(uint16_t)imm; break;  /* j   */
         case 0xc1: lr=pc; pc=(uint16_t)imm; break; /* jl  */
-        case 0xc2: if(!r[0]) pc=(uint16_t)imm; break; /* jz  */
-        case 0xc3: if( r[0]) pc=(uint16_t)imm; break; /* jnz */
-        case 0xc4:            /* enter */
-            write32((uint16_t)(sp-4),lr); write32((uint16_t)(sp-8),bp);
-            bp=(uint16_t)(sp-8); sp=(uint16_t)(sp-(uint16_t)imm-8);
+        case 0xc2:            /* enter: pack lr+bp into one 32-bit word (4-byte overhead) */
+            write32((uint16_t)(sp-4), ((uint32_t)lr << 16) | (uint32_t)bp);
+            bp=(uint16_t)(sp-4); sp=(uint16_t)(sp-(uint16_t)imm-4);
             break;
-        case 0xc5: sp=(uint16_t)imm; break;  /* ssp  */
-        case 0xc6: sp=(uint16_t)(sp+sx16(imm)); break; /* adjw */
+        /* new F3b: adjw=0xc8, lea=0xca */
+        case 0xc8: sp=(uint16_t)(sp+(uint16_t)(sx14(imm)<<2)); break; /* adjw */
+        case 0xca: r[rd]=(uint32_t)((int32_t)bp+(sx14(imm)<<2)); break; /* lea */
         /* F3b — register-relative */
         case 0xd0: r[rx]=read8 ((uint16_t)((int32_t)r[ry]+sx10(imm)));     break; /* llb  */
         case 0xd1: { uint16_t a = (uint16_t)((int32_t)r[ry]+sx10(imm)*2); check_align16(a, oldpc); r[rx]=read16(a); } break; /* llw  */
@@ -1004,10 +1046,16 @@ static void run_cpu4(int verbose)
         case 0xdc: if((int32_t)r[rx]<(int32_t)r[ry]) pc=(uint16_t)(pc+sx10(imm)); break; /* blts */
         case 0xdd: if((int32_t)r[rx]<=(int32_t)r[ry]) pc=(uint16_t)(pc+sx10(imm)); break; /* bles */
         case 0xde: r[rx]=r[ry]+(uint32_t)sx10(imm); break; /* addli */
-        /* F3c */
-        case 0xe8: r[rd]=(uint32_t)(uint16_t)imm; break; /* immw  */
-        case 0xf0: r[rd]=(r[rd]&0xffff)|((uint32_t)(uint16_t)imm<<16); break; /* immwh */
-        case 0xf8: r[rd]=(uint32_t)((int32_t)bp+sx16(imm)); break; /* lea   */
+        /* F3d: beqz/bnez */
+        case 0xdf:
+            if      (subop==0x00) { if(!r[rd]) pc=(uint16_t)(pc+sx10(imm)); } /* beqz */
+            else if (subop==0x01) { if( r[rd]) pc=(uint16_t)(pc+sx10(imm)); } /* bnez */
+            break;
+        /* F3e: one-reg + imm16 */
+        case 0xe0: r[rd]=(uint32_t)(uint16_t)imm; break;                              /* immw  */
+        case 0xe8: r[rd]=(r[rd]&0xffff)|((uint32_t)(uint16_t)imm<<16); break;        /* immwh */
+        case 0xf0: if(!r[rd]) pc=(uint16_t)imm; break;                               /* jz   */
+        case 0xf8: if( r[rd]) pc=(uint16_t)imm; break;                               /* jnz  */
         default:
             fprintf(stderr, "cpu4: unknown opcode 0x%02x at pc=%04x\n", b0, oldpc);
             fprintf(stderr, "Last %d instructions:\n", TRACE_N4);
