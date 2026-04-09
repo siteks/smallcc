@@ -941,8 +941,8 @@ static void emit_sx_data(Sx *sx, FILE *out) {
         const char *name = (name_sx->kind == SX_SYM || name_sx->kind == SX_STR) ? name_sx->s : "?";
         int size = size_sx && size_sx->kind == SX_INT ? size_sx->i : 2;
 
-        // Emit alignment directive for 4-byte (long/float) globals
-        if (size >= 4) fprintf(out, "    align\n");
+        // Emit alignment directive for multi-byte globals
+        if (size >= 2) fprintf(out, "    align\n");
         fprintf(out, "%s:\n", name);
 
         // Check for strref init: (strref "label") → emit word label

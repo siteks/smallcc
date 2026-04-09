@@ -444,7 +444,6 @@ int main(int argc, char **argv)
             fprintf(out, "    ssp     r0\n");
             fprintf(out, "    jl      main\n");
             fprintf(out, "    halt\n");
-            fprintf(out, ".data=0x4000\n");
         } else {
             fprintf(out, ".text=0\n");
             fprintf(out, "    ssp     0xF000\n");
@@ -455,6 +454,11 @@ int main(int argc, char **argv)
         if (show_stats)
             fprintf(stderr, "%-4s  %-10s  %8s  %8s\n", "TU", "file", "arena_before", "arena_used");
     }
+
+    // For CPU4: defer all globals/strlits to after all functions, so that
+    // _globals_start: marks the clean code/data boundary for clearmem + watchpoint.
+    FILE *globals_buf = target_cpu4 ? tmpfile() : NULL;
+    if (target_cpu4 && !globals_buf) { perror("tmpfile"); return 1; }
 
     int cpu4_strlit_id = 0;  // monotonically increasing string literal ID across TUs
     for (int tu = 0; tu < tu_count; tu++)
@@ -531,8 +535,8 @@ int main(int argc, char **argv)
             // New nanopass pipeline: Node* → Sexp → SSA → IRC → CPU4
             TypeMap *tm = typemap_new();
             Sx *sx_prog = lower_program(node, tm, tu, &cpu4_strlit_id);
-            // Emit data section (globals and string literals)
-            emit_globals(sx_prog, out);
+            // Accumulate globals and string literals into deferred buffer
+            emit_globals(sx_prog, globals_buf);
             if (irsim) irsim_populate_globals(irsim, sx_prog);
             // Compile each function
             Sx *items = sx_prog ? sx_prog->cdr : NULL;
@@ -576,6 +580,21 @@ int main(int argc, char **argv)
             fprintf(stderr, "%-4d  %-10s  %8zu  %8zu\n",
                     tu, all_files[tu], arena_before, tu_used);
         }
+    }
+
+    // Flush deferred CPU4 globals after all functions — _globals_start: marks
+    // the code/data boundary used by clearmem and the sim_c write watchpoint.
+    if (globals_buf && !run_oos && !run_irc) {
+        fprintf(out, "    align\n");
+        fprintf(out, "_globals_start:\n");
+        rewind(globals_buf);
+        char xbuf[4096];
+        size_t n;
+        while ((n = fread(xbuf, 1, sizeof(xbuf), globals_buf)) > 0)
+            fwrite(xbuf, 1, n, out);
+        fclose(globals_buf);
+    } else if (globals_buf) {
+        fclose(globals_buf);
     }
 
     if (show_stats)
