@@ -29,6 +29,8 @@ void     irsim_free(IrSim *sim);
 /* Registration — call for every Function* and every TU's sx_prog */
 void     irsim_add_function(IrSim *sim, Function *f);
 void     irsim_populate_globals(IrSim *sim, Sx *program);
+/* Register a string literal (from braun.c function-body strlits) */
+void     irsim_add_strlit(IrSim *sim, const char *label, const char *data, int len);
 
 /* Execution — finds "main" and calls it, returns r0 value */
 uint32_t irsim_call_main(IrSim *sim);

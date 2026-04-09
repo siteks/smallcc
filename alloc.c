@@ -145,6 +145,7 @@ typedef struct {
     int       *color;        // assigned physical register (-1 = unassigned)
     int       *precolored;   // precolored[v] = forced register, or -1
     int       *spilled;      // spilled[v] = 1 if spilled
+    int       *alias;        // alias[v] = canonical rep after coalescing (init: v)
 } IGraph;
 
 static IGraph *ig_new(int nv) {
@@ -158,9 +159,11 @@ static IGraph *ig_new(int nv) {
     g->color      = malloc(nv * sizeof(int));
     g->precolored = malloc(nv * sizeof(int));
     g->spilled    = calloc(nv, sizeof(int));
+    g->alias      = malloc(nv * sizeof(int));
     for (int i = 0; i < nv; i++) {
         g->color[i]      = -1;
         g->precolored[i] = -1;
+        g->alias[i]      = i;
     }
     return g;
 }
@@ -172,6 +175,7 @@ static void ig_free(IGraph *g) {
     free(g->color);
     free(g->precolored);
     free(g->spilled);
+    free(g->alias);
     free(g);
 }
 
@@ -184,6 +188,117 @@ static void ig_add_edge(IGraph *g, int u, int v) {
         // Don't count edges to/from precolored as degree
         if (g->precolored[u] < 0) g->degree[u]++;
         if (g->precolored[v] < 0) g->degree[v]++;
+    }
+}
+
+// Canonical representative lookup with path compression
+static int ig_find(IGraph *g, int v) {
+    while (g->alias[v] != v) {
+        g->alias[v] = g->alias[g->alias[v]];  // path compression (halving)
+        v = g->alias[v];
+    }
+    return v;
+}
+
+// Merge node v into node u: redirect all of v's interference edges to u.
+// After this, alias[v] = u and v is effectively removed from the graph.
+static void ig_merge(IGraph *g, int u, int v) {
+    for (int w = 0; w < g->nwords; w++) {
+        uint32_t word = g->adj[v][w];
+        while (word) {
+            int bit = __builtin_ctz(word); word &= word - 1;
+            int t = w * 32 + bit;
+            if (t >= g->nv || t == u) continue;
+            // Remove v-t edge (update t's degree)
+            bv_clear(g->adj[t], v);
+            if (g->precolored[t] < 0) g->degree[t]--;
+            // Add u-t edge if not present
+            ig_add_edge(g, u, t);
+        }
+    }
+    memset(g->adj[v], 0, g->nwords * sizeof(uint32_t));
+    g->degree[v] = 0;
+    g->alias[v]  = u;
+}
+
+// George's conservative coalescing test: can we safely merge v into u?
+// Safe if every neighbor t of v either already interferes with u, or has degree < K.
+// Precondition: u and v are canonical (ig_find) and do not interfere.
+static int can_coalesce_george(IGraph *g, int u, int v, int K) {
+    for (int w = 0; w < g->nwords; w++) {
+        uint32_t word = g->adj[v][w];
+        while (word) {
+            int bit = __builtin_ctz(word); word &= word - 1;
+            int t = w * 32 + bit;
+            if (t >= g->nv || t == u) continue;
+            if (!bv_test(g->adj[u], t)) {
+                // If t is precolored to the same register as u (precolored), merging
+                // would add edge u-t between two same-color precolored nodes, which
+                // means a non-precolored value would be coalesced into a precolored
+                // group while also interfering with another member of that same group.
+                if (g->precolored[u] >= 0 && g->precolored[t] >= 0 &&
+                    g->precolored[t] == g->precolored[u])
+                    return 0;
+                if (g->degree[t] >= K)
+                    return 0;
+            }
+        }
+    }
+    return 1;
+}
+
+// Coalesce IK_COPY instructions using George's conservative test.
+// Runs to fixpoint; marks coalesced copies is_dead = 1.
+// call_site_live[v] == 1 means value v is live across a call — it must stay
+// in a callee-saved register and cannot be coalesced into a caller-saved one.
+static void coalesce_copies(IGraph *g, Function *f, int K, int *call_site_live) {
+    int changed = 1;
+    while (changed) {
+        changed = 0;
+        for (int bi = 0; bi < f->nblocks; bi++) {
+            Block *b = f->blocks[bi];
+            for (Inst *inst = b->head; inst; inst = inst->next) {
+                if (inst->kind != IK_COPY || inst->is_dead || inst->nops < 1) continue;
+                Value *vdst = val_resolve(inst->dst);
+                Value *vsrc = val_resolve(inst->ops[0]);
+                if (!vdst || !vsrc || vdst == vsrc) { inst->is_dead = 1; changed = 1; continue; }
+                if (vdst->kind != VAL_INST || vsrc->kind != VAL_INST) continue;
+                if (vdst->id < 0 || vsrc->id < 0 ||
+                    vdst->id >= g->nv || vsrc->id >= g->nv) continue;
+
+                int u = ig_find(g, vdst->id);
+                int v = ig_find(g, vsrc->id);
+                if (u == v) { inst->is_dead = 1; changed = 1; continue; }
+
+                // Both precolored: only coalesce if same forced register
+                if (g->precolored[u] >= 0 && g->precolored[v] >= 0) {
+                    if (g->precolored[u] == g->precolored[v])
+                        { inst->is_dead = 1; changed = 1; }
+                    continue;
+                }
+                // Already interfere: cannot coalesce
+                if (bv_test(g->adj[u], v)) continue;
+
+                // Precolored node must be the "stay" side (u)
+                if (g->precolored[v] >= 0) { int tmp = u; u = v; v = tmp; }
+
+                // Among two non-precolored: put higher-degree as u for George's test
+                if (g->precolored[u] < 0 && g->degree[v] > g->degree[u]) {
+                    int tmp = u; u = v; v = tmp;
+                }
+
+                // If u is precolored to a caller-saved register (r0-r3) and v is
+                // live across a call, coalescing would clobber v at call sites.
+                if (g->precolored[u] >= 0 && g->precolored[u] < IRC_CALLER_REGS &&
+                    call_site_live && call_site_live[v]) continue;
+
+                if (can_coalesce_george(g, u, v, K)) {
+                    ig_merge(g, u, v);
+                    inst->is_dead = 1;
+                    changed = 1;
+                }
+            }
+        }
     }
 }
 
@@ -276,12 +391,12 @@ static int assign_colors(IGraph *g, Function *f, int K,
     int *degree   = malloc(nv * sizeof(int));
     memcpy(degree, g->degree, nv * sizeof(int));
 
-    // Worklist: all non-precolored values with degree < K go first
-    // Iterate until empty
+    // Worklist: all non-precolored, non-aliased values participate in simplify
     int remaining = 0;
     for (int i = 0; i < nv; i++) {
         if (g->precolored[i] >= 0) { removed[i] = 1; } // pre-colored: skip
         else if (f->values[i]->kind != VAL_INST) { removed[i] = 1; }
+        else if (ig_find(g, i) != i) { removed[i] = 1; } // merged away by coalescing
         else remaining++;
     }
 
@@ -386,6 +501,15 @@ static int assign_colors(IGraph *g, Function *f, int K,
     for (int i = 0; i < nv; i++) {
         if (g->precolored[i] >= 0)
             g->color[i] = g->precolored[i];
+    }
+
+    // Propagate colors (and spill marks) to nodes merged away by coalescing
+    for (int i = 0; i < nv; i++) {
+        if (ig_find(g, i) != i) {
+            int canon = ig_find(g, i);
+            g->color[i]   = g->color[canon];
+            g->spilled[i] = g->spilled[canon];
+        }
     }
 
     free(stack);
@@ -646,7 +770,19 @@ void irc_allocate(Function *f) {
     int K = IRC_K;
     int max_iter = 20;
     for (int iter = 0; iter < max_iter; iter++) {
+        // Reset is_dead on all still-linked IK_COPY instructions before each
+        // coalescing pass. DCE already unlinked truly dead instructions; any
+        // IK_COPY still in the block was only killed by a prior coalescing
+        // iteration and must be re-evaluated after spill rewrite changed the
+        // interference graph.
+        for (int bi = 0; bi < f->nblocks; bi++) {
+            for (Inst *inst = f->blocks[bi]->head; inst; inst = inst->next)
+                if (inst->kind == IK_COPY) inst->is_dead = 0;
+        }
+
         IGraph *g = build_interference_graph(f);
+
+        coalesce_copies(g, f, K, call_site_live);
 
         int ok = assign_colors(g, f, K, call_site_live);
 

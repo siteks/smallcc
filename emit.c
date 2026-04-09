@@ -592,13 +592,21 @@ static void emit_inst(Inst *inst, FILE *out) {
             // values (r4-r7) which the caller may hold as long-lived variables.
             int nreg  = inst->nops < 3 ? inst->nops : 3;
             int nextra = inst->nops > 3 ? inst->nops - 3 : 0;
+            // Compute mask of registers holding the first nreg args (to avoid
+            // clobbering them when materializing constants for stack args).
+            unsigned reg_arg_mask = 0;
+            for (int ai = 0; ai < nreg; ai++) {
+                Value *av = val_resolve(inst->ops[ai]);
+                if (av && av->kind == VAL_INST && av->phys_reg >= 0)
+                    reg_arg_mask |= (1u << av->phys_reg);
+            }
             // Push extra args in reverse order
             for (int ai = inst->nops - 1; ai >= 3; ai--) {
                 Value *av = val_resolve(inst->ops[ai]);
                 int ar = av ? (av->kind == VAL_CONST ? -1 : preg(av)) : -1;
                 if (av && av->kind == VAL_CONST) {
-                    // Use r0 as scratch for constant stack args (pushr r0)
-                    int sc = pick_scratch(0, 0);  // r0 is always scratch here (not a call arg)
+                    // Pick a scratch that doesn't hold a live register arg.
+                    int sc = pick_scratch(0, reg_arg_mask);
                     emit_const_into(out, av, sc);
                     fprintf(out, "    pushr %s\n", regname(sc));
                 } else if (ar >= 0) {
@@ -676,31 +684,55 @@ static void emit_inst(Inst *inst, FILE *out) {
 
     case IK_ICALL: {
         // indirect call: ops[0] = function pointer; ops[1..] = args
-        // ABI: args in r1..r3 (caller-saved); fp in r0 (for jlr); args 3+ on stack.
+        // ABI: args in r1..r3 (caller-saved); fp called via jlr rd; args 3+ on stack.
         if (inst->nops < 1) break;
-        int nreg  = (inst->nops - 1) < 3 ? (inst->nops - 1) : 3;
+        int nreg   = (inst->nops - 1) < 3 ? (inst->nops - 1) : 3;
         int nextra = (inst->nops - 1) > 3 ? (inst->nops - 1) - 3 : 0;
-        // Save fp first — it may be in any register that arg loading would overwrite
         int fp_reg = get_val_reg(out, inst->ops[0], 7);
-        // Args go in r1..r(nreg); fp cannot be in r0..r(nreg) safely
-        if (fp_reg <= nreg) {
-            unsigned arg_mask = nreg < 8 ? (((1u << nreg) - 1) << 1) | 1u : 0xffu;
-            int safe = pick_safe_scratch(arg_mask, inst);
-            fprintf(out, "    or %s, %s, %s\n", regname(safe), regname(fp_reg), regname(fp_reg));
-            fp_reg = safe;
+        int fp_on_stack = 0;
+
+        // Compute mask of registers currently holding register args (ops[1..nreg]).
+        unsigned icall_arg_mask = 0;
+        for (int ai = 0; ai < nreg; ai++) {
+            Value *av = val_resolve(inst->ops[ai + 1]);
+            if (av && av->kind == VAL_INST && av->phys_reg >= 0)
+                icall_arg_mask |= (1u << av->phys_reg);
         }
-        // Push extra args in reverse order
+
+        // Push extra stack args first (reverse order), using a scratch that avoids
+        // clobbering registers holding the first nreg args.
         for (int ai = inst->nops - 2; ai >= 3; ai--) {
             Value *av = val_resolve(inst->ops[ai + 1]);
-            int ar = av ? (av->kind == VAL_CONST ? -1 : preg(av)) : -1;
             if (av && av->kind == VAL_CONST) {
-                emit_imm(out, 0, av->iconst);
-                fprintf(out, "    push\n");
-            } else if (ar >= 0) {
-                fprintf(out, "    pushr %s\n", regname(ar));
+                int sc = pick_scratch(0, icall_arg_mask);
+                emit_imm(out, sc, av->iconst);
+                fprintf(out, "    pushr %s\n", regname(sc));
+            } else {
+                int ar = av ? preg(av) : -1;
+                if (ar >= 0) fprintf(out, "    pushr %s\n", regname(ar));
             }
         }
-        // Move args into r1..r(nreg): parallel-copy with cycle handling.
+
+        // If fp is in r1..r(nreg), it will be overwritten by the arg setup.
+        // Find a safe register to hold fp, or spill to the stack.
+        if (fp_reg >= 1 && fp_reg <= nreg) {
+            // Forbidden: arg destinations (r1..rnreg), arg sources, live-out / upcoming reads.
+            unsigned forbidden = nreg < 8 ? (((1u << nreg) - 1) << 1) : 0xfeu;
+            forbidden |= icall_arg_mask;
+            int safe = pick_safe_scratch(forbidden, inst);
+            if (forbidden & (1u << safe)) {
+                // No free register: push fp to stack now (on top of extra args).
+                // After the parallel copy, pop it into r0 (which is free post-copy).
+                fprintf(out, "    pushr %s\n", regname(fp_reg));
+                fp_on_stack = 1;
+                fp_reg = 0;  // placeholder; actual value restored via popr r0 below
+            } else {
+                fprintf(out, "    or %s, %s, %s\n", regname(safe), regname(fp_reg), regname(fp_reg));
+                fp_reg = safe;
+            }
+        }
+
+        // Move args into r1..r(nreg): parallel-copy to handle swap cycles.
         {
             int mv_src[8], mv_dst[8], mv_done[8], nmv = 0;
             int const_target[8], const_val[8], nconst = 0;
@@ -751,8 +783,11 @@ static void emit_inst(Inst *inst, FILE *out) {
             }
             for (int ci = 0; ci < nconst; ci++) emit_imm(out, const_target[ci], const_val[ci]);
         }
-        // jlr rd uses any register directly
-        fprintf(out, "    jlr %s\n", regname(fp_reg));
+        // Restore fp from stack into r0 (r0 is free after args are in r1..r3).
+        if (fp_on_stack)
+            fprintf(out, "    popr r0\n");
+        fprintf(out, "    jlr %s\n", fp_on_stack ? "r0" : regname(fp_reg));
+        // After the call, clean up extra stack args (fp was already popped if on stack).
         if (nextra > 0) fprintf(out, "    adjw %d\n", nextra * 4);
         if (dst && preg(dst) != 0)
             fprintf(out, "    or %s, r0, r0\n", regname(preg(dst)));

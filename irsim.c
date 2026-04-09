@@ -240,7 +240,9 @@ static Block *execute_block(IrSim *sim, Block *b, SimFrame *frame)
     uint32_t *vreg = frame->vreg;
 
     for (Inst *inst = b->head; inst; inst = inst->next) {
-        if (inst->is_dead) continue;
+        // DCE unlinks dead instructions entirely; is_dead=1 on a linked instruction
+        // means it was killed by coalescing (physically same register). The irsim
+        // works at the SSA-id level where two distinct ids must still be copied.
         sim->cycles++;
         Value *dst = inst->dst;
 
@@ -838,6 +840,15 @@ void irsim_add_function(IrSim *sim, Function *f)
         sim->ga_addrs[sim->ngaddrs] = fn_addr;
         sim->ngaddrs++;
     }
+}
+
+void irsim_add_strlit(IrSim *sim, const char *label, const char *data, int len)
+{
+    if (!sim || !label) return;
+    uint16_t addr = alloc_data(sim, label, len + 1);  // +1 for null terminator
+    for (int i = 0; i < len; i++)
+        sim->mem[addr + i] = (uint8_t)data[i];
+    sim->mem[addr + len] = 0;
 }
 
 void irsim_populate_globals(IrSim *sim, Sx *program)

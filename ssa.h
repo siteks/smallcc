@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include "sx.h"   // ValType, CallDesc
+#include "smallcc.h"  // Symbol
 
 // ============================================================
 // SSA IR — Regime 2 data structures
@@ -104,12 +105,12 @@ struct Block {
     int     sealed;         // all predecessors known
     int     filled;         // terminator emitted
 
-    // Braun maps
-    char   *def_names[BRAUN_MAP_MAX];
+    // Braun maps (Symbol* keys for O(1) pointer-equality lookup)
+    Symbol *def_syms [BRAUN_MAP_MAX];
     Value  *def_vals [BRAUN_MAP_MAX];
     int     ndef;
     Inst   *iphi_insts[BRAUN_MAP_MAX];
-    char   *iphi_names[BRAUN_MAP_MAX];
+    Symbol *iphi_syms[BRAUN_MAP_MAX];
     int     niphi;
 
     // Dominator analysis

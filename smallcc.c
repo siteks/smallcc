@@ -532,38 +532,41 @@ int main(int argc, char **argv)
 #endif
 
         if (target_cpu4) {
-            // New nanopass pipeline: Node* → Sexp → SSA → IRC → CPU4
-            TypeMap *tm = typemap_new();
-            Sx *sx_prog = lower_program(node, tm, tu, &cpu4_strlit_id);
-            // Accumulate globals and string literals into deferred buffer
+            // Nanopass pipeline: Node* → SSA → IRC → CPU4
+            // Phase 1: emit global variables and top-level string literals
+            Sx *sx_prog = lower_globals(node, tu, &cpu4_strlit_id);
             emit_globals(sx_prog, globals_buf);
             if (irsim) irsim_populate_globals(irsim, sx_prog);
-            // Compile each function
-            Sx *items = sx_prog ? sx_prog->cdr : NULL;
-            while (items && items->kind == SX_PAIR) {
-                Sx *item = items->car;
-                if (item && item->kind == SX_PAIR &&
-                    item->car && item->car->kind == SX_SYM &&
-                    strcmp(item->car->s, "func") == 0) {
-                    Function *f = braun_function(item, tm);
-                    if (f) {
-                        if (ssa_out) { fprintf(ssa_out, "=== SSA: %s ===\n", f->name); print_function(f, ssa_out); }
-                        compute_dominators(f);
-                        out_of_ssa(f);
-                        if (oos_out) { fprintf(oos_out, "=== OOS: %s ===\n", f->name); print_function(f, oos_out); }
-                        if (getenv("DUMP_IR")) { fprintf(stderr, "=== after oos ===\n"); print_function(f, stderr); }
-                        if (run_oos && irsim) { irsim_add_function(irsim, f); goto done_irc; }
-                        irc_allocate(f);
-                        if (irc_out) { fprintf(irc_out, "=== IRC: %s ===\n", f->name); print_function(f, irc_out); }
-                        if (getenv("DUMP_IR")) { fprintf(stderr, "=== after irc ===\n"); print_function(f, stderr); }
-                        if (run_irc && irsim) { irsim_add_function(irsim, f); goto done_irc; }
-                        emit_function(f, out);
-                        done_irc:;
+            // Phase 2: compile each function directly from Node* to SSA
+            Node *decls = (node && node->kind == ND_PROGRAM) ? node->ch[0] : node;
+            for (Node *d = decls; d; d = d->next) {
+                if (d->kind != ND_DECLARATION || !d->u.declaration.is_func_defn) continue;
+                Function *f = braun_function(d, tu, &cpu4_strlit_id);
+                if (irsim) {
+                    // Register function-body string literals with the irsim
+                    // before braun_emit_strlits clears them.
+                    int ns = braun_nstrlits();
+                    for (int _si = 0; _si < ns; _si++) {
+                        char _lbl[32]; const char *_dat; int _len;
+                        braun_get_strlit(_si, _lbl, &_dat, &_len);
+                        irsim_add_strlit(irsim, _lbl, _dat, _len);
                     }
                 }
-                items = items->cdr;
+                braun_emit_strlits(globals_buf);
+                if (f) {
+                    if (ssa_out) { fprintf(ssa_out, "=== SSA: %s ===\n", f->name); print_function(f, ssa_out); }
+                    compute_dominators(f);
+                    out_of_ssa(f);
+                    if (oos_out) { fprintf(oos_out, "=== OOS: %s ===\n", f->name); print_function(f, oos_out); }
+                    if (getenv("DUMP_IR")) { fprintf(stderr, "=== after oos ===\n"); print_function(f, stderr); }
+                    if (run_oos && irsim) { irsim_add_function(irsim, f); continue; }
+                    irc_allocate(f);
+                    if (irc_out) { fprintf(irc_out, "=== IRC: %s ===\n", f->name); print_function(f, irc_out); }
+                    if (getenv("DUMP_IR")) { fprintf(stderr, "=== after irc ===\n"); print_function(f, stderr); }
+                    if (run_irc && irsim) { irsim_add_function(irsim, f); continue; }
+                    emit_function(f, out);
+                }
             }
-            typemap_free(tm);
         } else {
             if (flag_annotate)
                 set_ann_source(source);
