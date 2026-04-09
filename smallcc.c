@@ -247,7 +247,9 @@ int main(int argc, char **argv)
     bool preprocess_only = false;
     int opt_level = 0;
     int target_cpu4 = 0;  // 0 = CPU3, 1 = CPU4 (new nanopass pipeline)
-    int flag_dump_ssa = 0; // -ssa: print Braun SSA IR to stderr after braun_function
+    FILE *ssa_out = NULL;  // -ssa file: write Braun SSA IR to this file after braun_function
+    FILE *oos_out = NULL;  // -oos file: write post-OOS IR to this file
+    FILE *irc_out = NULL;  // -irc file: write post-IRC IR to this file
     const char *cmdline_defines[256];
     int num_defines = 0;
 
@@ -306,10 +308,23 @@ int main(int argc, char **argv)
             else { fprintf(stderr, "smallcc: unknown arch: %s\n", arch); return 1; }
             file_start += 2;
         }
-        else if (strcmp(argv[file_start], "-ssa") == 0)
+        else if (strcmp(argv[file_start], "-ssa") == 0 && file_start + 1 < argc)
         {
-            flag_dump_ssa = 1;
-            file_start++;
+            ssa_out = fopen(argv[file_start + 1], "w");
+            if (!ssa_out) { perror(argv[file_start + 1]); return 1; }
+            file_start += 2;
+        }
+        else if (strcmp(argv[file_start], "-oos") == 0 && file_start + 1 < argc)
+        {
+            oos_out = fopen(argv[file_start + 1], "w");
+            if (!oos_out) { perror(argv[file_start + 1]); return 1; }
+            file_start += 2;
+        }
+        else if (strcmp(argv[file_start], "-irc") == 0 && file_start + 1 < argc)
+        {
+            irc_out = fopen(argv[file_start + 1], "w");
+            if (!irc_out) { perror(argv[file_start + 1]); return 1; }
+            file_start += 2;
         }
         else
         {
@@ -320,7 +335,7 @@ int main(int argc, char **argv)
 
     if (argc <= file_start)
     {
-        fprintf(stderr, "Usage: smallcc [-o outfile] [-E] [-stats] [-ann] [-ssa] [-DNAME[=VAL]] [-Idir] <source.c> [source2.c ...]\n");
+        fprintf(stderr, "Usage: smallcc [-o outfile] [-E] [-stats] [-ann] [-ssa ssafile] [-oos oosfile] [-irc ircfile] [-DNAME[=VAL]] [-Idir] <source.c> [source2.c ...]\n");
         return 1;
     }
 
@@ -352,14 +367,11 @@ int main(int argc, char **argv)
     for (int i = 0; i < user_count; i++) all_files[lib_count + i] = argv[file_start + i];
 
     if (!preprocess_only) {
-        // Preamble: emit crt0.s if present, else built-in default
+        // Preamble: emit arch-specific crt0_cpuN.s if present, else built-in default
         char crt0_path[4096];
-        snprintf(crt0_path, sizeof(crt0_path), "%s/lib/crt0.s", compiler_dir);
+        const char *crt0_name = target_cpu4 ? "crt0_cpu4.s" : "crt0_cpu3.s";
+        snprintf(crt0_path, sizeof(crt0_path), "%s/lib/%s", compiler_dir, crt0_name);
         FILE *crt0 = fopen(crt0_path, "r");
-        if (!crt0) {
-            snprintf(crt0_path, sizeof(crt0_path), "%s/lib/crt0.s", compiler_dir);
-            crt0 = fopen(crt0_path, "r");
-        }
         if (crt0) {
             char buf[256];
             while (fgets(buf, sizeof(buf), crt0))
@@ -468,11 +480,13 @@ int main(int argc, char **argv)
                     strcmp(item->car->s, "func") == 0) {
                     Function *f = braun_function(item, tm);
                     if (f) {
-                        if (flag_dump_ssa) { fprintf(stderr, "=== SSA: %s ===\n", f->name); print_function(f, stderr); }
+                        if (ssa_out) { fprintf(ssa_out, "=== SSA: %s ===\n", f->name); print_function(f, ssa_out); }
                         compute_dominators(f);
                         out_of_ssa(f);
+                        if (oos_out) { fprintf(oos_out, "=== OOS: %s ===\n", f->name); print_function(f, oos_out); }
                         if (getenv("DUMP_IR")) { fprintf(stderr, "=== after oos ===\n"); print_function(f, stderr); }
                         irc_allocate(f);
+                        if (irc_out) { fprintf(irc_out, "=== IRC: %s ===\n", f->name); print_function(f, irc_out); }
                         if (getenv("DUMP_IR")) { fprintf(stderr, "=== after irc ===\n"); print_function(f, stderr); }
                         emit_function(f, out);
                     }
@@ -504,6 +518,9 @@ int main(int argc, char **argv)
                 100.0 * (double)arena.used / (double)arena.cap);
 
     if (out != stdout) fclose(out);
+    if (ssa_out) fclose(ssa_out);
+    if (oos_out) fclose(oos_out);
+    if (irc_out) fclose(irc_out);
     return 0;
 }
 

@@ -66,7 +66,9 @@ directly from Braun → dom → OOS → IRC.
 
 | Mechanism | What it shows |
 |-----------|--------------|
-| `-ssa` flag | Braun SSA IR for each function, printed to stderr after `braun_function` |
+| `-ssa file` | Braun SSA IR for each function, written to `file` after `braun_function` |
+| `-oos file` | Post-OOS IR for each function, written to `file` after `out_of_ssa` |
+| `-irc file` | Post-IRC IR for each function, written to `file` after `irc_allocate` |
 | `DUMP_IR=1` env var | Post-OOS IR and post-IRC IR for each function, printed to stderr |
 
 ---

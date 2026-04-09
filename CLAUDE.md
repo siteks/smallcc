@@ -20,7 +20,9 @@ echo 'int main(){return 5+3;}' > t.c
 ./smallcc -o out.s t.c && ./sim_c out.s                   # output to file
 ./smallcc -o out.s file1.c file2.c && ./sim_c out.s       # multi-TU
 ./smallcc -ann -O1 -o out.s t.c                           # annotated output with source comments
-./smallcc -arch cpu4 -ssa -o out.s t.c                    # dump Braun SSA IR to stderr
+./smallcc -arch cpu4 -ssa t.ssa -o out.s t.c               # dump Braun SSA IR to t.ssa
+./smallcc -arch cpu4 -oos t.oos -o out.s t.c               # dump post-OOS IR to t.oos
+./smallcc -arch cpu4 -irc t.irc -o out.s t.c               # dump post-IRC IR to t.irc
 DUMP_IR=1 ./smallcc -arch cpu4 -o out.s t.c               # dump post-OOS and post-IRC IR to stderr
 ```
 
