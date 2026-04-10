@@ -222,12 +222,14 @@ static int can_coalesce_george(IGraph *g, int u, int v, int K) {
             int t = w * 32 + bit;
             if (t >= g->nv || t == u) continue;
             if (!bv_test(g->adj[u], t)) {
-                // If t is precolored to the same register as u (precolored), merging
-                // would add edge u-t between two same-color precolored nodes, which
-                // means a non-precolored value would be coalesced into a precolored
-                // group while also interfering with another member of that same group.
+                // Same-color precolored pair: merging would create a self-edge.
                 if (g->precolored[u] >= 0 && g->precolored[t] >= 0 &&
                     g->precolored[t] == g->precolored[u])
+                    return 0;
+                // Precolored nodes (including phantom register nodes) have infinite
+                // effective degree — they can never be simplified away, so treating
+                // them as degree >= K is always conservative and correct.
+                if (g->precolored[t] >= 0)
                     return 0;
                 if (g->degree[t] >= K)
                     return 0;
@@ -239,9 +241,10 @@ static int can_coalesce_george(IGraph *g, int u, int v, int K) {
 
 // Coalesce IK_COPY instructions using George's conservative test.
 // Runs to fixpoint; marks coalesced copies is_dead = 1.
-// call_site_live[v] == 1 means value v is live across a call — it must stay
-// in a callee-saved register and cannot be coalesced into a caller-saved one.
-static void coalesce_copies(IGraph *g, Function *f, int K, int *call_site_live) {
+// Call-site ABI constraints are encoded directly in the interference graph
+// via phantom nodes for r0-r3 (added in build_interference_graph), so no
+// side-channel is needed here.
+static void coalesce_copies(IGraph *g, Function *f, int K) {
     int changed = 1;
     while (changed) {
         changed = 0;
@@ -277,11 +280,6 @@ static void coalesce_copies(IGraph *g, Function *f, int K, int *call_site_live) 
                     int tmp = u; u = v; v = tmp;
                 }
 
-                // If u is precolored to a caller-saved register (r0-r3) and v is
-                // live across a call, coalescing would clobber v at call sites.
-                if (g->precolored[u] >= 0 && g->precolored[u] < IRC_CALLER_REGS &&
-                    call_site_live && call_site_live[v]) continue;
-
                 if (can_coalesce_george(g, u, v, K)) {
                     ig_merge(g, u, v);
                     inst->is_dead = 1;
@@ -292,13 +290,22 @@ static void coalesce_copies(IGraph *g, Function *f, int K, int *call_site_live) 
     }
 }
 
-// Build interference graph for one function
+// Build interference graph for one function.
+//
+// The graph has f->nvalues virtual-register nodes (indexed by Value.id)
+// plus IRC_K phantom nodes at indices f->nvalues..f->nvalues+IRC_K-1.
+// Each phantom node is pre-colored with its physical register number.
+//
+// Call-site ABI: at each IK_CALL/IK_ICALL, values live through the call
+// receive interference edges to the phantom nodes for r0..IRC_CALLER_REGS-1.
+// This forces them to be colored with callee-saved registers (r4-r7) or
+// spilled — no separate call_site_live side-channel needed.
 static IGraph *build_interference_graph(Function *f) {
-    int nv = f->nvalues;
-    IGraph *g = ig_new(nv);
+    int nv      = f->nvalues;   // virtual register count
+    int phantom = nv;            // base index of phantom physical-register nodes
+    IGraph *g   = ig_new(nv + IRC_K);
 
-    // Pre-color: values with phys_reg >= 0 set before IRC (e.g. IK_PARAM)
-    // Mark them in the interference graph's precolored array.
+    // Mark pre-colored virtual values (call landings, params)
     for (int i = 0; i < nv; i++) {
         if (f->values[i]->phys_reg >= 0) {
             g->precolored[i] = f->values[i]->phys_reg;
@@ -306,54 +313,50 @@ static IGraph *build_interference_graph(Function *f) {
         }
     }
 
-    // Live-range interference: for each instruction, the def interferes
-    // with everything live at that point.
+    // Initialize phantom nodes — permanently pre-colored, never simplified
+    for (int r = 0; r < IRC_K; r++) {
+        g->precolored[phantom + r] = r;
+        g->color[phantom + r]      = r;
+    }
 
     for (int bi = 0; bi < f->nblocks; bi++) {
         Block *b = f->blocks[bi];
         int nw = b->nwords;
 
-        // Start with live_out, walk backward
         uint32_t *live = arena_alloc(nw * sizeof(uint32_t));
         memcpy(live, b->live_out, nw * sizeof(uint32_t));
 
-        // Also add phi defs of successors' phis to live_out
-        // (handled by liveness already)
-
         for (Inst *inst = b->tail; inst; inst = inst->prev) {
-            // Handle call: caller-saved regs interfere with all live vregs
-            if (inst->kind == IK_CALL || inst->kind == IK_ICALL) {
-                // All values live at this call interfere with r0-r3
-                // We represent this by marking bits 0..IRC_CALLER_REGS-1
-                // as forced conflicts. We'll handle this via precolored nodes
-                // or by just not assigning caller-saved regs to values live across calls.
-                // For simplicity: any value live at a call site that later has
-                // the caller-saved regs assigned will conflict — this is enforced
-                // by adding interference edges to virtual "register nodes" 0-3.
-                // We use value IDs 0..K-1 as precolored physical register nodes.
-                // But our values start at id 0 for the first value...
-                // This is tricky without reserved slots. We'll use a simpler approach:
-                // mark live values as needing to avoid r0-r3.
-                // For now: record that these live values cannot use r0-r3.
-                // We do this by adding interference with a sentinel.
-                // TODO: proper call interference via precolored nodes.
-            }
-
-            // The def interferes with all currently live values (except itself)
+            // Def interferes with all currently live values
             if (inst->dst && inst->dst->id >= 0 && inst->dst->id < nv) {
                 int d = inst->dst->id;
                 for (int w = 0; w < nw; w++) {
                     uint32_t word = live[w];
                     while (word) {
-                        int bit = __builtin_ctz(word);
+                        int bit = __builtin_ctz(word); word &= word - 1;
                         int vid = w * 32 + bit;
                         if (vid != d && vid < nv)
                             ig_add_edge(g, d, vid);
-                        word &= word - 1;
                     }
                 }
-                // Remove def from live
                 bv_clear(live, d);
+            }
+
+            // Call-site interference: values that survive a call must not
+            // occupy r0-r3 (caller-saved).  Add edges to phantom r0-r3 nodes
+            // for every value live after (and therefore through) the call.
+            if (inst->kind == IK_CALL || inst->kind == IK_ICALL) {
+                for (int w = 0; w < nw; w++) {
+                    uint32_t word = live[w];
+                    while (word) {
+                        int bit = __builtin_ctz(word); word &= word - 1;
+                        int vid = w * 32 + bit;
+                        if (vid < nv) {
+                            for (int r = 0; r < IRC_CALLER_REGS; r++)
+                                ig_add_edge(g, vid, phantom + r);
+                        }
+                    }
+                }
             }
 
             // Add uses to live
@@ -370,8 +373,7 @@ static IGraph *build_interference_graph(Function *f) {
 
 // Assign colors using a simple greedy graph coloring
 // Returns 1 if all values colored, 0 if spills needed
-static int assign_colors(IGraph *g, Function *f, int K,
-                          int *call_site_live_any) {
+static int assign_colors(IGraph *g, Function *f, int K) {
     // Simplification order: build a stack using degree < K heuristic
     int nv = g->nv;
     int *stack    = arena_alloc(nv * sizeof(int));
@@ -459,44 +461,27 @@ static int assign_colors(IGraph *g, Function *f, int K,
         int v = stack[i];
         if (g->spilled[v]) continue;
 
-        // Find which colors are forbidden (used by neighbors)
+        // Collect forbidden colors from all colored neighbors.
+        // Phantom nodes (indices nv..nv+K-1) are included since uid < g->nv,
+        // and their g->color[] entries are set to their physical register —
+        // so values that interfere with phantom-r0..r3 (because they're live
+        // across a call) automatically have r0..r3 added to forbidden.
         uint8_t forbidden[MAX_REGS] = {0};
-
         for (int w = 0; w < g->nwords; w++) {
             uint32_t word = g->adj[v][w];
             while (word) {
-                int bit = __builtin_ctz(word);
+                int bit = __builtin_ctz(word); word &= word - 1;
                 int uid = w * 32 + bit;
                 if (uid < nv && g->color[uid] >= 0)
                     forbidden[g->color[uid]] = 1;
-                word &= word - 1;
             }
         }
 
-        // Also check precolored neighbors
-        for (int w = 0; w < g->nwords; w++) {
-            uint32_t word = g->adj[v][w];
-            while (word) {
-                int bit = __builtin_ctz(word);
-                int uid = w * 32 + bit;
-                if (uid < nv && g->precolored[uid] >= 0)
-                    forbidden[g->precolored[uid]] = 1;
-                word &= word - 1;
-            }
-        }
-
-        // Values live at a call site must avoid r0-r3 (caller-saved).
-        // Use callee-saved (r4-r7) only; if none available, spill — do not
-        // fall back to caller-saved registers (they get clobbered by callees).
-        if (call_site_live_any && call_site_live_any[v]) {
-            for (int r = 4; r < K; r++) {
-                if (!forbidden[r]) { g->color[v] = r; break; }
-            }
-            // If no callee-saved available: leave uncolored so spill fires
-        } else {
-            for (int r = 0; r < K; r++) {
-                if (!forbidden[r]) { g->color[v] = r; break; }
-            }
+        // Pick the lowest unforbidden register.
+        // If this value is live across a call, r0-r3 are already forbidden
+        // (via phantom-node interference), so this naturally picks r4-r7.
+        for (int r = 0; r < K; r++) {
+            if (!forbidden[r]) { g->color[v] = r; break; }
         }
         if (g->color[v] < 0) {
             g->spilled[v] = 1; // couldn't color
@@ -735,36 +720,6 @@ void irc_allocate(Function *f) {
     // Need liveness first
     compute_liveness(f);
 
-    // Compute call-site liveness (which values are live at any call)
-    int nv = f->nvalues;
-    int *call_site_live = arena_alloc(nv * sizeof(int));
-    for (int bi = 0; bi < f->nblocks; bi++) {
-        Block *b = f->blocks[bi];
-        int nw = b->nwords;
-        uint32_t *live = arena_alloc(nw * sizeof(uint32_t));
-        memcpy(live, b->live_out, nw * sizeof(uint32_t));
-        for (Inst *inst = b->tail; inst; inst = inst->prev) {
-            if (inst->kind == IK_CALL || inst->kind == IK_ICALL) {
-                for (int w = 0; w < nw; w++) {
-                    uint32_t word = live[w];
-                    while (word) {
-                        int bit = __builtin_ctz(word);
-                        int vid = w * 32 + bit;
-                        if (vid < nv) call_site_live[vid] = 1;
-                        word &= word - 1;
-                    }
-                }
-            }
-            if (inst->dst && inst->dst->id >= 0 && inst->dst->id < nv)
-                bv_clear(live, inst->dst->id);
-            for (int oi = 0; oi < inst->nops; oi++) {
-                Value *v = val_resolve(inst->ops[oi]);
-                if (v && v->kind == VAL_INST && v->id >= 0 && v->id < nv)
-                    bv_set(live, v->id);
-            }
-        }
-    }
-
     // Iterate until no spills
     int K = IRC_K;
     int max_iter = 20;
@@ -781,9 +736,9 @@ void irc_allocate(Function *f) {
 
         IGraph *g = build_interference_graph(f);
 
-        coalesce_copies(g, f, K, call_site_live);
+        coalesce_copies(g, f, K);
 
-        int ok = assign_colors(g, f, K, call_site_live);
+        int ok = assign_colors(g, f, K);
 
         if (ok) {
             // Apply colors to values
@@ -802,36 +757,5 @@ void irc_allocate(Function *f) {
         compute_liveness(f);
 
         ig_free(g);
-
-        // Reassign call_site_live for expanded function (fresh arena allocation)
-        nv = f->nvalues;
-        call_site_live = arena_alloc(nv * sizeof(int));
-        // (simplified: just re-run the call site scan)
-        for (int bi = 0; bi < f->nblocks; bi++) {
-            Block *b = f->blocks[bi];
-            int nw = b->nwords;
-            uint32_t *live = arena_alloc(nw * sizeof(uint32_t));
-            memcpy(live, b->live_out, nw * sizeof(uint32_t));
-            for (Inst *inst = b->tail; inst; inst = inst->prev) {
-                if (inst->kind == IK_CALL || inst->kind == IK_ICALL) {
-                    for (int w = 0; w < nw; w++) {
-                        uint32_t word = live[w];
-                        while (word) {
-                            int bit = __builtin_ctz(word);
-                            int vid = w * 32 + bit;
-                            if (vid < nv) call_site_live[vid] = 1;
-                            word &= word - 1;
-                        }
-                    }
-                }
-                if (inst->dst && inst->dst->id >= 0 && inst->dst->id < nv)
-                    bv_clear(live, inst->dst->id);
-                for (int oi = 0; oi < inst->nops; oi++) {
-                    Value *v = val_resolve(inst->ops[oi]);
-                    if (v && v->kind == VAL_INST && v->id >= 0 && v->id < nv)
-                        bv_set(live, v->id);
-                }
-            }
-        }
     }
 }
