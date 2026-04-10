@@ -5,6 +5,7 @@
 #include "braun.h"
 #include "dom.h"
 #include "oos.h"
+#include "legalize.h"
 #include "alloc.h"
 #include "emit.h"
 #include "irsim.h"
@@ -545,11 +546,13 @@ int main(int argc, char **argv)
                 braun_emit_strlits(globals_buf);
                 if (f) {
                     if (ssa_out) { fprintf(ssa_out, "=== SSA: %s ===\n", f->name); print_function(f, ssa_out); }
+                    split_critical_edges(f);
                     compute_dominators(f);
                     out_of_ssa(f);
                     if (oos_out) { fprintf(oos_out, "=== OOS: %s ===\n", f->name); print_function(f, oos_out); }
                     if (getenv("DUMP_IR")) { fprintf(stderr, "=== after oos ===\n"); print_function(f, stderr); }
                     if (run_oos && irsim) { irsim_add_function(irsim, f); continue; }
+                    legalize_function(f);
                     irc_allocate(f);
                     if (irc_out) { fprintf(irc_out, "=== IRC: %s ===\n", f->name); print_function(f, irc_out); }
                     if (getenv("DUMP_IR")) { fprintf(stderr, "=== after irc ===\n"); print_function(f, stderr); }

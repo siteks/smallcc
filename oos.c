@@ -195,7 +195,7 @@ static void sequentialize_copies(Block *b, PCopySet *s, Function *f) {
 
 // Split the edge pred→succ by inserting a new block between them.
 // Returns the new intermediate block.
-static Block *split_critical_edge(Function *f, Block *pred, Block *succ) {
+static Block *split_one_critical_edge(Function *f, Block *pred, Block *succ) {
     // Create a new block
     Block *mid = new_block(f);
     mid->sealed = 1;
@@ -241,13 +241,10 @@ static Block *split_critical_edge(Function *f, Block *pred, Block *succ) {
 // Main out-of-SSA pass
 // ============================================================
 
-void out_of_ssa(Function *f) {
-    // Step 1: Split critical edges where a phi predecessor has >1 successor.
-    // We iterate over all blocks and their phis, collecting edges that need splitting.
-    // Use a separate loop so we don't modify while iterating.
-
-    // Mark edges to split: for each phi block, for each predecessor with >1 successor
-    // (and this block has >1 predecessor), split pred→phi_block.
+void split_critical_edges(Function *f) {
+    // Split critical edges so the IR never has an edge from a multi-successor
+    // block to a multi-predecessor block.  Run once after braun_function() so
+    // OOS and any future optimisation passes never encounter critical edges.
     for (int bi = 0; bi < f->nblocks; bi++) {
         Block *b = f->blocks[bi];
         if (b->npreds <= 1) continue;
@@ -257,18 +254,17 @@ void out_of_ssa(Function *f) {
             if (inst->kind == IK_PHI) { has_phi = 1; break; }
         if (!has_phi) continue;
 
-        // Split critical edges into b
         for (int k = 0; k < b->npreds; k++) {
             Block *pred = b->preds[k];
-            if (pred->nsuccs > 1) {
-                // This is a critical edge; split it
-                Block *mid = split_critical_edge(f, pred, b);
-                // The preds array entry was updated in split_critical_edge
-                // but k still refers to the same slot (now = mid)
-                (void)mid;
-            }
+            if (pred->nsuccs > 1)
+                (void)split_one_critical_edge(f, pred, b);
         }
     }
+}
+
+void out_of_ssa(Function *f) {
+    // Critical edges were already split by split_critical_edges() which runs
+    // right after braun_function().  OOS can proceed without splitting.
 
     // For each block, collect parallel copies needed on each predecessor edge
     // For each phi in block b:

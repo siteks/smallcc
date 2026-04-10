@@ -639,54 +639,10 @@ static void cg_call_args(BraunCtx *ctx, Block **cur, Inst *call, Node *args_head
 }
 
 // ============================================================
-// Helper: insert pre-colored IK_COPY instructions for register ABI args
-// Called before inst_append(b, call) so IRC liveness sees the copies.
-// For IK_CALL: ops[0..2] → r1/r2/r3 (first 3 scalar args)
-// For IK_ICALL: ops[1..3] → r1/r2/r3, then ops[0] (fp) → r0 (LAST so fp
-//   remains live through the arg copies, forcing fp ∉ {r1,r2,r3} via interference)
-// Skipped for variadic calls — all args go to the stack.
-// ============================================================
-
-static void emit_reg_arg_copies(BraunCtx *ctx, Block *b, Inst *call) {
-    bool is_icall = (call->kind == IK_ICALL);
-    bool is_var   = call->calldesc && call->calldesc->is_variadic;
-    if (is_var) return;
-
-    int arg_base = is_icall ? 1 : 0;
-    int nargs    = call->nops - arg_base;
-    int nreg     = nargs < 3 ? nargs : 3;
-
-    for (int i = 0; i < nreg; i++) {
-        Value *arg = val_resolve(call->ops[arg_base + i]);
-        if (!arg) continue;
-        Value *v_ri = new_value(ctx->f, VAL_INST, arg->vtype);
-        v_ri->phys_reg = i + 1;           // pre-color to r{i+1}
-        Inst  *cp = bi(ctx, b, IK_COPY, v_ri);
-        inst_add_op(cp, arg);
-        inst_append(b, cp);
-        call->ops[arg_base + i] = v_ri;   // redirect call to pre-colored value
-    }
-
-    if (is_icall) {
-        // fp copy emitted AFTER arg copies so fp is live through them.
-        Value *fp = val_resolve(call->ops[0]);
-        if (fp) {
-            Value *v_r0 = new_value(ctx->f, VAL_INST, fp->vtype);
-            v_r0->phys_reg = 0;           // pre-color to r0
-            Inst  *fp_cp = bi(ctx, b, IK_COPY, v_r0);
-            inst_add_op(fp_cp, fp);
-            inst_append(b, fp_cp);
-            call->ops[0] = v_r0;
-        }
-    }
-}
-
-// ============================================================
 // Helper: emit a complete call (direct or indirect) with landing+copy
 // ============================================================
 
 static Value *emit_call_result(BraunCtx *ctx, Block *b, Inst *call, Type *ret_type) {
-    emit_reg_arg_copies(ctx, b, call);
     inst_append(b, call);
     ValType call_vt = ret_type ? type_to_valtype(ret_type) : VT_I16;
     if (call_vt == VT_VOID) call_vt = VT_I16;
@@ -1933,9 +1889,8 @@ Function *braun_function(Node *func_decl, int tu_index, int *strlit_id) {
             inst_append(entry, li);
             write_var(entry, ps, pv);
         } else if (idx < NREG_PARAMS) {
-            // Register param: landing pre-colored to r{idx+1}, copy freely allocated
+            // Register param: landing will be pre-colored by legalize_function()
             Value *landing = new_value(f, VAL_INST, pvt);
-            landing->phys_reg = idx + 1;
             Inst *pi = new_inst(f, entry, IK_PARAM, landing);
             pi->param_idx = idx + 1;
             inst_append(entry, pi);

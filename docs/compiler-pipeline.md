@@ -48,6 +48,12 @@ Node* parse tree  (output of resolve_symbols / derive_types / insert_coercions)
       │
       ├─ out_of_ssa()       oos.c        eliminate φ-nodes (Boissinot 2009 parallel copies)
       │
+      ├─ legalize_function() legalize.c  ISA/ABI lowering (see Legalize section)
+      │   ├─ Pass A: pre-color IK_PARAM landing values (r1/r2/r3)
+      │   ├─ Pass B: insert pre-colored IK_COPY for call args (r1/r2/r3) and IK_ICALL fp (r0)
+      │   ├─ Pass C: lower IK_NEG/IK_NOT → IK_SUB(0,src)/IK_EQ(src,0) + explicit IK_CONST(0)
+      │   └─ Pass D: lower IK_ZEXT/IK_TRUNC → IK_CONST(mask) + IK_AND
+      │
       ├─ irc_allocate()     alloc.c      IRC register allocation (Appel & George 1996)
       │                                  vregs → physical r0–r7; spills if needed
       │
@@ -406,6 +412,48 @@ struct Function {
 
 ---
 
+## Legalize Pass (`legalize.c`)
+
+**Entry:** `legalize_function(Function *f)`
+
+Runs after `out_of_ssa` and before `irc_allocate`. Consolidates all ISA- and ABI-specific
+lowering so that IRC and emission stay target-agnostic.
+
+### Pass A — Pre-color IK_PARAM landing values
+
+Assigns `Value.phys_reg` for each `IK_PARAM` in the entry block:
+`param_idx` 1 → r1, 2 → r2, 3 → r3 (1-based). This is the only place that knows the
+ABI register assignments for incoming parameters.
+
+### Pass B — Insert pre-colored IK_COPY for call arguments
+
+For each non-variadic `IK_CALL` or `IK_ICALL`:
+- For the first 1–3 register arguments: insert `IK_COPY vR ← arg` (vR pre-colored r1/r2/r3)
+  immediately before the call; replace the call's operand with vR.
+- For `IK_ICALL`: also insert a `IK_COPY v_fp ← fp` (v_fp pre-colored r0) for the function
+  pointer, emitted **after** the argument copies so the fp value stays live through them.
+
+This replaces the `emit_reg_arg_copies` helper that used to live in `braun.c`.
+
+### Pass C — Lower IK_NEG / IK_NOT
+
+Lowers unary ops that need an implicit zero register into explicit two-operand forms:
+- `IK_NEG src` → `IK_CONST(0)` + `IK_SUB(0, src)` (integer) or `IK_FSUB(0, src)` (float)
+- `IK_NOT src` → `IK_CONST(0)` + `IK_EQ(src, 0)`
+
+The explicit `IK_CONST(0)` gives IRC a proper virtual register for the zero value instead of
+relying on emit.c to borrow a scratch register.
+
+### Pass D — Lower IK_ZEXT / IK_TRUNC
+
+Replaces zero-extension and truncation with an explicit mask-and:
+`IK_ZEXT`/`IK_TRUNC src` → `IK_CONST(mask)` + `IK_AND(src, mask)`.
+`mask` is `0xff` for 8-bit and `0xffff` for 16-bit. 32-bit cases (mask_size ≥ 4) are
+skipped — no masking is needed. The explicit `IK_CONST(mask)` lets IRC allocate a physical
+register for the mask rather than emitting pushr/popr scratch sequences in emit.c.
+
+---
+
 ## IRC Register Allocation (`alloc.c`)
 
 **Entry:** `irc_allocate(Function *f)`
@@ -421,16 +469,22 @@ values and `IK_PARAM 0`.
 
 **Phases:**
 ```
+DCE (remove pure instructions with use_count == 0)
 liveness analysis (backward dataflow, bitvector per block)
     ↓
-repeat until no spills:
+repeat until no spills (max 20 iterations):
     ├─ reset IK_COPY is_dead flags (re-evaluate after each spill rewrite)
     ├─ build interference graph
     ├─ coalesce  (George's conservative test on all IK_COPY pairs; fixpoint)
     ├─ simplify/spill  (remove degree < K nodes; select spill candidates)
-    ├─ select  (assign colors from stack)
-    └─ if spills: rewrite_spills → recompute liveness + call_site_live → retry
+    ├─ select  (assign colors from stack; propagate color to coalescing aliases)
+    └─ if spills: rewrite_spills → recompute liveness → retry
 ```
+
+**Call-site ABI constraints** are encoded directly in the interference graph via phantom
+nodes (indices `nvalues..nvalues+K-1`) that are permanently pre-colored to r0–r7. At each
+`IK_CALL`/`IK_ICALL`, every value live through the call receives an interference edge to the
+phantom nodes for r0–r3, forcing such values to callee-saved registers or spill.
 
 **Coalescing:** `coalesce_copies` runs to fixpoint over all `IK_COPY` instructions.
 For each copy `dst ← src`, after resolving canonical nodes via `ig_find`:
@@ -438,7 +492,6 @@ For each copy `dst ← src`, after resolving canonical nodes via `ig_find`:
 - Both precolored to different registers → cannot coalesce
 - Already interfere → cannot coalesce
 - Precolored node is always the "stay" side (u); free value is merged away (v)
-- Caller-saved precolored u + call-site-live v → cannot coalesce (would clobber)
 - George's test: for every neighbor t of v not already adjacent to u,
   either `degree[t] < K` (safe) **and** t is not precolored to the same register as u
   (a non-obvious extra guard: two same-color precolored nodes cannot both be
@@ -455,6 +508,22 @@ opportunities but keeps the implementation simple.
 - `ig_merge(g, u, v)` — redirects all of v's edges to u, clears v's row
 - Aliased nodes are marked `removed` in `assign_colors` and skipped during simplify/spill;
   after stack-coloring, their color is propagated from their canonical
+
+**Spill rewriting:** `rewrite_spills` assigns a frame slot for each spilled value
+(`frame_size` grows), then walks all instructions inserting:
+- A spill load (`IK_ADDR` + `IK_LOAD`) before each use of a spilled value
+- A spill store (`IK_ADDR` + `IK_STORE`) after each def of a spilled value
+
+For spill slots within F2 range (±127 words/±63 longs from bp), the `IK_ADDR` is omitted
+and the load/store uses a NULL base with the bp-relative `imm` field directly.
+For out-of-F2-range slots, `IK_ADDR` is emitted so IRC allocates the address register.
+
+**Key invariant in `rewrite_spills`:** after inserting a spill store for a def, the loop
+advances past *both* the `IK_ADDR` (if present) and the `IK_STORE`, ensuring the store's
+src operand is never treated as a new use requiring another spill load. The out-of-range
+case requires two advances (`inst = inst->next` twice, or once plus a check for `IK_ADDR`)
+because `IK_ADDR` is inserted before the store, making `def->next` point to the ADDR
+rather than the STORE.
 
 **Output:** `Value.phys_reg` set for all live values (0–7). Coalesced `IK_COPY`
 instructions removed (marked `is_dead`). Spill loads/stores inserted.
@@ -539,7 +608,8 @@ or lowered to libcalls if needed. The target ISA has native float instructions.
 | **Braun SSA** | `braun.c` | ✅ | Braun 2013; for/do/while/goto native; call landing+copy |
 | **dominator tree** | `dom.c` | ✅ | Cooper 2001; loop_depth |
 | **out-of-SSA** | `oos.c` | ✅ | Boissinot 2009 parallel copies |
-| **IRC** | `alloc.c` | ✅ | Appel & George 1996; K=8; George coalescing; spill support |
+| **legalize** | `legalize.c` | ✅ | ABI pre-coloring (Passes A–B); NEG/NOT/ZEXT/TRUNC lowering (Passes C–D) |
+| **IRC** | `alloc.c` | ✅ | Appel & George 1996; K=8; phantom-node ABI; George coalescing; spill support |
 | **emission** | `emit.c` | ✅ | CPU4 assembly; F2 bp-rel selection; callee-save handling |
 | Regime 1 optimisations | — | ❌ | const-fold, CSE etc. — not yet implemented |
 | Regime 2 optimisations | — | ❌ | SCCP, DCE, LICM, GVN — not yet implemented |
@@ -575,6 +645,7 @@ Jump table optimisation is future work.
 | `braun.h` / `braun.c` | Braun SSA construction |
 | `dom.h` / `dom.c` | Dominator tree + loop depth |
 | `oos.h` / `oos.c` | Out-of-SSA (Boissinot) |
+| `legalize.h` / `legalize.c` | ISA/ABI legalization: Passes A–D |
 | `alloc.h` / `alloc.c` | Liveness + IRC |
 | `emit.h` / `emit.c` | CPU4 emission (globals + functions) |
 

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Debugging Rule
 
-**Always debug test failures at the earliest point in the pipeline.** For CPU4 pipeline failures, check and fix the issue in the IR (OOS IR via `-oos` dump) before looking at final CPU4 assembly output. The pipeline is: Braun SSA → OOS → IRC → emission. Fix the problem at the first stage where it appears.
+**Always debug test failures at the earliest point in the pipeline.** For CPU4 pipeline failures, check and fix the issue in the IR (OOS IR via `-oos` dump) before looking at final CPU4 assembly output. The pipeline is: Braun SSA → OOS → legalize → IRC → emission. Fix the problem at the first stage where it appears.
 
 ## Build & Test
 
@@ -99,6 +99,7 @@ Per-TU loop [smallcc.c] (lib TUs first, then user TUs):
     braun_function()        [braun.c]       Sexp → SSA IR (Braun 2013)
     compute_dominators()    [dom.c]         Dominator tree + loop depth
     out_of_ssa()            [oos.c]         φ elimination (Boissinot 2009)
+    legalize_function()     [legalize.c]    ABI pre-coloring; NEG/NOT/ZEXT/TRUNC lowering
     irc_allocate()          [alloc.c]       IRC register allocation (Appel & George)
     emit_function()         [emit.c]        Physical-reg IR → CPU4 assembly
 
@@ -121,7 +122,8 @@ Per-TU loop [smallcc.c] (lib TUs first, then user TUs):
 | `braun.h` / `braun.c` | Braun SSA construction from Sexp AST; handles for/do/while/goto/label; call result landing+copy pattern |
 | `dom.h` / `dom.c` | Dominator tree (Cooper 2001); loop depth; `compute_dominators`; `dominates` query |
 | `oos.h` / `oos.c` | Out-of-SSA: Boissinot 2009 parallel-copy insertion; swap cycle detection |
-| `alloc.h` / `alloc.c` | Liveness analysis + IRC register allocation (Appel & George 1996); K=8; George coalescing (with same-color precolored guard); spill support |
+| `legalize.h` / `legalize.c` | ISA/ABI legalization: Pass A (param pre-color); Pass B (call-arg IK_COPY); Pass C (NEG/NOT lowering); Pass D (ZEXT/TRUNC lowering) |
+| `alloc.h` / `alloc.c` | Liveness analysis + IRC register allocation (Appel & George 1996); K=8; phantom-node ABI; George coalescing; spill support |
 | `emit.h` / `emit.c` | CPU4 emission: `emit_globals` (data section) + `emit_function` (text section); F2 bp-rel selection; callee-save prologue/epilogue |
 | `sim_c.c` | CPU4 assembler + simulator (self-contained C program); `make sim_c` |
 | `lib/stdio.c` | `printf` (`%d %s %c %%`), `puts` — compiled as TU 0 automatically |

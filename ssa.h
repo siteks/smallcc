@@ -162,4 +162,10 @@ static inline Value *val_resolve(Value *v) {
     return v;
 }
 
+// Instruction insertion
+void inst_insert_before(Inst *next, Inst *new_inst);
+
+// ValType size in bytes
+int vtype_size(ValType vt);
+
 #endif // SSA_H

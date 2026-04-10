@@ -182,16 +182,7 @@ static int vtype_signed(ValType vt) {
     return vt == VT_I8 || vt == VT_I16 || vt == VT_I32;
 }
 
-// Size in bytes for ValType
-static int vtype_size(ValType vt) {
-    switch (vt) {
-    case VT_I8:  case VT_U8:  return 1;
-    case VT_I16: case VT_U16: return 2;
-    case VT_I32: case VT_U32: case VT_F32: return 4;
-    case VT_PTR: return 2; // 16-bit address space
-    default: return 2;
-    }
-}
+// vtype_size is defined in ssa.c / declared in ssa.h
 
 // Signed/unsigned ALU op suffix
 static const char *alu_mnemonic(InstKind k, int is_signed) {
@@ -286,114 +277,70 @@ static void emit_inst(Inst *inst, FILE *out) {
     case IK_FADD: case IK_FSUB: case IK_FMUL: case IK_FDIV:
     case IK_FLT:  case IK_FLE:  case IK_FEQ:  case IK_FNE: {
         if (!dst || inst->nops < 2) break;
-        int is_signed = dst ? vtype_signed(dst->vtype) : 0;
-        Value *ov0 = val_resolve(inst->ops[0]);
-        Value *ov1 = val_resolve(inst->ops[1]);
-        int ops0_reg = (ov0 && ov0->kind == VAL_INST) ? preg(ov0) : -1;
-        int ops1_reg = (ov1 && ov1->kind == VAL_INST) ? preg(ov1) : -1;
-        // Constant materialisation strategy:
-        // Prefer using rd as scratch (safe because CPU4 reads sources before
-        // writing the destination — CPU4 reads sources before writing dst, so
-        // `immw rd, K; op rd, live_src, rd` is correct).
-        // But if the non-const source is already in rd (ops_reg == rd), loading
-        // the constant into rd would clobber it before it is read.
-        // In that case we push a scratch register, materialize into it, do the
-        // op, then pop the scratch (always correct; no liveness analysis needed).
-        int r1, r2;
-        int saved_scratch = -1;
+        {
+        int is_signed = vtype_signed(dst->vtype);
+        Value *op0 = inst->ops[0] ? val_resolve(inst->ops[0]) : NULL;
+        Value *op1 = inst->ops[1] ? val_resolve(inst->ops[1]) : NULL;
+        int c0 = op0 && op0->kind == VAL_CONST;
+        int c1 = op1 && op1->kind == VAL_CONST;
+        // p0/p1: physical register of each operand (-1 if operand is const)
+        int p0 = c0 ? -1 : (op0 ? preg(op0) : rd);
+        int p1 = c1 ? -1 : (op1 ? preg(op1) : rd);
 
-        // Helper lambda (inlined): pick first reg not in avoid mask, push it.
-        #define PUSH_SCRATCH(avoid_mask) do { \
-            unsigned _av = (avoid_mask); \
-            int _sc = -1; \
-            for (int _r = 0; _r < 8; _r++) if (!(_av & (1u<<_r))) { _sc = _r; break; } \
-            if (_sc < 0) _sc = (__builtin_ctz(~_av)) & 7; \
-            fprintf(out, "    pushr %s\n", regname(_sc)); \
-            saved_scratch = _sc; \
-        } while (0)
-
-        int both_const = (ov0 && ov0->kind == VAL_CONST) &&
-                         (ov1 && ov1->kind == VAL_CONST);
-        if (both_const) {
-            // Use rd for const0, push a scratch for const1.
-            PUSH_SCRATCH(1u << rd);
-            r1 = get_val_reg(out, inst->ops[0], rd);
-            r2 = get_val_reg(out, inst->ops[1], saved_scratch);
-        } else if (ov0 && ov0->kind == VAL_CONST) {
-            // ops[0] is constant; ops[1] is in ops1_reg.
-            if (ops1_reg == rd) {
-                // Can't use rd (= ops1_reg) as scratch — push another reg.
-                PUSH_SCRATCH(1u << rd);
-                r1 = get_val_reg(out, inst->ops[0], saved_scratch);
-                r2 = ops1_reg;
-            } else {
-                // rd is a safe scratch (written last, after sources are read).
-                r1 = get_val_reg(out, inst->ops[0], rd);
-                r2 = ops1_reg >= 0 ? ops1_reg : rd;
+        if (!c0 && !c1) {
+            // Both VAL_INST: straightforward three-register emit.
+            fprintf(out, "    %s %s, %s, %s\n",
+                    alu_mnemonic(inst->kind, is_signed),
+                    regname(rd), regname(p0), regname(p1));
+        } else if (c1) {
+            // ops[1] is a constant.  Materialize into rd if safe, else scratch.
+            if (c0) {
+                // Both const: load op0 into rd, load op1 into scratch.
+                emit_imm(out, rd, op0->iconst);
+                p0 = rd;
             }
-        } else if (ov1 && ov1->kind == VAL_CONST) {
-            // ops[1] is constant; ops[0] is in ops0_reg.
-            if (ops0_reg == rd) {
-                // Can't use rd (= ops0_reg) as scratch — push another reg.
-                PUSH_SCRATCH(1u << rd);
-                r1 = ops0_reg;
-                r2 = get_val_reg(out, inst->ops[1], saved_scratch);
+            if (p0 == rd) {
+                // ops[0] occupies rd — can't use rd for the constant.
+                int sc = (rd == 0) ? 1 : 0;
+                fprintf(out, "    pushr %s\n", regname(sc));
+                emit_imm(out, sc, op1->iconst);
+                fprintf(out, "    %s %s, %s, %s\n",
+                        alu_mnemonic(inst->kind, is_signed),
+                        regname(rd), regname(rd), regname(sc));
+                fprintf(out, "    popr %s\n", regname(sc));
             } else {
-                // rd is a safe scratch.
-                r1 = ops0_reg >= 0 ? ops0_reg : rd;
-                r2 = get_val_reg(out, inst->ops[1], rd);
+                // ops[0] is in p0 != rd: load const into rd, emit op(p0, rd).
+                emit_imm(out, rd, op1->iconst);
+                fprintf(out, "    %s %s, %s, %s\n",
+                        alu_mnemonic(inst->kind, is_signed),
+                        regname(rd), regname(p0), regname(rd));
             }
         } else {
-            r1 = ops0_reg >= 0 ? ops0_reg : rd;
-            r2 = ops1_reg >= 0 ? ops1_reg : rd;
+            // ops[0] is const, ops[1] is VAL_INST.
+            if (p1 == rd) {
+                // ops[1] occupies rd — can't use rd for the constant.
+                int sc = (rd == 0) ? 1 : 0;
+                fprintf(out, "    pushr %s\n", regname(sc));
+                emit_imm(out, sc, op0->iconst);
+                fprintf(out, "    %s %s, %s, %s\n",
+                        alu_mnemonic(inst->kind, is_signed),
+                        regname(rd), regname(sc), regname(rd));
+                fprintf(out, "    popr %s\n", regname(sc));
+            } else {
+                // ops[1] in p1 != rd: load const into rd, emit op(rd, p1).
+                emit_imm(out, rd, op0->iconst);
+                fprintf(out, "    %s %s, %s, %s\n",
+                        alu_mnemonic(inst->kind, is_signed),
+                        regname(rd), regname(rd), regname(p1));
+            }
         }
-        #undef PUSH_SCRATCH
-
-        fprintf(out, "    %s %s, %s, %s\n",
-                alu_mnemonic(inst->kind, is_signed),
-                regname(rd), regname(r1), regname(r2));
-        if (saved_scratch >= 0)
-            fprintf(out, "    popr %s\n", regname(saved_scratch));
         break;
-    }
-
-    // Unary ops
-    case IK_NEG: {
-        if (!dst || inst->nops < 1) break;
-        int r1 = get_val_reg(out, inst->ops[0], rd);
-        int is_float_neg = (dst->vtype == VT_F32);
-        // Pick a scratch not equal to rd or r1, save/restore via pushr/popr.
-        unsigned avoid = (1u << rd) | (1u << r1);
-        int tmp = -1;
-        for (int r = 0; r < 8; r++) if (!(avoid & (1u << r))) { tmp = r; break; }
-        if (tmp < 0) tmp = (rd + 1) & 7;
-        fprintf(out, "    pushr %s\n", regname(tmp));
-        if (is_float_neg) {
-            // Float negation: load 0.0f into tmp, then fsub rd, tmp, r1
-            emit_imm(out, tmp, 0);  // 0 as raw bits = 0.0f
-            fprintf(out, "    fsub %s, %s, %s\n", regname(rd), regname(tmp), regname(r1));
-        } else {
-            emit_imm(out, tmp, 0);
-            fprintf(out, "    sub %s, %s, %s\n", regname(rd), regname(tmp), regname(r1));
         }
-        fprintf(out, "    popr %s\n", regname(tmp));
-        break;
     }
-    case IK_NOT: {
-        if (!dst || inst->nops < 1) break;
-        int r1 = get_val_reg(out, inst->ops[0], rd);
-        // logical NOT: rd = (r1 == 0) ? 1 : 0. Need a zero register.
-        // Pick a scratch not equal to rd or r1, save/restore via pushr/popr.
-        unsigned avoid = (1u << rd) | (1u << r1);
-        int tmp = -1;
-        for (int r = 0; r < 8; r++) if (!(avoid & (1u << r))) { tmp = r; break; }
-        if (tmp < 0) tmp = (rd + 1) & 7;
-        fprintf(out, "    pushr %s\n", regname(tmp));
-        emit_imm(out, tmp, 0);
-        fprintf(out, "    eq %s, %s, %s\n", regname(rd), regname(r1), regname(tmp));
-        fprintf(out, "    popr %s\n", regname(tmp));
-        break;
-    }
+
+    // IK_NEG and IK_NOT are lowered by legalize_function() to two-operand
+    // IK_SUB/IK_FSUB and IK_EQ respectively, with an explicit IK_CONST(0)
+    // operand so IRC allocates the zero register.  These cases are dead.
 
     case IK_ITOF: {
         if (!dst || inst->nops < 1) break;
@@ -432,27 +379,12 @@ static void emit_inst(Inst *inst, FILE *out) {
     }
     case IK_ZEXT:
     case IK_TRUNC: {
-        // Zero-extend or truncate: handled by masking or just copy
+        // legalize_function() lowered ZEXT/TRUNC with mask_size < 4 to
+        // IK_CONST + IK_AND before IRC, so any remaining ZEXT/TRUNC here
+        // is the mask_size >= 4 case (no masking needed — just copy).
         if (!dst || inst->nops < 1) break;
         int r1 = get_val_reg(out, inst->ops[0], rd);
-        int src_size = vtype_size(inst->ops[0] ? val_resolve(inst->ops[0])->vtype : VT_I16);
-        int dst_size = vtype_size(dst->vtype);
         if (r1 != rd) fprintf(out, "    or %s, %s, %s\n", regname(rd), regname(r1), regname(r1));
-        // IK_ZEXT must always mask to src_size bits: upper bits may be dirty after
-        // sign-extending loads (lwx/lbx), and we cannot assume they are zero.
-        // IK_TRUNC masks to dst_size bits when shrinking.
-        int mask_size = (inst->kind == IK_ZEXT) ? src_size : dst_size;
-        if (mask_size < 4) {
-            unsigned avoid = 1u << rd;
-            int tmp = -1;
-            for (int r = 0; r < 8; r++) if (!(avoid & (1u << r))) { tmp = r; break; }
-            if (tmp < 0) tmp = (rd + 1) & 7;
-            unsigned mask = (mask_size == 1) ? 0xff : 0xffff;
-            fprintf(out, "    pushr %s\n", regname(tmp));
-            emit_imm(out, tmp, (int)mask);
-            fprintf(out, "    and %s, %s, %s\n", regname(rd), regname(rd), regname(tmp));
-            fprintf(out, "    popr %s\n", regname(tmp));
-        }
         break;
     }
 

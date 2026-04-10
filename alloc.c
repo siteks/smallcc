@@ -12,15 +12,15 @@ static int bv_nwords(int nvalues) {
 }
 
 static void bv_set(uint32_t *bv, int id) {
-    bv[id / 32] |= (1u << (id % 32));
+    bv[id >> 5] |= (1u << (id & 31));
 }
 
 static void bv_clear(uint32_t *bv, int id) {
-    bv[id / 32] &= ~(1u << (id % 32));
+    bv[id >> 5] &= ~(1u << (id & 31));
 }
 
 static int bv_test(uint32_t *bv, int id) {
-    return (bv[id / 32] >> (id % 32)) & 1;
+    return (bv[id >> 5] >> (id & 31)) & 1;
 }
 
 // bv_or: dst |= src; return 1 if dst changed
@@ -510,19 +510,42 @@ static int assign_colors(IGraph *g, Function *f, int K) {
     return 1;
 }
 
+// F2 bp-relative range: same thresholds as emit.c
+// When a spill offset falls outside these ranges, emit.c cannot use the F2
+// encoding and instead picks an arbitrary tmp register — potential clobber.
+// Inserting an explicit IK_ADDR avoids the problem entirely.
+static int spill_in_f2_range(int off, int sz) {
+    if (sz == 4) return (off % 4) == 0 && off >= -256 && off <= 252;
+    if (sz == 2) return (off % 2) == 0 && off >= -128 && off <= 126;
+    return off >= -64 && off <= 63;
+}
+
+// Insert an IK_ADDR instruction to compute bp+slot_offset into a fresh register.
+static Value *insert_spill_addr(Function *f, Block *b, Inst *anchor, int slot_offset) {
+    Value *addr  = new_value(f, VAL_INST, VT_PTR);
+    Inst  *la    = new_inst(f, b, IK_ADDR, addr);
+    la->imm      = slot_offset;
+    la->block    = b;
+    la->prev     = anchor->prev;
+    la->next     = anchor;
+    if (anchor->prev) anchor->prev->next = la;
+    else              b->head = la;
+    anchor->prev = la;
+    return addr;
+}
+
 // Insert spill load/store for a spilled value
 // Returns a fresh Value* that holds the loaded value
 static Value *insert_spill_load(Function *f, Block *b, Inst *before,
                                  Value *spilled_val, int slot_offset) {
-    // Create a fresh value
-    Value *tmp = new_value(f, VAL_INST, spilled_val->vtype);
+    int sz = (spilled_val->vtype == VT_F32 || spilled_val->vtype == VT_I32 ||
+              spilled_val->vtype == VT_U32) ? 4 : 2;
+
+    Value *tmp  = new_value(f, VAL_INST, spilled_val->vtype);
     Inst  *load = new_inst(f, b, IK_LOAD, tmp);
-    load->imm  = slot_offset;
-    load->size = (spilled_val->vtype == VT_F32 || spilled_val->vtype == VT_I32 ||
-                  spilled_val->vtype == VT_U32) ? 4 : 2;
-    // NULL base signals bp-relative spill load (emit.c checks for nops<1 or NULL base)
-    inst_add_op(load, NULL);
-    // Insert before 'before'
+    load->size  = sz;
+
+    // Insert before 'before' first (sets load->block, prev/next)
     load->block = b;
     if (!before) {
         inst_append(b, load);
@@ -533,17 +556,31 @@ static Value *insert_spill_load(Function *f, Block *b, Inst *before,
         else              b->head = load;
         before->prev = load;
     }
+
+    if (spill_in_f2_range(slot_offset, sz)) {
+        // F2 bp-relative: NULL base + imm encodes the offset
+        load->imm = slot_offset;
+        inst_add_op(load, NULL);
+    } else {
+        // Out of F2 range: explicit IK_ADDR so IRC allocates the address register.
+        // Insert IK_ADDR before the load (which is now already in the block).
+        Value *addr = insert_spill_addr(f, b, load, slot_offset);
+        load->imm   = 0;
+        inst_add_op(load, addr);
+    }
     return tmp;
 }
 
 static void insert_spill_store(Function *f, Block *b, Inst *after,
                                 Value *src, int slot_offset) {
-    Inst *store = new_inst(f, b, IK_STORE, NULL);
-    store->imm  = slot_offset;
-    store->size = (src->vtype == VT_F32 || src->vtype == VT_I32 ||
-                   src->vtype == VT_U32) ? 4 : 2;
-    inst_add_op(store, src);  // address comes from frame (imm = offset)
+    int sz = (src->vtype == VT_F32 || src->vtype == VT_I32 ||
+              src->vtype == VT_U32) ? 4 : 2;
+
+    Inst *store  = new_inst(f, b, IK_STORE, NULL);
+    store->size  = sz;
     store->block = b;
+
+    // Link after 'after' first
     if (!after) {
         inst_append(b, store);
     } else {
@@ -552,6 +589,19 @@ static void insert_spill_store(Function *f, Block *b, Inst *after,
         if (after->next) after->next->prev = store;
         else             b->tail = store;
         after->next = store;
+    }
+
+    if (spill_in_f2_range(slot_offset, sz)) {
+        // F2 bp-relative: NULL base signals bp-relative encoding in emit.c
+        store->imm = slot_offset;
+        inst_add_op(store, src);
+    } else {
+        // Out of F2 range: explicit IK_ADDR so IRC allocates the address register
+        // rather than emit.c picking an arbitrary (potentially live) tmp register.
+        Value *addr = insert_spill_addr(f, b, store, slot_offset);
+        store->imm  = 0;
+        inst_add_op(store, addr);
+        inst_add_op(store, src);
     }
 }
 
@@ -608,11 +658,18 @@ static void rewrite_spills(Function *f, IGraph *g) {
             // its src operand (the spilled value) would trigger another LOAD
             // insertion, creating a bogus LOAD-STORE pair with no actual store of
             // the freshly computed value.
+            //
+            // For out-of-F2-range spill slots, insert_spill_store inserts an
+            // IK_ADDR *before* the IK_STORE (making copy->next = ADDR, not STORE).
+            // A single inst->next only reaches the ADDR; the for-loop increment
+            // would then land on the STORE and trigger the bogus LOAD above.
+            // Skip the IK_ADDR too so the for-loop increment lands on STORE->next.
             if (inst->dst) {
                 int id = inst->dst->id;
                 if (id < nv && g->spilled[id]) {
                     insert_spill_store(f, b, inst, inst->dst, spill_offset[id]);
-                    inst = inst->next; // skip the just-inserted store
+                    inst = inst->next; // skip to IK_ADDR (out-of-range) or IK_STORE (in-range)
+                    if (inst && inst->kind == IK_ADDR) inst = inst->next; // skip IK_ADDR → land on IK_STORE
                 }
             }
         }

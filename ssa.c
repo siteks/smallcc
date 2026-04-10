@@ -74,6 +74,26 @@ void inst_add_op(Inst *inst, Value *v) {
     if (v) v->use_count++;
 }
 
+void inst_insert_before(Inst *next, Inst *ins) {
+    Block *b   = next->block;
+    ins->block = b;
+    ins->next  = next;
+    ins->prev  = next->prev;
+    if (next->prev) next->prev->next = ins;
+    else            b->head = ins;
+    next->prev = ins;
+}
+
+int vtype_size(ValType vt) {
+    switch (vt) {
+    case VT_I8:  case VT_U8:  return 1;
+    case VT_I16: case VT_U16: return 2;
+    case VT_I32: case VT_U32: case VT_F32: return 4;
+    case VT_PTR: return 2;
+    default: return 2;
+    }
+}
+
 void inst_append(Block *b, Inst *inst) {
     inst->block = b;
     inst->prev  = b->tail;
