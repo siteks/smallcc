@@ -781,6 +781,24 @@ void emit_function(Function *f, FILE *out) {
         Value *dop1 = def->ops[1] ? val_resolve(def->ops[1]) : NULL;
         if (!dop0 || dop0->kind != VAL_INST || dop0->phys_reg < 0) continue;
         if (!dop1 || dop1->kind != VAL_INST || dop1->phys_reg < 0) continue;
+
+        // F3b branches use a 10-bit PC-relative offset (±511 bytes).
+        // Estimate the byte distance to the true target block; skip fusion
+        // if it might overflow the signed 10-bit range.
+        int target_bi = -1;
+        for (int k = 0; k < f->nblocks; k++) {
+            if (f->blocks[k] == term->target) { target_bi = k; break; }
+        }
+        if (target_bi < 0) continue;
+        int lo = (fbi < target_bi) ? fbi + 1 : target_bi;
+        int hi = (fbi < target_bi) ? target_bi : fbi;
+        int est_bytes = 0;
+        for (int k = lo; k < hi; k++) {
+            for (Inst *ii = f->blocks[k]->head; ii; ii = ii->next)
+                if (!ii->is_dead) est_bytes += 3; // worst-case 3 bytes/instruction
+        }
+        if (est_bytes > 450) continue;  // conservative: F3b range is ±511 bytes
+
         def->is_dead     = 1;
         fuse[fbi].fused  = 1;
         fuse[fbi].mnem   = mnem;
