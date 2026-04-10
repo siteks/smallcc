@@ -570,6 +570,42 @@ static Value *cg_addr(BraunCtx *ctx, Block **cur, Node *n);
 static Value *cg_logand(BraunCtx *ctx, Block **cur, Node *lhs, Node *rhs, bool is_or);
 
 // ============================================================
+// Helpers: SSA-eligibility check and read-modify-write
+// ============================================================
+
+// True if lhs is a non-addr-taken local/param scalar that can live in the
+// Braun variable map rather than memory.
+static bool is_ssa_var(BraunCtx *ctx, Node *lhs) {
+    if (lhs->kind != ND_IDENT || !lhs->symbol) return false;
+    Symbol *sym = lhs->symbol;
+    if (sym->kind != SYM_LOCAL && sym->kind != SYM_PARAM) return false;
+    if (istype_array(sym->type)) return false;
+    if (sym->type && sym->type->base == TB_STRUCT) return false;
+    return !is_addr_taken(ctx, sym);
+}
+
+// Perform a read-modify-write on lhs: new = binop(old, rhs).
+// Writes new back via write_var (SSA path) or store (memory path).
+// Returns old if want_old, else new.
+static Value *cg_rmw(BraunCtx *ctx, Block **cur, Node *lhs,
+                     InstKind bop, Value *rhs, ValType vt, bool want_old) {
+    Block *b = *cur;
+    if (is_ssa_var(ctx, lhs)) {
+        Symbol *sym  = lhs->symbol;
+        Value  *old  = read_var(ctx, b, sym);
+        Value  *newv = emit_binop(ctx, b, bop, old, rhs, vt);
+        write_var(b, sym, newv);
+        return want_old ? old : newv;
+    }
+    Value *addr = cg_addr(ctx, cur, lhs); b = *cur;
+    int    sz   = lhs->type ? lhs->type->size : 2;
+    Value *old  = emit_load(ctx, b, addr, sz, 0, vt);
+    Value *newv = emit_binop(ctx, b, bop, old, rhs, vt);
+    emit_store(ctx, b, addr, newv, sz, 0);
+    return want_old ? old : newv;
+}
+
+// ============================================================
 // Build CallDesc inline from function Type*
 // ============================================================
 
@@ -950,27 +986,7 @@ static Value *cg_expr(BraunCtx *ctx, Block **cur, Node *n) {
                 step = ot->u.ptr.pointee->size;
             else if (ot && ot->base == TB_ARRAY && ot->u.arr.elem)
                 step = ot->u.arr.elem->size;
-            Value *step_v = new_const(ctx->f, step, vt);
-
-            // Compute: load old, compute new, store back, return new
-            if (n->ch[0]->kind == ND_IDENT && n->ch[0]->symbol &&
-                (n->ch[0]->symbol->kind == SYM_LOCAL || n->ch[0]->symbol->kind == SYM_PARAM) &&
-                !is_addr_taken(ctx, n->ch[0]->symbol)) {
-                // SSA path
-                Symbol *sym = n->ch[0]->symbol;
-                Value *old_v = read_var(ctx, b, sym);
-                Value *new_v = emit_binop(ctx, b, bop, old_v, step_v, vt);
-                write_var(b, sym, new_v);
-                return new_v;
-            } else {
-                // Memory path
-                Value *addr = cg_addr(ctx, cur, n->ch[0]); b = *cur;
-                int sz = n->ch[0]->type ? n->ch[0]->type->size : 2;
-                Value *old_v = emit_load(ctx, b, addr, sz, 0, vt);
-                Value *new_v = emit_binop(ctx, b, bop, old_v, step_v, vt);
-                emit_store(ctx, b, addr, new_v, sz, 0);
-                return new_v;
-            }
+            return cg_rmw(ctx, cur, n->ch[0], bop, new_const(ctx->f, step, vt), vt, false);
         }
 
         // Post-increment / post-decrement
@@ -982,26 +998,7 @@ static Value *cg_expr(BraunCtx *ctx, Block **cur, Node *n) {
                 step = ot->u.ptr.pointee->size;
             else if (ot && ot->base == TB_ARRAY && ot->u.arr.elem)
                 step = ot->u.arr.elem->size;
-            Value *step_v = new_const(ctx->f, step, vt);
-
-            if (n->ch[0]->kind == ND_IDENT && n->ch[0]->symbol &&
-                (n->ch[0]->symbol->kind == SYM_LOCAL || n->ch[0]->symbol->kind == SYM_PARAM) &&
-                !is_addr_taken(ctx, n->ch[0]->symbol)) {
-                // SSA path: save old, write new, return old
-                Symbol *sym = n->ch[0]->symbol;
-                Value *old_v = read_var(ctx, b, sym);
-                Value *new_v = emit_binop(ctx, b, bop, old_v, step_v, vt);
-                write_var(b, sym, new_v);
-                return old_v;
-            } else {
-                // Memory path
-                Value *addr = cg_addr(ctx, cur, n->ch[0]); b = *cur;
-                int sz = n->ch[0]->type ? n->ch[0]->type->size : 2;
-                Value *old_v = emit_load(ctx, b, addr, sz, 0, vt);
-                Value *new_v = emit_binop(ctx, b, bop, old_v, step_v, vt);
-                emit_store(ctx, b, addr, new_v, sz, 0);
-                return old_v;
-            }
+            return cg_rmw(ctx, cur, n->ch[0], bop, new_const(ctx->f, step, vt), vt, true);
         }
 
         return new_value(ctx->f, VAL_UNDEF, vt);
@@ -1058,18 +1055,10 @@ static Value *cg_expr(BraunCtx *ctx, Block **cur, Node *n) {
 
         Value *rhs = cg_expr(ctx, cur, n->ch[1]); b = *cur;
 
-        // SSA assign (non-addr-taken local/param scalar)
-        if (n->ch[0]->kind == ND_IDENT && n->ch[0]->symbol &&
-            (n->ch[0]->symbol->kind == SYM_LOCAL || n->ch[0]->symbol->kind == SYM_PARAM) &&
-            !istype_array(n->ch[0]->symbol->type) &&
-            !(n->ch[0]->symbol->type && n->ch[0]->symbol->type->base == TB_STRUCT) &&
-            !is_addr_taken(ctx, n->ch[0]->symbol)) {
-            Symbol *sym = n->ch[0]->symbol;
-            write_var(b, sym, rhs);
+        if (is_ssa_var(ctx, n->ch[0])) {
+            write_var(b, n->ch[0]->symbol, rhs);
             return rhs;
         }
-
-        // Memory assign
         Value *addr = cg_addr(ctx, cur, n->ch[0]); b = *cur;
         int sz = n->ch[0]->type ? n->ch[0]->type->size : 2;
         emit_store(ctx, b, addr, rhs, sz, 0);
@@ -1078,46 +1067,11 @@ static Value *cg_expr(BraunCtx *ctx, Block **cur, Node *n) {
 
     // ----------------------------------------------------------
     case ND_COMPOUND_ASSIGN: {
-        Token_kind base_op = n->op_kind;
         ValType lhs_vt = n->ch[0]->type ? type_to_valtype(n->ch[0]->type) : VT_I16;
         if (lhs_vt == VT_VOID) lhs_vt = VT_I16;
-
-        Value *rhs = cg_expr(ctx, cur, n->ch[1]); b = *cur;
-
-        // SSA path for non-addr-taken scalar local/param
-        if (n->ch[0]->kind == ND_IDENT && n->ch[0]->symbol &&
-            (n->ch[0]->symbol->kind == SYM_LOCAL || n->ch[0]->symbol->kind == SYM_PARAM) &&
-            !istype_array(n->ch[0]->symbol->type) &&
-            !(n->ch[0]->symbol->type && n->ch[0]->symbol->type->base == TB_STRUCT) &&
-            !is_addr_taken(ctx, n->ch[0]->symbol)) {
-            Symbol *sym = n->ch[0]->symbol;
-            Value *old_v = read_var(ctx, b, sym);
-            bool swap = (base_op == TK_GT || base_op == TK_GE);
-            Value *lv = swap ? rhs : old_v;
-            Value *rv = swap ? old_v : rhs;
-            InstKind kind = tok_binop_kind(base_op, lhs_vt);
-            Value *new_v = emit_binop(ctx, b, kind, lv, rv, lhs_vt);
-            write_var(b, sym, new_v);
-            return new_v;
-        }
-
-        // Memory path — compute addr once, load, op, store, reload
-        Value *addr = cg_addr(ctx, cur, n->ch[0]); b = *cur;
-        // Save addr in a fresh SSA value to avoid re-evaluating side effects
-        Value *addr_saved = new_value(ctx->f, VAL_INST, VT_PTR);
-        Inst  *addr_copy = bi(ctx, b, IK_COPY, addr_saved);
-        inst_add_op(addr_copy, addr);
-        inst_append(b, addr_copy);
-
-        int sz = n->ch[0]->type ? n->ch[0]->type->size : 2;
-        Value *old_v = emit_load(ctx, b, addr_saved, sz, 0, lhs_vt);
-        bool swap = (base_op == TK_GT || base_op == TK_GE);
-        Value *lv = swap ? rhs : old_v;
-        Value *rv = swap ? old_v : rhs;
-        InstKind kind = tok_binop_kind(base_op, lhs_vt);
-        Value *new_v = emit_binop(ctx, b, kind, lv, rv, lhs_vt);
-        emit_store(ctx, b, addr_saved, new_v, sz, 0);
-        return new_v;
+        Value   *rhs  = cg_expr(ctx, cur, n->ch[1]); b = *cur;
+        InstKind kind = tok_binop_kind(n->op_kind, lhs_vt);
+        return cg_rmw(ctx, cur, n->ch[0], kind, rhs, lhs_vt, false);
     }
 
     // ----------------------------------------------------------
