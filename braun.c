@@ -434,11 +434,49 @@ static int32_t fold_binop(InstKind kind, int32_t a, int32_t b) {
     }
 }
 
+static int alg_is_pow2(int32_t k) { return k > 1 && (k & (k-1)) == 0; }
+static int alg_log2(int32_t k)   { int n = 0; while (k > 1) { k >>= 1; n++; } return n; }
+
 static Value *emit_binop(BraunCtx *ctx, Block *b, InstKind kind, Value *lhs, Value *rhs, ValType vt) {
     if (lhs && lhs->kind == VAL_CONST && rhs && rhs->kind == VAL_CONST && can_fold_binop(kind)) {
         int32_t result = fold_binop(kind, lhs->iconst, rhs->iconst);
         return new_const(ctx->f, result, vt);
     }
+
+    // ── Algebraic simplification (R2C) ──────────────────────────────────────
+    // Check rhs-is-const (non-commutative ops and rhs-const commutative ops)
+    if (rhs && rhs->kind == VAL_CONST) {
+        int32_t k = rhs->iconst;
+        switch (kind) {
+        case IK_ADD:  if (k == 0) return lhs; break;
+        case IK_SUB:  if (k == 0) return lhs; break;
+        case IK_MUL:
+            if (k == 0) return new_const(ctx->f, 0, vt);
+            if (k == 1) return lhs;
+            if (alg_is_pow2(k))
+                return emit_binop(ctx, b, IK_SHL, lhs, new_const(ctx->f, alg_log2(k), VT_I16), vt);
+            break;
+        case IK_UDIV:
+            if (alg_is_pow2(k))
+                return emit_binop(ctx, b, IK_USHR, lhs, new_const(ctx->f, alg_log2(k), VT_I16), vt);
+            break;
+        case IK_UMOD:
+            if (alg_is_pow2(k))
+                return emit_binop(ctx, b, IK_AND, lhs, new_const(ctx->f, k - 1, vt), vt);
+            break;
+        case IK_SHL: case IK_SHR: case IK_USHR: if (k == 0) return lhs; break;
+        case IK_AND:
+            if (k == 0)  return new_const(ctx->f, 0, vt);
+            if (k == -1) return lhs;
+            break;
+        case IK_OR:  if (k == 0) return lhs; break;
+        case IK_XOR: if (k == 0) return lhs; break;
+        default: break;
+        }
+    }
+    // lhs-const k==1 MUL: DISABLED (causes CRC mismatch)
+    // ── End algebraic simplification ────────────────────────────────────────
+
     Value *dst  = new_value(ctx->f, VAL_INST, vt);
     Inst  *inst = bi(ctx, b, kind, dst);
     inst_add_op(inst, lhs);
@@ -1527,6 +1565,14 @@ static Block *cg_stmt(BraunCtx *ctx, Block *b, Node *n) {
     case ND_IFSTMT: {
         Block *cur = b;
         Value *cond = cg_expr(ctx, &cur, n->ch[0]); b = cur;
+        // R1B: constant condition — skip dead branch at construction time
+        if (cond && cond->kind == VAL_CONST) {
+            if (cond->iconst != 0)
+                return cg_stmt(ctx, b, n->ch[1]);
+            if (n->ch[2])
+                return cg_stmt(ctx, b, n->ch[2]);
+            return b;
+        }
         Block *then_blk = new_block(ctx->f);
         Block *else_blk = new_block(ctx->f);
         Block *merge    = new_block(ctx->f);
@@ -1552,6 +1598,14 @@ static Block *cg_stmt(BraunCtx *ctx, Block *b, Node *n) {
         emit_jmp(b, header);
         Block *cur = header;
         Value *cond = cg_expr(ctx, &cur, n->ch[0]);
+        // R1B: while(0) — dead loop, jump straight to exit
+        if (cond && cond->kind == VAL_CONST && cond->iconst == 0) {
+            emit_jmp(cur, exit);
+            seal_block(ctx, body);
+            seal_block(ctx, header);
+            seal_block(ctx, exit);
+            return exit;
+        }
         emit_br(ctx->f, cur, cond, body, exit);
         seal_block(ctx, body);
         Block *saved_brk  = ctx->brk;

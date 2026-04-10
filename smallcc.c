@@ -5,6 +5,7 @@
 #include "braun.h"
 #include "dom.h"
 #include "oos.h"
+#include "opt.h"
 #include "legalize.h"
 #include "alloc.h"
 #include "emit.h"
@@ -549,6 +550,8 @@ int main(int argc, char **argv)
                     split_critical_edges(f);
                     compute_dominators(f);
                     out_of_ssa(f);
+                    opt_fold_branches(f);
+                    opt_remove_dead_blocks(f);
                     if (oos_out) { fprintf(oos_out, "=== OOS: %s ===\n", f->name); print_function(f, oos_out); }
                     if (getenv("DUMP_IR")) { fprintf(stderr, "=== after oos ===\n"); print_function(f, stderr); }
                     if (run_oos && irsim) { irsim_add_function(irsim, f); continue; }

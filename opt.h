@@ -1,0 +1,12 @@
+#ifndef OPT_H
+#define OPT_H
+
+#include "ssa.h"
+
+// R2A: Replace IK_BR with a VAL_CONST condition by IK_JMP to the taken target.
+void opt_fold_branches(Function *f);
+
+// R2B: Remove blocks with no predecessors (except entry block).
+void opt_remove_dead_blocks(Function *f);
+
+#endif

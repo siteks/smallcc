@@ -2,7 +2,7 @@
 CFLAGS=-std=c11 -g
 
 SRCS_COMMON = smallcc.c tokeniser.c parser.c types.c preprocess.c
-SRCS_NEW    = sx.c lower.c ssa.c braun.c dom.c oos.c legalize.c alloc.c emit.c irsim.c
+SRCS_NEW    = sx.c lower.c ssa.c braun.c dom.c oos.c opt.c legalize.c alloc.c emit.c irsim.c
 
 smallcc: $(SRCS_COMMON) $(SRCS_NEW)
 sim_c: sim_c.c
