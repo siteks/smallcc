@@ -558,7 +558,7 @@ static void emit_inst(Inst *inst, FILE *out) {
             if (inst->nops > 0) fprintf(out, "    adjw %d\n", inst->nops * 4);
         } else {
             // Non-variadic: register args (ops[0..nreg-1]) are pre-colored to r1..r3
-            // by IK_COPY instructions inserted by emit_reg_arg_copies in braun.c.
+            // by IK_COPY instructions inserted by legalize_function() (Pass B).
             // IRC's interference analysis guarantees sequential emission is cycle-free.
             int nreg   = inst->nops < 3 ? inst->nops : 3;
             int nextra = inst->nops > 3 ? inst->nops - 3 : 0;
@@ -590,7 +590,7 @@ static void emit_inst(Inst *inst, FILE *out) {
     }
 
     case IK_ICALL: {
-        // ops[0] = fp (pre-colored r0 by IK_COPY in braun.c)
+        // ops[0] = fp (pre-colored r0 by IK_COPY inserted by legalize_function() Pass B)
         // ops[1..nreg] = pre-colored reg args (r1..r3)
         // ops[nreg+1..] = extra stack args
         if (inst->nops < 1) break;
@@ -615,7 +615,7 @@ static void emit_inst(Inst *inst, FILE *out) {
                 if (ar >= 0) fprintf(out, "    pushr %s\n", regname(ar));
             }
         }
-        // fp is in r0 (pre-colored by IK_COPY in braun.c); jlr uses r0 implicitly
+        // fp is in r0 (pre-colored by IK_COPY from legalize_function() Pass B)
         fprintf(out, "    jlr r0\n");
         if (nextra > 0) fprintf(out, "    adjw %d\n", nextra * 4);
         if (dst && preg(dst) != 0)

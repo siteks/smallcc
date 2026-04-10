@@ -4,8 +4,8 @@
 **Target:** CPU4 RISC-like ISA; K=8 general-purpose registers (r0–r7); sp, bp, lr special
 **Driver benchmark:** CoreMark
 
-This document describes the `nanopass` CPU4 pipeline that replaces `codegen.c` /
-`backend.c` / `optimise.c` for `-arch cpu4`. The CPU3 stack-machine path is unchanged.
+This document describes the `nanopass` CPU4 pipeline. It is the compiler's sole backend;
+the CPU3 stack-machine backend (`codegen.c` / `backend.c` / `optimise.c`) has been removed.
 
 ---
 
@@ -64,7 +64,7 @@ Node* parse tree  (output of resolve_symbols / derive_types / insert_coercions)
 directly from lowering to Braun SSA construction.
 
 **Regime 2 (SSA graph) optimisation passes are not yet implemented.** The pipeline goes
-directly from Braun → dom → OOS → IRC.
+directly from Braun → dom → OOS → legalize → IRC.
 
 ---
 
@@ -387,8 +387,8 @@ struct Block {
     Block **succs;  int nsuccs;
     int     sealed, filled;
     // Braun maps (fixed-size arrays; valid only during construction):
-    char   *def_names[256];  Value *def_vals[256];  int ndef;
-    Inst   *iphi_insts[256]; char  *iphi_names[256]; int niphi;
+    Symbol *def_syms[BRAUN_MAP_MAX];  Value *def_vals[BRAUN_MAP_MAX];  int ndef;
+    Inst   *iphi_insts[BRAUN_MAP_MAX]; Symbol *iphi_syms[BRAUN_MAP_MAX]; int niphi;
     // Dominator analysis:
     int     loop_depth, rpo_index;
     Block  *idom;
@@ -461,7 +461,7 @@ register for the mask rather than emitting pushr/popr scratch sequences in emit.
 **Algorithm:** Appel & George 1996, Iterated Register Coalescing.
 
 **K = 8:** r0–r7 are allocatable. r0 is pre-colored for `IK_CALL`/`IK_ICALL` landing
-values and `IK_PARAM 0`.
+values. Parameters 1–3 are pre-colored to r1–r3 by the legalize pass (Pass A).
 
 **ABI constraints:**
 - r0–r3: caller-saved → interfere with all live values at call sites
@@ -550,12 +550,16 @@ bp+8+2*(n-1)   param n (last)
 bp+8           param 0 (first)
 bp+4           return address
 bp+0           saved bp          ← enter sets bp here
-bp-K           callee-saved reg save area (r4–r7 as needed)
-bp-K-M         spill slots
+               spill slots       (frame_size bytes; aligned to 4-byte boundary)
+bp-(frame+4)   callee-saved r4 (if used)
+    ...        callee-saved r5/r6/r7 (if used)
+sp             (sp = bp − (frame + callee_frame))
 ```
 
-`enter N` is emitted with N = frame_size (from Function.frame_size, expanded by IRC
-spill rewriting). `adjw` adjusts sp for scope-allocated locals.
+`enter N` is emitted with N = `frame + callee_frame`, where `frame` is
+`Function.frame_size` rounded up to 4-byte alignment and `callee_frame` is 4 bytes per
+used callee-saved register (r4–r7). Callee saves are stored **below** the spill area.
+`adjw` is used only to pop extra stack arguments after calls with more than 3 parameters.
 
 ### Instruction selection
 
@@ -572,8 +576,8 @@ spill rewriting). `adjw` adjusts sp for scope-allocated locals.
 | `IK_UDIV rd, ra, rb` | `div rd, ra, rb` |
 | `IK_LT rd, ra, rb` | `lts rd, ra, rb` |
 | `IK_ULT rd, ra, rb` | `lt rd, ra, rb` |
-| `IK_SEXT8 rd, ra` | `sxb rd` |
-| `IK_SEXT16 rd, ra` | `sxw rd` |
+| `IK_SEXT8 rd, ra` | `or rd, ra, ra` (if ra≠rd); `sxb rd` |
+| `IK_SEXT16 rd, ra` | `or rd, ra, ra` (if ra≠rd); `sxw rd` |
 | `IK_ITOF` | `itof` |
 | `IK_FTOI` | `ftoi` |
 | `IK_LOAD rd, [ra+0]` (bp-rel, in F2 range) | `lw/lb/ll rd, [bp+imm]` |
@@ -581,10 +585,10 @@ spill rewriting). `adjw` adjusts sp for scope-allocated locals.
 | `IK_STORE [ra+0], rb` (bp-rel, in F2 range) | `sw/sb/sl rb, [bp+imm]` |
 | `IK_STORE [ra+0], rb` (other) | `slw/slb/sll rb, [ra+0]` |
 | `IK_COPY rd, rs` | `or rd, rs, rs` (mov pseudo) |
-| `IK_MEMCPY dst, src, n` | inlined byte loop or call to memcpy |
+| `IK_MEMCPY dst, src, n` | inlined word/byte moves (always; no libcall) |
 | `IK_CALL "fname"` | `jl fname` |
 | `IK_ICALL fp` | `jlr` (fp in r0) |
-| `IK_BR cond, T, F` | `jnz T` + fall-through to F |
+| `IK_BR cond, T, F` | `jnz rx, T_label`; `j F_label` (both branches explicit) |
 | `IK_JMP target` | `j target` |
 | `IK_RET v` | move v to r0 (if not already); `ret` |
 | `IK_PUTCHAR v` | move v to r0; `putchar` |
@@ -660,6 +664,6 @@ globally unique and never collide with lib TU string literals.
 collisions when multiple functions are emitted to the same assembly file.
 
 **Call result pre-coloring:** `IK_CALL`/`IK_ICALL` landing values are pre-colored to r0.
-An immediate `IK_COPY working ← landing` gives IRC a freely-allocatable working value,
-avoiding conflicts between the call result and the next branch condition (which also
-uses r0 as its condition register).
+An immediate `IK_COPY working ← landing` gives IRC a freely-allocatable working value.
+This avoids pinning the call result in r0 for the rest of its live range — IRC can
+coalesce the copy away or assign `working` to any register.
