@@ -295,7 +295,8 @@ static void write_var(Block *b, Symbol *sym, Value *v) {
     for (int i = 0; i < b->ndef; i++) {
         if (b->def_syms[i] == sym) { b->def_vals[i] = v; return; }
     }
-    if (b->ndef >= BRAUN_MAP_MAX) return;
+    if (b->ndef >= BRAUN_MAP_MAX)
+        error("braun: block B%d has too many variable definitions (max %d); increase BRAUN_MAP_MAX in ssa.h", b->id, BRAUN_MAP_MAX);
     b->def_syms[b->ndef] = sym;
     b->def_vals[b->ndef] = v;
     b->ndef++;
@@ -328,7 +329,8 @@ static Value *read_var_recursive(BraunCtx *ctx, Block *b, Symbol *sym) {
         b->head = phi;
         phi->block = b;
         write_var(b, sym, dst);
-        if (b->niphi >= BRAUN_MAP_MAX) return dst;
+        if (b->niphi >= BRAUN_MAP_MAX)
+            error("braun: block B%d has too many incomplete phis (max %d); increase BRAUN_MAP_MAX in ssa.h", b->id, BRAUN_MAP_MAX);
         b->iphi_insts[b->niphi] = phi;
         b->iphi_syms [b->niphi] = sym;
         b->niphi++;

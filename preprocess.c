@@ -101,6 +101,8 @@ void add_include_dir(const char *dir)
 {
     if (pp_idir_count < PP_MAX_IDIRS)
         pp_idirs[pp_idir_count++] = dir;
+    else
+        error("too many include directories (max %d)", PP_MAX_IDIRS);
 }
 
 /* ------------------------------------------------------------------ */
@@ -833,6 +835,8 @@ char *preprocess(const char *src, const char *filename)
                                     m->params[m->nparams][63] = '\0';
                                     m->nparams++;
                                 }
+                                else
+                                    error("macro '%s' has too many parameters (max %d)", m->name, PP_MAX_PARAMS);
                                 q = pp_skip_ws(q);
                                 if (*q == ')') { q++; break; }
                                 if (*q == ',') q++;

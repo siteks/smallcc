@@ -1128,79 +1128,42 @@ void shift_param_offsets_for_struct_ret(Symbol_table *param_scope)
 // ---------------------------------------------------------------
 // fulltype_str
 // ---------------------------------------------------------------
-static char *fts2(Type *t, char *p)
+static char *fts2(Type *t, char *p, char *end)
 {
-    if (!t)
-    {
-        p += sprintf(p, "null");
-        return p;
-    }
+#define FW(fmt, ...) do { int _n = snprintf(p, (size_t)(end - p), fmt, ##__VA_ARGS__); if (_n > 0) p += _n; } while(0)
+    if (!t) { FW("null"); return p; }
     switch (t->base)
     {
-    case TB_VOID:
-        p += sprintf(p, "void");
-        break;
-    case TB_CHAR:
-        p += sprintf(p, "char");
-        break;
-    case TB_UCHAR:
-        p += sprintf(p, "uchar");
-        break;
-    case TB_SHORT:
-        p += sprintf(p, "short");
-        break;
-    case TB_USHORT:
-        p += sprintf(p, "ushort");
-        break;
-    case TB_INT:
-        p += sprintf(p, "int");
-        break;
-    case TB_UINT:
-        p += sprintf(p, "uint");
-        break;
-    case TB_LONG:
-        p += sprintf(p, "long");
-        break;
-    case TB_ULONG:
-        p += sprintf(p, "ulong");
-        break;
-    case TB_FLOAT:
-        p += sprintf(p, "float");
-        break;
-    case TB_DOUBLE:
-        p += sprintf(p, "double");
-        break;
+    case TB_VOID:   FW("void");   break;
+    case TB_CHAR:   FW("char");   break;
+    case TB_UCHAR:  FW("uchar");  break;
+    case TB_SHORT:  FW("short");  break;
+    case TB_USHORT: FW("ushort"); break;
+    case TB_INT:    FW("int");    break;
+    case TB_UINT:   FW("uint");   break;
+    case TB_LONG:   FW("long");   break;
+    case TB_ULONG:  FW("ulong");  break;
+    case TB_FLOAT:  FW("float");  break;
+    case TB_DOUBLE: FW("double"); break;
     case TB_POINTER:
-        p += sprintf(p, "ptr(");
-        p = fts2(t->u.ptr.pointee, p);
-        p += sprintf(p, ")");
-        break;
+        FW("ptr("); p = fts2(t->u.ptr.pointee, p, end); FW(")"); break;
     case TB_ARRAY:
-        p += sprintf(p, "arr[%d](", t->u.arr.count);
-        p = fts2(t->u.arr.elem, p);
-        p += sprintf(p, ")");
-        break;
+        FW("arr[%d](", t->u.arr.count); p = fts2(t->u.arr.elem, p, end); FW(")"); break;
     case TB_FUNCTION:
-        p += sprintf(p, "fn(ret=");
-        p = fts2(t->u.fn.ret, p);
-        p += sprintf(p, ")");
-        break;
+        FW("fn(ret="); p = fts2(t->u.fn.ret, p, end); FW(")"); break;
     case TB_STRUCT:
-        p += sprintf(p, "struct{%s}", t->u.composite.tag ? t->u.composite.tag->name : "anon");
-        break;
-    case TB_ENUM:
-        p += sprintf(p, "enum");
-        break;
-    default:
-        p += sprintf(p, "??? (%d)", t->base);
-        break;
+        FW("struct{%s}", t->u.composite.tag ? t->u.composite.tag->name : "anon"); break;
+    case TB_ENUM:   FW("enum"); break;
+    default:        FW("?(%d)", t->base); break;
     }
     return p;
+#undef FW
 }
 
 const char *fulltype_str(Type *t)
 {
-    fts2(t, type_ctx.ft_buf);
+    char *end = type_ctx.ft_buf + sizeof(type_ctx.ft_buf);
+    fts2(t, type_ctx.ft_buf, end);
     return type_ctx.ft_buf;
 }
 

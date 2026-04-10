@@ -192,6 +192,7 @@ static void add_sym(const char *n, uint16_t addr)
     if (i >= 0) { syms[i].addr = addr; return; }
     if (nsyms >= MAX_SYMS) { fprintf(stderr, "too many symbols\n"); exit(1); }
     strncpy(syms[nsyms].name, n, MAX_NAME-1);
+    syms[nsyms].name[MAX_NAME-1] = '\0';
     syms[nsyms].addr = addr;
     nsyms++;
 }

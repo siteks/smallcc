@@ -309,6 +309,10 @@ int main(int argc, char **argv)
         {
             if (num_defines < 256)
                 cmdline_defines[num_defines++] = argv[file_start] + 2;
+            else {
+                fprintf(stderr, "error: too many -D defines (max 256)\n");
+                return 1;
+            }
             file_start++;
         }
         else if (strncmp(argv[file_start], "-I", 2) == 0)
