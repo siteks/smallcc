@@ -10,6 +10,17 @@
  *
  * R2B  opt_remove_dead_blocks(): Remove blocks with npreds == 0 that are not
  *      the entry block.  Strips their outgoing edges and iterates until stable.
+ *
+ * R2D  opt_copy_prop():        Collapse IK_COPY chains post-OOS, before IRC.
+ *      Sets Value.alias for each copy destination so val_resolve() chains
+ *      through them, then rewrites all operand references and recounts
+ *      use_count.  IRC DCE then removes copies whose dst use_count == 0.
+ *      Copies whose resolved source is a call landing (IK_CALL/IK_ICALL),
+ *      param landing (IK_PARAM), or another IK_COPY are left intact —
+ *      collapsing them would extend constrained live ranges or mishandle
+ *      OOS swap-cycle temporaries.  Note: phys_reg is assigned by legalize
+ *      and irc_allocate which run after this pass, so phys_reg cannot be
+ *      used as a guard here.
  */
 
 // ── R2A: Constant-condition branch folding ────────────────────────────────
@@ -46,6 +57,60 @@ void opt_fold_branches(Function *f) {
         term->target  = taken;
         term->target2 = NULL;
         term->nops    = 0;  // drop the condition operand reference
+    }
+}
+
+// ── R2D: Copy propagation ─────────────────────────────────────────────────
+
+void opt_copy_prop(Function *f) {
+    // After OOS, phi-variables have one IK_COPY per predecessor block; they must
+    // not be aliased — collapsing them creates circular self-references in loops.
+    // Count how many IK_COPY instructions define each value; only alias values
+    // with exactly one copy definition.
+    int *copy_count = calloc(f->nvalues, sizeof(int));
+    for (int bi = 0; bi < f->nblocks; bi++) {
+        Block *b = f->blocks[bi];
+        for (Inst *inst = b->head; inst; inst = inst->next) {
+            if (!inst->is_dead && inst->kind == IK_COPY && inst->dst)
+                copy_count[inst->dst->id]++;
+        }
+    }
+
+    // Pass 1: alias each single-definition IK_COPY dst to its canonical source.
+    // val_resolve() chains through the aliases we set.
+    for (int bi = 0; bi < f->nblocks; bi++) {
+        Block *b = f->blocks[bi];
+        for (Inst *inst = b->head; inst; inst = inst->next) {
+            if (inst->is_dead) continue;
+            if (inst->kind != IK_COPY || inst->nops < 1 || !inst->ops[0]) continue;
+            Value *dst = inst->dst;
+            if (copy_count[dst->id] > 1) continue;  // phi-variable: multiple defs
+            Value *src = val_resolve(inst->ops[0]);
+            if (src->vtype != dst->vtype) continue;  // type-coercion copy (e.g. i32↔u32)
+            if (!src->def) continue;                 // VAL_CONST or VAL_UNDEF source
+            if (src->def->kind == IK_CALL   ||
+                src->def->kind == IK_ICALL  ||
+                src->def->kind == IK_PARAM  ||
+                src->def->kind == IK_COPY) continue; // constrained or swap-cycle source
+            dst->alias = src;
+        }
+    }
+    free(copy_count);
+
+    // Pass 2: rewrite every operand to its canonical value and recount use_count.
+    // Aliased copy dsts will end up with use_count == 0 and be removed by IRC DCE.
+    for (int i = 0; i < f->nvalues; i++) f->values[i]->use_count = 0;
+    for (int bi = 0; bi < f->nblocks; bi++) {
+        Block *b = f->blocks[bi];
+        for (Inst *inst = b->head; inst; inst = inst->next) {
+            if (inst->is_dead) continue;
+            for (int j = 0; j < inst->nops; j++) {
+                if (inst->ops[j]) {
+                    inst->ops[j] = val_resolve(inst->ops[j]);
+                    inst->ops[j]->use_count++;
+                }
+            }
+        }
     }
 }
 

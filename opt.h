@@ -9,4 +9,7 @@ void opt_fold_branches(Function *f);
 // R2B: Remove blocks with no predecessors (except entry block).
 void opt_remove_dead_blocks(Function *f);
 
+// R2D: Collapse IK_COPY chains; rewrite operands to canonical values; recount use_count.
+void opt_copy_prop(Function *f);
+
 #endif
