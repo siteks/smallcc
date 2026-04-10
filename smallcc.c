@@ -250,6 +250,7 @@ int main(int argc, char **argv)
     FILE *irc_out = NULL;  // -irc file: write post-IRC IR to this file
     int run_oos = 0;       // -runoos: interpret post-OOS IR
     int run_irc = 0;       // -runirc: interpret post-IRC IR
+    int opt_level = 0;     // -O / -O1 / -O2 (accepted; optimization passes TBD)
     IrSim *irsim = NULL;
     const char *cmdline_defines[256];
     int num_defines = 0;
@@ -277,6 +278,10 @@ int main(int argc, char **argv)
                 "IR interpretation (prints r0:XXXXXXXX to stdout):\n"
                 "  -runoos            Interpret post-OOS IR (skips register allocation)\n"
                 "  -runirc            Interpret post-IRC IR (after register allocation)\n"
+                "\n"
+                "Debug:\n"
+                "  -ann               Annotate assembly output with source comments\n"
+                "  -O / -O1 / -O2    Optimization level (accepted; passes TBD)\n"
                 "\n"
                 "Diagnostics:\n"
                 "  -stats             Print per-TU arena usage to stderr\n"
@@ -351,6 +356,17 @@ int main(int argc, char **argv)
         else if (strcmp(argv[file_start], "-runirc") == 0)
         {
             run_irc = 1;
+            file_start++;
+        }
+        else if (strcmp(argv[file_start], "-ann") == 0)
+        {
+            flag_annotate = 1;
+            file_start++;
+        }
+        else if (strncmp(argv[file_start], "-O", 2) == 0)
+        {
+            const char *n = argv[file_start] + 2;
+            opt_level = (*n == '\0') ? 1 : atoi(n);
             file_start++;
         }
         else
@@ -497,6 +513,11 @@ int main(int argc, char **argv)
         print_symbol_table(type_ctx.symbol_table, 0);
         print_type_table();
 #endif
+
+        if (flag_annotate && tu >= lib_count)
+            set_ann_source(source);
+        else if (flag_annotate)
+            set_ann_source(NULL);  // suppress lib-TU annotation
 
         {
             // Nanopass pipeline: Node* → SSA → IRC → CPU4

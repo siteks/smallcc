@@ -91,6 +91,7 @@ struct Inst {
     Inst     *prev, *next;
     Block    *block;
     int       is_dead;
+    int       line;         // source line (0 = unknown); used by -ann emission
 };
 
 // Braun variable maps (valid only during SSA construction)

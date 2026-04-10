@@ -22,6 +22,7 @@ echo 'int main(){return 5+3;}' > t.c
 ./smallcc -arch cpu4 -o out.s t.c && ./sim_c -arch cpu4 out.s  # compile and run
 ./smallcc -o out.s t.c && ./sim_c -arch cpu4 out.s             # -arch cpu4 is the default
 ./smallcc -o out.s file1.c file2.c && ./sim_c -arch cpu4 out.s # multi-TU
+./smallcc -ann -o out.s t.c                                    # annotate assembly with source comments
 ./smallcc -arch cpu4 -ssa t.ssa -o out.s t.c                   # dump Braun SSA IR to t.ssa
 ./smallcc -arch cpu4 -oos t.oos -o out.s t.c                   # dump post-OOS IR to t.oos
 ./smallcc -arch cpu4 -irc t.irc -o out.s t.c                   # dump post-IRC IR to t.irc

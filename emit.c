@@ -1,7 +1,73 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
+#include "smallcc.h"
 #include "emit.h"
+
+// ============================================================
+// Source annotation (-ann)
+// ============================================================
+
+int         flag_annotate = 0;
+
+static char       *ann_src    = NULL;
+static const char **ann_lines = NULL;
+static int          ann_nlines = 0;
+
+void set_ann_source(const char *src)
+{
+    ann_src    = NULL;
+    ann_lines  = NULL;
+    ann_nlines = 0;
+    if (!src) return;
+
+    ann_src = arena_strdup(src);
+
+    // Count physical lines for allocation bound
+    int count = 1;
+    for (const char *p = ann_src; *p; p++)
+        if (*p == '\n') count++;
+
+    ann_lines  = arena_alloc((count + 2) * sizeof(char *));
+    ann_nlines = count + 1;
+
+    // Walk preprocessed source tracking logical line numbers via linemarkers.
+    int cur_line = 1;
+    char *p = ann_src;
+    while (*p) {
+        char *line_start = p;
+        if (*p == '#') {
+            const char *q = p + 1;
+            while (*q == ' ' || *q == '\t') q++;
+            if (isdigit((unsigned char)*q)) {
+                char *end;
+                cur_line = (int)strtol(q, &end, 10);
+                while (*p && *p != '\n') p++;
+                if (*p == '\n') p++;
+                continue;
+            }
+        }
+        if (cur_line >= 1 && cur_line <= ann_nlines)
+            ann_lines[cur_line - 1] = line_start;
+        while (*p && *p != '\n') p++;
+        if (*p == '\n') p++;
+        cur_line++;
+    }
+}
+
+// Emit the text of source line N (1-based) as an assembly comment.
+static void emit_src_comment(int line, FILE *out)
+{
+    if (!ann_lines || line < 1 || line > ann_nlines) return;
+    const char *s = ann_lines[line - 1];
+    if (!s) return;
+    const char *e = s;
+    while (*e && *e != '\n') e++;
+    while (s < e && (*s == ' ' || *s == '\t')) s++;
+    if (s < e)
+        fprintf(out, ";; %.*s\n", (int)(e - s), s);
+}
 
 // ============================================================
 // Helpers
@@ -720,6 +786,7 @@ void emit_function(Function *f, FILE *out) {
     }
 
     // Emit blocks
+    int ann_prev_line = 0;
     for (int bi = 0; bi < f->nblocks; bi++) {
         Block *b = f->blocks[bi];
 
@@ -727,6 +794,11 @@ void emit_function(Function *f, FILE *out) {
         if (bi > 0)
             fprintf(out, "_%s_B%d:\n", f->name, b->id);
         for (Inst *inst = b->head; inst; inst = inst->next) {
+            // Emit source-line comment when line changes
+            if (flag_annotate && inst->line && inst->line != ann_prev_line) {
+                emit_src_comment(inst->line, out);
+                ann_prev_line = inst->line;
+            }
             if (inst->kind == IK_RET && callee_frame > 0) {
                 // Full RET sequence when callee saves exist:
                 // 1. Move return value to r0 (before restoring callee regs)

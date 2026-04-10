@@ -149,7 +149,18 @@ typedef struct {
     Block   **label_blocks;
     int       nlabels;
     int       label_cap;
+
+    // Source annotation (-ann): current source line being compiled
+    int       cur_line;
 } BraunCtx;
+
+// Create an instruction and stamp the current source line on it.
+static Inst *bi(BraunCtx *ctx, Block *b, InstKind k, Value *dst)
+{
+    Inst *inst = new_inst(ctx->f, b, k, dst);
+    inst->line = ctx->cur_line;
+    return inst;
+}
 
 // ============================================================
 // Helper: is sym address-taken in this function?
@@ -308,7 +319,7 @@ static Value *read_var_recursive(BraunCtx *ctx, Block *b, Symbol *sym) {
         ValType vt = sym->type ? type_to_valtype(sym->type) : VT_I16;
         if (vt == VT_VOID) vt = VT_I16;
         Value *dst = new_value(ctx->f, VAL_INST, vt);
-        Inst  *phi = new_inst(ctx->f, b, IK_PHI, dst);
+        Inst  *phi = bi(ctx, b, IK_PHI, dst);
         // Prepend to front of block so phi stays before all non-phi instructions
         phi->next = b->head;
         phi->prev = NULL;
@@ -339,7 +350,7 @@ static Value *read_var_recursive(BraunCtx *ctx, Block *b, Symbol *sym) {
     ValType vt = sym->type ? type_to_valtype(sym->type) : VT_I16;
     if (vt == VT_VOID) vt = VT_I16;
     Value *dst = new_value(ctx->f, VAL_INST, vt);
-    Inst  *phi = new_inst(ctx->f, b, IK_PHI, dst);
+    Inst  *phi = bi(ctx, b, IK_PHI, dst);
     phi->next   = b->head;
     phi->prev   = NULL;
     if (b->head) b->head->prev = phi;
@@ -427,7 +438,7 @@ static Value *emit_binop(BraunCtx *ctx, Block *b, InstKind kind, Value *lhs, Val
         return new_const(ctx->f, result, vt);
     }
     Value *dst  = new_value(ctx->f, VAL_INST, vt);
-    Inst  *inst = new_inst(ctx->f, b, kind, dst);
+    Inst  *inst = bi(ctx, b, kind, dst);
     inst_add_op(inst, lhs);
     inst_add_op(inst, rhs);
     inst_append(b, inst);
@@ -440,7 +451,7 @@ static Value *emit_unop(BraunCtx *ctx, Block *b, InstKind kind, Value *v, ValTyp
     if (v && v->kind == VAL_CONST && kind == IK_NOT)
         return new_const(ctx->f, !v->iconst, vt);
     Value *dst  = new_value(ctx->f, VAL_INST, vt);
-    Inst  *inst = new_inst(ctx->f, b, kind, dst);
+    Inst  *inst = bi(ctx, b, kind, dst);
     inst_add_op(inst, v);
     inst_append(b, inst);
     return dst;
@@ -448,7 +459,7 @@ static Value *emit_unop(BraunCtx *ctx, Block *b, InstKind kind, Value *v, ValTyp
 
 static Value *emit_load(BraunCtx *ctx, Block *b, Value *ptr, int size, int offset, ValType vt) {
     Value *dst  = new_value(ctx->f, VAL_INST, vt);
-    Inst  *inst = new_inst(ctx->f, b, IK_LOAD, dst);
+    Inst  *inst = bi(ctx, b, IK_LOAD, dst);
     inst_add_op(inst, ptr);
     inst->imm  = offset;
     inst->size = size;
@@ -460,12 +471,12 @@ static void emit_store(BraunCtx *ctx, Block *b, Value *ptr, Value *val, int size
     if (val && val->kind == VAL_CONST) {
         ValType vt = val->vtype != VT_VOID ? val->vtype : VT_I16;
         Value *mat = new_value(ctx->f, VAL_INST, vt);
-        Inst  *ci  = new_inst(ctx->f, b, IK_CONST, mat);
+        Inst  *ci  = bi(ctx, b, IK_CONST, mat);
         ci->imm = val->iconst;
         inst_append(b, ci);
         val = mat;
     }
-    Inst *inst = new_inst(ctx->f, b, IK_STORE, NULL);
+    Inst *inst = bi(ctx, b, IK_STORE, NULL);
     inst_add_op(inst, ptr);
     inst_add_op(inst, val);
     inst->imm  = offset;
@@ -612,7 +623,7 @@ static void emit_reg_arg_copies(BraunCtx *ctx, Block *b, Inst *call) {
         if (!arg) continue;
         Value *v_ri = new_value(ctx->f, VAL_INST, arg->vtype);
         v_ri->phys_reg = i + 1;           // pre-color to r{i+1}
-        Inst  *cp = new_inst(ctx->f, b, IK_COPY, v_ri);
+        Inst  *cp = bi(ctx, b, IK_COPY, v_ri);
         inst_add_op(cp, arg);
         inst_append(b, cp);
         call->ops[arg_base + i] = v_ri;   // redirect call to pre-colored value
@@ -624,7 +635,7 @@ static void emit_reg_arg_copies(BraunCtx *ctx, Block *b, Inst *call) {
         if (fp) {
             Value *v_r0 = new_value(ctx->f, VAL_INST, fp->vtype);
             v_r0->phys_reg = 0;           // pre-color to r0
-            Inst  *fp_cp = new_inst(ctx->f, b, IK_COPY, v_r0);
+            Inst  *fp_cp = bi(ctx, b, IK_COPY, v_r0);
             inst_add_op(fp_cp, fp);
             inst_append(b, fp_cp);
             call->ops[0] = v_r0;
@@ -644,7 +655,7 @@ static Value *emit_call_result(BraunCtx *ctx, Block *b, Inst *call, Type *ret_ty
     call->dst->vtype = call_vt;
     // Working copy — freely allocated by IRC
     Value *working = new_value(ctx->f, VAL_INST, call_vt);
-    Inst  *cp = new_inst(ctx->f, b, IK_COPY, working);
+    Inst  *cp = bi(ctx, b, IK_COPY, working);
     inst_add_op(cp, call->dst);
     inst_append(b, cp);
     return working;
@@ -668,7 +679,7 @@ static Value *cg_addr(BraunCtx *ctx, Block **cur, Node *n) {
             sym->kind == SYM_STATIC_GLOBAL || sym->kind == SYM_STATIC_LOCAL ||
             sym->kind == SYM_BUILTIN) {
             Value *dst = new_value(ctx->f, VAL_INST, VT_PTR);
-            Inst  *inst = new_inst(ctx->f, b, IK_GADDR, dst);
+            Inst  *inst = bi(ctx, b, IK_GADDR, dst);
             inst->fname = (char *)sym_label(ctx->tu_index, sym);
             inst_append(b, inst);
             return dst;
@@ -685,7 +696,7 @@ static Value *cg_addr(BraunCtx *ctx, Block **cur, Node *n) {
             int voff = vparam_off(ctx, sym);
             int bpoff = (voff >= 0) ? voff : param_home_off(ctx, sym);
             Value *dst = new_value(ctx->f, VAL_INST, VT_PTR);
-            Inst  *inst = new_inst(ctx->f, b, IK_ADDR, dst);
+            Inst  *inst = bi(ctx, b, IK_ADDR, dst);
             inst->imm = bpoff;
             inst_append(b, inst);
             return dst;
@@ -697,7 +708,7 @@ static Value *cg_addr(BraunCtx *ctx, Block **cur, Node *n) {
             int voff = vparam_off(ctx, sym);
             int bpoff = (voff >= 0) ? voff : sym->offset;
             Value *dst = new_value(ctx->f, VAL_INST, VT_PTR);
-            Inst  *inst = new_inst(ctx->f, b, IK_ADDR, dst);
+            Inst  *inst = bi(ctx, b, IK_ADDR, dst);
             inst->imm = bpoff;
             inst_append(b, inst);
             return dst;
@@ -706,7 +717,7 @@ static Value *cg_addr(BraunCtx *ctx, Block **cur, Node *n) {
         // Local: IK_ADDR at negative bp offset
         {
             Value *dst = new_value(ctx->f, VAL_INST, VT_PTR);
-            Inst  *inst = new_inst(ctx->f, b, IK_ADDR, dst);
+            Inst  *inst = bi(ctx, b, IK_ADDR, dst);
             inst->imm = -(sym->offset);
             inst_append(b, inst);
             return dst;
@@ -744,6 +755,8 @@ static Value *cg_addr(BraunCtx *ctx, Block **cur, Node *n) {
 static Value *cg_expr(BraunCtx *ctx, Block **cur, Node *n) {
     if (!n || !(*cur)) return new_value(ctx->f, VAL_UNDEF, VT_I16);
 
+    if (n->line) ctx->cur_line = n->line;
+
     Block *b = *cur;
     ValType vt = n->type ? type_to_valtype(n->type) : VT_I16;
     if (vt == VT_VOID) vt = VT_I16;
@@ -758,7 +771,7 @@ static Value *cg_expr(BraunCtx *ctx, Block **cur, Node *n) {
             strlits_push(lid, n->u.literal.strval, n->u.literal.strval_len);
             char buf[32]; snprintf(buf, sizeof(buf), "_l%d", lid);
             Value *dst = new_value(ctx->f, VAL_INST, VT_PTR);
-            Inst  *inst = new_inst(ctx->f, b, IK_GADDR, dst);
+            Inst  *inst = bi(ctx, b, IK_GADDR, dst);
             inst->fname = arena_strdup(buf);
             inst_append(b, inst);
             return dst;
@@ -790,7 +803,7 @@ static Value *cg_expr(BraunCtx *ctx, Block **cur, Node *n) {
             if (sym->kind == SYM_BUILTIN &&
                 (strcmp(sym->name, "putchar") == 0 || strcmp(sym->name, "__putchar") == 0)) {
                 Value *arg = cg_expr(ctx, cur, args_head); b = *cur;
-                Inst *inst = new_inst(ctx->f, b, IK_PUTCHAR, NULL);
+                Inst *inst = bi(ctx, b, IK_PUTCHAR, NULL);
                 inst_add_op(inst, arg);
                 inst_append(b, inst);
                 return new_const(ctx->f, 0, VT_I16);
@@ -799,7 +812,7 @@ static Value *cg_expr(BraunCtx *ctx, Block **cur, Node *n) {
             if (istype_function(sym->type)) {
                 // Direct call
                 Value *landing = new_value(ctx->f, VAL_INST, call_vt);
-                Inst  *call = new_inst(ctx->f, b, IK_CALL, landing);
+                Inst  *call = bi(ctx, b, IK_CALL, landing);
                 call->fname    = (char *)sym_label(ctx->tu_index, sym);
                 call->calldesc = make_calldesc(sym->type);
                 cg_call_args(ctx, cur, call, args_head); b = *cur;
@@ -808,7 +821,7 @@ static Value *cg_expr(BraunCtx *ctx, Block **cur, Node *n) {
                 // Indirect call via fn-ptr variable
                 Value *fp = read_var(ctx, b, sym); fp = val_resolve(fp);
                 Value *landing = new_value(ctx->f, VAL_INST, call_vt);
-                Inst  *call = new_inst(ctx->f, b, IK_ICALL, landing);
+                Inst  *call = bi(ctx, b, IK_ICALL, landing);
                 Type *ftype = sym->type->u.ptr.pointee;
                 call->calldesc = make_calldesc(ftype);
                 inst_add_op(call, fp);
@@ -829,7 +842,7 @@ static Value *cg_expr(BraunCtx *ctx, Block **cur, Node *n) {
         if (sym->kind == SYM_GLOBAL || sym->kind == SYM_EXTERN ||
             sym->kind == SYM_STATIC_GLOBAL || sym->kind == SYM_STATIC_LOCAL) {
             Value *addr = new_value(ctx->f, VAL_INST, VT_PTR);
-            Inst  *ga = new_inst(ctx->f, b, IK_GADDR, addr);
+            Inst  *ga = bi(ctx, b, IK_GADDR, addr);
             ga->fname = (char *)sym_label(ctx->tu_index, sym);
             inst_append(b, ga);
             int sz = sym->type ? sym->type->size : 2;
@@ -846,7 +859,7 @@ static Value *cg_expr(BraunCtx *ctx, Block **cur, Node *n) {
                 bpoff = -(sym->offset);
             }
             Value *addr = new_value(ctx->f, VAL_INST, VT_PTR);
-            Inst  *ai = new_inst(ctx->f, b, IK_ADDR, addr);
+            Inst  *ai = bi(ctx, b, IK_ADDR, addr);
             ai->imm = bpoff;
             inst_append(b, ai);
             int sz = sym->type ? sym->type->size : 2;
@@ -873,7 +886,7 @@ static Value *cg_expr(BraunCtx *ctx, Block **cur, Node *n) {
                 fp = emit_load(ctx, b, fp, 2, 0, VT_PTR);
             }
             Value *landing = new_value(ctx->f, VAL_INST, call_vt);
-            Inst  *call = new_inst(ctx->f, b, IK_ICALL, landing);
+            Inst  *call = bi(ctx, b, IK_ICALL, landing);
             Type *ftype = n->ch[0]->type;
             if (ftype && istype_ptr(ftype)) ftype = ftype->u.ptr.pointee;
             call->calldesc = make_calldesc(ftype);
@@ -1032,7 +1045,7 @@ static Value *cg_expr(BraunCtx *ctx, Block **cur, Node *n) {
         if (n->ch[0]->type && n->ch[0]->type->base == TB_STRUCT) {
             Value *src = cg_expr(ctx, cur, n->ch[1]); b = *cur;
             Value *dst_v = cg_addr(ctx, cur, n->ch[0]); b = *cur;
-            Inst *mc = new_inst(ctx->f, b, IK_MEMCPY, NULL);
+            Inst *mc = bi(ctx, b, IK_MEMCPY, NULL);
             mc->imm  = n->ch[0]->type->size;
             mc->size = n->ch[0]->type->size;
             inst_add_op(mc, dst_v);
@@ -1090,7 +1103,7 @@ static Value *cg_expr(BraunCtx *ctx, Block **cur, Node *n) {
         Value *addr = cg_addr(ctx, cur, n->ch[0]); b = *cur;
         // Save addr in a fresh SSA value to avoid re-evaluating side effects
         Value *addr_saved = new_value(ctx->f, VAL_INST, VT_PTR);
-        Inst  *addr_copy = new_inst(ctx->f, b, IK_COPY, addr_saved);
+        Inst  *addr_copy = bi(ctx, b, IK_COPY, addr_saved);
         inst_add_op(addr_copy, addr);
         inst_append(b, addr_copy);
 
@@ -1131,7 +1144,7 @@ static Value *cg_expr(BraunCtx *ctx, Block **cur, Node *n) {
         else if (src_vt == VT_I16)                                 kind = IK_SEXT16;
 
         Value *dst = new_value(ctx->f, VAL_INST, vt);
-        Inst  *inst = new_inst(ctx->f, b, kind, dst);
+        Inst  *inst = bi(ctx, b, kind, dst);
         inst->imm = (vt == VT_I8 || vt == VT_U8) ? 0xff :
                     (vt == VT_I16 || vt == VT_U16) ? 0xffff : 0;
         inst_add_op(inst, v);
@@ -1178,7 +1191,7 @@ static Value *cg_expr(BraunCtx *ctx, Block **cur, Node *n) {
         if (then_v && else_v) {
             ValType phi_vt = vt != VT_VOID ? vt : then_v->vtype;
             Value *phi_dst = new_value(ctx->f, VAL_INST, phi_vt);
-            Inst  *phi     = new_inst(ctx->f, merge, IK_PHI, phi_dst);
+            Inst  *phi     = bi(ctx, merge, IK_PHI, phi_dst);
             inst_add_op(phi, then_v);
             inst_add_op(phi, else_v);
             phi->next = merge->head; phi->prev = NULL;
@@ -1199,7 +1212,7 @@ static Value *cg_expr(BraunCtx *ctx, Block **cur, Node *n) {
             Value *fp_addr = cg_addr(ctx, cur, n); b = *cur;
             Value *fp = emit_load(ctx, b, fp_addr, 2, 0, VT_PTR);
             Value *landing = new_value(ctx->f, VAL_INST, call_vt);
-            Inst  *call = new_inst(ctx->f, b, IK_ICALL, landing);
+            Inst  *call = bi(ctx, b, IK_ICALL, landing);
             // Find function type from member
             Type *struct_t = n->ch[0]->type;
             if (struct_t && istype_ptr(struct_t)) struct_t = struct_t->u.ptr.pointee;
@@ -1317,7 +1330,7 @@ static Value *cg_logand(BraunCtx *ctx, Block **cur, Node *lhs, Node *rhs, bool i
     *cur = end_blk;
 
     Value *phi_dst = new_value(ctx->f, VAL_INST, VT_I16);
-    Inst  *phi     = new_inst(ctx->f, end_blk, IK_PHI, phi_dst);
+    Inst  *phi     = bi(ctx, end_blk, IK_PHI, phi_dst);
     Value *lhs_contrib = is_or ? new_const(ctx->f, 1, VT_I16) : new_const(ctx->f, 0, VT_I16);
     inst_add_op(phi, lhs_contrib);
     inst_add_op(phi, rhs_bool);
@@ -1433,7 +1446,7 @@ static void cg_decl_init(BraunCtx *ctx, Block **cur, Symbol *sym, Node *init) {
             int bpoff = -(sym->offset);
             if (sym->kind == SYM_PARAM) bpoff = param_home_off(ctx, sym);
             Value *addr = new_value(ctx->f, VAL_INST, VT_PTR);
-            Inst  *ai = new_inst(ctx->f, b, IK_ADDR, addr);
+            Inst  *ai = bi(ctx, b, IK_ADDR, addr);
             ai->imm = bpoff;
             inst_append(b, ai);
             emit_store(ctx, b, addr, v, ty->size, 0);
@@ -1447,7 +1460,7 @@ static void cg_decl_init(BraunCtx *ctx, Block **cur, Symbol *sym, Node *init) {
     if (istype_array(ty) && init->kind == ND_LITERAL && init->u.literal.strval) {
         int bpoff = -(sym->offset);
         Value *base_addr = new_value(ctx->f, VAL_INST, VT_PTR);
-        Inst  *ai = new_inst(ctx->f, b, IK_ADDR, base_addr);
+        Inst  *ai = bi(ctx, b, IK_ADDR, base_addr);
         ai->imm = bpoff;
         inst_append(b, ai);
         const char *str = init->u.literal.strval;
@@ -1470,7 +1483,7 @@ static void cg_decl_init(BraunCtx *ctx, Block **cur, Symbol *sym, Node *init) {
     if (istype_array(ty) && init->kind == ND_INITLIST) {
         int bpoff = -(sym->offset);
         Value *base_addr = new_value(ctx->f, VAL_INST, VT_PTR);
-        Inst  *ai = new_inst(ctx->f, b, IK_ADDR, base_addr);
+        Inst  *ai = bi(ctx, b, IK_ADDR, base_addr);
         ai->imm = bpoff;
         inst_append(b, ai);
         // Zero-fill entire array
@@ -1498,7 +1511,7 @@ static void cg_decl_init(BraunCtx *ctx, Block **cur, Symbol *sym, Node *init) {
     if (ty && ty->base == TB_STRUCT) {
         int bpoff = -(sym->offset);
         Value *dst_addr = new_value(ctx->f, VAL_INST, VT_PTR);
-        Inst  *ai = new_inst(ctx->f, b, IK_ADDR, dst_addr);
+        Inst  *ai = bi(ctx, b, IK_ADDR, dst_addr);
         ai->imm = bpoff;
         inst_append(b, ai);
 
@@ -1520,7 +1533,7 @@ static void cg_decl_init(BraunCtx *ctx, Block **cur, Symbol *sym, Node *init) {
         } else {
             // Struct from expression: memcpy
             Value *src_addr = cg_expr(ctx, cur, init); b = *cur;
-            Inst *mc = new_inst(ctx->f, b, IK_MEMCPY, NULL);
+            Inst *mc = bi(ctx, b, IK_MEMCPY, NULL);
             mc->imm  = ty->size;
             mc->size = ty->size;
             inst_add_op(mc, dst_addr);
@@ -1538,6 +1551,9 @@ static void cg_decl_init(BraunCtx *ctx, Block **cur, Symbol *sym, Node *init) {
 
 static Block *cg_stmt(BraunCtx *ctx, Block *b, Node *n) {
     if (!b || !n) return b;
+
+    // Track source line for -ann annotation
+    if (n->line) ctx->cur_line = n->line;
 
     // Labels must be processed even from a filled block
     if (n->kind == ND_LABELSTMT) {
