@@ -408,11 +408,28 @@ static int assign_colors(IGraph *g, Function *f, int K,
         }
 
         if (found < 0) {
-            // All remaining have degree >= K: spill one (heuristic: highest degree)
+            // All remaining have degree >= K: spill one.
+            // Heuristic: minimize spill_cost/degree where
+            //   spill_cost = use_count * 2^loop_depth
+            // Values used heavily in inner loops are expensive to spill; high
+            // degree means removing the node gives the most coloring benefit.
             int worst = -1;
+            long long cost_worst = 0;
             for (int i = 0; i < nv; i++) {
-                if (!removed[i]) {
-                    if (worst < 0 || degree[i] > degree[worst]) worst = i;
+                if (removed[i]) continue;
+                Value *vi = f->values[i];
+                int depth = (vi->def && vi->def->block)
+                            ? vi->def->block->loop_depth : 0;
+                if (depth > 20) depth = 20;  // clamp: 2^20 * use_count fits long long
+                long long cost_i = (long long)vi->use_count << depth;
+                // Prefer minimum cost_i/degree[i]; compare via cross-multiply
+                // to avoid division: cost_i/deg_i < cost_w/deg_w
+                //   ⟺  cost_i * deg_w < cost_w * deg_i
+                if (worst < 0 ||
+                    cost_i * (long long)degree[worst] <
+                    cost_worst * (long long)degree[i]) {
+                    worst = i;
+                    cost_worst = cost_i;
                 }
             }
             if (worst < 0) break;
