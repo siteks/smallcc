@@ -15,11 +15,12 @@ the CPU3 stack-machine backend (`codegen.c` / `backend.c` / `optimise.c`) has be
 tree→graph (Braun SSA construction) and graph→virtual-register sequence (out-of-SSA).
 Each representation is exactly what its regime needs.
 
-**Type information is spent at the boundary where it affects code shape.** The full
-`Type*` from the parse tree is consumed structurally during lowering. A small residual
-`ValType` enum survives into the IR, carrying what the backend needs for scalar
-decisions. `CallDesc` survives from lowering to emission where ABI decisions are made.
-The sexp AST and all post-lowering passes are type-unaware.
+**Type information is spent at the boundary where it affects code shape.** `Type*` from
+the parse tree flows into Braun SSA construction, where `type_to_valtype()` extracts the
+`ValType` for each value and `make_calldesc()` builds `CallDesc` for each call site.
+A small residual `ValType` enum survives into the IR, carrying what the backend needs for
+scalar decisions. `CallDesc` survives through IRC to emission where ABI decisions are made.
+All post-Braun passes are type-unaware.
 
 **Incremental testability.** Each stage is independently runnable: `-ssa` dumps Braun
 output; `DUMP_IR=1` dumps post-OOS and post-IRC IR.
@@ -31,18 +32,19 @@ output; `DUMP_IR=1` dumps post-OOS and post-IRC IR.
 ```
 Node* parse tree  (output of resolve_symbols / derive_types / insert_coercions)
   │
-  ├─ lower_program()        lower.c      Node* → Sexp AST + TypeMap
-  │   ├─ alpha-rename variables (Symbol* → "name@N")
-  │   ├─ lower ++/-- (in lowering, not a separate pass)
-  │   ├─ desugar switch (in lower.c, not a separate Regime 1 pass)
-  │   ├─ handle static locals (emit as data-section gvars)
-  │   └─ populate TypeMap with ValType + CallDesc
+  ├─ lower_globals()        lower.c      Node* → Sexp AST (data section only)
+  │   └─ global variables and pre-function string literals → gvar/strlit sexp nodes
   │
   ├─ emit_globals()         emit.c       data section: gvars + string literals
   │
   └─ per function:
-      ├─ braun_function()   braun.c      Sexp → SSA IR (Braun 2013)
-      │   └─ handles for/do/while/goto/label/switch natively
+      ├─ braun_function()   braun.c      Node* → SSA IR directly (Braun 2013)
+      │   ├─ walks Node* AST; variable maps keyed on Symbol* (no alpha-renaming)
+      │   ├─ derives ValType via type_to_valtype(); builds CallDesc via make_calldesc()
+      │   ├─ handles all statement kinds natively (if/for/while/do/switch/goto/label)
+      │   ├─ handles ++/-- with correct pre/post semantics and pointer stride scaling
+      │   └─ accumulates function-body string literals and static locals
+      │       (flushed to data section via braun_emit_strlits() after each function)
       │
       ├─ compute_dominators() dom.c      idom, dom_children, dom_pre/post, loop_depth
       │
@@ -81,20 +83,19 @@ directly from Braun → dom → OOS → legalize → IRC.
 
 ## Type Artifacts
 
-### `Type*` — Parse tree only
+### `Type*` — Parse tree through Braun SSA construction
 
 The full type system object from the parser. Rich structure: pointer chains, array
-dimensions, struct layouts, function signatures. **Consumed entirely during lowering.**
-Does not cross into the sexp AST or IR.
-
-Consumed to produce:
-- Explicit scale factor integers in pointer arithmetic sexp nodes
-- Explicit byte offset integers in struct member access sexp nodes
-- `(gaddr "name")` nodes for global variables
-- `(load N e)` / `(store N addr val)` nodes (N = byte size)
+dimensions, struct layouts, function signatures. Flows from the parse tree into `braun.c`
+where it is consumed to produce:
+- `ValType` for each SSA value via `type_to_valtype(node->type)`
+- `CallDesc` for each call site via `make_calldesc(fn_type)`
+- Load/store sizes from `type->size`
+- Pointer arithmetic stride from `elem_type->size`
+- Struct member offsets from field layout
 - Hidden first-parameter pattern for struct-returning functions
-- `CallDesc` attached to call nodes in the TypeMap
-- `ValType` annotation in the TypeMap
+
+Does not cross into the post-Braun passes (OOS, legalize, IRC, emission).
 
 ### `ValType` — IR values (Braun through emission)
 
@@ -114,7 +115,7 @@ Used for:
 - Spill slot sizing (byte / word / long)
 - Float vs integer arithmetic path selection
 
-### `CallDesc` — Call nodes (lowering through emission)
+### `CallDesc` — Call nodes (Braun through emission)
 
 ```c
 typedef struct {
@@ -126,171 +127,111 @@ typedef struct {
 } CallDesc;
 ```
 
-Survives from lowering through IRC to emission. Opaque to all intermediate passes.
-
-### `TypeMap` — Hash table `uint32_t id → {ValType, CallDesc*}`
-
-Keyed on `Sx.id` (not pointer — Sx nodes may be structurally rebuilt). Populated during
-`lower_program`, consumed during `braun_function`, freed afterwards.
+Built inline in `braun.c` via `make_calldesc(fn_type)` at each call site. Attached to
+`Inst.calldesc` and survives through IRC to emission. Opaque to all intermediate passes.
 
 ---
 
-## Lowering Pass (`lower.c`)
+## Global Lowering Pass (`lower.c`)
 
-**Entry:** `lower_program(Node *root, TypeMap *tm, int tu_index, int *strlit_id) → Sx*`
+**Entry:** `lower_globals(Node *root, int tu_index, int *strlit_id) → Sx*`
 
 `strlit_id` is a persistent counter threaded across TUs to give string literals
 monotonically increasing unique IDs (`_l0`, `_l1`, …) without collisions.
 
-**Output:** A `(program ...)` sexp whose children are gvar/strlit/func nodes, plus a
-populated TypeMap.
-
-### Alpha-renaming
-
-Every `Symbol*` is assigned a sequential integer id during lowering. Two identifiers
-with the same C name but different `Symbol*` pointers get different sexp names:
-`"x@N"` where N is the symbol id. Original name prefix is preserved for readability.
+**Output:** A `(program ...)` sexp whose children are `gvar` and `strlit` nodes for the
+data section only. Function bodies are compiled directly by `braun_function()`.
 
 ### Sexp nodes produced
 
-**Literals:**
-
 | Node | Shape | Notes |
 |------|-------|-------|
-| `int` | `(int v)` | integer literal |
-| `flt` | `(flt bits)` | float literal; bits = IEEE 754 bit pattern as int |
-
-**Variable access:**
-
-| Node | Shape | Notes |
-|------|-------|-------|
-| `var` | `(var "x@N")` | local/param variable reference |
-| `addr` | `(addr "x@N")` | address of local/param variable |
-| `gaddr` | `(gaddr "label")` | address of global symbol (function or global variable) |
-
-**Expressions:**
-
-| Node | Shape | Notes |
-|------|-------|-------|
-| `binop` | `(binop "op" lhs rhs)` | op: `+ - * / % & \| ^ << >> < <= > >= == != u< u<= u> u>=` |
-| `unop` | `(unop "op" expr)` | op: `- ~ !` |
-| `assign` | `(assign "x@N" rval)` | write to local/param variable |
-| `load` | `(load size ptr)` | load N bytes from pointer; size: 1/2/4 |
-| `store` | `(store size ptr val)` | store N bytes through pointer; size: 1/2/4 |
-| `call` | `(call "fname" args...)` | direct function call |
-| `icall` | `(icall fptr args...)` | indirect call through function pointer |
-| `sext8` | `(sext8 expr)` | sign-extend from 8 bits |
-| `sext16` | `(sext16 expr)` | sign-extend from 16 bits |
-| `itof` | `(itof expr)` | int-to-float conversion |
-| `ftoi` | `(ftoi expr)` | float-to-int conversion |
-
-**Statements:**
-
-| Node | Shape | Notes |
-|------|-------|-------|
-| `decl` | `(decl "x@N")` | declare local variable (storage allocated by frame layout) |
-| `block` | `(block stmt...)` | sequence of statements |
-| `if` | `(if cond then else?)` | else child is optional |
-| `while` | `(while cond body)` | |
-| `for` | `(for init cond step body)` | NOT desugared; handled natively in Braun |
-| `do` | `(do body cond)` | NOT desugared; handled natively in Braun |
-| `switch` | `(switch expr (case (int v) stmt...) ... (default stmt...))` | desugared in lower.c |
-| `return` | `(return expr?)` | expr omitted for void return |
-| `break` | `(break)` | |
-| `continue` | `(continue)` | |
-| `goto` | `(goto "label")` | |
-| `label` | `(label "name" stmt)` | |
-
-**Top-level:**
-
-| Node | Shape | Notes |
-|------|-------|-------|
-| `func` | `(func "name" frame_size is_variadic (params "p@N"...) body)` | is_variadic: 0 or 1 |
 | `gvar` | `(gvar "label" size init_bytes...)` | global variable |
-| `strlit` | `(strlit "_lN" bytes...)` | string literal data |
+| `strlit` | `(strlit "_lN" bytes...)` | top-level string literal (in global initializers) |
 
-### `++`/`--` handling
-
-Pre/post increment and decrement are handled in the lowering pass with correct semantics:
-- Pre-`++x`: compute `x+1`, store back, return new value
-- Post-`x++`: save old value, compute `x+1`, store back, return old value
-- For pointer operands, the step is scaled by the element size
-- LHS address is computed once (no double-evaluation)
-
-### `switch` desugaring
-
-`switch` is desugared during lowering (not as a separate Regime 1 pass) into:
-```
-(block
-  (decl "_sw@N")
-  (assign "_sw@N" expr)
-  (if (binop "==" (var "_sw@N") (int v1)) (goto "_case1@N") ...)
-  (goto "_default@N")
-  (label "_case1@N" stmt...)
-  (label "_default@N" stmt...)
-  (label "_swend@N"))
-```
-`(break)` inside switch body → `(goto "_swend@N")`.
-
-### Static local variables
-
-`SYM_STATIC_LOCAL` declarations inside functions are lowered as `gvar` data-section
-nodes (not stack locals) and appended after the enclosing function in the sexp output.
-They are initialized at program start (not at function entry).
+String literals that appear inside function bodies are accumulated separately by
+`braun.c` and flushed via `braun_emit_strlits()` after each function is compiled.
 
 ### Struct-returning functions
 
 Functions returning struct types use a hidden first parameter (sret pointer):
-- Callee receives `"sret@N"` as first param; writes return value through it
-- Callsite allocates a stack temp, passes its address as first arg
+- Callee receives the sret param as its first argument; writes the return value through it
+- Callsite allocates a stack temp, passes its address as the first arg
 - `CallDesc.hidden_sret = true` records this for emission
 
 ---
 
 ## Braun SSA Construction (`braun.c`)
 
-**Entry:** `braun_function(Sx *func_node, TypeMap *tm) → Function*`
+**Entry:** `braun_function(Node *func_decl, int tu_index, int *strlit_id) → Function*`
 
-**Algorithm:** Braun et al. 2013. `write_var(b, name, val)` / `read_var(b, name)` /
+**Algorithm:** Braun et al. 2013. `write_var(b, sym, val)` / `read_var(b, sym)` /
 `read_var_recursive` / `seal_block` / `try_remove_trivial_phi`.
 
-### Sexp → IR mapping
+Variable maps are keyed on `Symbol*` directly — no alpha-renaming is needed since each
+`Symbol*` is already unique. `ValType` is derived per-value via
+`type_to_valtype(node->type)`. `CallDesc` is built inline via `make_calldesc(fn_type)`
+and attached to `Inst.calldesc` at each call site.
 
-| Sexp | IR emitted |
-|------|-----------|
-| `(int v)` / `(flt bits)` | `IK_CONST dst, v` |
-| `(var "x@N")` | `read_var(b, "x@N")` |
-| `(addr "x@N")` | `IK_ADDR dst, frame_slot` |
-| `(gaddr "label")` | `IK_GADDR dst, "label"` |
-| `(binop "+" a b)` | `IK_ADD dst, va, vb` |
-| `(load N ptr)` | `IK_LOAD dst, ptr_val, size=N` |
-| `(store N ptr val)` | `IK_STORE ptr_val, val_val, size=N` |
-| `(assign "x@N" rhs)` | `write_var(b, "x@N", cg_expr(rhs))` |
-| `(call "f" args...)` | `IK_CALL landing → IK_COPY working` (landing pre-colored r0) |
-| `(icall fp args...)` | `IK_ICALL landing → IK_COPY working` |
-| `(if cond then else)` | `IK_BR cond_val → then_blk / else_blk` |
-| `(while cond body)` | header (unsealed) → body → seal; `IK_JMP` back-edge |
-| `(for init cond step body)` | entry; cond_blk (unsealed); body; step; seal |
-| `(do body cond)` | body_blk; cond; `IK_BR` back-edge / exit |
-| `(return expr)` | `IK_RET cg_expr(expr)` |
-| `(break)` | `IK_JMP brk_target` |
-| `(continue)` | `IK_JMP cont_target` |
-| `(goto "label")` | `IK_JMP named_block` |
-| `(label "name" stmt)` | create/retrieve named block; cg_stmt |
+### Node* → IR mapping
 
-**Call result landing+copy pattern:** To avoid IRC conflicts between call results
-(pre-colored r0) and subsequent branch conditions (also using r0), every call emits:
-1. `IK_CALL landing` — landing value pre-colored to r0
+**Expressions:**
+
+| Node kind | IR emitted |
+|-----------|-----------|
+| `ND_LITERAL` (int/float) | `IK_CONST dst, v` |
+| `ND_LITERAL` (string) | `IK_GADDR dst, "_lN"` + strlit accumulated |
+| `ND_IDENT` (local/param) | `read_var(b, sym)` |
+| `ND_IDENT` (addr-taken local) | `IK_ADDR + IK_LOAD` |
+| `ND_IDENT` (global) | `IK_GADDR + IK_LOAD` |
+| `ND_IDENT` (function call) | `IK_CALL landing → IK_COPY working` |
+| `ND_IDENT` (indirect call via fn-ptr) | `IK_ICALL landing → IK_COPY working` |
+| `ND_BINOP` | `IK_ADD/IK_SUB/IK_MUL/IK_DIV/IK_LT/IK_EQ/…` |
+| `ND_UNARYOP "-"` | `IK_NEG` |
+| `ND_UNARYOP "~"` | `IK_NOT` |
+| `ND_UNARYOP "!"` | `IK_EQ(v, IK_CONST(0))` |
+| `ND_UNARYOP "++" / "--"` (pre) | read-modify-write via `IK_ADD`/`IK_SUB` |
+| `ND_UNARYOP "++" / "--"` (post) | save old; read-modify-write; return old |
+| `ND_UNARYOP "*"` | `IK_LOAD` |
+| `ND_UNARYOP "&"` | `IK_ADDR` / `IK_GADDR` |
+| `ND_ASSIGN` (scalar) | `write_var` or `IK_STORE` (for addr-taken / global) |
+| `ND_ASSIGN` (struct) | `IK_MEMCPY` |
+| `ND_COMPOUND_ASSIGN` | read-modify-write via `cg_rmw` |
+| `ND_CAST` | `IK_SEXT8` / `IK_SEXT16` / `IK_ZEXT` / `IK_TRUNC` / `IK_ITOF` / `IK_FTOI` |
+| `ND_MEMBER "." / "->"` | `IK_LOAD` at computed byte offset |
+| `ND_TERNARY` | `IK_BR` + merge block |
+| `ND_VA_START` | `IK_ADDR` + `IK_ADD` → write ap |
+| `ND_VA_ARG` | `IK_LOAD`; advance ap |
+
+**Statements:**
+
+| Node kind | IR emitted |
+|-----------|-----------|
+| `ND_IFSTMT` | `IK_BR cond → then_blk / else_blk` |
+| `ND_WHILESTMT` | header (unsealed) → body → seal; `IK_JMP` back-edge |
+| `ND_FORSTMT` | entry; cond_blk (unsealed); body; step; seal |
+| `ND_DOWHILESTMT` | body_blk; cond; `IK_BR` back-edge / exit |
+| `ND_SWITCHSTMT` | comparison chain with `IK_BR`/`IK_JMP` (native, no desugaring) |
+| `ND_RETURNSTMT` | `IK_RET cg_expr(expr)` |
+| `ND_BREAKSTMT` | `IK_JMP brk_target` |
+| `ND_CONTINUESTMT` | `IK_JMP cont_target` |
+| `ND_GOTOSTMT` | `IK_JMP named_block` |
+| `ND_LABELSTMT` | create/retrieve named block; `cg_stmt` |
+| `ND_DECLARATION` (static local) | data-section entry accumulated; frame slot allocated |
+
+**Call result landing+copy pattern:** Every call emits:
+1. `IK_CALL/IK_ICALL landing` — landing value pre-colored to r0
 2. `IK_COPY working ← landing` — working value freely allocated by IRC
 
-Post-lowering code uses `working`, allowing IRC to assign it any register.
+Post-call code uses `working`, allowing IRC to assign it any register.
 
-**Parameters:** Each parameter is emitted as `IK_PARAM i` in the entry block;
-`write_var(entry, "p@N", param_val)` records it for Braun reads.
+**Parameters:** Register params (first 3) are emitted as `IK_PARAM i`; legalize Pass A
+pre-colors them to r1–r3. Stack params (4th and beyond) are emitted as `IK_LOAD`s from
+bp-relative frame slots. Address-taken register params are additionally homed to a frame
+slot via `IK_ADDR + IK_STORE`; subsequent reads come from memory, not an SSA value.
 
-**Type annotation:** After emitting each value, `braun_function` queries the TypeMap
-for the corresponding sexp node's `ValType` and sets `val->vtype`. For calls,
-`CallDesc` is transferred from TypeMap to `inst->calldesc`.
+**String literals and static locals** in function bodies are accumulated into internal
+lists and flushed to the data section via `braun_emit_strlits(out)` after each function.
 
 ---
 
@@ -643,22 +584,25 @@ Jump table optimisation is future work.
 
 | File | Role |
 |------|------|
-| `sx.h` / `sx.c` | Sexp AST types + constructors + printer + TypeMap |
-| `lower.h` / `lower.c` | Lowering pass: Node* → Sexp |
+| `sx.h` / `sx.c` | Sexp AST types + constructors + printer (data section only) |
+| `lower.h` / `lower.c` | Global lowering: Node* → `gvar`/`strlit` sexp for data section |
 | `ssa.h` / `ssa.c` | SSA IR types + constructors + printer |
-| `braun.h` / `braun.c` | Braun SSA construction |
+| `braun.h` / `braun.c` | Braun SSA construction directly from Node* AST |
 | `dom.h` / `dom.c` | Dominator tree + loop depth |
 | `oos.h` / `oos.c` | Out-of-SSA (Boissinot) |
 | `legalize.h` / `legalize.c` | ISA/ABI legalization: Passes A–D |
 | `alloc.h` / `alloc.c` | Liveness + IRC |
 | `emit.h` / `emit.c` | CPU4 emission (globals + functions) |
 
-**Alpha-renaming:** `Symbol*` → `"name@N"` where N is a sequential integer id assigned
-per `Symbol*` during lowering. Original name prefix preserved for IR dump readability.
+**Variable identity:** Braun variable maps are keyed on `Symbol*` directly. No
+alpha-renaming is needed — each `Symbol*` is already unique within the compilation.
 
-**String literal IDs:** `int *strlit_id` is threaded through `lower_program` across all
-TUs and persists in `smallcc.c` as `cpu4_strlit_id`. This ensures `_l0`, `_l1`, … are
-globally unique and never collide with lib TU string literals.
+**String literal IDs:** `int *strlit_id` is threaded through `lower_globals` and
+`braun_function` across all TUs and persists in `smallcc.c` as `cpu4_strlit_id`. This
+ensures `_l0`, `_l1`, … are globally unique across all TUs and lib files. Top-level
+string literals (in global initializers) are handled by `lower_globals`; function-body
+string literals are accumulated by `braun.c` and flushed via `braun_emit_strlits(out)`
+after each function is compiled.
 
 **Block labels in emission:** `_{funcname}_BN` prefix avoids cross-function label
 collisions when multiple functions are emitted to the same assembly file.

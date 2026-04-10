@@ -93,10 +93,10 @@ Per-TU loop [smallcc.c] (lib TUs first, then user TUs):
   finalize_local_offsets()  [types.c]       Compute bp-relative offsets
 
   ── CPU4 nanopass pipeline ─────────────────────────────────────────────────────
-  lower_program()           [lower.c]       Node* → Sexp AST + TypeMap
+  lower_globals()           [lower.c]       Node* → Sexp AST (data section only)
   emit_globals()            [emit.c]        Data section (globals, string literals)
   per function:
-    braun_function()        [braun.c]       Sexp → SSA IR (Braun 2013)
+    braun_function()        [braun.c]       Node* → SSA IR directly (Braun 2013)
     compute_dominators()    [dom.c]         Dominator tree + loop depth
     out_of_ssa()            [oos.c]         φ elimination (Boissinot 2009)
     legalize_function()     [legalize.c]    ABI pre-coloring; NEG/NOT/ZEXT/TRUNC lowering
@@ -116,10 +116,10 @@ Per-TU loop [smallcc.c] (lib TUs first, then user TUs):
 | `tokeniser.c` | Lexer — produces a `Token` linked list |
 | `parser.c` | Recursive-descent parser — builds AST; `resolve_symbols`, `derive_types`, `insert_coercions` |
 | `types.c` | Type table, symbol table, struct layout, `add_types_and_symbols`, `reset_types_state`, `insert_extern_sym` |
-| `sx.h` / `sx.c` | Sexp AST: `Sx` cons-cell tree with `SX_PAIR/SX_SYM/SX_STR/SX_INT` kinds; constructors; printer; TypeMap (`uint32_t id → {ValType, CallDesc*}`) |
-| `lower.h` / `lower.c` | Lowering pass: Node* → Sexp AST + TypeMap; alpha-renaming; ++/-- handling; switch desugaring; static local vars; struct-return rewriting |
+| `sx.h` / `sx.c` | Sexp AST: `Sx` cons-cell tree with `SX_PAIR/SX_SYM/SX_STR/SX_INT` kinds; constructors; printer (used for data-section globals only) |
+| `lower.h` / `lower.c` | Global lowering: Node* → Sexp `gvar`/`strlit` nodes for the data section; function bodies compiled directly by braun.c |
 | `ssa.h` / `ssa.c` | SSA IR types (`Value`, `Inst`, `Block`, `Function`); `InstKind` opcodes; constructors; IR printer (`print_function`) |
-| `braun.h` / `braun.c` | Braun SSA construction from Sexp AST; handles for/do/while/goto/label; call result landing+copy pattern |
+| `braun.h` / `braun.c` | Braun SSA construction directly from Node* AST; Symbol*-keyed variable maps; derives ValType/CallDesc from Node*.type; handles all statement/expression kinds; accumulates function-body string literals and static locals |
 | `dom.h` / `dom.c` | Dominator tree (Cooper 2001); loop depth; `compute_dominators`; `dominates` query |
 | `oos.h` / `oos.c` | Out-of-SSA: Boissinot 2009 parallel-copy insertion; swap cycle detection |
 | `legalize.h` / `legalize.c` | ISA/ABI legalization: Pass A (param pre-color); Pass B (call-arg IK_COPY); Pass C (NEG/NOT lowering); Pass D (ZEXT/TRUNC lowering) |
