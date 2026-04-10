@@ -514,10 +514,8 @@ int main(int argc, char **argv)
         print_type_table();
 #endif
 
-        if (flag_annotate && tu >= lib_count)
+        if (flag_annotate)
             set_ann_source(source);
-        else if (flag_annotate)
-            set_ann_source(NULL);  // suppress lib-TU annotation
 
         {
             // Nanopass pipeline: Node* → SSA → IRC → CPU4
