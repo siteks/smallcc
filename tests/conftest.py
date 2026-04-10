@@ -7,8 +7,8 @@ Each .c file may have magic // comments on its leading lines:
     // EXPECT_STDOUT: hello
     // FILES: lib.c main.c   (multi-TU: all relative to the .c file's directory)
 
-Default run: tests against cpu3 (via sim_c) and cpu4 (via sim_c -arch cpu4),
-producing items named e.g. recursive_factorial[cpu3] and recursive_factorial[cpu4].
+Default run: tests against cpu4 (via sim_c -arch cpu4),
+producing items named e.g. recursive_factorial[cpu4].
 
 With --irsim: tests against the built-in IR interpreter using -runoos and -runirc,
 producing items named e.g. recursive_factorial[runoos] and recursive_factorial[runirc].
@@ -24,7 +24,7 @@ import os
 import tempfile
 from pathlib import Path
 
-ARCHES = ['cpu3', 'cpu4']
+ARCHES = ['cpu4']
 IRSIM_MODES = ['runoos', 'runirc']
 CPU4_MAXSTEPS = 100_000   # generous limit for recursive/expensive tests
 
@@ -62,7 +62,7 @@ class CTestFile(pytest.File):
         if 'EXPECT_COMPILE_FAIL' in meta:
             # Compile errors are arch-independent; run once
             yield CTestItem.from_parent(self, name=self.path.stem,
-                                        path=self.path, arch='cpu3')
+                                        path=self.path, arch='cpu4')
         else:
             modes = IRSIM_MODES if irsim else ARCHES
             for arch in modes:
@@ -118,11 +118,8 @@ class CTestItem(pytest.Item):
         with tempfile.TemporaryDirectory() as tmp:
             asm = os.path.join(tmp, 'out.s')
 
-            # Compile (arch flag only for cpu4)
-            compile_cmd = [str(root / 'smallcc'), '-o', asm]
-            if self.arch == 'cpu4':
-                compile_cmd += ['-arch', 'cpu4']
-            compile_cmd += files
+            # Compile with -arch cpu4
+            compile_cmd = [str(root / 'smallcc'), '-arch', 'cpu4', '-o', asm] + files
 
             proc = subprocess.run(compile_cmd, capture_output=True, text=True)
 
@@ -134,12 +131,8 @@ class CTestItem(pytest.Item):
             assert proc.returncode == 0, \
                 f"compile failed (exit {proc.returncode}):\n{proc.stderr}"
 
-            # Simulate
-            # Both simulators: putchar → stderr, register state → stdout
-            if self.arch == 'cpu3':
-                sim_cmd = [str(root / 'sim_c'), asm]
-            else:
-                sim_cmd = [str(root / 'sim_c'), '-arch', 'cpu4', asm]
+            # Simulate with sim_c -arch cpu4
+            sim_cmd = [str(root / 'sim_c'), '-arch', 'cpu4', asm]
 
             sim = subprocess.run(sim_cmd, capture_output=True, text=True)
 

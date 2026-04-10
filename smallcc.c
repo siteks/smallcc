@@ -119,7 +119,6 @@ static void harvest_globals(void)
 static void reset_tu(int tu)
 {
     current_global_tu = tu;
-    reset_codegen();
     reset_parser();
     reset_types_state();
     reset_preprocessor();
@@ -241,13 +240,11 @@ static int collect_needed_libs(char **user_files, int user_count,
 
 int main(int argc, char **argv)
 {
-    // Parse flags: -o outfile, -stats, -O[N], -DNAME[=VALUE]
+    // Parse flags: -o outfile, -stats, -DNAME[=VALUE]
     FILE *out = stdout;
     int file_start = 1;
     bool show_stats = false;
     bool preprocess_only = false;
-    int opt_level = 0;
-    int target_cpu4 = 0;  // 0 = CPU3, 1 = CPU4 (new nanopass pipeline)
     FILE *ssa_out = NULL;  // -ssa file: write Braun SSA IR to this file after braun_function
     FILE *oos_out = NULL;  // -oos file: write post-OOS IR to this file
     FILE *irc_out = NULL;  // -irc file: write post-IRC IR to this file
@@ -268,29 +265,18 @@ int main(int argc, char **argv)
                 "  -o <file>          Write assembly to <file> (default: stdout)\n"
                 "  -E                 Preprocess only; write preprocessed source to stdout\n"
                 "\n"
-                "Target:\n"
-                "  -arch cpu3         Generate CPU3 assembly (default)\n"
-                "  -arch cpu4         Generate CPU4 assembly (nanopass pipeline)\n"
-                "\n"
-                "Optimisation:\n"
-                "  -O, -O1            Enable peephole optimisation (CPU3 only)\n"
-                "  -O2                Enable additional strength-reduction rules\n"
-                "\n"
                 "Preprocessor:\n"
                 "  -DNAME[=VALUE]     Define preprocessor macro\n"
                 "  -I<dir>            Add directory to #include <...> search path\n"
                 "\n"
-                "IR dumps (CPU4 only):\n"
+                "IR dumps:\n"
                 "  -ssa <file>        Write Braun SSA IR to <file> after braun_function\n"
                 "  -oos <file>        Write post-OOS IR to <file> after out_of_ssa\n"
                 "  -irc <file>        Write post-IRC IR to <file> after irc_allocate\n"
                 "\n"
-                "IR interpretation (CPU4 only, prints r0:XXXXXXXX to stdout):\n"
+                "IR interpretation (prints r0:XXXXXXXX to stdout):\n"
                 "  -runoos            Interpret post-OOS IR (skips register allocation)\n"
                 "  -runirc            Interpret post-IRC IR (after register allocation)\n"
-                "\n"
-                "Annotation:\n"
-                "  -ann               Annotate assembly output with source comments\n"
                 "\n"
                 "Diagnostics:\n"
                 "  -stats             Print per-TU arena usage to stderr\n"
@@ -309,20 +295,9 @@ int main(int argc, char **argv)
             show_stats = true;
             file_start++;
         }
-        else if (strncmp(argv[file_start], "-O", 2) == 0)
-        {
-            const char *n = argv[file_start] + 2;
-            opt_level = (*n == '\0') ? 1 : atoi(n);
-            file_start++;
-        }
         else if (strcmp(argv[file_start], "-E") == 0)
         {
             preprocess_only = true;
-            file_start++;
-        }
-        else if (strcmp(argv[file_start], "-ann") == 0)
-        {
-            flag_annotate = 1;
             file_start++;
         }
         else if (strncmp(argv[file_start], "-D", 2) == 0)
@@ -346,8 +321,7 @@ int main(int argc, char **argv)
         else if (strcmp(argv[file_start], "-arch") == 0 && file_start + 1 < argc)
         {
             const char *arch = argv[file_start + 1];
-            if (strcmp(arch, "cpu4") == 0) target_cpu4 = 1;
-            else if (strcmp(arch, "cpu3") == 0) target_cpu4 = 0;
+            if (strcmp(arch, "cpu4") == 0) { /* cpu4 is the only target */ }
             else { fprintf(stderr, "smallcc: unknown arch: %s\n", arch); return 1; }
             file_start += 2;
         }
@@ -393,7 +367,7 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    set_asm_out(out);
+    (void)out; // will be set via fopen -o or stdout below
 
     // Determine compiler binary directory for include/ and lib/ resolution
     char compiler_dir[4096];
@@ -428,25 +402,19 @@ int main(int argc, char **argv)
     }
 
     if (!preprocess_only) {
-        // Preamble: emit arch-specific crt0_cpuN.s if present, else built-in default
+        // Preamble: emit crt0_cpu4.s if present, else built-in default
         char crt0_path[4096];
-        const char *crt0_name = target_cpu4 ? "crt0_cpu4.s" : "crt0_cpu3.s";
-        snprintf(crt0_path, sizeof(crt0_path), "%s/lib/%s", compiler_dir, crt0_name);
+        snprintf(crt0_path, sizeof(crt0_path), "%s/lib/crt0_cpu4.s", compiler_dir);
         FILE *crt0 = fopen(crt0_path, "r");
         if (crt0) {
             char buf[256];
             while (fgets(buf, sizeof(buf), crt0))
                 fputs(buf, out);
             fclose(crt0);
-        } else if (target_cpu4) {
+        } else {
             fprintf(out, ".text=0\n");
             fprintf(out, "    immw     r0, 0xF000\n");
             fprintf(out, "    ssp     r0\n");
-            fprintf(out, "    jl      main\n");
-            fprintf(out, "    halt\n");
-        } else {
-            fprintf(out, ".text=0\n");
-            fprintf(out, "    ssp     0xF000\n");
             fprintf(out, "    jl      main\n");
             fprintf(out, "    halt\n");
         }
@@ -457,8 +425,8 @@ int main(int argc, char **argv)
 
     // For CPU4: defer all globals/strlits to after all functions, so that
     // _globals_start: marks the clean code/data boundary for clearmem + watchpoint.
-    FILE *globals_buf = target_cpu4 ? tmpfile() : NULL;
-    if (target_cpu4 && !globals_buf) { perror("tmpfile"); return 1; }
+    FILE *globals_buf = tmpfile();
+    if (!globals_buf) { perror("tmpfile"); return 1; }
 
     int cpu4_strlit_id = 0;  // monotonically increasing string literal ID across TUs
     for (int tu = 0; tu < tu_count; tu++)
@@ -523,7 +491,6 @@ int main(int argc, char **argv)
         resolve_symbols(node);
         derive_types(node);
         insert_coercions(node);
-        label_su(node);          // Sethi-Ullman: label + reorder commutative children
         finalize_local_offsets();
 #ifdef DEBUG_ENABLED
         print_tree(node, 0);
@@ -531,7 +498,7 @@ int main(int argc, char **argv)
         print_type_table();
 #endif
 
-        if (target_cpu4) {
+        {
             // Nanopass pipeline: Node* → SSA → IRC → CPU4
             // Phase 1: emit global variables and top-level string literals
             Sx *sx_prog = lower_globals(node, tu, &cpu4_strlit_id);
@@ -567,13 +534,6 @@ int main(int argc, char **argv)
                     emit_function(f, out);
                 }
             }
-        } else {
-            if (flag_annotate)
-                set_ann_source(source);
-            gen_ir(node, tu);
-            mark_basic_blocks();
-            peephole(opt_level);
-            backend_emit_asm(codegen_ctx.ir_head);
         }
         harvest_globals();
 
@@ -585,9 +545,9 @@ int main(int argc, char **argv)
         }
     }
 
-    // Flush deferred CPU4 globals after all functions — _globals_start: marks
+    // Flush deferred globals after all functions — _globals_start: marks
     // the code/data boundary used by clearmem and the sim_c write watchpoint.
-    if (globals_buf && !run_oos && !run_irc) {
+    if (!run_oos && !run_irc) {
         fprintf(out, "    align\n");
         fprintf(out, "_globals_start:\n");
         rewind(globals_buf);
@@ -595,10 +555,8 @@ int main(int argc, char **argv)
         size_t n;
         while ((n = fread(xbuf, 1, sizeof(xbuf), globals_buf)) > 0)
             fwrite(xbuf, 1, n, out);
-        fclose(globals_buf);
-    } else if (globals_buf) {
-        fclose(globals_buf);
     }
+    fclose(globals_buf);
 
     if (show_stats)
         fprintf(stderr, "arena total: %zu / %zu bytes (%.1f%%)\n",

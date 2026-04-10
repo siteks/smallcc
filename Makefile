@@ -2,10 +2,9 @@
 CFLAGS=-std=c11 -g
 
 SRCS_COMMON = smallcc.c tokeniser.c parser.c types.c preprocess.c
-SRCS_CPU3   = codegen.c backend.c optimise.c
 SRCS_NEW    = sx.c lower.c ssa.c braun.c dom.c oos.c alloc.c emit.c irsim.c
 
-smallcc: $(SRCS_COMMON) $(SRCS_CPU3) $(SRCS_NEW)
+smallcc: $(SRCS_COMMON) $(SRCS_NEW)
 sim_c: sim_c.c
 	$(CC) $(CFLAGS) -o sim_c sim_c.c -lm
 
@@ -29,7 +28,7 @@ test_irsim_p: smallcc
 
 clean:
 	rm -f smallcc sim_c mycc_* *.o *~ tmp* _tmp*.c test.s *.lst error.log
-	rm -rf .pytest_cache __pycache__ cpu3/__pycache__ cpu4/__pycache__
+	rm -rf .pytest_cache __pycache__ cpu4/__pycache__
 	rm -rf *.dSYM
 
 help:
@@ -38,7 +37,7 @@ help:
 	@echo "  sim_c      Build the C simulator"
 	@echo ""
 	@echo "Test"
-	@echo "  test          Run all pytest cases quietly (cpu3 + cpu4 via sim_c)"
+	@echo "  test          Run all pytest cases quietly (cpu4 via sim_c)"
 	@echo "  test_v        Run all pytest cases verbosely"
 	@echo "  test_p        Run pytest cases in parallel (pytest-xdist)"
 	@echo "  test_irsim    Run all pytest cases via -runoos and -runirc"

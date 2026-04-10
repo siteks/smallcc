@@ -19,26 +19,24 @@ make clean          # Remove binaries and temp files
 Run the compiler directly:
 ```bash
 echo 'int main(){return 5+3;}' > t.c
-./smallcc t.c > out.s && ./sim_c out.s                    # CPU3 (default)
-./smallcc -arch cpu4 -o out.s t.c && ./sim_c -arch cpu4 out.s  # CPU4 nanopass pipeline
-./smallcc -o out.s t.c && ./sim_c out.s                   # output to file
-./smallcc -o out.s file1.c file2.c && ./sim_c out.s       # multi-TU
-./smallcc -ann -O1 -o out.s t.c                           # annotated output with source comments
-./smallcc -arch cpu4 -ssa t.ssa -o out.s t.c               # dump Braun SSA IR to t.ssa
-./smallcc -arch cpu4 -oos t.oos -o out.s t.c               # dump post-OOS IR to t.oos
-./smallcc -arch cpu4 -irc t.irc -o out.s t.c               # dump post-IRC IR to t.irc
-DUMP_IR=1 ./smallcc -arch cpu4 -o out.s t.c               # dump post-OOS and post-IRC IR to stderr
+./smallcc -arch cpu4 -o out.s t.c && ./sim_c -arch cpu4 out.s  # compile and run
+./smallcc -o out.s t.c && ./sim_c -arch cpu4 out.s             # -arch cpu4 is the default
+./smallcc -o out.s file1.c file2.c && ./sim_c -arch cpu4 out.s # multi-TU
+./smallcc -arch cpu4 -ssa t.ssa -o out.s t.c                   # dump Braun SSA IR to t.ssa
+./smallcc -arch cpu4 -oos t.oos -o out.s t.c                   # dump post-OOS IR to t.oos
+./smallcc -arch cpu4 -irc t.irc -o out.s t.c                   # dump post-IRC IR to t.irc
+DUMP_IR=1 ./smallcc -arch cpu4 -o out.s t.c                    # dump post-OOS and post-IRC IR to stderr
 ```
 
 Tests use `sim_c` (the C simulator) to execute generated assembly and check the value left in register `r0`. On test failure, verbose output is written to `error.log`. The test harness is in `test.sh`; individual suites are in `tests/`.
 
 ### Simulators
 
-`sim_c` (`sim_c.c`) is the primary simulator — a self-contained C program that assembles and executes CPU3 assembly. Build with `make sim_c`. It is faster than the Python simulator and is what the test harness and `make test_all` use.
+`sim_c` (`sim_c.c`) is the primary simulator — a self-contained C program that assembles and executes CPU4 assembly. Build with `make sim_c`.
 
 **`sim_c` usage:**
 ```
-./sim_c [-v] file.s
+./sim_c [-v] [-arch cpu4] [-maxsteps N] file.s
 ```
 
 **`sim_c` debug facilities:**
@@ -51,29 +49,25 @@ Tests use `sim_c` (the C simulator) to execute generated assembly and check the 
 | Crash trace | On unknown opcode, dumps the last 32 executed instructions (pc, opcode, r0, sp, bp) to help locate the crash |
 | MMIO cycle counter | A 32-bit read-only cycle counter at address `0xFF00` incremented once per instruction; used by `core_portme.c` for timing |
 
-`cpu3/sim.py` (Python) is kept as a reference implementation and to support any legacy uses. It imports `cpu3/cpu.py` (instruction definitions, execution) and `cpu3/assembler.py` (two-pass assembler). The assembler picks up new instructions automatically from `cpu.py`'s `ptable`, so `cpu3/assembler.py` rarely needs changes.
-
 ### CoreMark Benchmark
 
-CoreMark lives in `../coremark` (relative to this repo). To rebuild `coremark4.s` (CPU4):
+CoreMark lives in `../coremark` (relative to this repo). To rebuild `coremark4.s`:
 
 ```bash
 cd ../coremark
-../smallcc/smallcc -Icpu3 -I. -arch cpu4 -ann \
-  -DFLAGS_STR=\""-O2 -DPERFORMANCE_RUN=1  "\" \
-  -DITERATIONS=8 -DPERFORMANCE_RUN=1 -O2 \
+../smallcc/smallcc -Icpu3 -I. -arch cpu4 \
+  -DFLAGS_STR=\""-DPERFORMANCE_RUN=1  "\" \
+  -DITERATIONS=8 -DPERFORMANCE_RUN=1 \
   -o ./coremark4.s \
   core_list_join.c core_main.c core_matrix.c core_state.c core_util.c cpu3/core_portme.c
-python3 ../smallcc/cpu4/sim.py coremark4.s
+../smallcc/sim_c -arch cpu4 -maxsteps 20000000 coremark4.s
 ```
-
-For CPU3: same command without `-arch cpu4`, output to `coremark.s`, run with `../smallcc/sim_c coremark.s`.
 
 ---
 
 ## Compiler Architecture
 
-C89 subset compiler. Input is one or more `.c` files; assembly is written to stdout or a file specified with `-o`. Usage: `smallcc [-o outfile] [-stats] [-ann] [-ssa] [-arch cpu3|cpu4] [-O[N]] <source.c> [source2.c ...]`.
+C89 subset compiler. Input is one or more `.c` files; assembly is written to stdout or a file specified with `-o`. Usage: `smallcc [-o outfile] [-stats] [-ssa] [-arch cpu4] <source.c> [source2.c ...]`.
 
 ### Compilation Pipeline
 
@@ -88,23 +82,16 @@ Preamble (ssp / jl main / halt) emitted once before per-TU loop.
 Per-TU loop [smallcc.c] (lib TUs first, then user TUs):
   read_file()               [smallcc.c]     Read source from disk
   preprocess()              [preprocess.c]  Macro expansion, #include, conditionals
-  reset_codegen/parse/types/preprocessor()  Reset per-TU state
+  reset_parse/types/preprocessor()          Reset per-TU state
   make_basic_types()        [types.c]       Populate type table
   tokenise()                [tokeniser.c]   Token linked list
   program()                 [parser.c]      AST (Node tree)
   resolve_symbols()         [parser.c]      Symbol table lookup
   derive_types()            [parser.c]      Bottom-up type propagation
   insert_coercions()        [parser.c]      Insert casts and stride-scaling
-  label_su()                [parser.c]      Sethi-Ullman labelling
   finalize_local_offsets()  [types.c]       Compute bp-relative offsets
 
-  ── CPU3 path (default) ────────────────────────────────────────────────────────
-  gen_ir()                  [codegen.c]     Build stack IR instruction list
-  mark_basic_blocks()       [codegen.c]     Insert BB sentinels
-  peephole()                [optimise.c]    Constant fold, dead branch elim
-  backend_emit_asm()        [backend.c]     Stack IR → CPU3 assembly
-
-  ── CPU4 path (-arch cpu4) — nanopass pipeline ─────────────────────────────────
+  ── CPU4 nanopass pipeline ─────────────────────────────────────────────────────
   lower_program()           [lower.c]       Node* → Sexp AST + TypeMap
   emit_globals()            [emit.c]        Data section (globals, string literals)
   per function:
@@ -122,14 +109,11 @@ Per-TU loop [smallcc.c] (lib TUs first, then user TUs):
 | File | Role |
 |---|---|
 | `smallcc.h` | All shared structs, enums, and function prototypes |
-| `smallcc.c` | Entry point; flag parsing; lib scanning; include-dir setup; per-TU loop; `harvest_globals`; CPU4 nanopass dispatch |
+| `smallcc.c` | Entry point; flag parsing; lib scanning; include-dir setup; per-TU loop; `harvest_globals`; nanopass dispatch |
 | `preprocess.c` | Preprocessor — `#define`/`#undef`, `#ifdef`/`#ifndef`/`#else`/`#endif`, `#include "f"`/`#include <f>`; `set_include_dir()` |
 | `tokeniser.c` | Lexer — produces a `Token` linked list |
 | `parser.c` | Recursive-descent parser — builds AST; `resolve_symbols`, `derive_types`, `insert_coercions` |
 | `types.c` | Type table, symbol table, struct layout, `add_types_and_symbols`, `reset_types_state`, `insert_extern_sym` |
-| `codegen.c` | AST walk; builds flat stack IR list (`gen_ir`); `reset_codegen`; static label mangling; `mark_basic_blocks` — CPU3 path only |
-| `optimise.c` | Peephole optimiser (`peephole`); rules 1–9; constant folding, dead branch elim, store/reload elim — CPU3 path only |
-| `backend.c` | Stack IR → CPU3 assembly (`backend_emit_asm`); `set_asm_out`; `-ann` annotation mode — CPU3 path only |
 | `sx.h` / `sx.c` | Sexp AST: `Sx` cons-cell tree with `SX_PAIR/SX_SYM/SX_STR/SX_INT` kinds; constructors; printer; TypeMap (`uint32_t id → {ValType, CallDesc*}`) |
 | `lower.h` / `lower.c` | Lowering pass: Node* → Sexp AST + TypeMap; alpha-renaming; ++/-- handling; switch desugaring; static local vars; struct-return rewriting |
 | `ssa.h` / `ssa.c` | SSA IR types (`Value`, `Inst`, `Block`, `Function`); `InstKind` opcodes; constructors; IR printer (`print_function`) |
@@ -138,10 +122,7 @@ Per-TU loop [smallcc.c] (lib TUs first, then user TUs):
 | `oos.h` / `oos.c` | Out-of-SSA: Boissinot 2009 parallel-copy insertion; swap cycle detection |
 | `alloc.h` / `alloc.c` | Liveness analysis + IRC register allocation (Appel & George 1996); K=8; George coalescing (with same-color precolored guard); spill support |
 | `emit.h` / `emit.c` | CPU4 emission: `emit_globals` (data section) + `emit_function` (text section); F2 bp-rel selection; callee-save prologue/epilogue |
-| `sim_c.c` | Primary simulator — self-contained C assembler + CPU3/CPU4 executor; `make sim_c` |
-| `cpu3/cpu.py` | Python CPU3 definition: `ptable` (opcode/format map) + execution handler |
-| `cpu3/assembler.py` | Python two-pass assembler; reads `ptable` from `cpu.py` — no changes needed for new instructions |
-| `cpu3/sim.py` | Python simulator (reference / legacy); imports `cpu.py` and `assembler.py` |
+| `sim_c.c` | CPU4 assembler + simulator (self-contained C program); `make sim_c` |
 | `lib/stdio.c` | `printf` (`%d %s %c %%`), `puts` — compiled as TU 0 automatically |
 | `lib/stdlib.c` | `abs` — compiled as TU 1 automatically |
 | `lib/string.c` | `strlen`, `strcmp`, `strcpy`, `strcat` — compiled as TU 2 automatically |

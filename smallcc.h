@@ -16,7 +16,7 @@ void src_error(int line, int col, const char *fmt, ...) __attribute__((noreturn)
 // ===============================================================
 // One bump-pointer arena:
 //
-//   arena   — permanent allocations (Types, Symbols, Nodes, IRInst).
+//   arena   — permanent allocations (Types, Symbols, Nodes).
 //             Pre-zeroed BSS; never reset.
 typedef struct
 {
@@ -370,17 +370,6 @@ void print_tree(Node *node, int depth);
 // or sibling linked lists (->next). fn is called for each child in declaration order.
 void for_each_child(Node *node, void (*fn)(Node *child, void *ctx), void *ctx);
 
-// ---------------------------------------------------------------
-// Code gen (IR construction)
-// ---------------------------------------------------------------
-
-void gen_ir(Node *node, int tu_index);
-void mark_basic_blocks(void);
-void peephole(int level);
-void reset_codegen(void);
-void gen_preamble(void);
-void gen_pop();
-void gen_stmt(Node *node);
 const char *nodestr(Node_kind k);
 const char *fulltype_str(Type *t);
 const char *token_str(Token_kind tk);
@@ -393,7 +382,6 @@ bool is_typequal(Token_kind tk);
 void resolve_symbols(Node *root);
 void derive_types(Node *root);
 void insert_coercions(Node *root);
-void label_su(Node *root);
 Node *new_node(Node_kind kind, char *val, bool is_expr);
 
 
@@ -487,55 +475,6 @@ Symbol *insert_enum_const(Symbol_table *st, Type *ety, char *ident, int value);
 Symbol *find_symbol_st(Symbol_table *st, const char *name, Namespace nspace);
 
 // ===============================================================
-// IR (Intermediate Representation)
-// ===============================================================
-// A flat linked list of IRInst nodes is built during AST traversal by gen_ir().
-// backend_emit_asm() walks the list and prints assembly text to the output file.
-
-typedef enum {
-    IR_IMM,
-    IR_PUSH, IR_PUSHW,
-    IR_POP,  IR_POPW,
-    IR_ADD, IR_SUB, IR_MUL, IR_DIV, IR_MOD,
-    IR_LB, IR_LW, IR_LL,
-    IR_SB, IR_SW, IR_SL,
-    IR_LEA,
-    IR_JZ, IR_JNZ, IR_J,
-    IR_JL,
-    IR_JLI,
-    IR_RET,
-    IR_ENTER,
-    IR_ADJ,
-    IR_LABEL,
-    IR_SYMLABEL,
-    IR_SXB, IR_SXW,
-    IR_ZXB, IR_ZXW,   /* zero-extend byte / word (in-place: rd &= 0xff / 0xffff) */
-    IR_FADD, IR_FSUB, IR_FMUL, IR_FDIV,
-    IR_ITOF, IR_FTOI,
-    IR_EQ, IR_NE, IR_LT, IR_LE, IR_GT, IR_GE,
-    IR_LTS, IR_LES, IR_GTS, IR_GES,        // signed comparisons
-    IR_DIVS, IR_MODS,                       // signed div / mod
-    IR_SHRS,                                // arithmetic right shift
-    IR_FLT, IR_FLE, IR_FGT, IR_FGE,
-    IR_SHL, IR_SHR, IR_AND, IR_OR, IR_XOR,
-    IR_ALIGN,
-    IR_WORD,
-    IR_BYTE,
-    IR_PUTCHAR,
-    IR_COMMENT,
-    IR_BB_START,    // basic-block boundary marker (no assembly emitted; peephole barrier)
-    IR_NOP,         // deleted instruction (no assembly emitted; removed by compact_ir)
-} IROp;
-
-typedef struct IRInst {
-    IROp          op;
-    int           operand;
-    const char   *sym;
-    int           line;     // source line number (0 = unknown); set during gen_ir
-    struct IRInst *next;
-} IRInst;
-
-// ===============================================================
 // Capacity constants for fixed-size arrays in context structs
 #define MAX_STRLITS         512
 #define MAX_LOCAL_STATICS   512
@@ -591,39 +530,10 @@ typedef struct ParserContext {
     int anon_index;             // anonymous label counter (monotonic across TUs)
 } ParserContext;
 
-// Helper types for CodegenContext
-typedef struct { int id; char *data; int len; } StrLit;
-typedef struct { int id; Symbol *sym; Node *decl_node; } LocalStaticEntry;
-typedef struct { char name[64]; int label_id; } LabelEntry;
-
-typedef struct CodegenContext {
-    int label_counter;          // label counter (monotonic across TUs)
-    int loop_depth;             // current loop nesting level
-    int break_labels[64];       // break target stack
-    int cont_labels[64];        // continue target stack
-    int loop_adj[64];           // adj_depth at each loop/switch entry (for break/continue cleanup)
-    // String literals
-    StrLit strlits[MAX_STRLITS];
-    int strlit_count;
-    // Local static variables
-    LocalStaticEntry local_statics[MAX_LOCAL_STATICS];
-    int local_static_count;
-    // Goto labels
-    LabelEntry label_table[MAX_LABEL_TABLE];
-    int label_table_size;
-    // IR instruction list (built during gen_*, emitted by backend_emit_asm after gen_ir)
-    IRInst *ir_head;
-    IRInst *ir_tail;
-    // Struct-return ABI support
-    int   adj_depth;            // bytes allocated for local scopes via adj (updated by gen_compstmt/gen_forstmt)
-    Type *current_fn_ret_type;  // return type of function currently being generated
-} CodegenContext;
-
 // Global context instances (defined in respective .c files)
 extern TypeContext type_ctx;
 extern TokenContext token_ctx;
 extern ParserContext parser_ctx;
-extern CodegenContext codegen_ctx;
 
 // Convenience macros for basic types (for backward compatibility)
 #define t_void   (type_ctx.t_void)
@@ -640,24 +550,6 @@ extern CodegenContext codegen_ctx;
 
 // Convenience alias used throughout codegen and types.
 #define current_global_tu (type_ctx.current_tu)
-
-// ---------------------------------------------------------------
-// Target architecture
-// ---------------------------------------------------------------
-
-// ---------------------------------------------------------------
-// Backend (IR → assembly)
-// ---------------------------------------------------------------
-
-extern FILE *asm_out;
-void set_asm_out(FILE *f);
-void backend_emit_asm(IRInst *ir);
-// Annotation mode (-ann): call with the preprocessed source before backend_emit_asm.
-// Enables source-line and basic-block comments in the assembly output.
-extern int          flag_annotate;
-extern const char **ann_lines;
-extern int          ann_nlines;
-void set_ann_source(const char *src);
 
 // Preprocessor
 void set_include_dir(const char *dir);
