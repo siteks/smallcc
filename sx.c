@@ -1,8 +1,8 @@
 #include <stdarg.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 #include "sx.h"
+#include "smallcc.h"
 
 // ============================================================
 // Sexp allocation
@@ -192,16 +192,15 @@ struct TypeMap {
 };
 
 TypeMap *typemap_new(void) {
-    TypeMap *tm = malloc(sizeof(TypeMap));
+    TypeMap *tm = arena_alloc(sizeof(TypeMap));
     tm->cap     = TM_INIT_SIZE;
     tm->count   = 0;
-    tm->buckets = calloc(tm->cap, sizeof(TypeEntry));
+    tm->buckets = arena_alloc(tm->cap * sizeof(TypeEntry));
     return tm;
 }
 
 void typemap_free(TypeMap *tm) {
-    free(tm->buckets);
-    free(tm);
+    (void)tm; // arena-allocated; nothing to free
 }
 
 static void tm_grow(TypeMap *tm);
@@ -232,7 +231,7 @@ static void tm_grow(TypeMap *tm) {
     TypeEntry *old_bkt = tm->buckets;
     tm->cap    *= 2;
     tm->count   = 0;
-    tm->buckets = calloc(tm->cap, sizeof(TypeEntry));
+    tm->buckets = arena_alloc(tm->cap * sizeof(TypeEntry));
     for (int i = 0; i < old_cap; i++) {
         if (old_bkt[i].id) {
             TypeEntry *e = tm_find(tm, old_bkt[i].id, true);
@@ -240,7 +239,6 @@ static void tm_grow(TypeMap *tm) {
             e->cd = old_bkt[i].cd;
         }
     }
-    free(old_bkt);
 }
 
 void typemap_set_vtype(TypeMap *tm, uint32_t id, ValType vt) {

@@ -8,7 +8,6 @@
 #include <assert.h>
 #include <stdint.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 #include "lower.h"
 #include "sx.h"
@@ -26,8 +25,11 @@ static int      g_strlit_id;  // current strlit counter (shared with caller via 
 // Push a new string literal entry (caller has already incremented g_strlit_id).
 static void push_strlit(int id, const char *data, int len) {
     if (g_nstrlits >= g_strlit_cap) {
-        g_strlit_cap = g_strlit_cap ? g_strlit_cap * 2 : 16;
-        g_strlits = realloc(g_strlits, g_strlit_cap * sizeof(LStrLit));
+        int nc = g_strlit_cap ? g_strlit_cap * 2 : 16;
+        LStrLit *nb = arena_alloc(nc * sizeof(LStrLit));
+        memcpy(nb, g_strlits, g_nstrlits * sizeof(LStrLit));
+        g_strlits    = nb;
+        g_strlit_cap = nc;
     }
     g_strlits[g_nstrlits].id   = id;
     g_strlits[g_nstrlits].data = data;

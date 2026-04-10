@@ -1,5 +1,4 @@
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 #include "ssa.h"
 #include "smallcc.h"
@@ -20,9 +19,8 @@ Block *new_block(Function *f) {
     // Grow blocks array
     if (f->nblocks >= f->blk_cap) {
         int nc = f->blk_cap ? f->blk_cap * 2 : 8;
-        Block **nb = malloc(nc * sizeof(Block *));
+        Block **nb = arena_alloc(nc * sizeof(Block *));
         memcpy(nb, f->blocks, f->nblocks * sizeof(Block *));
-        free(f->blocks);
         f->blocks  = nb;
         f->blk_cap = nc;
     }
@@ -40,9 +38,8 @@ Value *new_value(Function *f, ValKind kind, ValType vt) {
     // Grow values array
     if (f->nvalues >= f->val_cap) {
         int nc = f->val_cap ? f->val_cap * 2 : 16;
-        Value **nv = malloc(nc * sizeof(Value *));
+        Value **nv = arena_alloc(nc * sizeof(Value *));
         memcpy(nv, f->values, f->nvalues * sizeof(Value *));
-        free(f->values);
         f->values  = nv;
         f->val_cap = nc;
     }
@@ -69,10 +66,9 @@ Inst *new_inst(Function *f, Block *b, InstKind kind, Value *dst) {
 void inst_add_op(Inst *inst, Value *v) {
     // Dynamic array of operands
     int n   = inst->nops;
-    Value **ops = malloc((n + 1) * sizeof(Value *));
+    Value **ops = arena_alloc((n + 1) * sizeof(Value *));
     memcpy(ops, inst->ops, n * sizeof(Value *));
     ops[n] = v;
-    free(inst->ops);
     inst->ops  = ops;
     inst->nops = n + 1;
     if (v) v->use_count++;
@@ -88,12 +84,16 @@ void inst_append(Block *b, Inst *inst) {
 }
 
 void block_add_succ(Block *from, Block *to) {
-    from->succs = realloc(from->succs, (from->nsuccs + 1) * sizeof(Block *));
+    Block **ns = arena_alloc((from->nsuccs + 1) * sizeof(Block *));
+    memcpy(ns, from->succs, from->nsuccs * sizeof(Block *));
+    from->succs = ns;
     from->succs[from->nsuccs++] = to;
 }
 
 void block_add_pred(Block *to, Block *from) {
-    to->preds = realloc(to->preds, (to->npreds + 1) * sizeof(Block *));
+    Block **np = arena_alloc((to->npreds + 1) * sizeof(Block *));
+    memcpy(np, to->preds, to->npreds * sizeof(Block *));
+    to->preds = np;
     to->preds[to->npreds++] = from;
 }
 

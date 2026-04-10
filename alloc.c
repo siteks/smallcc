@@ -1,4 +1,3 @@
-#include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 #include "alloc.h"
@@ -47,8 +46,8 @@ void compute_liveness(Function *f) {
     for (int i = 0; i < f->nblocks; i++) {
         Block *b = f->blocks[i];
         b->nwords = nw;
-        b->live_in  = calloc(nw, sizeof(uint32_t));
-        b->live_out = calloc(nw, sizeof(uint32_t));
+        b->live_in  = arena_alloc(nw * sizeof(uint32_t));
+        b->live_out = arena_alloc(nw * sizeof(uint32_t));
     }
 
     // Iterate to fixed point
@@ -60,7 +59,7 @@ void compute_liveness(Function *f) {
             Block *b = f->blocks[bi];
 
             // Compute live_out = union of live_in of successors
-            uint32_t *new_out = calloc(nw, sizeof(uint32_t));
+            uint32_t *new_out = arena_alloc(nw * sizeof(uint32_t));
             for (int si = 0; si < b->nsuccs; si++) {
                 Block *s = b->succs[si];
                 // For phi operands: the operand from this predecessor is live out of b
@@ -70,7 +69,7 @@ void compute_liveness(Function *f) {
 
             // live_in = use(b) union (live_out - def(b))
             // We compute this by walking instructions backward
-            uint32_t *live = calloc(nw, sizeof(uint32_t));
+            uint32_t *live = arena_alloc(nw * sizeof(uint32_t));
             memcpy(live, new_out, nw * sizeof(uint32_t));
 
             // Walk instructions in reverse
@@ -118,8 +117,6 @@ void compute_liveness(Function *f) {
                 changed = 1;
             }
 
-            free(live);
-            free(new_out);
         }
     }
 }
@@ -149,17 +146,17 @@ typedef struct {
 } IGraph;
 
 static IGraph *ig_new(int nv) {
-    IGraph *g = calloc(1, sizeof(IGraph));
+    IGraph *g = arena_alloc(sizeof(IGraph));
     g->nv     = nv;
     g->nwords = bv_nwords(nv);
-    g->adj    = calloc(nv, sizeof(uint32_t *));
+    g->adj    = arena_alloc(nv * sizeof(uint32_t *));
     for (int i = 0; i < nv; i++)
-        g->adj[i] = calloc(g->nwords, sizeof(uint32_t));
-    g->degree     = calloc(nv, sizeof(int));
-    g->color      = malloc(nv * sizeof(int));
-    g->precolored = malloc(nv * sizeof(int));
-    g->spilled    = calloc(nv, sizeof(int));
-    g->alias      = malloc(nv * sizeof(int));
+        g->adj[i] = arena_alloc(g->nwords * sizeof(uint32_t));
+    g->degree     = arena_alloc(nv * sizeof(int));
+    g->color      = arena_alloc(nv * sizeof(int));
+    g->precolored = arena_alloc(nv * sizeof(int));
+    g->spilled    = arena_alloc(nv * sizeof(int));
+    g->alias      = arena_alloc(nv * sizeof(int));
     for (int i = 0; i < nv; i++) {
         g->color[i]      = -1;
         g->precolored[i] = -1;
@@ -169,14 +166,7 @@ static IGraph *ig_new(int nv) {
 }
 
 static void ig_free(IGraph *g) {
-    for (int i = 0; i < g->nv; i++) free(g->adj[i]);
-    free(g->adj);
-    free(g->degree);
-    free(g->color);
-    free(g->precolored);
-    free(g->spilled);
-    free(g->alias);
-    free(g);
+    (void)g; // arena-allocated; nothing to free
 }
 
 static void ig_add_edge(IGraph *g, int u, int v) {
@@ -324,7 +314,7 @@ static IGraph *build_interference_graph(Function *f) {
         int nw = b->nwords;
 
         // Start with live_out, walk backward
-        uint32_t *live = calloc(nw, sizeof(uint32_t));
+        uint32_t *live = arena_alloc(nw * sizeof(uint32_t));
         memcpy(live, b->live_out, nw * sizeof(uint32_t));
 
         // Also add phi defs of successors' phis to live_out
@@ -373,7 +363,6 @@ static IGraph *build_interference_graph(Function *f) {
                     bv_set(live, v->id);
             }
         }
-        free(live);
     }
 
     return g;
@@ -385,10 +374,10 @@ static int assign_colors(IGraph *g, Function *f, int K,
                           int *call_site_live_any) {
     // Simplification order: build a stack using degree < K heuristic
     int nv = g->nv;
-    int *stack    = malloc(nv * sizeof(int));
+    int *stack    = arena_alloc(nv * sizeof(int));
     int  stack_top = 0;
-    int *removed  = calloc(nv, sizeof(int));
-    int *degree   = malloc(nv * sizeof(int));
+    int *removed  = arena_alloc(nv * sizeof(int));
+    int *degree   = arena_alloc(nv * sizeof(int));
     memcpy(degree, g->degree, nv * sizeof(int));
 
     // Worklist: all non-precolored, non-aliased values participate in simplify
@@ -529,10 +518,6 @@ static int assign_colors(IGraph *g, Function *f, int K,
         }
     }
 
-    free(stack);
-    free(removed);
-    free(degree);
-
     // Check if any spills occurred
     for (int i = 0; i < nv; i++) {
         if (g->spilled[i]) return 0;
@@ -590,8 +575,7 @@ static void rewrite_spills(Function *f, IGraph *g) {
     int nv = g->nv;
 
     // Assign spill slots
-    int *spill_offset = malloc(nv * sizeof(int));
-    for (int i = 0; i < nv; i++) spill_offset[i] = 0;
+    int *spill_offset = arena_alloc(nv * sizeof(int));
 
     for (int i = 0; i < nv; i++) {
         if (!g->spilled[i]) continue;
@@ -649,7 +633,6 @@ static void rewrite_spills(Function *f, IGraph *g) {
         }
     }
 
-    free(spill_offset);
 }
 
 // ============================================================
@@ -754,11 +737,11 @@ void irc_allocate(Function *f) {
 
     // Compute call-site liveness (which values are live at any call)
     int nv = f->nvalues;
-    int *call_site_live = calloc(nv, sizeof(int));
+    int *call_site_live = arena_alloc(nv * sizeof(int));
     for (int bi = 0; bi < f->nblocks; bi++) {
         Block *b = f->blocks[bi];
         int nw = b->nwords;
-        uint32_t *live = calloc(nw, sizeof(uint32_t));
+        uint32_t *live = arena_alloc(nw * sizeof(uint32_t));
         memcpy(live, b->live_out, nw * sizeof(uint32_t));
         for (Inst *inst = b->tail; inst; inst = inst->prev) {
             if (inst->kind == IK_CALL || inst->kind == IK_ICALL) {
@@ -780,7 +763,6 @@ void irc_allocate(Function *f) {
                     bv_set(live, v->id);
             }
         }
-        free(live);
     }
 
     // Iterate until no spills
@@ -816,26 +798,19 @@ void irc_allocate(Function *f) {
         // Rewrite spills and try again
         rewrite_spills(f, g);
 
-        // Re-run liveness on the expanded function
-        // Free old liveness data
-        for (int bi = 0; bi < f->nblocks; bi++) {
-            Block *b = f->blocks[bi];
-            free(b->live_in);  b->live_in  = NULL;
-            free(b->live_out); b->live_out = NULL;
-        }
+        // Re-run liveness on the expanded function (old live_in/live_out stay in arena)
         compute_liveness(f);
 
         ig_free(g);
 
-        // Reassign call_site_live for expanded function
-        free(call_site_live);
+        // Reassign call_site_live for expanded function (fresh arena allocation)
         nv = f->nvalues;
-        call_site_live = calloc(nv, sizeof(int));
+        call_site_live = arena_alloc(nv * sizeof(int));
         // (simplified: just re-run the call site scan)
         for (int bi = 0; bi < f->nblocks; bi++) {
             Block *b = f->blocks[bi];
             int nw = b->nwords;
-            uint32_t *live = calloc(nw, sizeof(uint32_t));
+            uint32_t *live = arena_alloc(nw * sizeof(uint32_t));
             memcpy(live, b->live_out, nw * sizeof(uint32_t));
             for (Inst *inst = b->tail; inst; inst = inst->prev) {
                 if (inst->kind == IK_CALL || inst->kind == IK_ICALL) {
@@ -857,9 +832,6 @@ void irc_allocate(Function *f) {
                         bv_set(live, v->id);
                 }
             }
-            free(live);
         }
     }
-
-    free(call_site_live);
 }

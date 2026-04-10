@@ -1,6 +1,6 @@
-#include <stdlib.h>
 #include <string.h>
 #include "dom.h"
+#include "smallcc.h"
 
 // ============================================================
 // RPO computation (DFS-based)
@@ -100,7 +100,6 @@ static void build_dom_children(Function *f, Block **rpo, int nrpo) {
     // Count children for each block
     for (int i = 0; i < f->nblocks; i++) {
         f->blocks[i]->ndom_children = 0;
-        free(f->blocks[i]->dom_children);
         f->blocks[i]->dom_children = NULL;
     }
 
@@ -112,7 +111,7 @@ static void build_dom_children(Function *f, Block **rpo, int nrpo) {
     for (int i = 0; i < nrpo; i++) {
         Block *b = rpo[i];
         if (b->ndom_children > 0)
-            b->dom_children = malloc(b->ndom_children * sizeof(Block *));
+            b->dom_children = arena_alloc(b->ndom_children * sizeof(Block *));
         b->ndom_children = 0; // reset for fill pass
     }
 
@@ -176,7 +175,7 @@ static void mark_loop_depth(Block **rpo, int nrpo) {
 void compute_dominators(Function *f) {
     if (f->nblocks == 0) return;
 
-    Block **rpo = malloc(f->nblocks * sizeof(Block *));
+    Block **rpo = arena_alloc(f->nblocks * sizeof(Block *));
     int nrpo = build_rpo(f, rpo);
 
     // Clear idom for all blocks
@@ -191,6 +190,4 @@ void compute_dominators(Function *f) {
     dom_dfs(rpo[0]);
 
     mark_loop_depth(rpo, nrpo);
-
-    free(rpo);
 }

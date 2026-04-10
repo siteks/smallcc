@@ -136,7 +136,7 @@ Per-TU loop [smallcc.c] (lib TUs first, then user TUs):
 | `braun.h` / `braun.c` | Braun SSA construction from Sexp AST; handles for/do/while/goto/label; call result landing+copy pattern |
 | `dom.h` / `dom.c` | Dominator tree (Cooper 2001); loop depth; `compute_dominators`; `dominates` query |
 | `oos.h` / `oos.c` | Out-of-SSA: Boissinot 2009 parallel-copy insertion; swap cycle detection |
-| `alloc.h` / `alloc.c` | Liveness analysis + IRC register allocation (Appel & George 1996); K=8; spill support |
+| `alloc.h` / `alloc.c` | Liveness analysis + IRC register allocation (Appel & George 1996); K=8; George coalescing (with same-color precolored guard); spill support |
 | `emit.h` / `emit.c` | CPU4 emission: `emit_globals` (data section) + `emit_function` (text section); F2 bp-rel selection; callee-save prologue/epilogue |
 | `sim_c.c` | Primary simulator — self-contained C assembler + CPU3/CPU4 executor; `make sim_c` |
 | `cpu3/cpu.py` | Python CPU3 definition: `ptable` (opcode/format map) + execution handler |

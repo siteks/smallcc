@@ -13,24 +13,7 @@ static const char *regname(int r) {
     return "??";
 }
 
-// Physical registers live at the end of the current block being emitted.
-// Set by emit_function before emitting each block's instructions.
-static unsigned g_block_live_out_regs = 0;
 static const char *g_cur_func_name = "";
-
-// Return a bitmask of physical registers that are read by instructions
-// AFTER inst (within the same block).
-static unsigned upcoming_reads(Inst *inst) {
-    unsigned mask = 0;
-    for (Inst *nx = inst->next; nx; nx = nx->next) {
-        for (int i = 0; i < nx->nops; i++) {
-            Value *v = val_resolve(nx->ops[i]);
-            if (v && v->kind == VAL_INST && v->phys_reg >= 0)
-                mask |= (1u << v->phys_reg);
-        }
-    }
-    return mask;
-}
 
 // Pick a scratch register that is not in forbidden (combined already_used|blocked).
 // Falls back to r0 if nothing is clean.
@@ -40,13 +23,6 @@ static int pick_scratch(unsigned already_used, unsigned forbidden) {
             return r;
     }
     return 0; // fallback
-}
-
-// Pick a scratch register safe for constant materialisation:
-// avoids registers live at block exit AND upcoming within-block reads.
-static int pick_safe_scratch(unsigned also_avoid, Inst *inst) {
-    unsigned forbidden = g_block_live_out_regs | upcoming_reads(inst) | also_avoid;
-    return pick_scratch(0, forbidden);
 }
 
 // Get the physical register for a value (must be allocated)
@@ -561,10 +537,8 @@ static void emit_inst(Inst *inst, FILE *out) {
         if (!inst->fname) break;
         int is_var = inst->calldesc && inst->calldesc->is_variadic;
         if (is_var) {
-            // Variadic call: use stack ABI — push all args right-to-left.
-            // CPU4 push is 32-bit (4 bytes per slot); callee reads at bp+4, bp+8, ...
-            // Compute mask of all registers holding non-const args; consts get a
-            // scratch register that doesn't alias any pending arg register.
+            // Variadic: push all args right-to-left (stack ABI).
+            // Compute mask of all registers holding non-const args.
             unsigned arg_regs = 0;
             for (int ai = 0; ai < inst->nops; ai++) {
                 Value *av = val_resolve(inst->ops[ai]);
@@ -574,220 +548,77 @@ static void emit_inst(Inst *inst, FILE *out) {
             for (int ai = inst->nops - 1; ai >= 0; ai--) {
                 Value *av = val_resolve(inst->ops[ai]);
                 if (av && av->kind == VAL_CONST) {
-                    // Use a scratch not in arg_regs to avoid clobbering live args.
                     int sc = pick_scratch(0, arg_regs);
-                    if (sc < 0) sc = 0;  // fallback (should not happen for ≤8 args)
                     emit_const_into(out, av, sc);
-                    fprintf(out, "    pushr %s\n", regname(sc));  // 4-byte push
+                    fprintf(out, "    pushr %s\n", regname(sc));
                 } else {
                     int ar = av ? preg(av) : -1;
-                    if (ar >= 0) fprintf(out, "    pushr %s\n", regname(ar));  // 4-byte push
+                    if (ar >= 0) fprintf(out, "    pushr %s\n", regname(ar));
                 }
             }
             fprintf(out, "    jl %s\n", inst->fname);
             if (inst->nops > 0) fprintf(out, "    adjw %d\n", inst->nops * 4);
         } else {
-            // Non-variadic: register ABI — args 0-2 in r1-r3 (caller-saved); args 3+ on stack.
-            // Using only caller-saved registers avoids clobbering the caller's callee-saved
-            // values (r4-r7) which the caller may hold as long-lived variables.
-            int nreg  = inst->nops < 3 ? inst->nops : 3;
+            // Non-variadic: register args (ops[0..nreg-1]) are pre-colored to r1..r3
+            // by IK_COPY instructions inserted by emit_reg_arg_copies in braun.c.
+            // IRC's interference analysis guarantees sequential emission is cycle-free.
+            int nreg   = inst->nops < 3 ? inst->nops : 3;
             int nextra = inst->nops > 3 ? inst->nops - 3 : 0;
-            // Compute mask of registers holding the first nreg args (to avoid
-            // clobbering them when materializing constants for stack args).
-            unsigned reg_arg_mask = 0;
-            for (int ai = 0; ai < nreg; ai++) {
+            // Compute mask of all registers holding extra (stack) args, plus r1/r2/r3.
+            unsigned extra_avoid = 0x0e; // r1|r2|r3 always off-limits for scratch
+            for (int ai = nreg; ai < inst->nops; ai++) {
                 Value *av = val_resolve(inst->ops[ai]);
                 if (av && av->kind == VAL_INST && av->phys_reg >= 0)
-                    reg_arg_mask |= (1u << av->phys_reg);
+                    extra_avoid |= (1u << av->phys_reg);
             }
-            // Push extra args in reverse order
-            for (int ai = inst->nops - 1; ai >= 3; ai--) {
+            // Push extra stack args right-to-left
+            for (int ai = inst->nops - 1; ai >= nreg; ai--) {
                 Value *av = val_resolve(inst->ops[ai]);
-                int ar = av ? (av->kind == VAL_CONST ? -1 : preg(av)) : -1;
                 if (av && av->kind == VAL_CONST) {
-                    // Pick a scratch that doesn't hold a live register arg.
-                    int sc = pick_scratch(0, reg_arg_mask);
+                    int sc = pick_scratch(0, extra_avoid);
                     emit_const_into(out, av, sc);
                     fprintf(out, "    pushr %s\n", regname(sc));
-                } else if (ar >= 0) {
-                    fprintf(out, "    pushr %s\n", regname(ar));
-                }
-            }
-            // Set up register args in r1..r(nreg): parallel-copy to handle swap cycles.
-            // Collect reg-to-reg moves (constants handled separately at end).
-            int mv_src[8], mv_dst[8], mv_done[8], nmv = 0;
-            int const_target[8], const_val[8], nconst = 0;
-            for (int ai = 0; ai < nreg; ai++) {
-                Value *av = val_resolve(inst->ops[ai]);
-                int target = ai + 1;
-                if (!av) continue;
-                if (av->kind == VAL_CONST) {
-                    const_target[nconst] = target;
-                    const_val[nconst]    = av->iconst;
-                    nconst++;
                 } else {
-                    int s = preg(av);
-                    mv_src[nmv] = s; mv_dst[nmv] = target;
-                    mv_done[nmv] = (s == target) ? 1 : 0;
-                    nmv++;
+                    int ar = av ? preg(av) : -1;
+                    if (ar >= 0) fprintf(out, "    pushr %s\n", regname(ar));
                 }
-            }
-            // Phase 1: emit moves where dst is not a pending source (cycle-free).
-            int progress = 1;
-            while (progress) {
-                progress = 0;
-                for (int i = 0; i < nmv; i++) {
-                    if (mv_done[i]) continue;
-                    int blocked = 0;
-                    for (int j = 0; j < nmv; j++) {
-                        if (!mv_done[j] && j != i && mv_src[j] == mv_dst[i]) { blocked=1; break; }
-                    }
-                    if (!blocked) {
-                        fprintf(out, "    or %s, %s, %s\n", regname(mv_dst[i]), regname(mv_src[i]), regname(mv_src[i]));
-                        mv_done[i] = 1; progress = 1;
-                    }
-                }
-            }
-            // Phase 2: break remaining cycles using XOR swap (no scratch register needed).
-            for (int i = 0; i < nmv; i++) {
-                if (mv_done[i]) continue;
-                int buf = mv_src[i];
-                mv_done[i] = 1;
-                int cur_target = mv_dst[i];
-                while (cur_target != buf) {
-                    // XOR swap: buf gets cur_target's old value; cur_target gets old buf value.
-                    fprintf(out, "    xor %s, %s, %s\n", regname(buf), regname(buf), regname(cur_target));
-                    fprintf(out, "    xor %s, %s, %s\n", regname(cur_target), regname(cur_target), regname(buf));
-                    fprintf(out, "    xor %s, %s, %s\n", regname(buf), regname(buf), regname(cur_target));
-                    int found = -1;
-                    for (int j = 0; j < nmv; j++) {
-                        if (!mv_done[j] && mv_src[j] == cur_target) { found = j; break; }
-                    }
-                    if (found < 0) break;
-                    mv_done[found] = 1;
-                    cur_target = mv_dst[found];
-                }
-                // When cur_target == buf: buf already holds the correct value for its slot.
-            }
-            // Phase 3: load constants into their targets (after all reg moves).
-            for (int ci = 0; ci < nconst; ci++) {
-                emit_imm(out, const_target[ci], const_val[ci]);
             }
             fprintf(out, "    jl %s\n", inst->fname);
             if (nextra > 0) fprintf(out, "    adjw %d\n", nextra * 4);
         }
-        // Result in r0; if dst phys_reg != 0, copy
         if (dst && preg(dst) != 0)
             fprintf(out, "    or %s, r0, r0\n", regname(preg(dst)));
         break;
     }
 
     case IK_ICALL: {
-        // indirect call: ops[0] = function pointer; ops[1..] = args
-        // ABI: args in r1..r3 (caller-saved); fp called via jlr rd; args 3+ on stack.
+        // ops[0] = fp (pre-colored r0 by IK_COPY in braun.c)
+        // ops[1..nreg] = pre-colored reg args (r1..r3)
+        // ops[nreg+1..] = extra stack args
         if (inst->nops < 1) break;
         int nreg   = (inst->nops - 1) < 3 ? (inst->nops - 1) : 3;
         int nextra = (inst->nops - 1) > 3 ? (inst->nops - 1) - 3 : 0;
-        int fp_reg = get_val_reg(out, inst->ops[0], 7);
-        int fp_on_stack = 0;
-
-        // Compute mask of registers currently holding register args (ops[1..nreg]).
-        unsigned icall_arg_mask = 0;
-        for (int ai = 0; ai < nreg; ai++) {
-            Value *av = val_resolve(inst->ops[ai + 1]);
+        // Compute mask of registers holding extra args, plus r0/r1/r2/r3.
+        unsigned extra_avoid = 0x0f; // r0|r1|r2|r3 always off-limits for scratch
+        for (int ai = nreg + 1; ai < inst->nops; ai++) {
+            Value *av = val_resolve(inst->ops[ai]);
             if (av && av->kind == VAL_INST && av->phys_reg >= 0)
-                icall_arg_mask |= (1u << av->phys_reg);
+                extra_avoid |= (1u << av->phys_reg);
         }
-
-        // Push extra stack args first (reverse order), using a scratch that avoids
-        // clobbering registers holding the first nreg args.
-        for (int ai = inst->nops - 2; ai >= 3; ai--) {
-            Value *av = val_resolve(inst->ops[ai + 1]);
+        // Push extra stack args right-to-left
+        for (int ai = inst->nops - 1; ai > nreg; ai--) {
+            Value *av = val_resolve(inst->ops[ai]);
             if (av && av->kind == VAL_CONST) {
-                int sc = pick_scratch(0, icall_arg_mask);
-                emit_imm(out, sc, av->iconst);
+                int sc = pick_scratch(0, extra_avoid);
+                emit_const_into(out, av, sc);
                 fprintf(out, "    pushr %s\n", regname(sc));
             } else {
                 int ar = av ? preg(av) : -1;
                 if (ar >= 0) fprintf(out, "    pushr %s\n", regname(ar));
             }
         }
-
-        // If fp is in r1..r(nreg), it will be overwritten by the arg setup.
-        // Find a safe register to hold fp, or spill to the stack.
-        if (fp_reg >= 1 && fp_reg <= nreg) {
-            // Forbidden: arg destinations (r1..rnreg), arg sources, live-out / upcoming reads.
-            unsigned forbidden = nreg < 8 ? (((1u << nreg) - 1) << 1) : 0xfeu;
-            forbidden |= icall_arg_mask;
-            int safe = pick_safe_scratch(forbidden, inst);
-            if (forbidden & (1u << safe)) {
-                // No free register: push fp to stack now (on top of extra args).
-                // After the parallel copy, pop it into r0 (which is free post-copy).
-                fprintf(out, "    pushr %s\n", regname(fp_reg));
-                fp_on_stack = 1;
-                fp_reg = 0;  // placeholder; actual value restored via popr r0 below
-            } else {
-                fprintf(out, "    or %s, %s, %s\n", regname(safe), regname(fp_reg), regname(fp_reg));
-                fp_reg = safe;
-            }
-        }
-
-        // Move args into r1..r(nreg): parallel-copy to handle swap cycles.
-        {
-            int mv_src[8], mv_dst[8], mv_done[8], nmv = 0;
-            int const_target[8], const_val[8], nconst = 0;
-            for (int ai = 0; ai < nreg; ai++) {
-                Value *av = val_resolve(inst->ops[ai + 1]);
-                int target = ai + 1;
-                if (!av) continue;
-                if (av->kind == VAL_CONST) {
-                    const_target[nconst] = target; const_val[nconst] = av->iconst; nconst++;
-                } else {
-                    int s = preg(av);
-                    mv_src[nmv] = s; mv_dst[nmv] = target;
-                    mv_done[nmv] = (s == target) ? 1 : 0; nmv++;
-                }
-            }
-            int progress = 1;
-            while (progress) {
-                progress = 0;
-                for (int i = 0; i < nmv; i++) {
-                    if (mv_done[i]) continue;
-                    int blocked = 0;
-                    for (int j = 0; j < nmv; j++) {
-                        if (!mv_done[j] && j != i && mv_src[j] == mv_dst[i]) { blocked=1; break; }
-                    }
-                    if (!blocked) {
-                        fprintf(out, "    or %s, %s, %s\n", regname(mv_dst[i]), regname(mv_src[i]), regname(mv_src[i]));
-                        mv_done[i] = 1; progress = 1;
-                    }
-                }
-            }
-            for (int i = 0; i < nmv; i++) {
-                if (mv_done[i]) continue;
-                int buf = mv_src[i];
-                mv_done[i] = 1;
-                int cur_target = mv_dst[i];
-                while (cur_target != buf) {
-                    fprintf(out, "    xor %s, %s, %s\n", regname(buf), regname(buf), regname(cur_target));
-                    fprintf(out, "    xor %s, %s, %s\n", regname(cur_target), regname(cur_target), regname(buf));
-                    fprintf(out, "    xor %s, %s, %s\n", regname(buf), regname(buf), regname(cur_target));
-                    int found = -1;
-                    for (int j = 0; j < nmv; j++) {
-                        if (!mv_done[j] && mv_src[j] == cur_target) { found = j; break; }
-                    }
-                    if (found < 0) break;
-                    mv_done[found] = 1;
-                    cur_target = mv_dst[found];
-                }
-            }
-            for (int ci = 0; ci < nconst; ci++) emit_imm(out, const_target[ci], const_val[ci]);
-        }
-        // Restore fp from stack into r0 (r0 is free after args are in r1..r3).
-        if (fp_on_stack)
-            fprintf(out, "    popr r0\n");
-        fprintf(out, "    jlr %s\n", fp_on_stack ? "r0" : regname(fp_reg));
-        // After the call, clean up extra stack args (fp was already popped if on stack).
+        // fp is in r0 (pre-colored by IK_COPY in braun.c); jlr uses r0 implicitly
+        fprintf(out, "    jlr r0\n");
         if (nextra > 0) fprintf(out, "    adjw %d\n", nextra * 4);
         if (dst && preg(dst) != 0)
             fprintf(out, "    or %s, r0, r0\n", regname(preg(dst)));
@@ -891,16 +722,6 @@ void emit_function(Function *f, FILE *out) {
     // Emit blocks
     for (int bi = 0; bi < f->nblocks; bi++) {
         Block *b = f->blocks[bi];
-        // Compute live-out register mask for this block (used by pick_safe_scratch).
-        g_block_live_out_regs = 0;
-        if (b->live_out) {
-            for (int vi = 0; vi < f->nvalues; vi++) {
-                Value *v = f->values[vi];
-                if (v->phys_reg >= 0 &&
-                    (b->live_out[vi / 32] >> (vi % 32)) & 1)
-                    g_block_live_out_regs |= (1u << v->phys_reg);
-            }
-        }
 
         // Emit block label (skip for entry block — the function label serves)
         if (bi > 0)

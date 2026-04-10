@@ -423,20 +423,42 @@ values and `IK_PARAM 0`.
 ```
 liveness analysis (backward dataflow, bitvector per block)
     ↓
-build interference graph
-    ↓
-repeat until stable:
-    ├─ simplify   (remove non-move-related nodes of degree < K)
-    ├─ coalesce   (merge IK_COPY pairs; George criterion)
-    ├─ freeze     (give up coalescing for low-degree move-related nodes)
-    └─ spill      (select by spill_cost = use_count / (1 + loop_depth))
-    ↓
-select (assign colors; actual spills insert loads/stores and restart)
+repeat until no spills:
+    ├─ reset IK_COPY is_dead flags (re-evaluate after each spill rewrite)
+    ├─ build interference graph
+    ├─ coalesce  (George's conservative test on all IK_COPY pairs; fixpoint)
+    ├─ simplify/spill  (remove degree < K nodes; select spill candidates)
+    ├─ select  (assign colors from stack)
+    └─ if spills: rewrite_spills → recompute liveness + call_site_live → retry
 ```
 
+**Coalescing:** `coalesce_copies` runs to fixpoint over all `IK_COPY` instructions.
+For each copy `dst ← src`, after resolving canonical nodes via `ig_find`:
+- Both precolored to same register → trivially dead (mark `is_dead`)
+- Both precolored to different registers → cannot coalesce
+- Already interfere → cannot coalesce
+- Precolored node is always the "stay" side (u); free value is merged away (v)
+- Caller-saved precolored u + call-site-live v → cannot coalesce (would clobber)
+- George's test: for every neighbor t of v not already adjacent to u,
+  either `degree[t] < K` (safe) **and** t is not precolored to the same register as u
+  (a non-obvious extra guard: two same-color precolored nodes cannot both be
+  "safely below K" for a new neighbor, since that would assign the same register
+  to two interfering values).
+
+**Freeze** is not implemented: move-related nodes that fail coalescing are treated
+as ordinary nodes during simplify. This foregoes a few additional coalescing
+opportunities but keeps the implementation simple.
+
+**IGraph internals:**
+- `alias[]` — union-find array; `alias[v] = v` initially; `ig_merge` sets `alias[v] = u`
+- `ig_find(g, v)` — path-compressed canonical lookup
+- `ig_merge(g, u, v)` — redirects all of v's edges to u, clears v's row
+- Aliased nodes are marked `removed` in `assign_colors` and skipped during simplify/spill;
+  after stack-coloring, their color is propagated from their canonical
+
 **Output:** `Value.phys_reg` set for all live values (0–7). Coalesced `IK_COPY`
-instructions removed. Spill loads/stores inserted. `Value.spill_slot` set for spilled
-values.
+instructions removed (marked `is_dead`). Spill loads/stores inserted.
+`Value.spill_slot` set for spilled values.
 
 ---
 
@@ -517,7 +539,7 @@ or lowered to libcalls if needed. The target ISA has native float instructions.
 | **Braun SSA** | `braun.c` | ✅ | Braun 2013; for/do/while/goto native; call landing+copy |
 | **dominator tree** | `dom.c` | ✅ | Cooper 2001; loop_depth |
 | **out-of-SSA** | `oos.c` | ✅ | Boissinot 2009 parallel copies |
-| **IRC** | `alloc.c` | ✅ | Appel & George 1996; K=8; spill support |
+| **IRC** | `alloc.c` | ✅ | Appel & George 1996; K=8; George coalescing; spill support |
 | **emission** | `emit.c` | ✅ | CPU4 assembly; F2 bp-rel selection; callee-save handling |
 | Regime 1 optimisations | — | ❌ | const-fold, CSE etc. — not yet implemented |
 | Regime 2 optimisations | — | ❌ | SCCP, DCE, LICM, GVN — not yet implemented |

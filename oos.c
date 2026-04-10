@@ -1,6 +1,6 @@
-#include <stdlib.h>
 #include <string.h>
 #include "ssa.h"
+#include "smallcc.h"
 
 /*
  * oos.c — Out-of-SSA via parallel-copy insertion (Boissinot et al. 2009)
@@ -32,8 +32,11 @@ typedef struct {
 
 static void pcs_add(PCopySet *s, Value *dst, Value *src) {
     if (s->n >= s->cap) {
-        s->cap = s->cap ? s->cap * 2 : 8;
-        s->copies = realloc(s->copies, s->cap * sizeof(PCopy));
+        int nc = s->cap ? s->cap * 2 : 8;
+        PCopy *nc_arr = arena_alloc(nc * sizeof(PCopy));
+        memcpy(nc_arr, s->copies, s->n * sizeof(PCopy));
+        s->copies = nc_arr;
+        s->cap = nc;
     }
     s->copies[s->n].dst = dst;
     s->copies[s->n].src = src;
@@ -113,11 +116,11 @@ static void sequentialize_copies(Block *b, PCopySet *s, Function *f) {
     s->n = n;
     if (n == 0) return;
 
-    int *done = calloc(n, sizeof(int));
+    int *done = arena_alloc(n * sizeof(int));
 
     // For each copy, check if its dst appears as a src anywhere
     // ready[i] = 1 if copy i can be emitted now (dst not used as src)
-    int *ready = calloc(n, sizeof(int));
+    int *ready = arena_alloc(n * sizeof(int));
 
     for (int i = 0; i < n; i++) {
         int used_as_src = 0;
@@ -181,8 +184,6 @@ static void sequentialize_copies(Block *b, PCopySet *s, Function *f) {
         }
     }
 
-    free(done);
-    free(ready);
 }
 
 // ============================================================
@@ -286,7 +287,7 @@ void out_of_ssa(Function *f) {
         if (nphi == 0) continue;
 
         // For each predecessor, build a parallel copy set
-        PCopySet *pred_copies = calloc(b->npreds, sizeof(PCopySet));
+        PCopySet *pred_copies = arena_alloc(b->npreds * sizeof(PCopySet));
 
         for (Inst *inst = b->head; inst; inst = inst->next) {
             if (inst->kind != IK_PHI) continue;
@@ -298,11 +299,8 @@ void out_of_ssa(Function *f) {
         }
 
         // Sequentialize and insert copies for each predecessor
-        for (int k = 0; k < b->npreds; k++) {
+        for (int k = 0; k < b->npreds; k++)
             sequentialize_copies(b->preds[k], &pred_copies[k], f);
-            free(pred_copies[k].copies);
-        }
-        free(pred_copies);
     }
 
     // Now remove all IK_PHI instructions
