@@ -525,6 +525,7 @@ static Value *insert_spill_addr(Function *f, Block *b, Inst *anchor, int slot_of
     Value *addr  = new_value(f, VAL_INST, VT_PTR);
     Inst  *la    = new_inst(f, b, IK_ADDR, addr);
     la->imm      = slot_offset;
+    la->line     = anchor->line;
     la->block    = b;
     la->prev     = anchor->prev;
     la->next     = anchor;
@@ -544,6 +545,7 @@ static Value *insert_spill_load(Function *f, Block *b, Inst *before,
     Value *tmp  = new_value(f, VAL_INST, spilled_val->vtype);
     Inst  *load = new_inst(f, b, IK_LOAD, tmp);
     load->size  = sz;
+    if (before) load->line = before->line;
 
     // Insert before 'before' first (sets load->block, prev/next)
     load->block = b;
@@ -579,6 +581,7 @@ static void insert_spill_store(Function *f, Block *b, Inst *after,
     Inst *store  = new_inst(f, b, IK_STORE, NULL);
     store->size  = sz;
     store->block = b;
+    if (after) store->line = after->line;
 
     // Link after 'after' first
     if (!after) {

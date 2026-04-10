@@ -61,6 +61,7 @@ static void insert_copy_before_terminator(Block *b, Value *dst, Value *src) {
 
     // Insert before terminator
     Inst *term = b->tail;
+    if (term) copy->line = term->line;
     if (!term) {
         inst_append(b, copy);
         return;

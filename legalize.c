@@ -37,6 +37,7 @@ void legalize_function(Function *f) {
                 Value *v_ri = new_value(f, VAL_INST, arg->vtype);
                 v_ri->phys_reg = i + 1;  // r1, r2, r3
                 Inst  *cp = new_inst(f, b, IK_COPY, v_ri);
+                cp->line = inst->line;
                 inst_add_op(cp, arg);
                 inst_insert_before(inst, cp);
                 inst->ops[arg_base + i] = v_ri;
@@ -49,6 +50,7 @@ void legalize_function(Function *f) {
                     Value *v_r0 = new_value(f, VAL_INST, fp->vtype);
                     v_r0->phys_reg = 0;  // r0 for jlr
                     Inst  *fp_cp = new_inst(f, b, IK_COPY, v_r0);
+                    fp_cp->line = inst->line;
                     inst_add_op(fp_cp, fp);
                     inst_insert_before(inst, fp_cp);
                     inst->ops[0] = v_r0;
@@ -72,6 +74,7 @@ void legalize_function(Function *f) {
             Value *zero_v = new_value(f, VAL_INST, inst->dst->vtype);
             Inst  *zero_i = new_inst(f, b, IK_CONST, zero_v);
             zero_i->imm   = 0;
+            zero_i->line  = inst->line;
             inst_insert_before(inst, zero_i);
 
             Value  *src      = inst->ops[0];
@@ -116,6 +119,7 @@ void legalize_function(Function *f) {
             Value *mask_v = new_value(f, VAL_INST, VT_I16);
             Inst  *mask_i = new_inst(f, b, IK_CONST, mask_v);
             mask_i->imm   = mask_val;
+            mask_i->line  = inst->line;
             inst_insert_before(inst, mask_i);
 
             // Replace the ZEXT/TRUNC in-place with IK_AND(src, mask)
