@@ -218,6 +218,19 @@ static const char *alu_mnemonic(InstKind k, int is_signed) {
     }
 }
 
+// Map fuseable comparison kind to F3b branch mnemonic (P5 compare+branch fusion)
+static const char *fused_branch_mnemonic(InstKind kind) {
+    switch (kind) {
+    case IK_EQ:  return "beq";
+    case IK_NE:  return "bne";
+    case IK_LT:  return "blts";
+    case IK_LE:  return "bles";
+    case IK_ULT: return "blt";
+    case IK_ULE: return "ble";
+    default:     return NULL;
+    }
+}
+
 // ============================================================
 // Emit one instruction
 // ============================================================
@@ -286,6 +299,31 @@ static void emit_inst(Inst *inst, FILE *out) {
         // p0/p1: physical register of each operand (-1 if operand is const)
         int p0 = c0 ? -1 : (op0 ? preg(op0) : rd);
         int p1 = c1 ? -1 : (op1 ? preg(op1) : rd);
+
+        // P2/P3/P4: compact encoding for ADD/SUB with exactly one const operand
+        if ((inst->kind == IK_ADD || inst->kind == IK_SUB) && (c0 ^ c1)) {
+            int k = 0, ps = -1, ok = 1;
+            if (inst->kind == IK_ADD) {
+                // ADD is commutative: either operand can be the constant
+                k  = c1 ? op1->iconst : op0->iconst;
+                ps = c1 ? p0 : p1;
+            } else {
+                // IK_SUB: only optimise when ops[1] is the constant
+                // rd = p0 - k  →  rd = p0 + (-k), use addli rd, p0, -k
+                if (!c1) { ok = 0; }
+                else { k = -op1->iconst; ps = p0; }
+            }
+            if (ok) {
+                if (k == 1 && ps == rd)
+                    { fprintf(out, "    inc %s\n", regname(rd)); break; }
+                if (k == -1 && ps == rd)
+                    { fprintf(out, "    dec %s\n", regname(rd)); break; }
+                if (k >= -64 && k <= 63 && ps == rd)
+                    { fprintf(out, "    addi %s, %d\n", regname(rd), k); break; }
+                if (k >= -512 && k <= 511)
+                    { fprintf(out, "    addli %s, %s, %d\n", regname(rd), regname(ps), k); break; }
+            }
+        }
 
         if (!c0 && !c1) {
             // Both VAL_INST: straightforward three-register emit.
@@ -668,6 +706,12 @@ static void emit_inst(Inst *inst, FILE *out) {
 // emit_function
 // ============================================================
 
+typedef struct {
+    int         fused;   // 1 if this block's branch was fused with its comparison
+    const char *mnem;    // F3b branch mnemonic (beq/bne/blt/ble/blts/bles)
+    int         p0, p1;  // physical registers of the two comparison operands
+} BranchFuse;
+
 void emit_function(Function *f, FILE *out) {
     if (!f || f->nblocks == 0) return;
 
@@ -717,6 +761,33 @@ void emit_function(Function *f, FILE *out) {
         }
     }
 
+    // P5 pre-pass: detect comparison+branch pairs that can be fused into a single
+    // F3b branch instruction (beq/bne/blt/ble/blts/bles ra, rb, label).
+    // Criteria: tail is IK_BR, condition has use_count==1, defining instruction
+    // is a supported comparison in the same block, both operands have phys regs.
+    BranchFuse *fuse = arena_alloc(f->nblocks * sizeof(BranchFuse));
+    memset(fuse, 0, f->nblocks * sizeof(BranchFuse));
+    for (int fbi = 0; fbi < f->nblocks; fbi++) {
+        Block *fb  = f->blocks[fbi];
+        Inst  *term = fb->tail;
+        if (!term || term->kind != IK_BR || term->nops < 1) continue;
+        Value *cond = val_resolve(term->ops[0]);
+        if (!cond || cond->kind != VAL_INST || cond->use_count != 1) continue;
+        Inst *def = cond->def;
+        if (!def || def->block != fb || def->is_dead || def->nops < 2) continue;
+        const char *mnem = fused_branch_mnemonic(def->kind);
+        if (!mnem) continue;
+        Value *dop0 = def->ops[0] ? val_resolve(def->ops[0]) : NULL;
+        Value *dop1 = def->ops[1] ? val_resolve(def->ops[1]) : NULL;
+        if (!dop0 || dop0->kind != VAL_INST || dop0->phys_reg < 0) continue;
+        if (!dop1 || dop1->kind != VAL_INST || dop1->phys_reg < 0) continue;
+        def->is_dead     = 1;
+        fuse[fbi].fused  = 1;
+        fuse[fbi].mnem   = mnem;
+        fuse[fbi].p0     = dop0->phys_reg;
+        fuse[fbi].p1     = dop1->phys_reg;
+    }
+
     // Emit blocks
     int ann_prev_line = 0;
     for (int bi = 0; bi < f->nblocks; bi++) {
@@ -753,6 +824,26 @@ void emit_function(Function *f, FILE *out) {
                 }
                 // 3. ret
                 fprintf(out, "    ret\n");
+            } else if (inst->kind == IK_BR && !inst->is_dead && inst->nops >= 1) {
+                // P1 + P5: branch-to-next elimination and compare+branch fusion
+                Block *next_blk = (bi + 1 < f->nblocks) ? f->blocks[bi + 1] : NULL;
+                if (fuse[bi].fused) {
+                    // P5: fused compare+branch — single F3b instruction
+                    if (inst->target)
+                        fprintf(out, "    %s %s, %s, _%s_B%d\n",
+                                fuse[bi].mnem,
+                                regname(fuse[bi].p0), regname(fuse[bi].p1),
+                                f->name, inst->target->id);
+                } else {
+                    // Standard: jnz cond, T_label
+                    int r1 = get_val_reg(out, inst->ops[0], 0);
+                    if (inst->target)
+                        fprintf(out, "    jnz %s, _%s_B%d\n",
+                                regname(r1), f->name, inst->target->id);
+                }
+                // P1: omit j F when F is the immediately following block
+                if (inst->target2 && inst->target2 != next_blk)
+                    fprintf(out, "    j _%s_B%d\n", f->name, inst->target2->id);
             } else {
                 emit_inst(inst, out);
             }
