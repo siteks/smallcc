@@ -1,14 +1,14 @@
 # Target ISA: CPU4
 
 A custom 32-bit RISC-like machine with a dense variable-width encoding. Simulated by
-`sim_c` (fast C simulator supporting both CPU3 and CPU4 ISAs) and `cpu4/sim.py` (Python
-reference implementation). The canonical reference is `cpu4/cpu.py`.
+`sim_c` (fast C simulator) and `cpu4/sim.py` (Python reference implementation). The
+canonical reference is `cpu4/cpu.py`.
 
 ## Registers
 
 | Register | Width | Role |
 |---|---|---|
-| `r0`–`r7` | 32-bit | General-purpose; r0 is the return value and implicit operand for some F0/F3a ops |
+| `r0`–`r7` | 32-bit | General-purpose; r0 is the return value |
 | `r0` | 32-bit | Accumulator and function return value |
 | `r1`–`r3` | 32-bit | Scratch (caller-saved); available for register allocation |
 | `r4`–`r7` | 32-bit | Callee-saved; available for register allocation; saved/restored by callees |
@@ -21,52 +21,52 @@ reference implementation). The canonical reference is `cpu4/cpu.py`.
 **Calling convention:** r0–r3 are caller-saved (a call may clobber them). r4–r7 are
 callee-saved — any function that uses them must save them on entry and restore them before
 returning. r0 holds the return value. The compiler enforces this via `insert_callee_saves`
-in `irc.c`, which inserts prologue stores and epilogue loads for r4–r7 when they are
+in `alloc.c`, which inserts prologue stores and epilogue loads for r4–r7 when they are
 assigned by the register allocator.
 
-**Alignment Requirements (CPU4 only):** `sp` and `bp` must be 32-bit aligned at all times.
-Any misaligned access (16-bit or 32-bit load/store to an odd address, or 32-bit access to an
+**Alignment Requirements:** `sp` and `bp` must be 32-bit aligned at all times. Any
+misaligned access (16-bit or 32-bit load/store to an odd address, or 32-bit access to an
 address not divisible by 4) causes an alignment exception and the simulator will terminate
-with an error. The `sim_c` simulator enforces this strictly in CPU4 mode.
+with an error.
 
-Memory is 65536 bytes. Data is little-endian. The stack starts at `sp = 0x1000` (set by `ssp`).
+Memory is 65536 bytes. Data is little-endian. The stack starts at `sp = 0xF000` (set by
+`immw r0, 0xF000; ssp r0`).
 
 ## Instruction Encoding
 
-Seven formats with variable widths (1, 2, or 3 bytes). The format is determined by the top bits
-of the first byte:
+Nine formats with variable widths (1, 2, or 3 bytes). The format is determined by the top
+bits of the first byte:
 
 | Format | Width | First-byte pattern | Used for |
 |---|---|---|---|
 | F0 | 1 byte | `00oooooo` | No-operand (64 slots) |
 | F1a | 2 bytes | `01ooooo ddd xxx yyy` | Three-register ALU (31 usable slots; `11111` is F1b escape) |
 | F1b | 2 bytes | `0111111 ddd oooooo` | One-register ops (64 slots; triggered when F1a opcode = `11111`) |
-| F2 | 2 bytes | `100 ooo xxx iiiiiii` | One reg + imm7; bp-relative load/store/addi (16 slots) |
-| F3a | 3 bytes | `1100 oooo iiiiiiiiiiiiiiii` | Zero reg + imm16 (16 slots) |
-| F3b | 3 bytes | `1101 oooo xxx yyy iiiiiiiiii` | Two reg + imm10 (16 slots) |
-| F3c | 3 bytes | `111 oo xxx iiiiiiiiiiiiiiii` | One reg + imm16 (4 slots) |
+| F2 | 2 bytes | `10 oooo xxx iiiiiii` | One reg + imm7; bp-relative load/store/addi (16 slots) |
+| F3a | 3 bytes | `11000 ooo iiiiiiiiiiiiiiii` | Zero reg + imm16 (8 slots) |
+| F3b | 3 bytes | `11001 oo ddd iiiiiiiiiiiiii` | One reg + imm14 (4 slots) |
+| F3c | 3 bytes | `1101 oooo xxx yyy iiiiiiiiii` | Two reg + imm10 (15 usable slots; `1111` is F3d escape) |
+| F3d | 3 bytes | `11011111 xxx ooo iiiiiiiiii` | One reg + imm10 (8 slots; triggered when F3c opcode = `1111`) |
+| F3e | 3 bytes | `111 oo xxx iiiiiiiiiiiiiiii` | One reg + imm16 (4 slots) |
 
 F1b is an escape from F1a: when the F1a opcode field is all-ones (`11111`), the remaining bits
-select a 1-register operation from a 64-slot space.
+select a 1-register operation from a 64-slot space. Similarly, F3d escapes from F3c when
+the F3c opcode field is `1111`.
 
 ---
 
 ## Format F0 — No Operand (1 byte)
 
-Operates on `r0` or special registers implicitly.
+Operates on special registers implicitly.
 
 | Opcode | Mnemonic | Semantics |
 |---|---|---|
 | 0x00 | `halt` | H = 1 |
-| 0x01 | `ret` | sp = bp; bp = mem32[sp]; pc = mem32[sp+4]; sp += 8 |
-| 0x02 | `itof` | r0 = float_bits(float(signed32(r0))) |
-| 0x03 | `ftoi` | r0 = int(float(r0)) truncated toward zero |
-| 0x04 | `jlr` | lr = pc; pc = r0 & 0xffff (indirect call via r0) |
-| 0x05 | `push` | sp -= 4; mem32[sp] = r0 |
-| 0x06 | `pop` | r0 = mem32[sp]; sp += 4 |
-| 0x1e | `putchar` | write chr(r0 & 0xff) to stderr; r0 unchanged |
+| 0x01 | `ret` | sp = bp; tmp = mem32[sp]; bp = tmp & 0xffff; pc = tmp >> 16; sp += 4 |
 
-*(~56 slots reserved for future hotspot encodings.)*
+`ret` unpacks the saved `(lr << 16) | bp` word written by `enter`.
+
+*(62 slots reserved for future hotspot encodings.)*
 
 ---
 
@@ -132,9 +132,9 @@ comparison directions are single instructions via operand swapping: `gt rd, rx, 
 
 ## Format F1b — Single-Register (2 bytes)
 
-`0111111 ddd oooooo` — triggered when F1a opcode field = `11111` (byte 0x7e). The `yyy`
-bits from the F1a encoding become the low 3 bits of a 6-bit opcode, giving 64 single-register
-slots.
+`0111111 ddd oooooo` — triggered when F1a opcode field = `11111` (byte 0x7e). The `ddd`
+bits encode the destination/source register. The `oooooo` bits are a 6-bit subopcode,
+giving 64 single-register slots.
 
 | Subopcode | Mnemonic | Semantics |
 |---|---|---|
@@ -144,19 +144,32 @@ slots.
 | 0x03 | `dec rd` | rd = rd − 1 |
 | 0x04 | `pushr rd` | sp -= 4; mem32[sp] = rd |
 | 0x05 | `popr rd` | rd = mem32[sp]; sp += 4 |
+| 0x06 | `zxb rd` | rd = rd & 0xff (zero-extend byte) |
+| 0x07 | `zxw rd` | rd = rd & 0xffff (zero-extend word) |
+| 0x08 | `itof rd` | rd = float_bits(float(signed32(rd))) (in-place) |
+| 0x09 | `ftoi rd` | rd = int(float(rd)) truncated toward zero (in-place) |
+| 0x0a | `jlr rd` | lr = pc; pc = rd & 0xffff (indirect call via rd) |
+| 0x0b | `jr rd` | pc = rd & 0xffff (indirect jump via rd) |
+| 0x0c | `ssp rd` | sp = rd & 0xffff (set stack pointer from register) |
+| 0x3f | `putchar rd` | write chr(rd & 0xff) to stderr; rd unchanged |
 
-*(58 slots reserved for future hotspot encodings.)*
+*(50 slots reserved for future hotspot encodings.)*
 
 `inc`/`dec` cover the K=±1 in-place case in 2 bytes, compared to 5 bytes for the general
 `immw r_tmp, 1; add rd, rd, r_tmp` sequence. They are particularly effective for loop counters
-and pointer bumps by 1. The in-place `sxb`/`sxw` cover the overwhelming majority of
-sign-extension uses; there is no separate F1a form for cross-register sign-extension.
+and pointer bumps by 1.
+
+`sxb`/`sxw` and `zxb`/`zxw` are the sign-extending and zero-extending counterparts.
+The in-place form covers the overwhelming majority of extension uses.
+
+`itof`/`ftoi`, `jlr`/`jr`, `ssp`, and `putchar` all operate on an arbitrary register
+(not just r0).
 
 ---
 
 ## Format F2 — BP-Relative Load/Store/Addi (2 bytes)
 
-`100 ooo xxx iiiiiii` — 3-bit opcode, 3-bit register (`rx`), 7-bit signed immediate.
+`10 oooo xxx iiiiiii` — 4-bit opcode, 3-bit register (`rx`), 7-bit signed immediate.
 All memory accesses are relative to `bp`. The immediate is scaled by access width.
 
 | Opcode | Mnemonic | Semantics |
@@ -170,8 +183,10 @@ All memory accesses are relative to `bp`. The immediate is scaled by access widt
 | 0x98 | `lbx rx, [bp+imm7]` | rx = sign_extend_8(mem8[bp + sext7(imm7)]) |
 | 0x9c | `lwx rx, [bp+imm7*2]` | rx = sign_extend_16(mem16[bp + sext7(imm7) × 2]) |
 | 0xa0 | `addi rx, imm7` | rx = rx + sext7(imm7) (in-place add of signed constant) |
+| 0xa4 | `shli rx, imm7` | rx = rx << (imm7 & 0x1f) (in-place shift left) |
+| 0xa8 | `andi rx, imm7` | rx = rx & sext7(imm7) (in-place bitwise AND) |
 
-*(7 slots available.)*
+*(5 slots available.)*
 
 `lbx`/`lwx` (sign-extending loads) replace the `lb`/`lbx; sxb` pair that would otherwise be
 needed for every signed `char` or `short` local read.
@@ -181,6 +196,10 @@ The scaled immediate gives `lw` a ±127-word (±254-byte) reach and `ll` a ±127
 It is particularly useful for loop counters and pointer bumps when the constant fits in 7 bits
 (−64 to +63).
 
+`shli` provides an in-place shift-left by an immediate, useful for address computation and
+power-of-2 multiplications. `andi` provides an in-place AND with a sign-extended 7-bit mask,
+useful for byte/word truncation.
+
 **Alignment requirement:** `lw`/`sw` require the effective address (`bp + imm7 × 2`) to be
 2-byte aligned; `ll`/`sl` require 4-byte alignment. This means:
 - `bp` must be 4-byte aligned (achieved by rounding the `enter N` frame size up to a multiple
@@ -188,37 +207,60 @@ It is particularly useful for loop counters and pointer bumps when the constant 
 - Individual `long`/`float` locals must be placed at 4-byte-aligned offsets within the frame
   (requires `finalize_local_offsets()` to insert alignment padding before each 4-byte local).
 
-Until both changes are in place, `ll`/`sl` for misaligned locals fall back to the 2-instruction
-`lea + lll`/`sll` sequence.
-
 ---
 
 ## Format F3a — Zero-Register + imm16 (3 bytes)
 
-`1100 oooo iiiiiiiiiiiiiiii` — 4-bit opcode, 16-bit immediate. Operates on `r0` or `pc`
-implicitly.
+`11000 ooo iiiiiiiiiiiiiiii` — 3-bit opcode, 16-bit immediate. Operates on `pc`, `sp`, `bp`,
+and `lr` implicitly.
 
 | Opcode | Mnemonic | Semantics |
 |---|---|---|
 | 0xc0 | `j imm16` | pc = imm16 |
 | 0xc1 | `jl imm16` | lr = pc; pc = imm16 (direct call) |
-| 0xc2 | `jz imm16` | if r0 == 0: pc = imm16 |
-| 0xc3 | `jnz imm16` | if r0 != 0: pc = imm16 |
-| 0xc4 | `enter imm16` | mem32[sp-4] = lr; mem32[sp-8] = bp; bp = sp-8; sp -= imm16+8 |
-| 0xc5 | `ssp imm16` | sp = imm16 (startup stack pointer) |
-| 0xc6 | `adjw imm16` | sp += sext16(imm16) |
+| 0xc2 | `enter imm14` | mem32[sp-4] = (lr << 16) \| bp; bp = sp-4; sp -= imm14+4 |
 
-*(9 slots available.)*
+*(5 slots available.)*
 
-`enter` / `ret` / `adjw` use the same frame layout as CPU3. Direct calls use `jl`; indirect
-calls through a register use `jlr` (F0).
+`enter` packs `lr` and `bp` into a single 32-bit word `(lr << 16) | bp` and saves it at
+`sp-4`. The frame pointer is set to point at this saved word, and the stack pointer is
+lowered by `imm14 + 4` bytes (4 for the saved word plus `imm14` for the local frame).
+
+**Encoding note:** `enter` uses a 14-bit immediate (not 16-bit) because 3 bits of the
+second and third bytes are reserved (same field layout as F3b). The 14-bit range (0–16383)
+is more than sufficient for any realistic stack frame.
+
+Direct calls use `jl`; indirect calls through a register use `jlr` (F1b).
 
 ---
 
-## Format F3b — Two-Register + imm10 (3 bytes)
+## Format F3b — One-Register + imm14 (3 bytes)
+
+`11001 oo ddd iiiiiiiiiiiiii` — 2-bit opcode, 3-bit register (`rd`), 14-bit immediate.
+The raw immediate is shifted left by 2 (multiplied by 4) before use, giving 4-byte-aligned
+offsets with ±32768-byte reach.
+
+| Opcode | Mnemonic | Semantics |
+|---|---|---|
+| 0xc8 | `adjw rd, imm14` | sp += sext16(imm14 << 2) |
+| 0xca | `lea rd, imm14` | rd = bp + sext16(imm14 << 2) (bp-relative address; no load) |
+
+*(2 slots available.)*
+
+`adjw` adjusts the stack pointer by a 4-byte-aligned amount. The register field is present
+in the encoding but unused by `adjw` — only `sp` is modified.
+
+`lea` computes a bp-relative address without performing a load — needed for `&local_var`,
+passing locals by pointer, and `va_start`. The 4-byte-aligned offset covers any realistic
+stack frame.
+
+---
+
+## Format F3c — Two-Register + imm10 (3 bytes)
 
 `1101 oooo xxx yyy iiiiiiiiii` — 4-bit opcode, 3-bit rx, 3-bit ry, 10-bit signed immediate.
-Memory accesses are register-relative (ry is the base; rx is source/destination).
+Memory accesses are register-relative (ry is the base; rx is source/destination). Opcode
+`1111` (0xdf) is the F3d escape.
 
 | Opcode | Mnemonic | Semantics |
 |---|---|---|
@@ -238,10 +280,8 @@ Memory accesses are register-relative (ry is the base; rx is source/destination)
 | 0xdd | `bles rx, ry, imm10` | if signed(rx) <= signed(ry): pc += sext10(imm10) |
 | 0xde | `addli rx, ry, imm10` | rx = ry + sext10(imm10) (separate source and destination) |
 
-*(1 slot available: 0xdf.)*
-
 Branch offsets are **PC-relative** — the offset is added to `pc` (which has already been
-advanced past the current instruction). `llbx`/`llwx` make F3b symmetric with F2: both
+advanced past the current instruction). `llbx`/`llwx` make F3c symmetric with F2: both
 formats provide sign-extending load variants, so a signed `char` or `short` read through any
 pointer costs one instruction regardless of whether the base is `bp` or a general register.
 
@@ -259,53 +299,68 @@ separate destination register and a wider 10-bit immediate.
 
 ---
 
-## Format F3c — One-Register + imm16 (3 bytes)
+## Format F3d — One-Register + imm10 (3 bytes)
+
+`11011111 xxx ooo iiiiiiiiii` — triggered when F3c opcode field = `1111` (byte 0xdf). The
+`xxx` bits encode the register, `ooo` is a 3-bit subopcode (8 slots), and the remaining
+10 bits are a signed immediate.
+
+| Subopcode | Mnemonic | Semantics |
+|---|---|---|
+| 0x00 | `beqz rx, imm10` | if rx == 0: pc += sext10(imm10) |
+| 0x01 | `bnez rx, imm10` | if rx != 0: pc += sext10(imm10) |
+
+*(6 slots available.)*
+
+`beqz`/`bnez` are PC-relative branches that test a single register against zero. They are
+the short-range (10-bit offset) counterpart to `jz`/`jnz` (F3e, 16-bit absolute address).
+Both test any register, not just r0.
+
+---
+
+## Format F3e — One-Register + imm16 (3 bytes)
 
 `111 oo xxx iiiiiiiiiiiiiiii` — 2-bit opcode, 3-bit register, 16-bit immediate.
 
 | Opcode | Mnemonic | Semantics |
 |---|---|---|
-| 0xe8 | `immw rd, imm16` | rd = zero_extend(imm16) |
-| 0xf0 | `immwh rd, imm16` | rd = (rd & 0xffff) \| (imm16 << 16) (load upper half) |
-| 0xf8 | `lea rd, imm16` | rd = bp + sext16(imm16) (bp-relative address; no load) |
-
-*(1 slot available.)*
+| 0xe0 | `immw rd, imm16` | rd = zero_extend(imm16) |
+| 0xe8 | `immwh rd, imm16` | rd = (rd & 0xffff) \| (imm16 << 16) (load upper half) |
+| 0xf0 | `jz rd, imm16` | if rd == 0: pc = imm16 |
+| 0xf8 | `jnz rd, imm16` | if rd != 0: pc = imm16 |
 
 **Loading a 32-bit constant:** use `immw rd, lo16` followed by `immwh rd, hi16`. The lower 16
 bits are written first (zeroing the upper half), then `immwh` fills the upper half.
 
-`lea` computes a bp-relative address without performing a load — needed for `&local_var`,
-passing locals by pointer, and `va_start`. The 16-bit signed offset covers any realistic
-stack frame.
+`jz`/`jnz` test any register (not just r0) and jump to an absolute 16-bit address. For
+short-range branches, use `beqz`/`bnez` (F3d) which are PC-relative with a 10-bit offset.
 
 ---
 
 ## Stack Frame Layout
 
-Identical to CPU3:
-
 ```
-bp+8+2*(n-1)   param n   (last parameter)
+bp+4+2*(n-1)   param n   (last parameter)
     ...
-bp+8           param 0   (first parameter)
-bp+4           return address (lr)
-bp+0           saved bp        ← enter sets bp here
+bp+4           param 0   (first parameter)
+bp+0           saved (lr<<16 | bp)   ← enter sets bp here
 bp-2           local 0
 bp-4           local 1
     ...
 ```
 
-`enter N` executes: `mem32[sp-4] = lr; mem32[sp-8] = bp; bp = sp-8; sp -= N + 8`.
-`ret` executes: `sp = bp; bp = mem32[sp]; pc = mem32[sp+4]; sp += 8`.
+`enter N` executes: `mem32[sp-4] = (lr << 16) | bp; bp = sp-4; sp -= N + 4`.
+`ret` executes: `sp = bp; tmp = mem32[sp]; bp = tmp & 0xffff; pc = tmp >> 16; sp += 4`.
 
-Locals within a compound statement are allocated with `adjw -size` on scope entry and
-reclaimed with `adjw +size` on exit.
+The saved link register and frame pointer are packed into a single 32-bit word, using only
+4 bytes of stack overhead per frame. `enter` and `ret` are inverses: `enter` packs and
+saves; `ret` loads and unpacks.
 
 ---
 
 ## Memory Map
 
-Same as CPU3. The top 256 bytes are MMIO.
+The top 256 bytes are MMIO.
 
 | Address | Size | Register | Access |
 |---|---|---|---|
@@ -317,8 +372,6 @@ The cycle counter increments once per instruction executed.
 ---
 
 ## Assembly Syntax
-
-Same assembler directives as CPU3:
 
 ```
 .text=0               ; set text section origin
@@ -344,19 +397,20 @@ Comments start with `;`.
 
 ```asm
 .text=0
-    ssp     0x1000      ; set stack pointer
+    immw    r0, 0xf000  ; load stack address (F3e)
+    ssp     r0          ; set stack pointer (F1b)
     jl      main        ; call main (F3a)
     halt
 
 main:
-    enter   4           ; save lr, bp; allocate 4 bytes for locals
-    sw      r0, [bp-1]  ; a = param r0 (F2, imm7=-1, scaled×2 = bp-2)
-    lw      r0, [bp-1]  ; load a (F2)
-    immw    r1, 0x000a  ; r1 = 10 (F3c)
+    enter   4           ; save (lr<<16|bp); allocate 4 bytes for locals
+    sw      r0, -1      ; a = param r0 (F2, imm7=-1, scaled×2 = bp-2)
+    lw      r0, -1      ; load a (F2)
+    immw    r1, 0x000a  ; r1 = 10 (F3e)
     add     r0, r0, r1  ; a + 10 (F1a)
     ret
 ```
 
 **Key idiom — local variable access:** The CPU3 `lea -4; lw` pair (4 bytes, 2 instructions)
-collapses to `lw r0, [bp-2]` (2 bytes, 1 instruction) on CPU4, the single most impactful
+collapses to `lw r0, -1` (2 bytes, 1 instruction) on CPU4, the single most impactful
 encoding improvement over the stack machine.

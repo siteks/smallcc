@@ -52,16 +52,33 @@ Tests use `sim_c` (the C simulator) to execute generated assembly and check the 
 
 ### CoreMark Benchmark
 
-CoreMark lives in `../coremark` (relative to this repo). To rebuild `coremark4.s`:
+Use `../coremark_single_file` for testing — it is a single-file CoreMark with 1 iteration
+and performance-run seeds, suitable for quick validation and profiling:
 
+```bash
+cd ../coremark_single_file
+../smallcc/smallcc -arch cpu4 -o coremark.s coremark_single.c
+../smallcc/sim_c -arch cpu4 -maxsteps 4000000 coremark.s
+# Expect: crcfinal printed to stderr, "Correct operation validated"
+```
+
+To generate an execution profile:
+```bash
+cd ../coremark_single_file
+../smallcc/smallcc -arch cpu4 -o coremark_single.s coremark_single.c
+../smallcc/sim_c -arch cpu4 -maxsteps 4000000 -profile coremark_single.s > profile.s
+```
+
+The multi-file CoreMark in `../coremark` can also be used for multi-iteration runs:
 ```bash
 cd ../coremark
 ../smallcc/smallcc -Icpu3 -I. -arch cpu4 \
   -DFLAGS_STR=\""-DPERFORMANCE_RUN=1  "\" \
-  -DITERATIONS=8 -DPERFORMANCE_RUN=1 \
+  -DITERATIONS=10 -DPERFORMANCE_RUN=1 \
   -o ./coremark4.s \
   core_list_join.c core_main.c core_matrix.c core_state.c core_util.c cpu3/core_portme.c
 ../smallcc/sim_c -arch cpu4 -maxsteps 20000000 coremark4.s
+# Expect: "Correct operation validated" (needs ITERATIONS>=10 to pass min runtime check)
 ```
 
 ---

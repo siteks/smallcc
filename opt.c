@@ -282,6 +282,300 @@ void opt_cse(Function *f) {
     }
 }
 
+// ── R2G: Redundant booleanisation elimination ────────────────────────────
+
+static int is_comparison(InstKind k) {
+    switch (k) {
+    case IK_EQ: case IK_NE: case IK_LT: case IK_LE:
+    case IK_ULT: case IK_ULE:
+    case IK_FEQ: case IK_FNE: case IK_FLT: case IK_FLE:
+        return 1;
+    default: return 0;
+    }
+}
+
+void opt_redundant_bool(Function *f) {
+    // NE(cmp_result, 0) ≡ cmp_result when cmp_result is from a comparison
+    // instruction (which already produces exactly 0 or 1).
+    // Typical source: cg_logand inserts NE(rhs, 0) to booleanise && operands,
+    // but when rhs is already NE/EQ/LT etc. the booleanisation is identity.
+    int changed = 0;
+    for (int bi = 0; bi < f->nblocks; bi++) {
+        Block *b = f->blocks[bi];
+        for (Inst *inst = b->head; inst; inst = inst->next) {
+            if (inst->is_dead || inst->nops < 2 || !inst->dst) continue;
+            if (inst->kind != IK_NE) continue;
+
+            Value *v0 = val_resolve(inst->ops[0]);
+            Value *v1 = val_resolve(inst->ops[1]);
+            Value *src = NULL;
+            if (v1 && v1->kind == VAL_CONST && v1->iconst == 0)      src = v0;
+            else if (v0 && v0->kind == VAL_CONST && v0->iconst == 0)  src = v1;
+            if (!src || src->kind != VAL_INST || !src->def) continue;
+            if (!is_comparison(src->def->kind)) continue;
+
+            inst->dst->alias = src;
+            inst->is_dead = 1;
+            changed = 1;
+        }
+    }
+    if (!changed) return;
+
+    // Recount use_count after aliasing
+    for (int i = 0; i < f->nvalues; i++) f->values[i]->use_count = 0;
+    for (int bi = 0; bi < f->nblocks; bi++) {
+        Block *b = f->blocks[bi];
+        for (Inst *inst = b->head; inst; inst = inst->next) {
+            if (inst->is_dead) continue;
+            for (int j = 0; j < inst->nops; j++) {
+                if (inst->ops[j]) {
+                    inst->ops[j] = val_resolve(inst->ops[j]);
+                    inst->ops[j]->use_count++;
+                }
+            }
+        }
+    }
+}
+
+// ── R2F: LICM for IK_CONST (loop-invariant constant hoisting) ────────────
+//
+// Constants used inside loop bodies are materialized (immw) on every iteration.
+// This pass finds frequently-used VAL_CONST operands inside loops and
+// materializes them once in the pre-header as IK_CONST instructions, giving
+// IRC a register to hold the constant across the loop body.
+//
+// Cap at LICM_MAX_HOIST constants per loop to avoid register pressure explosion
+// (K=8; typical loops already use 4-5 registers for variables).
+
+#define LICM_MAX_HOIST 4
+#define LICM_MAX_CANDS 32
+
+typedef struct {
+    int     iconst;
+    ValType vtype;
+    int     uses;       // total use count inside the loop
+    Value  *hoisted;    // non-NULL once materialized in pre-header
+} LicmCand;
+
+void opt_licm_const(Function *f) {
+    if (f->nblocks < 2) return;
+    // Step 1: Find loop headers via back edges.
+    Block **headers = NULL;
+    int nheaders = 0, hdr_cap = 0;
+
+    for (int i = 0; i < f->nblocks; i++) {
+        Block *b = f->blocks[i];
+        for (int j = 0; j < b->nsuccs; j++) {
+            Block *h = b->succs[j];
+            if (h->rpo_index <= b->rpo_index && dominates(h, b)) {
+                int dup = 0;
+                for (int k = 0; k < nheaders; k++)
+                    if (headers[k] == h) { dup = 1; break; }
+                if (!dup) {
+                    if (nheaders >= hdr_cap) {
+                        hdr_cap = hdr_cap ? hdr_cap * 2 : 4;
+                        Block **nh = arena_alloc(hdr_cap * sizeof(Block *));
+                        if (headers) memcpy(nh, headers, nheaders * sizeof(Block *));
+                        headers = nh;
+                    }
+                    headers[nheaders++] = h;
+                }
+            }
+        }
+    }
+    if (nheaders == 0) return;
+
+    int changed = 0;
+
+    for (int li = 0; li < nheaders; li++) {
+        Block *h = headers[li];
+
+        // Only hoist in leaf loops (no inner loop headers dominated by h).
+        // Hoisting in outer loops with nested inner loops makes constants live
+        // across the entire function, causing register pressure > K and spill
+        // cascades that can produce incorrect code.
+        int has_inner = 0;
+        for (int k = 0; k < nheaders; k++) {
+            if (k != li && dominates(h, headers[k])) {
+                has_inner = 1;
+                break;
+            }
+        }
+        if (has_inner) continue;
+
+        // Step 2: Find the pre-header.
+        Block *preheader = NULL;
+        int outside_count = 0;
+        for (int k = 0; k < h->npreds; k++) {
+            Block *p = h->preds[k];
+            if (!dominates(h, p)) {
+                preheader = p;
+                outside_count++;
+            }
+        }
+        if (outside_count != 1 || !preheader) continue;
+        if (!preheader->tail) continue;
+
+        // Guard: estimate how many values are already live across the loop.
+        // Count unique VAL_INST operands used in the loop body that are
+        // defined outside the loop.  Also count operands of the loop header
+        // as a proxy for phi-variables that are live across the back edge.
+        // If these already consume most of K=8 registers, hoisting would
+        // cause spill cascades.
+        int body_size = 0;
+        for (int bi = 0; bi < f->nblocks; bi++)
+            if (dominates(h, f->blocks[bi])) body_size++;
+
+        #define LIVE_CAP 32
+        int live_ids[LIVE_CAP];
+        int nlive = 0;
+        for (int bi = 0; bi < f->nblocks; bi++) {
+            Block *b = f->blocks[bi];
+            if (!dominates(h, b)) continue;
+            for (Inst *inst = b->head; inst; inst = inst->next) {
+                if (inst->is_dead) continue;
+                for (int j = 0; j < inst->nops; j++) {
+                    Value *v = val_resolve(inst->ops[j]);
+                    if (!v || v->kind != VAL_INST || !v->def) continue;
+                    // Cross-loop: defined outside the loop body
+                    if (!dominates(h, v->def->block)) {
+                        int vid = v->id, dup = 0;
+                        for (int k = 0; k < nlive && !dup; k++)
+                            if (live_ids[k] == vid) dup = 1;
+                        if (!dup && nlive < LIVE_CAP)
+                            live_ids[nlive++] = vid;
+                    }
+                }
+                // Also count dst values that are redefined across the loop
+                // header (phi-variables): if an instruction defines a value
+                // that is ALSO defined outside the loop, it's live across the
+                // header and occupies a register throughout.
+            }
+        }
+        // Also count operands of the header block itself — these are
+        // live at loop entry and include phi-variables.
+        for (Inst *inst = h->head; inst; inst = inst->next) {
+            if (inst->is_dead) continue;
+            for (int j = 0; j < inst->nops; j++) {
+                Value *v = val_resolve(inst->ops[j]);
+                if (!v || v->kind != VAL_INST) continue;
+                int vid = v->id, dup = 0;
+                for (int k = 0; k < nlive && !dup; k++)
+                    if (live_ids[k] == vid) dup = 1;
+                if (!dup && nlive < LIVE_CAP)
+                    live_ids[nlive++] = vid;
+            }
+        }
+
+        // K=8; need at least 2 free registers for temporaries in the loop body.
+        if (nlive + 1 > 8 - 2) continue;  // +1 for the hoisted constant
+
+        int max_hoist = LICM_MAX_HOIST;
+
+        // Step 4: Count VAL_CONST operand uses inside the loop body.
+        LicmCand cands[LICM_MAX_CANDS];
+        int ncands = 0;
+
+        for (int bi = 0; bi < f->nblocks; bi++) {
+            Block *b = f->blocks[bi];
+            if (b->loop_depth == 0) continue;
+            if (!dominates(h, b)) continue;
+
+            for (Inst *inst = b->head; inst; inst = inst->next) {
+                if (inst->is_dead) continue;
+                for (int j = 0; j < inst->nops; j++) {
+                    Value *v = val_resolve(inst->ops[j]);
+                    if (!v || v->kind != VAL_CONST) continue;
+                    // Find or create candidate
+                    int found = -1;
+                    for (int k = 0; k < ncands; k++) {
+                        if (cands[k].iconst == v->iconst && cands[k].vtype == v->vtype) {
+                            found = k; break;
+                        }
+                    }
+                    if (found >= 0) {
+                        cands[found].uses++;
+                    } else if (ncands < LICM_MAX_CANDS) {
+                        cands[ncands++] = (LicmCand){
+                            .iconst = v->iconst, .vtype = v->vtype,
+                            .uses = 1, .hoisted = NULL
+                        };
+                    }
+                }
+            }
+        }
+
+        // Step 5: Sort candidates by use count (descending) and pick top N.
+        // Simple selection: find the top max_hoist by uses.
+        // Only hoist constants with uses >= 3 (enough savings to justify the
+        // register cost across the loop body).
+        int nhoisted = 0;
+        for (int pass = 0; pass < max_hoist; pass++) {
+            int best = -1, best_uses = 2; // threshold: >= 3 uses
+            for (int k = 0; k < ncands; k++) {
+                if (!cands[k].hoisted && cands[k].uses > best_uses) {
+                    best = k;
+                    best_uses = cands[k].uses;
+                }
+            }
+            if (best < 0) break;
+
+            // Materialize in pre-header
+            Value *nv = new_value(f, VAL_INST, cands[best].vtype);
+            Inst *ni = new_inst(f, preheader, IK_CONST, nv);
+            ni->imm = cands[best].iconst;
+            nv->iconst = cands[best].iconst;
+            inst_insert_before(preheader->tail, ni);
+
+            cands[best].hoisted = nv;
+            nhoisted++;
+        }
+        if (nhoisted == 0) continue;
+
+        // Step 6: Replace VAL_CONST operands in loop body with hoisted values.
+        for (int bi = 0; bi < f->nblocks; bi++) {
+            Block *b = f->blocks[bi];
+            if (b->loop_depth == 0) continue;
+            if (!dominates(h, b)) continue;
+
+            for (Inst *inst = b->head; inst; inst = inst->next) {
+                if (inst->is_dead) continue;
+                for (int j = 0; j < inst->nops; j++) {
+                    Value *v = val_resolve(inst->ops[j]);
+                    if (!v || v->kind != VAL_CONST) continue;
+                    // Check if this constant was hoisted
+                    for (int k = 0; k < ncands; k++) {
+                        if (cands[k].hoisted &&
+                            cands[k].iconst == v->iconst &&
+                            cands[k].vtype == v->vtype) {
+                            inst->ops[j] = cands[k].hoisted;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        changed = 1;
+    }
+
+    if (!changed) return;
+
+    // Recount use_count
+    for (int i = 0; i < f->nvalues; i++) f->values[i]->use_count = 0;
+    for (int bi = 0; bi < f->nblocks; bi++) {
+        Block *b = f->blocks[bi];
+        for (Inst *inst = b->head; inst; inst = inst->next) {
+            if (inst->is_dead) continue;
+            for (int j = 0; j < inst->nops; j++) {
+                if (inst->ops[j]) {
+                    inst->ops[j] = val_resolve(inst->ops[j]);
+                    inst->ops[j]->use_count++;
+                }
+            }
+        }
+    }
+}
+
 // ── R2B: Dead block elimination ───────────────────────────────────────────
 
 void opt_remove_dead_blocks(Function *f) {

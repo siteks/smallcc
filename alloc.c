@@ -424,20 +424,10 @@ static int assign_colors(IGraph *g, Function *f, int K) {
                 }
             }
             if (worst < 0) break;
-            g->spilled[worst] = 1;
-            removed[worst] = 1;
-            remaining--;
-            // Update neighbors' degrees
-            for (int w = 0; w < g->nwords; w++) {
-                uint32_t word = g->adj[worst][w];
-                while (word) {
-                    int bit = __builtin_ctz(word);
-                    int vid = w * 32 + bit;
-                    if (vid < nv && !removed[vid]) degree[vid]--;
-                    word &= word - 1;
-                }
-            }
-            continue;
+            // Optimistic spilling (Briggs): push onto stack instead of
+            // immediately marking as spilled.  During select, we'll try to
+            // color it; only if no color is available does it actually spill.
+            found = worst;
         }
 
         // Push onto stack and remove from graph

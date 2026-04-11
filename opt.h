@@ -15,4 +15,10 @@ void opt_copy_prop(Function *f);
 // R2E: Hash-based CSE; eliminates duplicate pure computations across dominating blocks.
 void opt_cse(Function *f);
 
+// R2G: Eliminate NE(cmp_result, 0) → cmp_result when input is a comparison.
+void opt_redundant_bool(Function *f);
+
+// R2F: Hoist IK_CONST out of loop bodies into pre-headers.
+void opt_licm_const(Function *f);
+
 #endif

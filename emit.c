@@ -296,9 +296,60 @@ static void emit_inst(Inst *inst, FILE *out) {
         Value *op1 = inst->ops[1] ? val_resolve(inst->ops[1]) : NULL;
         int c0 = op0 && op0->kind == VAL_CONST;
         int c1 = op1 && op1->kind == VAL_CONST;
+        // Also detect IK_CONST-defined values (VAL_INST from legalize Pass D)
+        int k0 = c0 || (op0 && op0->kind == VAL_INST && op0->def && op0->def->kind == IK_CONST && !op0->def->fname);
+        int k1 = c1 || (op1 && op1->kind == VAL_INST && op1->def && op1->def->kind == IK_CONST && !op1->def->fname);
         // p0/p1: physical register of each operand (-1 if operand is const)
         int p0 = c0 ? -1 : (op0 ? preg(op0) : rd);
         int p1 = c1 ? -1 : (op1 ? preg(op1) : rd);
+
+        // P7: Both operands are compile-time constants — fold at emit time.
+        // Handles both VAL_CONST operands and VAL_INST from IK_CONST instructions
+        // (e.g. AND(mask, const) from legalize Pass D TRUNC/ZEXT lowering).
+        // Folding here is safe: IRC is done, no interference-graph impact.
+        if (k0 && k1) {
+            int32_t a = c0 ? op0->iconst : op0->def->imm;
+            int32_t b = c1 ? op1->iconst : op1->def->imm;
+            uint32_t ua = (uint32_t)a, ub = (uint32_t)b;
+            int32_t result;
+            switch (inst->kind) {
+            case IK_ADD:  result = a + b;  break;
+            case IK_SUB:  result = a - b;  break;
+            case IK_MUL:  result = a * b;  break;
+            case IK_AND:  result = a & b;  break;
+            case IK_OR:   result = a | b;  break;
+            case IK_XOR:  result = a ^ b;  break;
+            case IK_SHL:  result = (int32_t)(ua << (ub & 31)); break;
+            case IK_SHR:  result = (int32_t)(ua >> (ub & 31)); break;
+            case IK_USHR: result = (int32_t)(ua >> (ub & 31)); break;
+            case IK_EQ:   result = (a == b); break;
+            case IK_NE:   result = (a != b); break;
+            case IK_LT:   result = (a < b);  break;
+            case IK_ULT:  result = (ua < ub); break;
+            case IK_LE:   result = (a <= b);  break;
+            case IK_ULE:  result = (ua <= ub); break;
+            default: goto p7_no_fold;
+            }
+            emit_imm(out, rd, result);
+            break;
+            p7_no_fold:;
+        }
+
+        // P8: AND(x, 0xFF) → zxb; AND(x, 0xFFFF) → zxw
+        // In-place (rd == preg(x)): just zxb/zxw rd (2 bytes).
+        // Cross-register: or rd, ps, ps; zxb/zxw rd (4 bytes vs 5 for immw+and).
+        if (inst->kind == IK_AND && (k0 ^ k1)) {
+            int kv = k1 ? (c1 ? op1->iconst : op1->def->imm)
+                        : (c0 ? op0->iconst : op0->def->imm);
+            int ps = k1 ? p0 : p1;
+            if (kv == 0xff || kv == 0xffff) {
+                const char *zx = kv == 0xff ? "zxb" : "zxw";
+                if (ps != rd)
+                    fprintf(out, "    or %s, %s, %s\n", regname(rd), regname(ps), regname(ps));
+                fprintf(out, "    %s %s\n", zx, regname(rd));
+                break;
+            }
+        }
 
         // P2/P3/P4: compact encoding for ADD/SUB with exactly one const operand
         if ((inst->kind == IK_ADD || inst->kind == IK_SUB) && (c0 ^ c1)) {
@@ -403,16 +454,34 @@ static void emit_inst(Inst *inst, FILE *out) {
     }
     case IK_SEXT8: {
         if (!dst || inst->nops < 1) break;
-        int r1 = get_val_reg(out, inst->ops[0], rd);
-        if (r1 != rd) fprintf(out, "    or %s, %s, %s\n", regname(rd), regname(r1), regname(r1));
-        fprintf(out, "    sxb %s\n", regname(rd));
+        Value *sv = inst->ops[0] ? val_resolve(inst->ops[0]) : NULL;
+        if (sv && sv->kind == VAL_CONST) {
+            int v = (int8_t)(sv->iconst & 0xff);
+            emit_imm(out, rd, v);
+        } else if (sv && sv->kind == VAL_INST && sv->def && sv->def->kind == IK_CONST && !sv->def->fname) {
+            int v = (int8_t)(sv->def->imm & 0xff);
+            emit_imm(out, rd, v);
+        } else {
+            int r1 = get_val_reg(out, inst->ops[0], rd);
+            if (r1 != rd) fprintf(out, "    or %s, %s, %s\n", regname(rd), regname(r1), regname(r1));
+            fprintf(out, "    sxb %s\n", regname(rd));
+        }
         break;
     }
     case IK_SEXT16: {
         if (!dst || inst->nops < 1) break;
-        int r1 = get_val_reg(out, inst->ops[0], rd);
-        if (r1 != rd) fprintf(out, "    or %s, %s, %s\n", regname(rd), regname(r1), regname(r1));
-        fprintf(out, "    sxw %s\n", regname(rd));
+        Value *sv = inst->ops[0] ? val_resolve(inst->ops[0]) : NULL;
+        if (sv && sv->kind == VAL_CONST) {
+            int v = (int16_t)(sv->iconst & 0xffff);
+            emit_imm(out, rd, v);
+        } else if (sv && sv->kind == VAL_INST && sv->def && sv->def->kind == IK_CONST && !sv->def->fname) {
+            int v = (int16_t)(sv->def->imm & 0xffff);
+            emit_imm(out, rd, v);
+        } else {
+            int r1 = get_val_reg(out, inst->ops[0], rd);
+            if (r1 != rd) fprintf(out, "    or %s, %s, %s\n", regname(rd), regname(r1), regname(r1));
+            fprintf(out, "    sxw %s\n", regname(rd));
+        }
         break;
     }
     case IK_ZEXT:
@@ -707,9 +776,12 @@ static void emit_inst(Inst *inst, FILE *out) {
 // ============================================================
 
 typedef struct {
-    int         fused;   // 1 if this block's branch was fused with its comparison
-    const char *mnem;    // F3b branch mnemonic (beq/bne/blt/ble/blts/bles)
-    int         p0, p1;  // physical registers of the two comparison operands
+    int         fused;     // 0=none, 1=P5 two-reg, 2=P5+ const-operand, 3=P6 zero-test
+    const char *mnem;      // F3b branch mnemonic (beq/bne/blt/ble/blts/bles)
+    int         p0, p1;    // physical registers of the comparison operands
+    int         const_val; // P5+: the constant operand's value
+    int         swap;      // P5+: 1 if constant is the first (lhs) operand
+    int         is_eq;     // P6: 1 for EQ(x,0)→jz, 0 for NE(x,0)→jnz
 } BranchFuse;
 
 void emit_function(Function *f, FILE *out) {
@@ -761,6 +833,47 @@ void emit_function(Function *f, FILE *out) {
         }
     }
 
+    // P7/P8 pre-pass: mark IK_CONST instructions dead when their only consumer
+    // is an ALU op that P7 will fold (both operands constant) or P8 will replace
+    // with zxb/zxw (AND with mask 0xFF/0xFFFF).
+    for (int bi = 0; bi < f->nblocks; bi++) {
+        Block *b = f->blocks[bi];
+        for (Inst *inst = b->head; inst; inst = inst->next) {
+            if (inst->is_dead) continue;
+            // P9: SEXT8/SEXT16 of constant → immw; source IK_CONST not needed
+            if ((inst->kind == IK_SEXT8 || inst->kind == IK_SEXT16) && inst->nops >= 1) {
+                Value *sv = inst->ops[0] ? val_resolve(inst->ops[0]) : NULL;
+                if (sv && sv->kind == VAL_INST && sv->def && sv->def->kind == IK_CONST
+                    && !sv->def->fname && sv->use_count <= 1)
+                    sv->def->is_dead = 1;
+                continue;
+            }
+            if (inst->kind < IK_ADD || inst->kind > IK_FNE) continue;
+            if (inst->nops < 2) continue;
+            Value *o0 = inst->ops[0] ? val_resolve(inst->ops[0]) : NULL;
+            Value *o1 = inst->ops[1] ? val_resolve(inst->ops[1]) : NULL;
+            int ik0 = o0 && o0->kind == VAL_INST && o0->def && o0->def->kind == IK_CONST && !o0->def->fname;
+            int ik1 = o1 && o1->kind == VAL_INST && o1->def && o1->def->kind == IK_CONST && !o1->def->fname;
+            int is_k0 = (o0 && o0->kind == VAL_CONST) || ik0;
+            int is_k1 = (o1 && o1->kind == VAL_CONST) || ik1;
+
+            // P7: both operands constant — fold eliminates entire ALU op
+            if (is_k0 && is_k1) {
+                if (ik0 && o0->use_count <= 1) o0->def->is_dead = 1;
+                if (ik1 && o1->use_count <= 1) o1->def->is_dead = 1;
+                continue;
+            }
+            // P8: AND(x, 0xFF/0xFFFF) → zxb/zxw; mask IK_CONST is not needed
+            if (inst->kind == IK_AND && (is_k0 ^ is_k1)) {
+                Value *kv = is_k1 ? o1 : o0;
+                int mask = (kv->kind == VAL_CONST) ? kv->iconst : kv->def->imm;
+                int is_ik = is_k1 ? ik1 : ik0;
+                if ((mask == 0xff || mask == 0xffff) && is_ik && kv->use_count <= 1)
+                    kv->def->is_dead = 1;
+            }
+        }
+    }
+
     // P5 pre-pass: detect comparison+branch pairs that can be fused into a single
     // F3b branch instruction (beq/bne/blt/ble/blts/bles ra, rb, label).
     // Criteria: tail is IK_BR, condition has use_count==1, defining instruction
@@ -779,9 +892,6 @@ void emit_function(Function *f, FILE *out) {
         if (!mnem) continue;
         Value *dop0 = def->ops[0] ? val_resolve(def->ops[0]) : NULL;
         Value *dop1 = def->ops[1] ? val_resolve(def->ops[1]) : NULL;
-        if (!dop0 || dop0->kind != VAL_INST || dop0->phys_reg < 0) continue;
-        if (!dop1 || dop1->kind != VAL_INST || dop1->phys_reg < 0) continue;
-
         // F3b branches use a 10-bit PC-relative offset (±511 bytes).
         // Estimate the byte distance to the true target block; skip fusion
         // if it might overflow the signed 10-bit range.
@@ -797,13 +907,81 @@ void emit_function(Function *f, FILE *out) {
             for (Inst *ii = f->blocks[k]->head; ii; ii = ii->next)
                 if (!ii->is_dead) est_bytes += 3; // worst-case 3 bytes/instruction
         }
-        if (est_bytes > 450) continue;  // conservative: F3b range is ±511 bytes
+        int in_range = (est_bytes <= 450);
 
-        def->is_dead     = 1;
-        fuse[fbi].fused  = 1;
-        fuse[fbi].mnem   = mnem;
-        fuse[fbi].p0     = dop0->phys_reg;
-        fuse[fbi].p1     = dop1->phys_reg;
+        // P5: both operands are registers
+        if (in_range &&
+            dop0 && dop0->kind == VAL_INST && dop0->phys_reg >= 0 &&
+            dop1 && dop1->kind == VAL_INST && dop1->phys_reg >= 0) {
+            def->is_dead     = 1;
+            fuse[fbi].fused  = 1;
+            fuse[fbi].mnem   = mnem;
+            fuse[fbi].p0     = dop0->phys_reg;
+            fuse[fbi].p1     = dop1->phys_reg;
+            continue;
+        }
+
+        // P5+: one operand is VAL_CONST, the other has a phys_reg.
+        // Use cond->phys_reg (dead after this block, use_count==1) as scratch
+        // for materialising the constant, then emit a fused F3b branch.
+        if (in_range && cond->phys_reg >= 0) {
+            Value *reg_op = NULL, *const_op = NULL;
+            int const_is_lhs = 0;
+            if (dop1 && dop1->kind == VAL_CONST &&
+                dop0 && dop0->kind == VAL_INST && dop0->phys_reg >= 0) {
+                reg_op = dop0; const_op = dop1;
+            } else if (dop0 && dop0->kind == VAL_CONST &&
+                       dop1 && dop1->kind == VAL_INST && dop1->phys_reg >= 0) {
+                reg_op = dop1; const_op = dop0; const_is_lhs = 1;
+            }
+            if (reg_op && const_op) {
+                int sc = cond->phys_reg;
+                int rp = reg_op->phys_reg;
+                // If scratch == reg_op's register, look through IK_COPY to find
+                // the source register (e.g. type-coercing copies u8→i16).  The
+                // source is still live at this point, so its register is valid.
+                Inst *looked_through = NULL;
+                if (sc == rp && reg_op->def && reg_op->def->kind == IK_COPY
+                    && reg_op->def->nops >= 1) {
+                    Value *src = val_resolve(reg_op->def->ops[0]);
+                    if (src && src->kind == VAL_INST && src->phys_reg >= 0
+                        && src->phys_reg != sc) {
+                        rp = src->phys_reg;
+                        if (reg_op->use_count <= 1)
+                            looked_through = reg_op->def;
+                    }
+                }
+                if (sc != rp) {
+                    def->is_dead       = 1;
+                    if (looked_through) looked_through->is_dead = 1;
+                    fuse[fbi].fused     = 2;
+                    fuse[fbi].mnem      = mnem;
+                    fuse[fbi].p0        = rp;
+                    fuse[fbi].p1        = sc;
+                    fuse[fbi].const_val = const_op->iconst;
+                    fuse[fbi].swap      = const_is_lhs;
+                    continue;
+                }
+            }
+        }
+
+        // P6: NE(x, 0) or EQ(x, 0) — eliminate comparison, use jnz/jz directly.
+        // jnz/jz (F3a) only test r0; if x is in another register, emit a MOV first.
+        if ((def->kind == IK_NE || def->kind == IK_EQ) && def->nops >= 2) {
+            Value *test_val = NULL;
+            if (dop1 && dop1->kind == VAL_CONST && dop1->iconst == 0 &&
+                dop0 && dop0->kind == VAL_INST && dop0->phys_reg >= 0)
+                test_val = dop0;
+            else if (dop0 && dop0->kind == VAL_CONST && dop0->iconst == 0 &&
+                     dop1 && dop1->kind == VAL_INST && dop1->phys_reg >= 0)
+                test_val = dop1;
+            if (test_val) {
+                def->is_dead     = 1;
+                fuse[fbi].fused  = 3;
+                fuse[fbi].p0     = test_val->phys_reg;
+                fuse[fbi].is_eq  = (def->kind == IK_EQ);
+            }
+        }
     }
 
     // Emit blocks
@@ -845,12 +1023,35 @@ void emit_function(Function *f, FILE *out) {
             } else if (inst->kind == IK_BR && !inst->is_dead && inst->nops >= 1) {
                 // P1 + P5: branch-to-next elimination and compare+branch fusion
                 Block *next_blk = (bi + 1 < f->nblocks) ? f->blocks[bi + 1] : NULL;
-                if (fuse[bi].fused) {
+                if (fuse[bi].fused == 1) {
                     // P5: fused compare+branch — single F3b instruction
                     if (inst->target)
                         fprintf(out, "    %s %s, %s, _%s_B%d\n",
                                 fuse[bi].mnem,
                                 regname(fuse[bi].p0), regname(fuse[bi].p1),
+                                f->name, inst->target->id);
+                } else if (fuse[bi].fused == 2) {
+                    // P5+: load constant into scratch, then F3b branch
+                    emit_imm(out, fuse[bi].p1, fuse[bi].const_val);
+                    if (inst->target) {
+                        if (fuse[bi].swap)
+                            fprintf(out, "    %s %s, %s, _%s_B%d\n",
+                                    fuse[bi].mnem,
+                                    regname(fuse[bi].p1), regname(fuse[bi].p0),
+                                    f->name, inst->target->id);
+                        else
+                            fprintf(out, "    %s %s, %s, _%s_B%d\n",
+                                    fuse[bi].mnem,
+                                    regname(fuse[bi].p0), regname(fuse[bi].p1),
+                                    f->name, inst->target->id);
+                    }
+                } else if (fuse[bi].fused == 3) {
+                    // P6: NE(x,0)/EQ(x,0) → jnz/jz rX directly
+                    // jnz/jz (F3e) accept any register (rd + imm16)
+                    if (inst->target)
+                        fprintf(out, "    %s %s, _%s_B%d\n",
+                                fuse[bi].is_eq ? "jz" : "jnz",
+                                regname(fuse[bi].p0),
                                 f->name, inst->target->id);
                 } else {
                     // Standard: jnz cond, T_label
