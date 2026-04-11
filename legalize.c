@@ -2,6 +2,14 @@
 #include "legalize.h"
 #include "alloc.h"   // IRC_CALLER_REGS
 
+// Return 1 and set *out if v is a compile-time integer constant (VAL_CONST or IK_CONST).
+static int get_iconst(Value *v, int *out) {
+    if (!v) return 0;
+    if (v->kind == VAL_CONST)                            { *out = v->iconst;   return 1; }
+    if (v->kind == VAL_INST && v->def->kind == IK_CONST) { *out = v->def->imm; return 1; }
+    return 0;
+}
+
 void legalize_function(Function *f) {
     if (!f || f->nblocks == 0) return;
 
@@ -104,6 +112,7 @@ void legalize_function(Function *f) {
     for (int bi = 0; bi < f->nblocks; bi++) {
         Block *b = f->blocks[bi];
         for (Inst *inst = b->head; inst; inst = inst->next) {
+            if (inst->is_dead) continue;
             if (inst->kind != IK_ZEXT && inst->kind != IK_TRUNC) continue;
             if (!inst->dst || inst->nops < 1) continue;
 
@@ -115,6 +124,22 @@ void legalize_function(Function *f) {
 
             int mask_val = (mask_size == 1) ? 0xff : 0xffff;
 
+            // Fast path: constant source — fold to IK_CONST(src & mask).
+            // Restricted to mask_size == 1 (u8 truncation) only.  The u16 fold
+            // (mask_size == 2) changes the IRC interference graph in a way that
+            // causes IRC to drop the OOS phi-copy for the CRC loop variable in
+            // crcu8 (the shifted partial value r3 = crc>>1 ends up in the phi
+            // slot that B2 reads, instead of the full post-update crc in r5).
+            // The u16 fold is mathematically correct but exposes a latent IRC
+            // coalescing bug; defer until IRC phi-copy handling is hardened.
+            if (src_val && src_val->kind == VAL_CONST && mask_size == 1) {
+                int folded = src_val->iconst & mask_val;
+                inst->kind = IK_CONST;
+                inst->imm  = folded;
+                inst->nops = 0;
+                continue;
+            }
+
             // Insert %mask = IK_CONST mask_val before this instruction
             Value *mask_v = new_value(f, VAL_INST, VT_I16);
             Inst  *mask_i = new_inst(f, b, IK_CONST, mask_v);
@@ -125,6 +150,51 @@ void legalize_function(Function *f) {
             // Replace the ZEXT/TRUNC in-place with IK_AND(src, mask)
             inst->kind = IK_AND;
             inst_add_op(inst, mask_v);  // ops[0]=src already; ops[1]=mask
+        }
+    }
+
+    // ── Pass E: AND-chain constant folding ──────────────────────────────
+    // Fold AND(AND(x, c1), c2) → AND(x, c1 & c2) when both c1, c2 are constants.
+    // Also looks through type-coercing IK_COPY instructions (e.g. u8→i16 zero-
+    // extension after TRUNC lowering), since copy_prop leaves those intact.
+    // Typical source: (unsigned char)expr & 1 — Pass D lowers TRUNC(expr) to
+    // AND(expr, 255); the result is sign/zero-copied to i16; then AND(copy, 1).
+    // Fold: AND(copy(AND(expr, 255)), 1) → AND(expr, 1).  Correct because the
+    // copy zero-extends (high bits 0) so AND with any mask c2 ≤ 0xff is safe.
+    // Dead inner AND + IK_CONST(255) + copy are removed by irc_allocate DCE.
+    for (int bi = 0; bi < f->nblocks; bi++) {
+        Block *b = f->blocks[bi];
+        for (Inst *inst = b->head; inst; inst = inst->next) {
+            if (inst->is_dead || inst->kind != IK_AND || inst->nops < 2) continue;
+            int c2;
+            if (!get_iconst(val_resolve(inst->ops[1]), &c2)) continue;
+
+            // Look through copy_prop-surviving IK_COPY chains (e.g. u8→i16 coercion)
+            Value *inner = val_resolve(inst->ops[0]);
+            while (inner && inner->kind == VAL_INST && inner->def &&
+                   inner->def->kind == IK_COPY && inner->def->nops >= 1)
+                inner = val_resolve(inner->def->ops[0]);
+
+            if (!inner || inner->kind != VAL_INST || !inner->def) continue;
+            if (inner->def->kind != IK_AND || inner->def->nops < 2) continue;
+
+            int c1;
+            if (!get_iconst(val_resolve(inner->def->ops[1]), &c1)) continue;
+
+            int combined = c1 & c2;
+            // Repoint outer AND's first operand past the inner AND (and any copies)
+            inst->ops[0] = val_resolve(inner->def->ops[0]);
+
+            if (combined != c2) {
+                // Need a new constant; replace ops[1] with IK_CONST(combined)
+                Value *new_mask_v = new_value(f, VAL_INST, VT_I16);
+                Inst  *new_mask_i = new_inst(f, b, IK_CONST, new_mask_v);
+                new_mask_i->imm  = combined;
+                new_mask_i->line = inst->line;
+                inst_insert_before(inst, new_mask_i);
+                inst->ops[1] = new_mask_v;
+            }
+            // If combined == c2, ops[1] is already the right constant; leave it alone.
         }
     }
 

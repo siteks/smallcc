@@ -705,6 +705,7 @@ static void dce_pass(Function *f) {
     for (int bi = 0; bi < f->nblocks; bi++) {
         Block *b = f->blocks[bi];
         for (Inst *inst = b->head; inst; inst = inst->next) {
+            if (inst->is_dead) continue;
             for (int oi = 0; oi < inst->nops; oi++) {
                 Value *v = val_resolve(inst->ops[oi]);
                 if (v && v->kind == VAL_INST)
@@ -783,6 +784,7 @@ void irc_allocate(Function *f) {
     // Iterate until no spills
     int K = IRC_K;
     int max_iter = 20;
+    int converged = 0;
     for (int iter = 0; iter < max_iter; iter++) {
         // Reset is_dead on all still-linked IK_COPY instructions before each
         // coalescing pass. DCE already unlinked truly dead instructions; any
@@ -807,6 +809,7 @@ void irc_allocate(Function *f) {
                     f->values[i]->phys_reg = g->color[i];
             }
             ig_free(g);
+            converged = 1;
             break;
         }
 
@@ -816,6 +819,20 @@ void irc_allocate(Function *f) {
         // Re-run liveness on the expanded function (old live_in/live_out stay in arena)
         compute_liveness(f);
 
+        ig_free(g);
+    }
+
+    // Safety net: if the main loop didn't converge, apply best-effort colors
+    // from one final pass.  This prevents phys_reg=-1 → r0 fallback in emit.c
+    // from generating completely wrong assembly when spill iteration limit is hit.
+    if (!converged) {
+        IGraph *g = build_interference_graph(f);
+        coalesce_copies(g, f, K);
+        assign_colors(g, f, K);
+        for (int i = 0; i < f->nvalues && i < g->nv; i++) {
+            if (g->color[i] >= 0)
+                f->values[i]->phys_reg = g->color[i];
+        }
         ig_free(g);
     }
 }

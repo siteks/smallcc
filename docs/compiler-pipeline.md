@@ -50,23 +50,35 @@ Node* parse tree  (output of resolve_symbols / derive_types / insert_coercions)
       │
       ├─ out_of_ssa()       oos.c        eliminate φ-nodes (Boissinot 2009 parallel copies)
       │
-      ├─ legalize_function() legalize.c  ISA/ABI lowering (see Legalize section)
+      ├─ opt_fold_branches()  opt.c      R2A: fold IK_BR with VAL_CONST condition → IK_JMP
+      ├─ opt_remove_dead_blocks() opt.c  R2B: remove blocks with npreds==0 (iterates to fixpoint)
+      ├─ opt_copy_prop()      opt.c      R2D: collapse IK_COPY chains; alias single-def copies
+      ├─ opt_cse()            opt.c      R2E: hash-based CSE within each basic block
+      │
+      ├─ legalize_function() legalize.c  ISA/ABI lowering + post-OOS folding (see Legalize section)
       │   ├─ Pass A: pre-color IK_PARAM landing values (r1/r2/r3)
       │   ├─ Pass B: insert pre-colored IK_COPY for call args (r1/r2/r3) and IK_ICALL fp (r0)
       │   ├─ Pass C: lower IK_NEG/IK_NOT → IK_SUB(0,src)/IK_EQ(src,0) + explicit IK_CONST(0)
-      │   └─ Pass D: lower IK_ZEXT/IK_TRUNC → IK_CONST(mask) + IK_AND
+      │   ├─ Pass D: lower IK_ZEXT/IK_TRUNC → IK_CONST(mask) + IK_AND
+      │   │           fast-path: TRUNC(VAL_CONST(k)) → IK_CONST(k & 0xff) for 8-bit truncation
+      │   └─ Pass E: AND-chain constant folding — AND(AND(x,c1),c2) → AND(x,c1&c2);
+      │               also looks through type-coercing IK_COPY chains
       │
       ├─ irc_allocate()     alloc.c      IRC register allocation (Appel & George 1996)
       │                                  vregs → physical r0–r7; spills if needed
       │
       └─ emit_function()    emit.c       physical-reg IR → CPU4 assembly text
+                                         P1: branch-to-next elimination
+                                         P2–P4: inc/dec, addi, addli compact encodings
+                                         P5: compare+branch fusion (F3b)
 ```
 
-**Regime 1 (Sexp tree) optimisation passes are not yet implemented.** The pipeline goes
-directly from lowering to Braun SSA construction.
+**Regime 1 (Sexp tree) optimisation passes are not implemented.** The pipeline goes
+directly from lowering to Braun SSA construction. Constant folding, strength reduction,
+and algebraic simplification run during Braun SSA construction in `emit_binop` (R2C/R1B).
 
-**Regime 2 (SSA graph) optimisation passes are not yet implemented.** The pipeline goes
-directly from Braun → dom → OOS → legalize → IRC.
+**Regime 2 SSA-level passes** (R2A–R2E) run after OOS, before legalize. See the
+Optimisation Passes section for details. LICM (R2F) is not yet implemented.
 
 ---
 
@@ -233,6 +245,34 @@ slot via `IK_ADDR + IK_STORE`; subsequent reads come from memory, not an SSA val
 **String literals and static locals** in function bodies are accumulated into internal
 lists and flushed to the data section via `braun_emit_strlits(out)` after each function.
 
+### R2C — Algebraic simplification (in `emit_binop`)
+
+`emit_binop` folds both const+const and one-const cases during SSA construction:
+
+- **Const-const folding:** `IK_ADD/SUB/MUL/DIV/…(VAL_CONST, VAL_CONST)` → `VAL_CONST`
+  via `fold_binop`. No instruction is emitted.
+- **Identity/zero rules (rhs-const):**
+  - `x + 0`, `x - 0`, `x << 0`, `x >> 0`, `x | 0`, `x ^ 0` → `x`
+  - `x * 0` → `0`; `x * 1` → `x`
+  - `x & 0` → `0`; `x & -1` (all bits set) → `x`
+- **Strength reduction (rhs-const power-of-2):**
+  - `x * 2^n` → `x << n`
+  - `x / 2^n` (unsigned) → `x >> n` (logical)
+  - `x % 2^n` (unsigned) → `x & (2^n - 1)`
+
+These rules fire at Braun time, before any IR is created for the folded operands.
+
+### R1B — Dead branch elimination (in statement handlers)
+
+When a branch condition is a `VAL_CONST` at SSA construction time, the dead branch is
+eliminated immediately rather than emitting `IK_BR` and relying on R2A to clean it up:
+- `ND_IFSTMT` / `ND_WHILESTMT`: if condition resolves to `VAL_CONST`, emit `IK_JMP` to
+  the taken target only; the dead block is never created.
+- `while(0)`: the loop body is never entered; emit only the exit `IK_JMP`.
+
+This fires for constants that are literal or that `emit_binop` folds at construction time.
+R2A catches the remaining cases (conditions that become constant after phi resolution).
+
 ---
 
 ## Dominator Analysis (`dom.c`)
@@ -263,6 +303,65 @@ For each `IK_PHI v = phi(v1@B1, v2@B2, ...)`:
 - Detect swap cycles (where copies on one edge form a permutation); break with a temp
 
 After insertion: all `IK_PHI` instructions are removed.
+
+---
+
+## Optimisation Passes (`opt.c`)
+
+All four passes run after `out_of_ssa` and before `legalize_function`, in order:
+`opt_fold_branches` → `opt_remove_dead_blocks` → `opt_copy_prop` → `opt_cse`.
+
+### R2A — `opt_fold_branches(Function *f)`
+
+Replaces `IK_BR` with a compile-time-constant condition by `IK_JMP` to the taken target.
+Removes the dead predecessor edge from the dropped successor.
+
+- Walks all blocks; skips if the terminator is not `IK_BR` or if `val_resolve(cond)` is
+  not a `VAL_CONST`.
+- Rewrites: `term->kind = IK_JMP; term->target = taken; term->nops = 0`.
+- Predecessor/successor lists are updated in place.
+
+Designed to clean up after R1B (which may not fire for conditions that only become
+constant after phi resolution). R2B then removes the resulting zero-predecessor blocks.
+
+### R2B — `opt_remove_dead_blocks(Function *f)`
+
+Iteratively removes blocks with `npreds == 0` that are not the entry block (index 0).
+For each dead block, strips its outgoing edges from successors' predecessor lists.
+Repeats until no blocks are removed in a pass.
+
+### R2D — `opt_copy_prop(Function *f)`
+
+Collapses `IK_COPY` chains after OOS, before IRC.
+
+**Pass 1:** For each `IK_COPY dst ← src` where `dst` has exactly one copy definition
+(not an OOS phi-variable with multiple defs), and the resolved source is not a call
+landing (`IK_CALL`/`IK_ICALL`), param landing (`IK_PARAM`), or another `IK_COPY`:
+set `dst->alias = val_resolve(src)`. Skips type-coercing copies (`src->vtype != dst->vtype`,
+e.g. u8→i16) — those are needed as zero-extension markers for Pass E.
+
+**Pass 2:** Rewrites every live instruction's operands via `val_resolve()` and recounts
+`use_count` from scratch. Aliased copy dsts reach `use_count == 0` and are removed by
+IRC's DCE pass.
+
+### R2E — `opt_cse(Function *f)`
+
+Hash-based common subexpression elimination, restricted to the same basic block.
+
+**Eligible instructions:** all pure ALU, comparison, conversion, and `IK_GADDR` operations.
+Excludes loads (memory aliasing), stores, calls, and control flow.
+
+**Algorithm:**
+1. Sort blocks in dominator-tree pre-order (`dom_pre` ascending).
+2. For each pure instruction in each block: compute a hash over `(kind, operands-by-id,
+   imm, fname)`. Probe a 256-bucket open-addressing table. On a match, check `cse_equiv`
+   (same kind, nops, imm, dst vtype, operands via `val_resolve`). Alias the duplicate dst
+   to the canonical value and mark it dead — **only if both instructions are in the same
+   basic block** (cross-block CSE is disabled: post-OOS phi-variable copies mean SSA
+   dominance no longer guarantees semantic equality across blocks, and cross-block CSE
+   extends canonical live ranges into parallel-branch loops, pushing register pressure
+   past K=8 and causing IRC convergence failure).
+3. If anything changed: zero all `use_count`, recount from live instructions.
 
 ---
 
@@ -357,7 +456,7 @@ struct Function {
 
 **Entry:** `legalize_function(Function *f)`
 
-Runs after `out_of_ssa` and before `irc_allocate`. Consolidates all ISA- and ABI-specific
+Runs after `opt_cse` and before `irc_allocate`. Consolidates all ISA- and ABI-specific
 lowering so that IRC and emission stay target-agnostic.
 
 ### Pass A — Pre-color IK_PARAM landing values
@@ -392,6 +491,39 @@ Replaces zero-extension and truncation with an explicit mask-and:
 `mask` is `0xff` for 8-bit and `0xffff` for 16-bit. 32-bit cases (mask_size ≥ 4) are
 skipped — no masking is needed. The explicit `IK_CONST(mask)` lets IRC allocate a physical
 register for the mask rather than emitting pushr/popr scratch sequences in emit.c.
+
+**Fast path (8-bit truncation):** When the source of `IK_TRUNC` is a `VAL_CONST` and the
+destination is 8-bit, the instruction is folded directly to `IK_CONST(k & 0xff)` without
+creating a mask value. This avoids adding a register to the interference graph for a
+constant that is known at compile time.
+
+Note: The 16-bit constant-source fast-path is intentionally deferred. Applying it changes
+the IRC interference graph in a way that exposes a latent coalescing bug where an OOS
+phi-copy for a loop variable is dropped even though source and destination have different
+physical registers (manifests in `crcu8`: the shifted partial-CRC ends up in the loop
+phi slot instead of the full post-update CRC). Fix requires hardening IRC phi-copy
+handling under changed graph topology.
+
+### Pass E — AND-chain constant folding
+
+Folds `AND(AND(x, c1), c2) → AND(x, c1 & c2)` when both c1 and c2 are compile-time
+constants (either `VAL_CONST` or the result of `IK_CONST`).
+
+**Motivation:** Pass D lowers `(unsigned char)expr` (TRUNC to u8) to `AND(expr, 0xff)`.
+The result is often type-coercion-copied to i16 (a copy that `opt_copy_prop` does not
+alias, since `src->vtype != dst->vtype`). When code then does `& 1`, the pattern becomes
+`AND(copy(AND(expr, 255)), 1)`. Without Pass E, both mask constants (255 and 1) occupy
+IRC registers; in tight loops this can force a pushr/popr spill. Pass E folds to
+`AND(expr, 1)`, making the inner AND and its `IK_CONST(255)` dead.
+
+**IK_COPY chain traversal:** Before checking whether the inner operand is an AND, Pass E
+chases through any type-coercing `IK_COPY` chains that `val_resolve` stops at (since
+those copies are not aliased by `opt_copy_prop`).
+
+**Correctness:** `AND(AND(x, c1), c2) == AND(x, c1 & c2)` for all integers. The inner
+AND may have other uses; Pass E only bypasses it in the outer AND — the inner AND's other
+uses remain valid and it becomes dead only if `use_count` drops to 0 after IRC DCE.
+No same-block restriction: the inner AND dominates the outer by SSA construction.
 
 ---
 
@@ -542,32 +674,102 @@ immediately before each `ret`. Uses bp-relative F2 instructions when in range.
 Float operations (`IK_FADD` etc.) are emitted as CPU4 float instructions (`fadd`, etc.)
 or lowered to libcalls if needed. The target ISA has native float instructions.
 
+### Peephole passes (P1–P5)
+
+These run inside `emit_function` on the physical-register IR. They fire during emission
+with no IR mutations — each fires only when the exact structural condition is met.
+
+**P1 — Branch-to-next elimination**
+
+When `IK_BR`'s false target is the immediately following block in `f->blocks[]`, the
+`j false_target` is omitted. Saves 3 bytes per conditional branch where the fall-through
+is the false path (the common case after Braun's natural block ordering).
+
+```
+Before: jnz rx, T_label; j F_label   (6 bytes)
+After:  jnz rx, T_label              (3 bytes, when F == next block)
+```
+
+**P2 — Inc/dec for ±1 in-place adds**
+
+When `IK_ADD`/`IK_SUB` has one constant operand `±1` and `rd == preg(other_operand)`:
+emits `inc rd` or `dec rd` (F1b, 2 bytes) instead of `immw + add` (5 bytes).
+
+**P3 — Addi for in-place small constants**
+
+When `IK_ADD` has one constant operand `k ∈ [−64, 63]` and `rd == preg(other_operand)`:
+emits `addi rd, k` (F2, 2 bytes) instead of `immw + add` (5 bytes).
+
+**P4 — Addli for cross-register medium constants**
+
+When `IK_ADD` has one constant operand `k` with `|k| ≤ 511` and `rd ≠ preg(other_operand)`:
+emits `addli rd, src, k` (F3b, 3 bytes) instead of `immw rd, k; add rd, src, rd` (5 bytes).
+P2/P3/P4 are checked in order: P2 first (smallest), then P3 (in-place), then P4 (cross-reg).
+Negative-constant subtraction is canonicalized: `sub rd, ra, k` → `add rd, ra, -k` before
+the P2–P4 range checks.
+
+**P5 — Compare+branch fusion**
+
+Replaces a comparison instruction immediately followed by `IK_BR` using that comparison's
+result (with `use_count == 1`) by a single F3b branch instruction.
+
+A pre-pass over all blocks marks fuseable pairs by recording `(mnemonic, op0, op1)` in
+a per-block side table. During emission, the comparison is suppressed and the `IK_BR` emits
+`bcc ra, rb, T_label` (3 bytes) instead of the unfused `cmp_instr; jnz rd, T; j F` (8 bytes).
+P1 (branch-to-next) still applies to the `j F` part after fusion.
+
+```
+Before: lts rd, ra, rb; jnz rd, T; j F   (8 bytes)
+After:  blts ra, rb, T_label             (3 bytes, when F == next block)
+After:  blts ra, rb, T_label; j F        (6 bytes, otherwise)
+```
+
+Supported fused comparisons: `IK_LT/LE/EQ/NE` (signed: `blts/bles/beq/bne`) and
+`IK_ULT/ULE` (unsigned: `blt/ble`). Float comparisons are not fused (no F3b float-branch).
+
+Fusion is skipped when the estimated byte distance to the true target exceeds the F3b
+signed 10-bit offset range (±511 bytes from the instruction end).
+
 ---
 
 ## Pass Summary (Implemented)
 
-| Pass | File | Status | Notes |
-|------|------|--------|-------|
-| **lowering** | `lower.c` | ✅ | Node* → Sexp + TypeMap; handles ++/--, switch, static locals |
-| **emit_globals** | `emit.c` | ✅ | Data section emission |
-| **Braun SSA** | `braun.c` | ✅ | Braun 2013; for/do/while/goto native; call landing+copy |
-| **dominator tree** | `dom.c` | ✅ | Cooper 2001; loop_depth |
-| **out-of-SSA** | `oos.c` | ✅ | Boissinot 2009 parallel copies |
-| **legalize** | `legalize.c` | ✅ | ABI pre-coloring (Passes A–B); NEG/NOT/ZEXT/TRUNC lowering (Passes C–D) |
-| **IRC** | `alloc.c` | ✅ | Appel & George 1996; K=8; phantom-node ABI; George coalescing; spill support |
-| **emission** | `emit.c` | ✅ | CPU4 assembly; F2 bp-rel selection; callee-save handling |
-| Regime 1 optimisations | — | ❌ | const-fold, CSE etc. — not yet implemented |
-| Regime 2 optimisations | — | ❌ | SCCP, DCE, LICM, GVN — not yet implemented |
+| Pass | File | Notes |
+|------|------|-------|
+| lowering | `lower.c` | Node* → Sexp + TypeMap; handles ++/--, switch, static locals |
+| emit_globals | `emit.c` | Data section emission |
+| Braun SSA | `braun.c` | Braun 2013; for/do/while/goto native; call landing+copy |
+| R2C algebraic simplification | `braun.c` | In `emit_binop`: const-fold, identity/zero rules, strength reduction |
+| R1B dead branch in braun | `braun.c` | Const-condition if/while/for short-circuits at construction time |
+| dominator tree | `dom.c` | Cooper 2001; loop_depth |
+| out-of-SSA | `oos.c` | Boissinot 2009 parallel copies |
+| R2A const-condition branch folding | `opt.c` | Fold IK_BR(VAL_CONST) → IK_JMP |
+| R2B dead block elimination | `opt.c` | Remove zero-predecessor blocks; iterates to fixpoint |
+| R2D copy propagation | `opt.c` | Collapse single-def IK_COPY chains; recount use_count |
+| R2E CSE | `opt.c` | Same-block hash-based CSE of pure instructions |
+| legalize Pass A | `legalize.c` | Pre-color IK_PARAM → r1/r2/r3 |
+| legalize Pass B | `legalize.c` | Insert pre-colored IK_COPY for call args and IK_ICALL fp |
+| legalize Pass C | `legalize.c` | Lower IK_NEG/IK_NOT → explicit IK_CONST(0) + IK_SUB/IK_EQ |
+| legalize Pass D | `legalize.c` | Lower IK_ZEXT/IK_TRUNC → IK_CONST(mask) + IK_AND; 8-bit const fast-path |
+| legalize Pass E | `legalize.c` | AND-chain constant folding; traverses type-coercing IK_COPY chains |
+| IRC | `alloc.c` | Appel & George 1996; K=8; phantom-node ABI; George coalescing; spill support |
+| emission + P1 | `emit.c` | CPU4 assembly; branch-to-next elimination |
+| emission P2–P4 | `emit.c` | inc/dec, addi, addli compact encodings |
+| emission P5 | `emit.c` | Compare+branch fusion (F3b beq/bne/blt/ble/blts/bles) |
 
 ---
 
 ## What Is Deliberately Absent
 
-**Regime 1 passes.** Constant folding, CSE, strength reduction etc. as sexp-tree rewrites.
-Will be implemented as plain C recursive tree-walker functions (not a DSL/pattern engine).
+**Regime 1 (sexp-tree) passes.** Constant folding, CSE, strength reduction as tree
+rewrites. The current regime-1 optimisations (R2C, R1B) run during Braun construction
+rather than as a separate tree pass; no sexp-level pass infrastructure exists.
 
-**Regime 2 passes.** SCCP, DCE, LICM, GVN, SSA peephole. The pipeline is currently
--O0 only; optimisation passes will be added incrementally.
+**LICM (R2F).** Requires loop identification (natural loops via back-edge detection from
+the dominator tree), pre-header creation, and loop-invariant instruction movement. The
+infrastructure (`dom.c` loop_depth) is in place; the pass itself is not yet implemented.
+
+**SCCP / GVN.** More complex SSA-level passes deferred after LICM.
 
 **`long long` / 64-bit arithmetic.** Not required by C89 on this 32-bit target.
 
