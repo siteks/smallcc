@@ -345,14 +345,17 @@ static IGraph *build_interference_graph(Function *f) {
             // Call-site interference: values that survive a call must not
             // occupy r0-r3 (caller-saved).  Add edges to phantom r0-r3 nodes
             // for every value live after (and therefore through) the call.
-            if (inst->kind == IK_CALL || inst->kind == IK_ICALL) {
+            if (inst->kind == IK_CALL || inst->kind == IK_ICALL || inst->kind == IK_SWITCH) {
+                // IK_SWITCH dispatch uses one scratch from {r0,r1}; phantom-interfere
+                // with those two so live-through values avoid them.
+                int max_r = (inst->kind == IK_SWITCH) ? 2 : IRC_CALLER_REGS;
                 for (int w = 0; w < nw; w++) {
                     uint32_t word = live[w];
                     while (word) {
                         int bit = __builtin_ctz(word); word &= word - 1;
                         int vid = w * 32 + bit;
                         if (vid < nv) {
-                            for (int r = 0; r < IRC_CALLER_REGS; r++)
+                            for (int r = 0; r < max_r; r++)
                                 ig_add_edge(g, vid, phantom + r);
                         }
                     }
@@ -678,7 +681,7 @@ static void rewrite_spills(Function *f, IGraph *g) {
 static int is_pure_inst(Inst *inst) {
     switch (inst->kind) {
         case IK_STORE: case IK_CALL: case IK_ICALL:
-        case IK_BR: case IK_JMP: case IK_RET:
+        case IK_BR: case IK_JMP: case IK_RET: case IK_SWITCH:
         case IK_PUTCHAR: case IK_MEMCPY:
             return 0;
         default:

@@ -843,6 +843,11 @@ typedef struct {
 void emit_function(Function *f, FILE *out) {
     if (!f || f->nblocks == 0) return;
 
+    // Jump table tracking for IK_SWITCH
+    #define MAX_JT 16
+    struct { Inst *inst; int mn, mx; } jt_info[MAX_JT];
+    int jt_count = 0;
+
     // DEBUG: dump IR to stderr for variadic functions
     if (getenv("SMALLCC_DEBUG_IR")) {
         fprintf(stderr, "=== IR dump for %s ===\n", f->name);
@@ -1217,9 +1222,85 @@ void emit_function(Function *f, FILE *out) {
                 } else {
                     emit_inst(inst, out);
                 }
+            } else if (inst->kind == IK_SWITCH && inst->nops >= 1) {
+                // Jump table dispatch.
+                // Allocator adds phantom interference for r0 and r1 at IK_SWITCH,
+                // so live-through values avoid those two registers.
+                // We save sel_r on the stack (it may be live-through), use sel_r
+                // freely for computation, then copy the target address to scr,
+                // restore sel_r, and jr scr.
+                int sel_r = get_val_reg(out, inst->ops[0], 0);
+                // Pick scratch from {r0, r1} (guaranteed not live-through)
+                int scr = (sel_r == 0) ? 1 : 0;
+                int nc = inst->switch_ncase;
+                int mn = inst->switch_vals[0], mx = inst->switch_vals[0];
+                for (int i = 1; i < nc; i++) {
+                    if (inst->switch_vals[i] < mn) mn = inst->switch_vals[i];
+                    if (inst->switch_vals[i] > mx) mx = inst->switch_vals[i];
+                }
+                int def_id = inst->switch_default->id;
+                // Save selector (might be live-through in a callee-saved reg)
+                fprintf(out, "    pushr %s\n", regname(sel_r));
+                // Range check: sel < min → default
+                emit_imm(out, scr, mn);
+                fprintf(out, "    blts %s, %s, _%s_sw%d\n",
+                        regname(sel_r), regname(scr), f->name, jt_count);
+                // Range check: sel > max → default
+                emit_imm(out, scr, mx);
+                fprintf(out, "    blts %s, %s, _%s_sw%d\n",
+                        regname(scr), regname(sel_r), f->name, jt_count);
+                // Compute target address: sel_r is saved, use freely
+                if (mn == 0) {
+                    fprintf(out, "    add %s, %s, %s\n",
+                            regname(scr), regname(sel_r), regname(sel_r));
+                } else {
+                    emit_imm(out, scr, mn);
+                    fprintf(out, "    sub %s, %s, %s\n",
+                            regname(scr), regname(sel_r), regname(scr));
+                    fprintf(out, "    shli %s, 1\n", regname(scr));
+                }
+                // Load table base into sel_r (safe to clobber, saved on stack)
+                fprintf(out, "    immw %s, _%s_jt%d\n", regname(sel_r), f->name, jt_count);
+                fprintf(out, "    add %s, %s, %s\n",
+                        regname(scr), regname(sel_r), regname(scr));
+                fprintf(out, "    llw %s, %s, 0\n", regname(scr), regname(scr));
+                // Restore selector, jump via scr
+                fprintf(out, "    popr %s\n", regname(sel_r));
+                fprintf(out, "    jr %s\n", regname(scr));
+                // Default path
+                fprintf(out, "_%s_sw%d:\n", f->name, jt_count);
+                fprintf(out, "    popr %s\n", regname(sel_r));
+                fprintf(out, "    j _%s_B%d\n", f->name, def_id);
+                // Record table for data emission
+                if (jt_count < MAX_JT) {
+                    jt_info[jt_count].inst = inst;
+                    jt_info[jt_count].mn = mn;
+                    jt_info[jt_count].mx = mx;
+                }
+                jt_count++;
             } else {
                 emit_inst(inst, out);
             }
+        }
+    }
+    // Emit jump tables after function body
+    for (int ti = 0; ti < jt_count && ti < MAX_JT; ti++) {
+        Inst *sw = jt_info[ti].inst;
+        int mn = jt_info[ti].mn, mx = jt_info[ti].mx;
+        int def_id = sw->switch_default->id;
+        fprintf(out, "    align\n");
+        fprintf(out, "_%s_jt%d:\n", f->name, ti);
+        for (int v = mn; v <= mx; v++) {
+            int found = 0;
+            for (int ci = 0; ci < sw->switch_ncase; ci++) {
+                if (sw->switch_vals[ci] == v) {
+                    fprintf(out, "    word _%s_B%d\n", f->name, sw->switch_targets[ci]->id);
+                    found = 1;
+                    break;
+                }
+            }
+            if (!found)
+                fprintf(out, "    word _%s_B%d\n", f->name, def_id);
         }
     }
 }

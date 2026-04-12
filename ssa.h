@@ -54,6 +54,7 @@ typedef enum {
     IK_BR,      // if ops[0] goto target else target2
     IK_JMP,     // goto target
     IK_RET,     // return ops[0]  (or void: nops==0)
+    IK_SWITCH,  // switch ops[0]: jump table dispatch
 } InstKind;
 
 typedef enum { VAL_CONST, VAL_INST, VAL_UNDEF } ValKind;
@@ -88,6 +89,11 @@ struct Inst {
     char     *fname;        // IK_CALL / IK_GADDR
     char     *label;        // IK_JMP to named label (goto)
     CallDesc *calldesc;
+    // IK_SWITCH fields
+    Block   **switch_targets;  // per-case target blocks
+    int      *switch_vals;     // per-case integer values
+    int       switch_ncase;    // number of cases
+    Block    *switch_default;  // default target block
     Inst     *prev, *next;
     Block    *block;
     int       is_dead;

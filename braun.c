@@ -1778,16 +1778,54 @@ static Block *cg_stmt(BraunCtx *ctx, Block *b, Node *n) {
 
         Block *dispatch_default = default_blk ? default_blk : exit_blk;
 
-        // Emit comparison chain
-        for (int ci = 0; ci < ncases; ci++) {
-            Value *kv  = new_const(ctx->f, case_vals[ci], VT_I16);
-            Value *cmp = emit_binop(ctx, b, IK_EQ, sel, kv, VT_I16);
-            Block *nc  = new_block(ctx->f);
-            seal_block(ctx, nc);
-            emit_br(ctx->f, b, cmp, case_blks[ci], nc);
-            b = nc;
+        // Check if dense enough for jump table dispatch
+        int use_jumptable = 0;
+        if (ncases >= 12) {
+            int mn = case_vals[0], mx = case_vals[0];
+            for (int i = 1; i < ncases; i++) {
+                if (case_vals[i] < mn) mn = case_vals[i];
+                if (case_vals[i] > mx) mx = case_vals[i];
+            }
+            int range = mx - mn + 1;
+            // Dense if ≥50% coverage and table fits in 256 entries
+            if (range > 0 && range <= 256 && ncases * 2 >= range)
+                use_jumptable = 1;
         }
-        emit_jmp(b, dispatch_default);
+
+        if (use_jumptable) {
+            // Emit IK_SWITCH instruction
+            Inst *sw = arena_alloc(sizeof(Inst));
+            memset(sw, 0, sizeof(Inst));
+            sw->kind = IK_SWITCH;
+            sw->block = b;
+            inst_add_op(sw, sel);
+            sw->switch_ncase = ncases;
+            sw->switch_vals = arena_alloc(ncases * sizeof(int));
+            sw->switch_targets = arena_alloc(ncases * sizeof(Block *));
+            memcpy(sw->switch_vals, case_vals, ncases * sizeof(int));
+            memcpy(sw->switch_targets, case_blks, ncases * sizeof(Block *));
+            sw->switch_default = dispatch_default;
+            inst_append(b, sw);
+            b->filled = 1;
+            // Build succs/preds
+            for (int ci = 0; ci < ncases; ci++) {
+                block_add_succ(b, case_blks[ci]);
+                block_add_pred(case_blks[ci], b);
+            }
+            block_add_succ(b, dispatch_default);
+            block_add_pred(dispatch_default, b);
+        } else {
+            // Emit comparison chain (original path)
+            for (int ci = 0; ci < ncases; ci++) {
+                Value *kv  = new_const(ctx->f, case_vals[ci], VT_I16);
+                Value *cmp = emit_binop(ctx, b, IK_EQ, sel, kv, VT_I16);
+                Block *nc  = new_block(ctx->f);
+                seal_block(ctx, nc);
+                emit_br(ctx->f, b, cmp, case_blks[ci], nc);
+                b = nc;
+            }
+            emit_jmp(b, dispatch_default);
+        }
 
         // Walk body statements
         Block *saved_brk = ctx->brk;

@@ -67,7 +67,7 @@ static void insert_copy_before_terminator(Block *b, Value *dst, Value *src) {
         return;
     }
     // Check if tail is a terminator
-    if (term->kind == IK_BR || term->kind == IK_JMP || term->kind == IK_RET) {
+    if (term->kind == IK_BR || term->kind == IK_JMP || term->kind == IK_RET || term->kind == IK_SWITCH) {
         // Insert before term
         copy->prev = term->prev;
         copy->next = term;
@@ -214,11 +214,17 @@ static Block *split_one_critical_edge(Function *f, Block *pred, Block *succ) {
     // branch instruction via inst_append when the block was unsealed.  Walk back
     // from the tail to find the actual terminator (IK_BR / IK_JMP / IK_RET).
     Inst *term = pred->tail;
-    while (term && term->kind != IK_BR && term->kind != IK_JMP && term->kind != IK_RET)
+    while (term && term->kind != IK_BR && term->kind != IK_JMP && term->kind != IK_RET && term->kind != IK_SWITCH)
         term = term->prev;
     if (term) {
         if (term->target  == succ) term->target  = mid;
         if (term->target2 == succ) term->target2 = mid;
+        // IK_SWITCH: patch switch_targets and switch_default
+        if (term->kind == IK_SWITCH) {
+            for (int i = 0; i < term->switch_ncase; i++)
+                if (term->switch_targets[i] == succ) term->switch_targets[i] = mid;
+            if (term->switch_default == succ) term->switch_default = mid;
+        }
     }
 
     // Update pred's succs array

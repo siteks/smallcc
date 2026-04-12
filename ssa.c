@@ -131,7 +131,7 @@ static const char *instname(InstKind k) {
         "itof","ftoi","sext8","sext16","zext","trunc",
         "load","store","addr","gaddr","memcpy",
         "call","icall","putchar",
-        "br","jmp","ret",
+        "br","jmp","ret","switch",
     };
     if (k >= 0 && k < (int)(sizeof(names)/sizeof(names[0])))
         return names[k];
@@ -195,6 +195,18 @@ void print_inst(Inst *inst, FILE *out) {
         break;
     case IK_JMP:
         fprintf(out, " B%d", inst->target ? inst->target->id : -1);
+        break;
+    case IK_SWITCH:
+        fprintf(out, " ");
+        if (inst->nops >= 1) print_val(inst->ops[0], out);
+        fprintf(out, " [");
+        for (int i = 0; i < inst->switch_ncase; i++) {
+            if (i) fprintf(out, ", ");
+            fprintf(out, "%d:B%d", inst->switch_vals[i],
+                    inst->switch_targets[i] ? inst->switch_targets[i]->id : -1);
+        }
+        fprintf(out, " default:B%d]",
+                inst->switch_default ? inst->switch_default->id : -1);
         break;
     case IK_LOAD:
         fprintf(out, "[");
