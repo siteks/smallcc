@@ -474,7 +474,15 @@ static Value *emit_binop(BraunCtx *ctx, Block *b, InstKind kind, Value *lhs, Val
         default: break;
         }
     }
-    // lhs-const k==1 MUL: DISABLED (causes CRC mismatch)
+    // Check lhs-is-const for commutative ops (MUL identity/power-of-2)
+    if (lhs && lhs->kind == VAL_CONST && kind == IK_MUL) {
+        int32_t k = lhs->iconst;
+        // Note: k==1 fold (return rhs) is intentionally skipped. It changes the
+        // IRC interference graph in core_init_state and triggers a latent
+        // coalescing bug (same family as the TRUNC constant-fold IRC bug).
+        if (k > 1 && alg_is_pow2(k))
+            return emit_binop(ctx, b, IK_SHL, rhs, new_const(ctx->f, alg_log2(k), VT_I16), vt);
+    }
     // ── End algebraic simplification ────────────────────────────────────────
 
     Value *dst  = new_value(ctx->f, VAL_INST, vt);
@@ -498,6 +506,14 @@ static Value *emit_unop(BraunCtx *ctx, Block *b, InstKind kind, Value *v, ValTyp
 }
 
 static Value *emit_load(BraunCtx *ctx, Block *b, Value *ptr, int size, int offset, ValType vt) {
+    // Absorb constant ADD offset into load: LOAD(ADD(base, k), 0) → LOAD(base, k)
+    if (offset == 0 && ptr && ptr->kind == VAL_INST && ptr->def &&
+        ptr->def->kind == IK_ADD && ptr->def->nops >= 2) {
+        Value *a0 = ptr->def->ops[0];
+        Value *a1 = ptr->def->ops[1];
+        if (a1 && a1->kind == VAL_CONST) { ptr = a0; offset = a1->iconst; }
+        else if (a0 && a0->kind == VAL_CONST) { ptr = a1; offset = a0->iconst; }
+    }
     Value *dst  = new_value(ctx->f, VAL_INST, vt);
     Inst  *inst = bi(ctx, b, IK_LOAD, dst);
     inst_add_op(inst, ptr);
@@ -508,6 +524,14 @@ static Value *emit_load(BraunCtx *ctx, Block *b, Value *ptr, int size, int offse
 }
 
 static void emit_store(BraunCtx *ctx, Block *b, Value *ptr, Value *val, int size, int offset) {
+    // Absorb constant ADD offset into store: STORE(ADD(base, k), v, 0) → STORE(base, v, k)
+    if (offset == 0 && ptr && ptr->kind == VAL_INST && ptr->def &&
+        ptr->def->kind == IK_ADD && ptr->def->nops >= 2) {
+        Value *a0 = ptr->def->ops[0];
+        Value *a1 = ptr->def->ops[1];
+        if (a1 && a1->kind == VAL_CONST) { ptr = a0; offset = a1->iconst; }
+        else if (a0 && a0->kind == VAL_CONST) { ptr = a1; offset = a0->iconst; }
+    }
     if (val && val->kind == VAL_CONST) {
         ValType vt = val->vtype != VT_VOID ? val->vtype : VT_I16;
         Value *mat = new_value(ctx->f, VAL_INST, vt);
@@ -1092,6 +1116,16 @@ static Value *cg_expr(BraunCtx *ctx, Block **cur, Node *n) {
         else if (vt == VT_U16 && src_vt == VT_I16)                kind = IK_TRUNC;
         else if (src_vt == VT_I8)                                  kind = IK_SEXT8;
         else if (src_vt == VT_I16)                                 kind = IK_SEXT16;
+
+        // Fold SEXT of constants at construction time.
+        // Skip pointer types: VAL_CONST can't be used as a memory base
+        // address (no phys_reg), so pointer-typed constants must remain
+        // as VAL_INST to get a register from IRC.
+        if (v->kind == VAL_CONST && vt != VT_PTR) {
+            int32_t k = v->iconst;
+            if (kind == IK_SEXT8)  return new_const(ctx->f, (int8_t)(k & 0xff), vt);
+            if (kind == IK_SEXT16) return new_const(ctx->f, (int16_t)(k & 0xffff), vt);
+        }
 
         Value *dst = new_value(ctx->f, VAL_INST, vt);
         Inst  *inst = bi(ctx, b, kind, dst);

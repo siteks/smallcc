@@ -184,9 +184,10 @@ All memory accesses are relative to `bp`. The immediate is scaled by access widt
 | 0x9c | `lwx rx, [bp+imm7*2]` | rx = sign_extend_16(mem16[bp + sext7(imm7) × 2]) |
 | 0xa0 | `addi rx, imm7` | rx = rx + sext7(imm7) (in-place add of signed constant) |
 | 0xa4 | `shli rx, imm7` | rx = rx << (imm7 & 0x1f) (in-place shift left) |
-| 0xa8 | `andi rx, imm7` | rx = rx & sext7(imm7) (in-place bitwise AND) |
+| 0xa8 | `andi rx, imm7` | rx = rx & imm7 (in-place bitwise AND; no sign-extension) |
+| 0xac | `shrsi rx, imm7` | rx = signed(rx) >> (imm7 & 0x1f) (in-place arithmetic right shift) |
 
-*(5 slots available.)*
+*(4 slots available.)*
 
 `lbx`/`lwx` (sign-extending loads) replace the `lb`/`lbx; sxb` pair that would otherwise be
 needed for every signed `char` or `short` local read.
@@ -197,8 +198,9 @@ It is particularly useful for loop counters and pointer bumps when the constant 
 (−64 to +63).
 
 `shli` provides an in-place shift-left by an immediate, useful for address computation and
-power-of-2 multiplications. `andi` provides an in-place AND with a sign-extended 7-bit mask,
-useful for byte/word truncation.
+power-of-2 multiplications. `andi` provides an in-place AND with a raw (unsigned) 7-bit mask
+(0–127), useful for byte/word truncation. `shrsi` provides an in-place arithmetic right shift
+by an immediate, useful for sign-preserving divisions by powers of 2.
 
 **Alignment requirement:** `lw`/`sw` require the effective address (`bp + imm7 × 2`) to be
 2-byte aligned; `ll`/`sl` require 4-byte alignment. This means:

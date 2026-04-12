@@ -351,6 +351,19 @@ static void emit_inst(Inst *inst, FILE *out) {
             }
         }
 
+        // P14: AND(x, k) where k in 0..127 → andi (F2, in-place, 2 bytes)
+        if (inst->kind == IK_AND && (k0 ^ k1)) {
+            int kv = k1 ? (c1 ? op1->iconst : op1->def->imm)
+                        : (c0 ? op0->iconst : op0->def->imm);
+            int ps = k1 ? p0 : p1;
+            if (kv >= 0 && kv <= 127) {
+                if (ps != rd)
+                    fprintf(out, "    or %s, %s, %s\n", regname(rd), regname(ps), regname(ps));
+                fprintf(out, "    andi %s, %d\n", regname(rd), kv);
+                break;
+            }
+        }
+
         // P2/P3/P4: compact encoding for ADD/SUB with exactly one const operand
         if ((inst->kind == IK_ADD || inst->kind == IK_SUB) && (c0 ^ c1)) {
             int k = 0, ps = -1, ok = 1;
@@ -373,6 +386,37 @@ static void emit_inst(Inst *inst, FILE *out) {
                     { fprintf(out, "    addi %s, %d\n", regname(rd), k); break; }
                 if (k >= -512 && k <= 511)
                     { fprintf(out, "    addli %s, %s, %d\n", regname(rd), regname(ps), k); break; }
+            }
+        }
+
+        // P11: SHL with constant shift amount → shli (F2, in-place, 2 bytes)
+        // In-place: shli rd, k (2 bytes vs 5 for immw+shl)
+        // Cross-reg: or rd, ps, ps; shli rd, k (4 bytes vs 5 for immw+shl)
+        if (inst->kind == IK_SHL && c1 && !c0) {
+            int k = op1->iconst & 31;
+            if (k >= 0 && k <= 63) {
+                if (p0 != rd)
+                    fprintf(out, "    or %s, %s, %s\n", regname(rd), regname(p0), regname(p0));
+                fprintf(out, "    shli %s, %d\n", regname(rd), k);
+                break;
+            }
+        }
+
+        // P13: Right shift with constant amount → shrsi (F2, in-place, 2 bytes)
+        // Signed: always safe (shrsi is arithmetic).
+        // Unsigned: safe when operand is ≤16 bits (upper bits are 0, arith == logical).
+        if ((inst->kind == IK_SHR || inst->kind == IK_USHR) && c1 && !c0) {
+            int k = op1->iconst & 31;
+            int safe = is_signed;
+            if (!safe && inst->dst) {
+                ValType dvt = inst->dst->vtype;
+                safe = (dvt != VT_U32 && dvt != VT_I32);
+            }
+            if (safe && k >= 0 && k <= 63) {
+                if (p0 != rd)
+                    fprintf(out, "    or %s, %s, %s\n", regname(rd), regname(p0), regname(p0));
+                fprintf(out, "    shrsi %s, %d\n", regname(rd), k);
+                break;
             }
         }
 
@@ -461,6 +505,12 @@ static void emit_inst(Inst *inst, FILE *out) {
         } else if (sv && sv->kind == VAL_INST && sv->def && sv->def->kind == IK_CONST && !sv->def->fname) {
             int v = (int8_t)(sv->def->imm & 0xff);
             emit_imm(out, rd, v);
+        } else if (sv && sv->kind == VAL_INST && sv->def &&
+                   sv->def->kind == IK_LOAD && sv->def->size == 1 &&
+                   vtype_signed(sv->vtype)) {
+            // P10: load already used lbx (sign-extending); sxb is redundant
+            int r1 = get_val_reg(out, inst->ops[0], rd);
+            if (r1 != rd) fprintf(out, "    or %s, %s, %s\n", regname(rd), regname(r1), regname(r1));
         } else {
             int r1 = get_val_reg(out, inst->ops[0], rd);
             if (r1 != rd) fprintf(out, "    or %s, %s, %s\n", regname(rd), regname(r1), regname(r1));
@@ -477,6 +527,12 @@ static void emit_inst(Inst *inst, FILE *out) {
         } else if (sv && sv->kind == VAL_INST && sv->def && sv->def->kind == IK_CONST && !sv->def->fname) {
             int v = (int16_t)(sv->def->imm & 0xffff);
             emit_imm(out, rd, v);
+        } else if (sv && sv->kind == VAL_INST && sv->def &&
+                   sv->def->kind == IK_LOAD && sv->def->size == 2 &&
+                   vtype_signed(sv->vtype)) {
+            // P10: load already used lwx/llwx (sign-extending); sxw is redundant
+            int r1 = get_val_reg(out, inst->ops[0], rd);
+            if (r1 != rd) fprintf(out, "    or %s, %s, %s\n", regname(rd), regname(r1), regname(r1));
         } else {
             int r1 = get_val_reg(out, inst->ops[0], rd);
             if (r1 != rd) fprintf(out, "    or %s, %s, %s\n", regname(rd), regname(r1), regname(r1));
@@ -1021,8 +1077,11 @@ void emit_function(Function *f, FILE *out) {
                 // 3. ret
                 fprintf(out, "    ret\n");
             } else if (inst->kind == IK_BR && !inst->is_dead && inst->nops >= 1) {
-                // P1 + P5: branch-to-next elimination and compare+branch fusion
+                // P1 + P5 + P15: branch elimination, fusion, and branch inversion
                 Block *next_blk = (bi + 1 < f->nblocks) ? f->blocks[bi + 1] : NULL;
+                // P15: when true target is the next block, invert the branch to
+                // target false directly — saves the unconditional j instruction.
+                int inverted = 0;
                 if (fuse[bi].fused == 1) {
                     // P5: fused compare+branch — single F3b instruction
                     if (inst->target)
@@ -1047,22 +1106,117 @@ void emit_function(Function *f, FILE *out) {
                     }
                 } else if (fuse[bi].fused == 3) {
                     // P6: NE(x,0)/EQ(x,0) → jnz/jz rX directly
-                    // jnz/jz (F3e) accept any register (rd + imm16)
-                    if (inst->target)
+                    if (inst->target == next_blk && inst->target2) {
+                        // P15: true is next block — invert sense, target false
+                        fprintf(out, "    %s %s, _%s_B%d\n",
+                                fuse[bi].is_eq ? "jnz" : "jz",
+                                regname(fuse[bi].p0),
+                                f->name, inst->target2->id);
+                        inverted = 1;
+                    } else if (inst->target) {
                         fprintf(out, "    %s %s, _%s_B%d\n",
                                 fuse[bi].is_eq ? "jz" : "jnz",
                                 regname(fuse[bi].p0),
                                 f->name, inst->target->id);
+                    }
                 } else {
-                    // Standard: jnz cond, T_label
+                    // Standard: jnz/jz cond
                     int r1 = get_val_reg(out, inst->ops[0], 0);
-                    if (inst->target)
+                    if (inst->target == next_blk && inst->target2) {
+                        // P15: true is next block — invert to jz false_target
+                        fprintf(out, "    jz %s, _%s_B%d\n",
+                                regname(r1), f->name, inst->target2->id);
+                        inverted = 1;
+                    } else if (inst->target) {
                         fprintf(out, "    jnz %s, _%s_B%d\n",
                                 regname(r1), f->name, inst->target->id);
+                    }
                 }
                 // P1: omit j F when F is the immediately following block
-                if (inst->target2 && inst->target2 != next_blk)
+                // (skip entirely when P15 inverted — false was already targeted)
+                if (!inverted && inst->target2 && inst->target2 != next_blk)
                     fprintf(out, "    j _%s_B%d\n", f->name, inst->target2->id);
+            } else if (inst->kind == IK_JMP && inst->target &&
+                       inst->target == ((bi + 1 < f->nblocks) ? f->blocks[bi + 1] : NULL)) {
+                // P1: omit unconditional j to the immediately following block
+            } else if (inst->kind == IK_JMP && inst->target) {
+                // P12: loop rotation — when jumping to a header that only
+                // contains IK_BR, duplicate the branch here to eliminate the
+                // unconditional jump per iteration.
+                Block *hdr = inst->target;
+                // Find the IK_BR terminator in the header and check that all
+                // other instructions are dead (OOS copies already executed here).
+                Inst *hdr_br = NULL;
+                int hdr_clean = 1;
+                for (Inst *hi = hdr->head; hi; hi = hi->next) {
+                    if (hi->kind == IK_BR && !hi->is_dead && hi->nops >= 1) {
+                        hdr_br = hi;
+                    } else if (!hi->is_dead && hi->kind != IK_JMP) {
+                        hdr_clean = 0;
+                        break;
+                    }
+                }
+                if (hdr_clean && hdr_br && hdr_br->nops >= 1) {
+                    Value *cond = val_resolve(hdr_br->ops[0]);
+                    if (cond && cond->kind == VAL_INST && cond->phys_reg >= 0) {
+                        // Find the header's block index for fuse table lookup
+                        int hbi = -1;
+                        for (int hi = 0; hi < f->nblocks; hi++) {
+                            if (f->blocks[hi] == hdr) { hbi = hi; break; }
+                        }
+                        Block *next_blk = (bi + 1 < f->nblocks) ? f->blocks[bi + 1] : NULL;
+                        int rotated = 0;
+                        if (hbi >= 0 && fuse[hbi].fused == 0) {
+                            // Standard branch: jnz cond, true_target
+                            if (hdr_br->target)
+                                fprintf(out, "    jnz %s, _%s_B%d\n",
+                                        regname(cond->phys_reg), f->name, hdr_br->target->id);
+                            rotated = 1;
+                        } else if (hbi >= 0 && fuse[hbi].fused == 1) {
+                            // P5 fused: two-reg compare+branch
+                            if (hdr_br->target)
+                                fprintf(out, "    %s %s, %s, _%s_B%d\n",
+                                        fuse[hbi].mnem,
+                                        regname(fuse[hbi].p0), regname(fuse[hbi].p1),
+                                        f->name, hdr_br->target->id);
+                            rotated = 1;
+                        } else if (hbi >= 0 && fuse[hbi].fused == 2) {
+                            // P5+ fused: constant-operand compare+branch
+                            emit_imm(out, fuse[hbi].p1, fuse[hbi].const_val);
+                            if (hdr_br->target) {
+                                if (fuse[hbi].swap)
+                                    fprintf(out, "    %s %s, %s, _%s_B%d\n",
+                                            fuse[hbi].mnem,
+                                            regname(fuse[hbi].p1), regname(fuse[hbi].p0),
+                                            f->name, hdr_br->target->id);
+                                else
+                                    fprintf(out, "    %s %s, %s, _%s_B%d\n",
+                                            fuse[hbi].mnem,
+                                            regname(fuse[hbi].p0), regname(fuse[hbi].p1),
+                                            f->name, hdr_br->target->id);
+                            }
+                            rotated = 1;
+                        } else if (hbi >= 0 && fuse[hbi].fused == 3) {
+                            // P6 fused: zero-test jnz/jz
+                            if (hdr_br->target)
+                                fprintf(out, "    %s %s, _%s_B%d\n",
+                                        fuse[hbi].is_eq ? "jz" : "jnz",
+                                        regname(fuse[hbi].p0),
+                                        f->name, hdr_br->target->id);
+                            rotated = 1;
+                        }
+                        if (rotated) {
+                            if (hdr_br->target2 && hdr_br->target2 != next_blk)
+                                fprintf(out, "    j _%s_B%d\n", f->name, hdr_br->target2->id);
+                        } else {
+                            emit_inst(inst, out);
+                        }
+                    } else {
+                        emit_inst(inst, out);
+                    }
+                } else {
+                    emit_inst(inst, out);
+                }
             } else {
                 emit_inst(inst, out);
             }

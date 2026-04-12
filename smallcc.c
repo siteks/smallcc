@@ -555,6 +555,7 @@ int main(int argc, char **argv)
                     opt_copy_prop(f);
                     opt_cse(f);
                     opt_redundant_bool(f);
+                    opt_narrow_loads(f);
                     opt_licm_const(f);
                     if (oos_out) { fprintf(oos_out, "=== OOS: %s ===\n", f->name); print_function(f, oos_out); }
                     if (getenv("DUMP_IR")) { fprintf(stderr, "=== after oos ===\n"); print_function(f, stderr); }

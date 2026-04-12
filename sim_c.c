@@ -250,6 +250,7 @@ static const Instr4 itab4[] = {
     {"addi",   0xa0,1,0,0},
     {"shli",   0xa4,1,0,0},
     {"andi",   0xa8,1,0,0},
+    {"shrsi",  0xac,1,0,0},
     /* F3a — 3 bytes, imm16 only */
     {"j",      0xc0,2,0,0}, {"jl",     0xc1,2,0,0},
     {"enter",  0xc2,2,0,0},
@@ -799,7 +800,8 @@ static void run_cpu4(int verbose)
         case 0x9c: { uint16_t a = (uint16_t)((int32_t)bp+sx7(imm)*2); check_align16(a, oldpc); r[rd]=(uint32_t)(int32_t)(int16_t)read16(a); } break; /* lwx */
         case 0xa0: r[rd]=r[rx]+(uint32_t)sx7(imm); break;           /* addi */
         case 0xa4: r[rd]=r[rx]<<(imm&0x1f); break;                /* shli */
-        case 0xa8: r[rd]=r[rx]&(uint32_t)sx7(imm); break;        /* andi */
+        case 0xa8: r[rd]=r[rx]&(uint32_t)imm; break;              /* andi (no sext) */
+        case 0xac: r[rd]=(uint32_t)((int32_t)r[rx]>>(imm&0x1f)); break; /* shrsi */
         /* F3a */
         case 0xc0: pc=(uint16_t)imm; break;  /* j   */
         case 0xc1: lr=pc; pc=(uint16_t)imm; break; /* jl  */

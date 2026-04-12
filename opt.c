@@ -294,11 +294,36 @@ static int is_comparison(InstKind k) {
     }
 }
 
+// Chase through SHL/MUL-by-nonzero-const to find the underlying boolean source.
+// SHL(bool, k) and MUL(bool, k) with k != 0 preserve zero/nonzero, so
+// NE(SHL(cmp, k), 0) ≡ cmp and NE(MUL(cmp, k), 0) ≡ cmp.
+static Value *find_bool_source(Value *v) {
+    if (!v || v->kind != VAL_INST || !v->def) return NULL;
+    if (is_comparison(v->def->kind)) return v;
+    // Look through SHL(x, const) or MUL(x, const) where const != 0
+    if ((v->def->kind == IK_SHL || v->def->kind == IK_MUL) && v->def->nops >= 2) {
+        Value *a = val_resolve(v->def->ops[0]);
+        Value *b = val_resolve(v->def->ops[1]);
+        // Check if one operand is a nonzero constant
+        int has_nz_const = 0;
+        Value *other = NULL;
+        if (b && b->kind == VAL_CONST && b->iconst != 0) { has_nz_const = 1; other = a; }
+        else if (a && a->kind == VAL_CONST && a->iconst != 0) { has_nz_const = 1; other = b; }
+        if (has_nz_const && other)
+            return find_bool_source(other);
+    }
+    return NULL;
+}
+
 void opt_redundant_bool(Function *f) {
     // NE(cmp_result, 0) ≡ cmp_result when cmp_result is from a comparison
     // instruction (which already produces exactly 0 or 1).
-    // Typical source: cg_logand inserts NE(rhs, 0) to booleanise && operands,
-    // but when rhs is already NE/EQ/LT etc. the booleanisation is identity.
+    // Also handles NE(SHL(cmp, k), 0) and NE(MUL(cmp, k), 0) where k != 0,
+    // since multiplying/shifting a boolean by a nonzero constant preserves
+    // zero/nonzero.  The intermediate SHL/MUL may go dead after this.
+    // Typical source: cg_logand inserts NE(rhs, 0) to booleanise && operands;
+    // insert_coercions may apply pointer stride (×4) via MUL/SHL between the
+    // comparison and the booleanisation.
     int changed = 0;
     for (int bi = 0; bi < f->nblocks; bi++) {
         Block *b = f->blocks[bi];
@@ -311,10 +336,12 @@ void opt_redundant_bool(Function *f) {
             Value *src = NULL;
             if (v1 && v1->kind == VAL_CONST && v1->iconst == 0)      src = v0;
             else if (v0 && v0->kind == VAL_CONST && v0->iconst == 0)  src = v1;
-            if (!src || src->kind != VAL_INST || !src->def) continue;
-            if (!is_comparison(src->def->kind)) continue;
+            if (!src) continue;
 
-            inst->dst->alias = src;
+            Value *bool_src = find_bool_source(src);
+            if (!bool_src) continue;
+
+            inst->dst->alias = bool_src;
             inst->is_dead = 1;
             changed = 1;
         }
@@ -322,6 +349,66 @@ void opt_redundant_bool(Function *f) {
     if (!changed) return;
 
     // Recount use_count after aliasing
+    for (int i = 0; i < f->nvalues; i++) f->values[i]->use_count = 0;
+    for (int bi = 0; bi < f->nblocks; bi++) {
+        Block *b = f->blocks[bi];
+        for (Inst *inst = b->head; inst; inst = inst->next) {
+            if (inst->is_dead) continue;
+            for (int j = 0; j < inst->nops; j++) {
+                if (inst->ops[j]) {
+                    inst->ops[j] = val_resolve(inst->ops[j]);
+                    inst->ops[j]->use_count++;
+                }
+            }
+        }
+    }
+}
+
+// ── R2H: Load narrowing ──────────────────────────────────────────────────
+//
+// AND(LOAD(addr, size=2), 0xFF) → LOAD(addr, size=1) when the load has
+// no other uses.  Eliminates a word load + zxb pair in favour of a single
+// byte load.  Also handles AND(LOAD(addr, size=4), 0xFFFF) → size=2.
+
+void opt_narrow_loads(Function *f) {
+    int changed = 0;
+    for (int bi = 0; bi < f->nblocks; bi++) {
+        Block *b = f->blocks[bi];
+        for (Inst *inst = b->head; inst; inst = inst->next) {
+            if (inst->is_dead || inst->kind != IK_AND || inst->nops < 2 || !inst->dst)
+                continue;
+            Value *v0 = val_resolve(inst->ops[0]);
+            Value *v1 = val_resolve(inst->ops[1]);
+            Value *load_v = NULL, *mask_v = NULL;
+            if (v1 && v1->kind == VAL_CONST) { load_v = v0; mask_v = v1; }
+            else if (v0 && v0->kind == VAL_CONST) { load_v = v1; mask_v = v0; }
+            if (!load_v || !mask_v) continue;
+            if (load_v->kind != VAL_INST || !load_v->def) continue;
+            if (load_v->def->kind != IK_LOAD) continue;
+            if (load_v->use_count != 1) continue;
+
+            int mask = mask_v->iconst;
+            int lsz = load_v->def->size;
+            if (mask == 0xff && lsz >= 2) {
+                // Narrow to byte load
+                load_v->def->size = 1;
+                load_v->vtype = VT_U8;
+                inst->dst->alias = load_v;
+                inst->is_dead = 1;
+                changed = 1;
+            } else if (mask == 0xffff && lsz >= 4) {
+                // Narrow to word load
+                load_v->def->size = 2;
+                load_v->vtype = VT_U16;
+                inst->dst->alias = load_v;
+                inst->is_dead = 1;
+                changed = 1;
+            }
+        }
+    }
+    if (!changed) return;
+
+    // Recount use_count
     for (int i = 0; i < f->nvalues; i++) f->values[i]->use_count = 0;
     for (int bi = 0; bi < f->nblocks; bi++) {
         Block *b = f->blocks[bi];

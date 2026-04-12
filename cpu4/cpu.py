@@ -90,7 +90,8 @@ import sys
 #   lwx     rx = sxt([bp+sxt(imm7*2)])
 #   addi    rx = rx + sxt(imm7)
 #   shli    rx = rx << imm7
-#   andi    rx = rx & sxt(imm7)
+#   andi    rx = rx & imm7
+#   shrsi   rx = rx >> imm7
 #
 #   Format 3a - zero op + imm16 (8 slots, could cut to 2 and make two more 1op+imm14)
 #   j       pc = imm16
@@ -210,6 +211,7 @@ class G:
         'addi'  :   (0xa0, 1, 0, 0),
         'shli'  :   (0xa4, 1, 0, 0),
         'andi'  :   (0xa8, 1, 0, 0),
+        'shrsi' :   (0xac, 1, 0, 0),
         # format 3a - zero op + imm16   11000oooiiiiiiiiiiiiiiii
         'j'     :   (0xc0, 2, 0, 0),
         'jl'    :   (0xc1, 2, 0, 0),
@@ -513,7 +515,8 @@ class CPU:
         elif    i == 'lwx':     s.r[dst] = sext(m.read16(s.bp + sext(imm<<1, 8)), 16)
         elif    i == 'addi':    s.r[dst] = s.r[src0] + sext(imm, 7)
         elif    i == 'shli':    s.r[dst] = s.r[src0] << (imm & 0x1f)
-        elif    i == 'andi':    s.r[dst] = s.r[src0] & sext(imm, 7)
+        elif    i == 'andi':    s.r[dst] = s.r[src0] & imm
+        elif    i == 'shrsi':   s.r[dst] = sext(s.r[src0], 32) >> (imm & 0x1f)
         # f3a
         elif    i == 'j':       s.pc = imm
         elif    i == 'jl':      s.pc, s.lr = imm, s.pc
