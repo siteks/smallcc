@@ -253,6 +253,18 @@ void braun_register_inline_candidate(Node *func_decl, int tu_index) {
 // BraunCtx
 // ============================================================
 
+// Local Value Numbering — per-block CSE during SSA construction
+#define LVN_SIZE 64
+#define LVN_MASK (LVN_SIZE - 1)
+
+typedef struct {
+    int      occupied;
+    InstKind kind;
+    int      key0;      // val_resolve(op0)->id, or sym hash for GADDR
+    int      key1;      // val_resolve(op1)->id, or -1
+    Value   *result;
+} LvnEntry;
+
 typedef struct {
     Function *f;
     int       tu_index;
@@ -287,6 +299,11 @@ typedef struct {
 
     // Source annotation (-ann): current source line being compiled
     int       cur_line;
+
+    // Local value numbering (per-block dedup of pure expressions)
+    LvnEntry  lvn[LVN_SIZE];
+    Block    *lvn_block;
+    int       lvn_count;
 } BraunCtx;
 
 // Create an instruction and stamp the current source line on it.
@@ -554,6 +571,62 @@ static int32_t fold_binop(InstKind kind, int32_t a, int32_t b) {
 static int alg_is_pow2(int32_t k) { return k > 1 && (k & (k-1)) == 0; }
 static int alg_log2(int32_t k)   { int n = 0; while (k > 1) { k >>= 1; n++; } return n; }
 
+// ============================================================
+// Local Value Numbering helpers
+// ============================================================
+
+static int lvn_val_key(Value *v) {
+    if (!v) return -1;
+    return val_resolve(v)->id;
+}
+
+static unsigned lvn_hash(InstKind kind, int k0, int k1) {
+    unsigned h = (unsigned)kind * 2654435761u;
+    h ^= (unsigned)(k0 + 1) * 2246822519u;
+    h ^= (unsigned)(k1 + 1) * 3266489917u;
+    return h & LVN_MASK;
+}
+
+static void lvn_check_block(BraunCtx *ctx, Block *b) {
+    if (ctx->lvn_block != b) {
+        ctx->lvn_block = b;
+        ctx->lvn_count = 0;
+        memset(ctx->lvn, 0, sizeof(ctx->lvn));
+    }
+}
+
+static Value *lvn_lookup(BraunCtx *ctx, Block *b, InstKind kind, int k0, int k1) {
+    lvn_check_block(ctx, b);
+    unsigned h = lvn_hash(kind, k0, k1);
+    for (int i = 0; i < LVN_SIZE; i++) {
+        unsigned idx = (h + i) & LVN_MASK;
+        LvnEntry *e = &ctx->lvn[idx];
+        if (!e->occupied) return NULL;
+        if (e->kind == kind && e->key0 == k0 && e->key1 == k1)
+            return e->result;
+    }
+    return NULL;
+}
+
+static void lvn_insert(BraunCtx *ctx, Block *b, InstKind kind, int k0, int k1, Value *result) {
+    lvn_check_block(ctx, b);
+    if (ctx->lvn_count >= LVN_SIZE * 3 / 4) return;
+    unsigned h = lvn_hash(kind, k0, k1);
+    for (int i = 0; i < LVN_SIZE; i++) {
+        unsigned idx = (h + i) & LVN_MASK;
+        LvnEntry *e = &ctx->lvn[idx];
+        if (!e->occupied) {
+            e->occupied = 1;
+            e->kind = kind;
+            e->key0 = k0;
+            e->key1 = k1;
+            e->result = result;
+            ctx->lvn_count++;
+            return;
+        }
+    }
+}
+
 static Value *emit_binop(BraunCtx *ctx, Block *b, InstKind kind, Value *lhs, Value *rhs, ValType vt) {
     if (lhs && lhs->kind == VAL_CONST && rhs && rhs->kind == VAL_CONST && can_fold_binop(kind)) {
         int32_t result = fold_binop(kind, lhs->iconst, rhs->iconst);
@@ -602,11 +675,17 @@ static Value *emit_binop(BraunCtx *ctx, Block *b, InstKind kind, Value *lhs, Val
     }
     // ── End algebraic simplification ────────────────────────────────────────
 
+    // LVN: reuse identical pure computation already emitted in this block
+    int lk = lvn_val_key(lhs), rk = lvn_val_key(rhs);
+    Value *hit = lvn_lookup(ctx, b, kind, lk, rk);
+    if (hit) return hit;
+
     Value *dst  = new_value(ctx->f, VAL_INST, vt);
     Inst  *inst = bi(ctx, b, kind, dst);
     inst_add_op(inst, lhs);
     inst_add_op(inst, rhs);
     inst_append(b, inst);
+    lvn_insert(ctx, b, kind, lk, rk, dst);
     return dst;
 }
 
@@ -615,10 +694,14 @@ static Value *emit_unop(BraunCtx *ctx, Block *b, InstKind kind, Value *v, ValTyp
         return new_const(ctx->f, -v->iconst, vt);
     if (v && v->kind == VAL_CONST && kind == IK_NOT)
         return new_const(ctx->f, !v->iconst, vt);
+    int vk = lvn_val_key(v);
+    Value *hit = lvn_lookup(ctx, b, kind, vk, -1);
+    if (hit) return hit;
     Value *dst  = new_value(ctx->f, VAL_INST, vt);
     Inst  *inst = bi(ctx, b, kind, dst);
     inst_add_op(inst, v);
     inst_append(b, inst);
+    lvn_insert(ctx, b, kind, vk, -1, dst);
     return dst;
 }
 
@@ -851,10 +934,16 @@ static Value *cg_addr(BraunCtx *ctx, Block **cur, Node *n) {
         if (sym->kind == SYM_GLOBAL || sym->kind == SYM_EXTERN ||
             sym->kind == SYM_STATIC_GLOBAL || sym->kind == SYM_STATIC_LOCAL ||
             sym->kind == SYM_BUILTIN) {
+            // LVN: dedup by Symbol pointer (unique per symbol)
+            uintptr_t sp = (uintptr_t)sym;
+            int sk = (int)(sp ^ (sp >> 16));
+            Value *hit = lvn_lookup(ctx, b, IK_GADDR, sk, -1);
+            if (hit) return hit;
             Value *dst = new_value(ctx->f, VAL_INST, VT_PTR);
             Inst  *inst = bi(ctx, b, IK_GADDR, dst);
             inst->fname = (char *)sym_label(sym);
             inst_append(b, inst);
+            lvn_insert(ctx, b, IK_GADDR, sk, -1, dst);
             return dst;
         }
 

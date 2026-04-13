@@ -29,6 +29,8 @@ static uint32_t g_cycles = 0;
 /* ------------------------------------------------------------------ */
 
 static int       g_profile   = 0;
+static int       g_dump      = 0;
+static uint16_t  g_asm_end   = 0;   /* high-water mark of assembler cur */
 static uint32_t  prof_count[65536];   /* execution count per PC address */
 static int16_t   prof_lineno[65536];  /* addr -> source line index (-1 = none) */
 static char    **prof_lines  = NULL;  /* original source lines (strdup'd) */
@@ -623,8 +625,271 @@ static void assemble_cpu4(const char *src)
                 exit(1);
             }
         }
+        if (pass == 2 && (uint16_t)cur > g_asm_end)
+            g_asm_end = (uint16_t)cur;
     }
     free(buf);
+}
+
+/* ------------------------------------------------------------------ */
+/* Disassembler / dump                                                   */
+/* ------------------------------------------------------------------ */
+
+/* Reverse-lookup: (lookupop, subop) → mnemonic name */
+static const char *lookup_mnemonic(uint8_t lookupop, int subop)
+{
+    for (int i = 0; itab4[i].name; i++) {
+        if (itab4[i].first_byte == lookupop) {
+            if (lookupop == 0x7e || lookupop == 0xdf) {
+                if (itab4[i].subop == subop) return itab4[i].name;
+            } else {
+                return itab4[i].name;
+            }
+        }
+    }
+    return NULL;
+}
+
+/* Find a symbol name at a given address (first match) */
+static const char *sym_at_addr(uint16_t addr)
+{
+    for (int i = 0; i < nsyms; i++)
+        if (syms[i].addr == addr) return syms[i].name;
+    return NULL;
+}
+
+/* Find a symbol name for a branch/jump target; returns "" if none */
+static const char *sym_for_target(uint16_t addr)
+{
+    const char *s = sym_at_addr(addr);
+    return s ? s : "";
+}
+
+static int sym_cmp(const void *a, const void *b)
+{
+    const Sym *sa = (const Sym *)a;
+    const Sym *sb = (const Sym *)b;
+    if (sa->addr != sb->addr) return (int)sa->addr - (int)sb->addr;
+    return strcmp(sa->name, sb->name);
+}
+
+static void print_dump(uint16_t code_end, uint16_t data_end)
+{
+    FILE *out = stderr;
+
+    /* --- Symbol table --- */
+    Sym *sorted = malloc((size_t)nsyms * sizeof(Sym));
+    if (!sorted) { fprintf(stderr, "oom\n"); return; }
+    memcpy(sorted, syms, (size_t)nsyms * sizeof(Sym));
+    qsort(sorted, (size_t)nsyms, sizeof(Sym), sym_cmp);
+
+    fprintf(out, "=== Symbol Table (%d symbols) ===\n", nsyms);
+    for (int i = 0; i < nsyms; i++)
+        fprintf(out, "  %04x  %s\n", sorted[i].addr, sorted[i].name);
+    fprintf(out, "\n");
+    free(sorted);
+
+    /* --- Code disassembly --- */
+    fprintf(out, "=== Code (0x0000 - 0x%04x) ===\n\n", code_end ? code_end - 1 : 0);
+
+    uint16_t pc = 0;
+    while (pc < code_end) {
+        /* Print all labels at this address */
+        for (int i = 0; i < nsyms; i++)
+            if (syms[i].addr == pc) fprintf(out, "%s:\n", syms[i].name);
+
+        uint8_t  b0 = mem[pc];
+        uint8_t  b1 = 0, b2 = 0;
+        uint8_t  lookupop;
+        int      rd = 0, rx = 0, ry = 0, subop = 0;
+        int32_t  imm = 0;
+        int      len = 1;
+        uint8_t  fmt2 = b0 >> 6;
+
+        if (fmt2 == 0) {
+            /* F0: 1 byte */
+            lookupop = b0;
+            len = 1;
+        } else if (fmt2 == 1) {
+            /* F1a or F1b: 2 bytes */
+            b1 = mem[(uint16_t)(pc+1)];
+            uint16_t ins16 = ((uint16_t)b0 << 8) | b1;
+            len = 2;
+            if ((b0 & 0xfe) == 0x7e) {
+                lookupop = 0x7e;
+                rd = (ins16 >> 6) & 0x7;
+                subop = b1 & 0x3f;
+            } else {
+                lookupop = b0 & 0xfe;
+                rd = (ins16 >> 6) & 0x7;
+                rx = (ins16 >> 3) & 0x7;
+                ry = ins16 & 0x7;
+            }
+        } else if (fmt2 == 2) {
+            /* F2: 2 bytes */
+            b1 = mem[(uint16_t)(pc+1)];
+            uint16_t ins16 = ((uint16_t)b0 << 8) | b1;
+            lookupop = b0 & 0xfc;
+            rd = rx = (ins16 >> 7) & 0x7;
+            imm = ins16 & 0x7f;
+            len = 2;
+        } else {
+            /* F3*: 3 bytes */
+            b1 = mem[(uint16_t)(pc+1)];
+            b2 = mem[(uint16_t)(pc+2)];
+            uint32_t ins24 = ((uint32_t)b0 << 16) | ((uint32_t)b1 << 8) | b2;
+            len = 3;
+
+            if ((b0 & 0xf8) == 0xc0) {
+                /* F3a */
+                lookupop = b0;
+                imm = (int32_t)(uint32_t)(((uint16_t)b1 << 8) | b2);
+            } else if ((b0 & 0xf8) == 0xc8) {
+                /* new F3b: adjw, lea */
+                lookupop = b0 & 0xfe;
+                rd = rx = (int)((ins24 >> 14) & 0x7);
+                imm = (int32_t)(ins24 & 0x3fff);
+            } else if (b0 == 0xdf) {
+                /* F3d: beqz, bnez */
+                lookupop = 0xdf;
+                rd = rx = (int)((ins24 >> 13) & 0x7);
+                subop = (int)((ins24 >> 10) & 0x7);
+                imm = (int32_t)(ins24 & 0x3ff);
+            } else if ((b0 & 0xf0) == 0xd0) {
+                /* F3c */
+                lookupop = b0;
+                rd = rx = (int)((ins24 >> 13) & 0x7);
+                ry = (int)((ins24 >> 10) & 0x7);
+                imm = (int32_t)(ins24 & 0x3ff);
+            } else {
+                /* F3e */
+                lookupop = b0 & 0xf8;
+                rd = b0 & 0x7;
+                imm = (int32_t)(uint32_t)(((uint16_t)b1 << 8) | b2);
+            }
+        }
+
+        const char *mnem = lookup_mnemonic(lookupop, subop);
+
+        /* Format hex bytes */
+        char hexbytes[12];
+        if (len == 1) snprintf(hexbytes, sizeof(hexbytes), "%02x", b0);
+        else if (len == 2) snprintf(hexbytes, sizeof(hexbytes), "%02x %02x", b0, b1);
+        else snprintf(hexbytes, sizeof(hexbytes), "%02x %02x %02x", b0, b1, b2);
+
+        /* Format operands */
+        char operands[80] = "";
+        if (!mnem) {
+            snprintf(operands, sizeof(operands), "???");
+            mnem = ".byte";
+        } else if (fmt2 == 0) {
+            /* F0: no operands */
+        } else if (fmt2 == 1 && (b0 & 0xfe) == 0x7e) {
+            /* F1b: single register */
+            snprintf(operands, sizeof(operands), "r%d", rd);
+        } else if (fmt2 == 1) {
+            /* F1a: three register */
+            snprintf(operands, sizeof(operands), "r%d, r%d, r%d", rd, rx, ry);
+        } else if (fmt2 == 2) {
+            /* F2: register + signed imm7 */
+            int32_t simm7 = (imm >= 64) ? imm - 128 : imm;
+            snprintf(operands, sizeof(operands), "r%d, %d", rx, (int)simm7);
+        } else if ((b0 & 0xf8) == 0xc0) {
+            /* F3a: j/jl → target, enter → frame size */
+            if (lookupop == 0xc2) {
+                /* enter: show decimal frame size */
+                snprintf(operands, sizeof(operands), "%d", (int)(imm & 0x3fff));
+            } else {
+                const char *tgt = sym_for_target((uint16_t)imm);
+                if (*tgt) snprintf(operands, sizeof(operands), "%s", tgt);
+                else snprintf(operands, sizeof(operands), "0x%04x", (unsigned)(imm & 0xffff));
+            }
+        } else if ((b0 & 0xf8) == 0xc8) {
+            /* new F3b: adjw/lea */
+            int32_t byte_off = (int32_t)(int16_t)((int16_t)(imm << 2));
+            if (lookupop == 0xc8) {
+                /* adjw: show byte offset */
+                snprintf(operands, sizeof(operands), "%d", (int)byte_off);
+            } else {
+                /* lea: rd, byte_offset */
+                snprintf(operands, sizeof(operands), "r%d, %d", rd, (int)byte_off);
+            }
+        } else if (b0 == 0xdf) {
+            /* F3d: beqz/bnez — rx, target */
+            int32_t simm10 = (imm >= 512) ? imm - 1024 : imm;
+            uint16_t target = (uint16_t)((int)(pc + len) + simm10);
+            const char *tgt = sym_for_target(target);
+            if (*tgt) snprintf(operands, sizeof(operands), "r%d, %s", rx, tgt);
+            else snprintf(operands, sizeof(operands), "r%d, 0x%04x", rx, (unsigned)target);
+        } else if ((b0 & 0xf0) == 0xd0) {
+            /* F3c: loads/stores/branches/addli */
+            int32_t simm10 = (imm >= 512) ? imm - 1024 : imm;
+            if (lookupop >= 0xd8 && lookupop <= 0xdd) {
+                /* branch: rx, ry, target */
+                uint16_t target = (uint16_t)((int)(pc + len) + simm10);
+                const char *tgt = sym_for_target(target);
+                if (*tgt) snprintf(operands, sizeof(operands), "r%d, r%d, %s", rx, ry, tgt);
+                else snprintf(operands, sizeof(operands), "r%d, r%d, 0x%04x", rx, ry, (unsigned)target);
+            } else if (lookupop == 0xde) {
+                /* addli: rx, ry, imm */
+                snprintf(operands, sizeof(operands), "r%d, r%d, %d", rx, ry, (int)simm10);
+            } else {
+                /* load/store: rx, [ry+imm] */
+                snprintf(operands, sizeof(operands), "r%d, [r%d%+d]", rx, ry, (int)simm10);
+            }
+        } else {
+            /* F3e: rd, imm16 */
+            if (lookupop == 0xf0 || lookupop == 0xf8) {
+                /* jz/jnz: rd, target */
+                const char *tgt = sym_for_target((uint16_t)imm);
+                if (*tgt) snprintf(operands, sizeof(operands), "r%d, %s", rd, tgt);
+                else snprintf(operands, sizeof(operands), "r%d, 0x%04x", rd, (unsigned)(imm & 0xffff));
+            } else {
+                /* immw/immwh: rd, hex_literal */
+                snprintf(operands, sizeof(operands), "r%d, 0x%04x", rd, (unsigned)(imm & 0xffff));
+            }
+        }
+
+        fprintf(out, "  %04x  %-9s %-7s %s\n", (unsigned)pc, hexbytes, mnem ? mnem : "???", operands);
+        pc += (uint16_t)len;
+    }
+
+    /* --- Data section --- */
+    if (data_end > code_end) {
+        fprintf(out, "\n=== Data (0x%04x - 0x%04x) ===\n\n", code_end, data_end - 1);
+        uint16_t addr = code_end;
+        while (addr < data_end) {
+            /* Print all labels at this address */
+            for (int i = 0; i < nsyms; i++)
+                if (syms[i].addr == addr) fprintf(out, "%s:\n", syms[i].name);
+
+            /* Print up to 16 bytes per row */
+            int row_len = data_end - addr;
+            if (row_len > 16) row_len = 16;
+
+            /* But break at the next symbol boundary */
+            for (int i = 0; i < nsyms; i++) {
+                if (syms[i].addr > addr && syms[i].addr < addr + row_len)
+                    row_len = syms[i].addr - addr;
+            }
+
+            fprintf(out, "  %04x ", (unsigned)addr);
+            for (int j = 0; j < row_len; j++)
+                fprintf(out, " %02x", mem[(uint16_t)(addr + j)]);
+            /* Pad to align ASCII column */
+            for (int j = row_len; j < 16; j++)
+                fprintf(out, "   ");
+            fprintf(out, "  |");
+            for (int j = 0; j < row_len; j++) {
+                uint8_t c = mem[(uint16_t)(addr + j)];
+                fprintf(out, "%c", (c >= 0x20 && c < 0x7f) ? c : '.');
+            }
+            fprintf(out, "|\n");
+            addr += (uint16_t)row_len;
+        }
+    }
+
+    fprintf(out, "\n");
 }
 
 /* ------------------------------------------------------------------ */
@@ -901,6 +1166,7 @@ int main(int argc, char **argv)
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-v") == 0) verbose = 1;
         else if (strcmp(argv[i], "-profile") == 0) g_profile = 1;
+        else if (strcmp(argv[i], "-dump") == 0) g_dump = 1;
         else if (strcmp(argv[i], "-arch") == 0 && i+1 < argc) {
             i++;
             if (strcmp(argv[i], "cpu4") != 0) {
@@ -914,7 +1180,7 @@ int main(int argc, char **argv)
         else filename = argv[i];
     }
     if (!filename) {
-        fprintf(stderr, "usage: sim_c [-v] [-profile] [-arch cpu4] [-maxsteps N] file.s\n");
+        fprintf(stderr, "usage: sim_c [-v] [-dump] [-profile] [-arch cpu4] [-maxsteps N] file.s\n");
         return 1;
     }
 
@@ -927,6 +1193,12 @@ int main(int argc, char **argv)
     free(src);
     { int i = find_sym("_globals_start"); if (i >= 0) g_write_threshold = syms[i].addr; }
     g_assembler_done = 1;
+    if (g_dump) {
+        uint16_t code_end = g_asm_end;
+        { int i = find_sym("_globals_start"); if (i >= 0) code_end = syms[i].addr; }
+        print_dump(code_end, g_asm_end);
+        return 0;
+    }
     run_cpu4(verbose);
     if (g_profile) print_profile();
     return 0;

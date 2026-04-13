@@ -134,11 +134,12 @@ void opt_copy_prop(Function *f) {
     }
 }
 
-// ── R2E: Common subexpression elimination ─────────────────────────────────
+// ── R2E: Global value numbering (dominator-tree CSE) ──────────────────────
 
 #define CSE_BUCKETS 256
 
 typedef struct { Inst *inst; Value *val; } CseEntry;
+typedef struct { int slot; CseEntry prev; } CseUndo;
 
 static int is_cse_pure(InstKind k) {
     switch (k) {
@@ -200,73 +201,136 @@ static int cse_equiv(Inst *a, Inst *b) {
     return 1;
 }
 
-static int cmp_dom_pre(const void *a, const void *b) {
-    return (*(const Block **)a)->dom_pre - (*(const Block **)b)->dom_pre;
+// GVN state (module-level for recursive walk)
+static CseEntry  gvn_table[CSE_BUCKETS];
+static CseUndo  *gvn_undo;
+static int       gvn_undo_top;
+static int      *gvn_cc;      // copy_count: >0 means phi-variable
+static int       gvn_changed;
+static int       gvn_pre_oos; // 0 = post-OOS (strict xblock), 1 = pre-OOS (relaxed)
+
+static void gvn_push(int slot) {
+    gvn_undo[gvn_undo_top].slot = slot;
+    gvn_undo[gvn_undo_top].prev = gvn_table[slot];
+    gvn_undo_top++;
 }
 
-void opt_cse(Function *f) {
-    CseEntry table[CSE_BUCKETS];
-    memset(table, 0, sizeof(table));
+// Check that all operands are non-phi (safe for cross-block elimination).
+// Phi-variables can be redefined by OOS copies on different paths, so a
+// dominated instruction using the same Value* may see a different runtime value.
+static int gvn_ops_safe(Inst *inst) {
+    for (int i = 0; i < inst->nops; i++) {
+        Value *v = inst->ops[i];
+        if (!v) continue;
+        v = val_resolve(v);
+        if (v->kind == VAL_CONST) continue;
+        if (gvn_cc[v->id] > 0) return 0;
+    }
+    return 1;
+}
 
-    // Process blocks in dominator-tree pre-order so every block's dominators
-    // are visited before the block itself.
-    Block **order = malloc(f->nblocks * sizeof(Block *));
-    for (int i = 0; i < f->nblocks; i++) order[i] = f->blocks[i];
-    qsort(order, f->nblocks, sizeof(Block *), cmp_dom_pre);
+static void gvn_walk(Block *b, Function *f) {
+    int mark = gvn_undo_top;
 
-    int changed = 0;
-    for (int bi = 0; bi < f->nblocks; bi++) {
-        Block *b = order[bi];
-        for (Inst *inst = b->head; inst; inst = inst->next) {
-            if (inst->is_dead || !inst->dst) continue;
-            if (!is_cse_pure(inst->kind))    continue;
+    for (Inst *inst = b->head; inst; inst = inst->next) {
+        if (inst->is_dead || !inst->dst) continue;
+        if (!is_cse_pure(inst->kind))    continue;
 
-            uint32_t h = cse_hash(inst) & (CSE_BUCKETS - 1);
-            int done = 0;
-            for (int k = 0; k < CSE_BUCKETS && !done; k++) {
-                CseEntry *e = &table[(h + k) & (CSE_BUCKETS - 1)];
-                if (!e->inst) {
-                    e->inst = inst;
-                    e->val  = inst->dst;
-                    done    = 1;
-                } else if (cse_equiv(e->inst, inst)) {
-                    if (dominates(e->inst->block, b)) {
-                        // Guard: only CSE within the same basic block OR when the
-                        // canonical block directly dominates the current block with
-                        // no increase in loop depth on the entire dom path.
-                        //
-                        // Cross-block CSE in loops can extend a value's live range
-                        // across an entire loop body (or across sibling-branch loops
-                        // that the dom path doesn't traverse but the CFG does).
-                        // Either case pushes register pressure past K=8 and causes
-                        // IRC convergence failure on loop-heavy functions.
-                        // Only CSE within the same basic block.  Cross-block CSE
-                        // extends the canonical value's live range, which in loop-heavy
-                        // functions can push register pressure past K=8 and cause IRC
-                        // convergence failure or miscoloring.  Same-block CSE is always
-                        // safe: no live range extension, no register pressure increase.
-                        int safe = (e->inst->block == b);
-                        if (safe) {
-                            Value *canon = val_resolve(e->val);
-                            if (getenv("CSE_DEBUG")) {
-                                fprintf(stderr, "CSE: func=%s alias v%d->v%d (kind=%d B%d->B%d)\n",
-                                    f->name, inst->dst->id, canon->id,
-                                    inst->kind, inst->block->id, e->inst->block->id);
-                            }
-                            inst->dst->alias = canon;
-                            inst->is_dead    = 1;
-                            changed          = 1;
-                        }
+        uint32_t h = cse_hash(inst) & (CSE_BUCKETS - 1);
+        int done = 0;
+        for (int k = 0; k < CSE_BUCKETS && !done; k++) {
+            int idx = (int)((h + (uint32_t)k) & (CSE_BUCKETS - 1));
+            CseEntry *e = &gvn_table[idx];
+            if (!e->inst) {
+                gvn_push(idx);
+                e->inst = inst;
+                e->val  = inst->dst;
+                done    = 1;
+            } else if (cse_equiv(e->inst, inst)) {
+                Value *canon = val_resolve(e->val);
+                // Same-block CSE is always safe.  Cross-block CSE requires:
+                // (1) all operands are non-phi-variables (single-def values
+                //     whose semantic value is the same at both program points)
+                // (2) the eliminated block is NOT at a deeper loop depth
+                //     than the canonical (avoids extending live ranges into
+                //     loops, which pushes register pressure past K=8)
+                // Pre-OOS: no phi-variables, cross-block CSE safe when
+                // canonical dominates target and the idom path doesn't
+                // cross through a loop deeper than both endpoints
+                // (avoids extending live ranges through intermediate loops).
+                // Post-OOS: strict predecessor + non-loop guard.
+                int xblock_ok = 0;
+                if (gvn_pre_oos) {
+                    Block *cb = e->inst->block;
+                    // Only CSE from outer loop into inner loop: the value
+                    // is already live at the outer level, so reusing it
+                    // inside the inner loop is free.  Same-depth cross-block
+                    // CSE extends live ranges and increases pressure.
+                    if (dominates(cb, b) &&
+                        b->loop_depth > cb->loop_depth) {
+                        int crosses = 0;
+                        for (Block *w = b; w && w != cb; w = w->idom)
+                            if (w->loop_depth > b->loop_depth) { crosses = 1; break; }
+                        if (!crosses) xblock_ok = 1;
                     }
-                    done = 1;
+                } else {
+                    if (gvn_ops_safe(inst) &&
+                        b->loop_depth == 0 && e->inst->block->loop_depth == 0) {
+                        for (int p = 0; p < b->npreds; p++)
+                            if (b->preds[p] == e->inst->block) { xblock_ok = 1; break; }
+                    }
                 }
-                // else: hash collision with a different expression; probe next slot
+                if (inst->dst != canon &&
+                    (e->inst->block == b || xblock_ok)) {
+                    if (getenv("CSE_DEBUG"))
+                        fprintf(stderr, "GVN: func=%s alias v%d->v%d (kind=%d B%d->B%d)\n",
+                            f->name, inst->dst->id, canon->id, inst->kind,
+                            e->inst->block->id, b->id);
+                    inst->dst->alias = canon;
+                    inst->is_dead    = 1;
+                    gvn_changed      = 1;
+                }
+                done = 1;
             }
         }
     }
-    free(order);
 
-    if (!changed) return;
+    for (int i = 0; i < b->ndom_children; i++)
+        gvn_walk(b->dom_children[i], f);
+
+    // Undo table entries added by this block and its subtree
+    while (gvn_undo_top > mark) {
+        --gvn_undo_top;
+        gvn_table[gvn_undo[gvn_undo_top].slot] = gvn_undo[gvn_undo_top].prev;
+    }
+}
+
+void opt_cse(Function *f) {
+    // Compute copy_count to identify phi-variables (multi-def OOS copies).
+    gvn_cc = calloc(f->nvalues, sizeof(int));
+    for (int bi = 0; bi < f->nblocks; bi++) {
+        Block *b = f->blocks[bi];
+        for (Inst *inst = b->head; inst; inst = inst->next) {
+            if (!inst->is_dead && inst->kind == IK_COPY && inst->dst)
+                gvn_cc[inst->dst->id]++;
+        }
+    }
+
+    memset(gvn_table, 0, sizeof(gvn_table));
+    gvn_undo = malloc(f->nvalues * sizeof(CseUndo));
+    gvn_undo_top = 0;
+    gvn_changed  = 0;
+
+    // Walk dominator tree from the entry block
+    if (f->nblocks > 0)
+        gvn_walk(f->blocks[0], f);
+
+    free(gvn_undo);
+    free(gvn_cc);
+    gvn_undo = NULL;
+    gvn_cc   = NULL;
+
+    if (!gvn_changed) return;
 
     // Recount use_count after aliasing (same pattern as opt_copy_prop).
     for (int i = 0; i < f->nvalues; i++) f->values[i]->use_count = 0;
@@ -282,6 +346,12 @@ void opt_cse(Function *f) {
             }
         }
     }
+}
+
+void opt_pre_oos_cse(Function *f) {
+    gvn_pre_oos = 1;
+    opt_cse(f);
+    gvn_pre_oos = 0;
 }
 
 // ── R2G: Redundant booleanisation elimination ────────────────────────────
@@ -408,6 +478,33 @@ void opt_narrow_loads(Function *f) {
             }
         }
     }
+    // Also fold SEXT8/SEXT16 of a signed load → IK_COPY.
+    // The ISA's sign-extending loads (llbx/llwx/lbx/lwx) already produce
+    // a sign-extended result, so the SEXT is redundant.  Replacing it with
+    // IK_COPY lets IRC coalesce the load result and the widened value into
+    // the same register, eliminating a spurious mov.
+    for (int bi = 0; bi < f->nblocks; bi++) {
+        Block *b = f->blocks[bi];
+        for (Inst *inst = b->head; inst; inst = inst->next) {
+            if (inst->is_dead || !inst->dst || inst->nops < 1) continue;
+            if (inst->kind != IK_SEXT8 && inst->kind != IK_SEXT16) continue;
+            Value *src = val_resolve(inst->ops[0]);
+            if (!src || src->kind != VAL_INST || !src->def) continue;
+            if (src->def->kind != IK_LOAD) continue;
+            int lsz = src->def->size;
+            // SEXT8 is redundant after a 1-byte signed load;
+            // SEXT16 is redundant after a 2-byte signed load.
+            int src_signed = (src->vtype == VT_I8 || src->vtype == VT_I16 || src->vtype == VT_I32);
+            if (inst->kind == IK_SEXT8 && lsz == 1 && src_signed) {
+                inst->kind = IK_COPY;
+                changed = 1;
+            } else if (inst->kind == IK_SEXT16 && lsz == 2 && src_signed) {
+                inst->kind = IK_COPY;
+                changed = 1;
+            }
+        }
+    }
+
     if (!changed) return;
 
     // Recount use_count
@@ -556,8 +653,20 @@ void opt_licm_const(Function *f) {
             }
         }
 
-        // K=8; need at least 2 free registers for temporaries in the loop body.
-        if (nlive + 1 > 8 - 2) continue;  // +1 for the hoisted constant
+        // Count non-dead instructions in loop body to estimate complexity.
+        int body_insts = 0;
+        for (int bi = 0; bi < f->nblocks; bi++) {
+            Block *b = f->blocks[bi];
+            if (!dominates(h, b)) continue;
+            for (Inst *inst = b->head; inst; inst = inst->next)
+                if (!inst->is_dead) body_insts++;
+        }
+
+        // K=8; complex loop bodies need more in-body registers for temporaries.
+        // Default: leave 2 free. For loops with >16 instructions, the address
+        // computation chains create high peak pressure — leave more headroom.
+        int budget = (body_insts > 16) ? 3 : 6;
+        if (nlive + 1 > budget) continue;
 
         int max_hoist = LICM_MAX_HOIST;
 
@@ -663,6 +772,245 @@ void opt_licm_const(Function *f) {
             }
         }
     }
+}
+
+// ── R2K: General LICM (loop-invariant code motion) ──────────────────────
+//
+// Move pure loop-invariant instructions from loop bodies to pre-headers.
+// A pure instruction is loop-invariant if all its operands are either
+// constants, defined outside the loop, or themselves loop-invariant.
+// Only processes leaf loops with a single pre-header.
+// Excludes division/mod (potential traps if loop executes 0 times).
+
+#define LICM_GEN_MAX 4  // max instructions to hoist per loop
+
+void opt_licm(Function *f) {
+    if (f->nblocks < 2) return;
+
+    // Step 1: Find loop headers via back edges.
+    Block **headers = NULL;
+    int nheaders = 0, hdr_cap = 0;
+    for (int i = 0; i < f->nblocks; i++) {
+        Block *b = f->blocks[i];
+        for (int j = 0; j < b->nsuccs; j++) {
+            Block *h = b->succs[j];
+            if (h->rpo_index <= b->rpo_index && dominates(h, b)) {
+                int dup = 0;
+                for (int k = 0; k < nheaders; k++)
+                    if (headers[k] == h) { dup = 1; break; }
+                if (!dup) {
+                    if (nheaders >= hdr_cap) {
+                        hdr_cap = hdr_cap ? hdr_cap * 2 : 4;
+                        Block **nh = arena_alloc(hdr_cap * sizeof(Block *));
+                        if (headers) memcpy(nh, headers, nheaders * sizeof(Block *));
+                        headers = nh;
+                    }
+                    headers[nheaders++] = h;
+                }
+            }
+        }
+    }
+    if (nheaders == 0) return;
+
+    int changed = 0;
+
+    for (int li = 0; li < nheaders; li++) {
+        Block *h = headers[li];
+
+        // Only leaf loops (no inner loop headers dominated by h).
+        int has_inner = 0;
+        for (int k = 0; k < nheaders; k++) {
+            if (k != li && dominates(h, headers[k])) {
+                has_inner = 1; break;
+            }
+        }
+        if (has_inner) continue;
+
+        // Find pre-header (single outside predecessor).
+        Block *preheader = NULL;
+        int outside_count = 0;
+        for (int k = 0; k < h->npreds; k++) {
+            Block *p = h->preds[k];
+            if (!dominates(h, p)) {
+                preheader = p;
+                outside_count++;
+            }
+        }
+        if (outside_count != 1 || !preheader || !preheader->tail) continue;
+
+        // Register pressure guard: count distinct VAL_INST values used
+        // inside the loop body that are defined OUTSIDE the loop.  Each
+        // hoisted instruction adds one more cross-loop live value, so we
+        // need headroom.  Also count unique definitions inside the loop
+        // to estimate peak internal pressure.
+        #define LICM_GEN_LIVE_CAP 64
+        int live_ids[LICM_GEN_LIVE_CAP];
+        int nlive = 0;          // values defined outside, used inside
+        int nloop_defs = 0;     // unique values defined inside
+        for (int bi = 0; bi < f->nblocks; bi++) {
+            Block *b = f->blocks[bi];
+            if (!dominates(h, b)) continue;
+            for (Inst *inst = b->head; inst; inst = inst->next) {
+                if (inst->is_dead) continue;
+                // Count defs
+                if (inst->dst) {
+                    int vid = inst->dst->id, dup2 = 0;
+                    for (int k = 0; k < nlive + nloop_defs && !dup2; k++)
+                        if (live_ids[k] == vid) dup2 = 1;
+                    if (!dup2 && nlive + nloop_defs < LICM_GEN_LIVE_CAP) {
+                        live_ids[nlive + nloop_defs] = vid;
+                        nloop_defs++;
+                    }
+                }
+                // Count uses defined outside
+                for (int j = 0; j < inst->nops; j++) {
+                    Value *v = val_resolve(inst->ops[j]);
+                    if (!v || v->kind != VAL_INST || !v->def) continue;
+                    if (!dominates(h, v->def->block)) {
+                        int vid = v->id, dup2 = 0;
+                        for (int k = 0; k < nlive && !dup2; k++)
+                            if (live_ids[k] == vid) dup2 = 1;
+                        if (!dup2 && nlive < LICM_GEN_LIVE_CAP)
+                            live_ids[nlive++] = vid;
+                    }
+                }
+            }
+        }
+
+        // Conservative budget: need at least 4 free registers for in-body
+        // temporaries (address computations, intermediate values), and each
+        // hoist adds 1 to the cross-loop pressure.  Cap budget when loop-
+        // internal definitions are high (tight loops with many values).
+        int budget = 8 - 4 - nlive;
+        if (budget <= 0) continue;
+        if (nloop_defs > 10) budget = budget < 1 ? 0 : 1;
+        else if (nloop_defs > 6) budget = budget < 2 ? budget : 2;
+        if (budget > LICM_GEN_MAX) budget = LICM_GEN_MAX;
+
+        // Build def-count per value inside the loop.
+        int nv = f->nvalues;
+        int *loop_defined = calloc(nv, sizeof(int));
+        int *def_count    = calloc(nv, sizeof(int));
+        if (!loop_defined || !def_count) goto next_loop;
+
+        for (int bi = 0; bi < f->nblocks; bi++) {
+            if (!dominates(h, f->blocks[bi])) continue;
+            Block *b = f->blocks[bi];
+            for (Inst *inst = b->head; inst; inst = inst->next) {
+                if (!inst->dst) continue;
+                // Resolve through aliases so that CSE'd duplicates (e.g.
+                // v50→v28 after CSE aliased v50=shl to v28=shl) are
+                // counted against the canonical value.
+                int did = val_resolve(inst->dst)->id;
+                // Only count live definitions.  Dead defs (CSE-killed
+                // duplicates) are now unlinked before liveness analysis
+                // (alloc.c pre-pass), so they don't affect register pressure.
+                if (!inst->is_dead) {
+                    def_count[did]++;
+                    loop_defined[did] = 1;
+                }
+            }
+        }
+
+        // Iterative invariance marking.
+        int *inv = calloc(nv, sizeof(int));
+        if (!inv) goto next_loop;
+
+        int progress = 1;
+        while (progress) {
+            progress = 0;
+            for (int bi = 0; bi < f->nblocks; bi++) {
+                if (!dominates(h, f->blocks[bi])) continue;
+                Block *b = f->blocks[bi];
+                for (Inst *inst = b->head; inst; inst = inst->next) {
+                    if (inst->is_dead || !inst->dst) continue;
+                    int did = val_resolve(inst->dst)->id;
+                    if (inv[did]) continue;
+                    if (!is_cse_pure(inst->kind)) continue;
+                    // Exclude division/mod — could trap if loop runs 0 times
+                    if (inst->kind == IK_DIV  || inst->kind == IK_UDIV ||
+                        inst->kind == IK_MOD  || inst->kind == IK_UMOD ||
+                        inst->kind == IK_FDIV) continue;
+                    // Exclude IK_GADDR — cheap to recompute (3 bytes, 1 cycle);
+                    // not worth occupying a register across the entire loop.
+                    if (inst->kind == IK_GADDR) continue;
+                    // Exclude type conversions — they lower to a single AND or
+                    // sign-extend instruction (1–2 cycles); hoisting extends a
+                    // live range across the loop for negligible savings.
+                    if (inst->kind == IK_SEXT8  || inst->kind == IK_SEXT16 ||
+                        inst->kind == IK_ZEXT   || inst->kind == IK_TRUNC) continue;
+                    // Must be the only definition in the loop (no phi-vars
+                    // or CSE-eliminated duplicates)
+                    if (def_count[did] != 1) continue;
+
+                    int all_inv = 1;
+                    for (int j = 0; j < inst->nops; j++) {
+                        Value *v = val_resolve(inst->ops[j]);
+                        if (v->kind == VAL_CONST || v->kind == VAL_UNDEF)
+                            continue;
+                        if (!loop_defined[v->id]) continue; // outside → ok
+                        if (inv[v->id]) continue;           // marked inv → ok
+                        all_inv = 0;
+                        break;
+                    }
+                    if (all_inv) {
+                        inv[did] = 1;
+                        progress = 1;
+                    }
+                }
+            }
+        }
+
+        // Collect invariant instructions in IR order, limited by budget.
+        Inst **to_hoist = malloc(budget * sizeof(Inst *));
+        int nhoist = 0;
+        if (!to_hoist) goto next_loop;
+
+        for (int bi = 0; bi < f->nblocks && nhoist < budget; bi++) {
+            if (!dominates(h, f->blocks[bi])) continue;
+            Block *b = f->blocks[bi];
+            for (Inst *inst = b->head; inst && nhoist < budget; inst = inst->next) {
+                if (inst->is_dead || !inst->dst) continue;
+                int rid = val_resolve(inst->dst)->id;
+                if (inv[rid])
+                    to_hoist[nhoist++] = inst;
+            }
+        }
+
+        // Hoist: unlink from current block, insert in pre-header before terminator.
+        if (getenv("LICM_DEBUG")) {
+            if (nhoist > 0) {
+                fprintf(stderr, "LICM: func=%s loop B%d→pre B%d, hoisting %d (budget=%d nlive=%d nloop_defs=%d):\n",
+                        f->name, h->id, preheader->id, nhoist, budget, nlive, nloop_defs);
+                for (int i = 0; i < nhoist; i++) {
+                    Inst *di = to_hoist[i];
+                    fprintf(stderr, "  v%d (kind=%d) from B%d\n",
+                            di->dst->id, di->kind, di->block->id);
+                }
+            }
+        }
+        for (int i = 0; i < nhoist; i++) {
+            Inst *inst = to_hoist[i];
+            Block *b = inst->block;
+
+            // Unlink
+            if (inst->prev) inst->prev->next = inst->next;
+            else            b->head = inst->next;
+            if (inst->next) inst->next->prev = inst->prev;
+            else            b->tail = inst->prev;
+
+            // Insert before pre-header terminator
+            inst_insert_before(preheader->tail, inst);
+            changed = 1;
+        }
+
+        free(to_hoist);
+    next_loop:
+        free(loop_defined);
+        free(def_count);
+        free(inv);
+    }
+    (void)changed;
 }
 
 // ── R2I: Jump threading ──────────────────────────────────────────────────
@@ -1129,5 +1477,864 @@ void opt_unroll_loops(Function *f) {
 
         free(vmap);
         break;  // only unroll one loop per function per pass
+    }
+}
+
+// ── Loop Strength Reduction (pre-OOS) ────────────────────────────────────
+//
+// For each leaf loop, find basic induction variables (phis whose back-edge
+// input is iv + const_step).  For each IK_MUL(iv, loop_invariant), replace
+// with a strength-reduced induction variable: sr_phi = phi(iv_init * inv,
+// sr_prev + step * inv).  The original MUL becomes dead after aliasing.
+
+#define LSR_MAX_IVS  8
+#define LSR_MAX_REDS 4
+
+typedef struct {
+    Value *phi_val;    // the phi's dst value
+    Inst  *phi_inst;   // the IK_PHI instruction
+    int    init_idx;   // index in ops[] of the pre-header operand
+    int    back_idx;   // index in ops[] of the back-edge operand
+    Value *init_val;   // initial value (from pre-header)
+    Value *step_val;   // constant step value
+    Inst  *add_inst;   // the IK_ADD instruction (iv_next = iv + step)
+} IVInfo;
+
+void opt_lsr(Function *f) {
+    if (f->nblocks < 2) return;
+
+    // Step 1: Find loop headers via back edges.
+    Block **headers = NULL;
+    int nheaders = 0, hdr_cap = 0;
+    for (int i = 0; i < f->nblocks; i++) {
+        Block *b = f->blocks[i];
+        for (int j = 0; j < b->nsuccs; j++) {
+            Block *h = b->succs[j];
+            if (h->rpo_index <= b->rpo_index && dominates(h, b)) {
+                int dup = 0;
+                for (int k = 0; k < nheaders; k++)
+                    if (headers[k] == h) { dup = 1; break; }
+                if (!dup) {
+                    if (nheaders >= hdr_cap) {
+                        hdr_cap = hdr_cap ? hdr_cap * 2 : 4;
+                        Block **nh = malloc(hdr_cap * sizeof(Block *));
+                        if (headers) { memcpy(nh, headers, nheaders * sizeof(Block *)); free(headers); }
+                        headers = nh;
+                    }
+                    headers[nheaders++] = h;
+                }
+            }
+        }
+    }
+    if (nheaders == 0) return;
+
+    int changed = 0;
+
+    for (int li = 0; li < nheaders; li++) {
+        Block *h = headers[li];
+
+        // Only leaf loops (no inner loop headers dominated by h).
+        int has_inner = 0;
+        for (int k = 0; k < nheaders; k++) {
+            if (k != li && dominates(h, headers[k])) {
+                has_inner = 1; break;
+            }
+        }
+        if (has_inner) continue;
+
+        // Find pre-header (single non-back-edge predecessor) and back-edge pred.
+        Block *preheader = NULL;
+        int pre_idx = -1, back_idx = -1;
+        int outside_count = 0;
+        for (int k = 0; k < h->npreds; k++) {
+            Block *p = h->preds[k];
+            if (dominates(h, p)) {
+                back_idx = k;
+            } else {
+                preheader = p;
+                pre_idx = k;
+                outside_count++;
+            }
+        }
+        if (outside_count != 1 || !preheader || pre_idx < 0 || back_idx < 0) continue;
+
+        // Register pressure guard: count values defined outside the loop
+        // that are used inside (cross-loop live-ins), plus header phis.
+        // Each LSR reduction adds one new cross-loop phi, so we need room.
+        int nlive = 0;
+        {
+            int live_cap = 64;
+            int live_ids[64];
+            // Count header phis
+            for (Inst *inst = h->head; inst; inst = inst->next) {
+                if (inst->is_dead) continue;
+                if (inst->kind != IK_PHI) break;
+                if (nlive < live_cap) live_ids[nlive++] = inst->dst->id;
+            }
+            // Count external values used inside the loop
+            for (int bi = 0; bi < f->nblocks; bi++) {
+                Block *bb = f->blocks[bi];
+                if (!dominates(h, bb)) continue;
+                for (Inst *inst = bb->head; inst; inst = inst->next) {
+                    if (inst->is_dead) continue;
+                    for (int j = 0; j < inst->nops; j++) {
+                        Value *v = val_resolve(inst->ops[j]);
+                        if (!v || v->kind != VAL_INST || !v->def) continue;
+                        if (dominates(h, v->def->block)) continue;  // internal
+                        int dup = 0;
+                        for (int k = 0; k < nlive; k++)
+                            if (live_ids[k] == v->id) { dup = 1; break; }
+                        if (!dup && nlive < live_cap) live_ids[nlive++] = v->id;
+                    }
+                }
+            }
+        }
+        int lsr_budget = 8 - 4 - nlive;  // K - scratch - existing cross-loop values
+        if (lsr_budget <= 0) continue;
+
+        // Step 2: Detect basic induction variables in header phis.
+        IVInfo ivs[LSR_MAX_IVS];
+        int niv = 0;
+
+        for (Inst *inst = h->head; inst; inst = inst->next) {
+            if (inst->is_dead || inst->kind != IK_PHI) continue;
+            if (inst->nops != h->npreds) continue;
+            if (niv >= LSR_MAX_IVS) break;
+
+            Value *init = val_resolve(inst->ops[pre_idx]);
+            Value *back = val_resolve(inst->ops[back_idx]);
+
+            // back must be iv + step_const (or step_const + iv)
+            if (back->kind != VAL_INST || !back->def) continue;
+            Inst *add = back->def;
+            if (add->kind != IK_ADD || add->nops != 2) continue;
+            if (!dominates(h, add->block)) continue;  // must be inside loop
+
+            Value *a0 = val_resolve(add->ops[0]);
+            Value *a1 = val_resolve(add->ops[1]);
+            Value *step = NULL;
+            if (a0 == inst->dst && (a1->kind == VAL_CONST ||
+                (a1->kind == VAL_INST && a1->def && a1->def->kind == IK_CONST))) {
+                step = a1;
+            } else if (a1 == inst->dst && (a0->kind == VAL_CONST ||
+                (a0->kind == VAL_INST && a0->def && a0->def->kind == IK_CONST))) {
+                step = a0;
+            }
+            if (!step) continue;
+
+            ivs[niv].phi_val  = inst->dst;
+            ivs[niv].phi_inst = inst;
+            ivs[niv].init_idx = pre_idx;
+            ivs[niv].back_idx = back_idx;
+            ivs[niv].init_val = init;
+            ivs[niv].step_val = step;
+            ivs[niv].add_inst = add;
+            niv++;
+        }
+        if (niv == 0) continue;
+
+        // Step 3: Find MUL candidates in loop body.
+        int nreduced = 0;
+        int max_reds = lsr_budget < LSR_MAX_REDS ? lsr_budget : LSR_MAX_REDS;
+        for (int bi = 0; bi < f->nblocks && nreduced < max_reds; bi++) {
+            Block *b = f->blocks[bi];
+            if (!dominates(h, b)) continue;
+            for (Inst *inst = b->head; inst && nreduced < max_reds; inst = inst->next) {
+                if (inst->is_dead || inst->kind != IK_MUL || inst->nops != 2) continue;
+
+                Value *m0 = val_resolve(inst->ops[0]);
+                Value *m1 = val_resolve(inst->ops[1]);
+
+                // Match MUL(iv, invariant) or MUL(invariant, iv)
+                for (int iv_i = 0; iv_i < niv; iv_i++) {
+                    IVInfo *iv = &ivs[iv_i];
+                    Value *inv = NULL;
+                    if (m0 == iv->phi_val) inv = m1;
+                    else if (m1 == iv->phi_val) inv = m0;
+                    if (!inv) continue;
+
+                    // inv must be loop-invariant (defined outside or constant)
+                    if (inv->kind == VAL_INST && inv->def && dominates(h, inv->def->block))
+                        continue;  // defined inside loop — not invariant
+
+                    // Create strength-reduced induction variable:
+                    // sr_init = iv_init * inv  (in pre-header)
+                    // sr_step = step * inv     (in pre-header)
+                    // sr_phi  = phi(sr_init, sr_next)  (in header)
+                    // sr_next = sr_phi + sr_step       (after iv's add)
+
+                    ValType vt = inst->dst->vtype;
+
+                    // sr_init = iv_init * inv
+                    Value *sr_init_val = new_value(f, VAL_INST, vt);
+                    Inst  *sr_init = new_inst(f, preheader, IK_MUL, sr_init_val);
+                    inst_add_op(sr_init, iv->init_val);
+                    inst_add_op(sr_init, inv);
+                    inst_insert_before(preheader->tail, sr_init);
+
+                    // sr_step = step * inv
+                    Value *sr_step_val = new_value(f, VAL_INST, vt);
+                    Inst  *sr_step = new_inst(f, preheader, IK_MUL, sr_step_val);
+                    inst_add_op(sr_step, iv->step_val);
+                    inst_add_op(sr_step, inv);
+                    inst_insert_before(preheader->tail, sr_step);
+
+                    // sr_phi = phi(sr_init, sr_next) in header
+                    // (sr_next is a forward reference, patched below)
+                    Value *sr_phi_val = new_value(f, VAL_INST, vt);
+                    Inst  *sr_phi = new_inst(f, h, IK_PHI, sr_phi_val);
+                    // Add ops in preds[] order
+                    for (int p = 0; p < h->npreds; p++) {
+                        if (p == pre_idx) inst_add_op(sr_phi, sr_init_val);
+                        else              inst_add_op(sr_phi, sr_init_val); // placeholder
+                    }
+                    // Prepend phi to header (before first non-phi)
+                    Inst *first_non_phi = h->head;
+                    while (first_non_phi && first_non_phi->kind == IK_PHI)
+                        first_non_phi = first_non_phi->next;
+                    if (first_non_phi)
+                        inst_insert_before(first_non_phi, sr_phi);
+                    else
+                        inst_append(h, sr_phi);
+
+                    // sr_next = sr_phi + sr_step (placed right after iv's add)
+                    Value *sr_next_val = new_value(f, VAL_INST, vt);
+                    Inst  *sr_next = new_inst(f, iv->add_inst->block, IK_ADD, sr_next_val);
+                    inst_add_op(sr_next, sr_phi_val);
+                    inst_add_op(sr_next, sr_step_val);
+                    // Insert after iv's add instruction
+                    if (iv->add_inst->next)
+                        inst_insert_before(iv->add_inst->next, sr_next);
+                    else
+                        inst_append(iv->add_inst->block, sr_next);
+
+                    // Patch phi's back-edge operand to sr_next
+                    sr_phi->ops[back_idx] = sr_next_val;
+                    sr_next_val->use_count++;
+                    sr_init_val->use_count--;  // was placeholder
+
+                    // Alias original MUL's result to sr_phi
+                    inst->dst->alias = sr_phi_val;
+                    inst->is_dead = 1;
+
+                    if (getenv("LSR_DEBUG"))
+                        fprintf(stderr, "LSR: func=%s v%d=mul(iv=v%d,inv=v%d) → sr_phi=v%d in B%d\n",
+                            f->name, inst->dst->id, iv->phi_val->id,
+                            inv->id, sr_phi_val->id, h->id);
+
+                    nreduced++;
+                    changed = 1;
+                    break;  // move to next instruction
+                }
+            }
+        }
+    }
+
+    free(headers);
+
+    if (!changed) return;
+
+    // Physically unlink dead instructions (the reduced MULs) so they don't
+    // participate in OOS or subsequent passes.
+    for (int bi = 0; bi < f->nblocks; bi++) {
+        Block *b = f->blocks[bi];
+        Inst *inst = b->head;
+        while (inst) {
+            Inst *next = inst->next;
+            if (inst->is_dead) {
+                if (inst->prev) inst->prev->next = inst->next;
+                else            b->head = inst->next;
+                if (inst->next) inst->next->prev = inst->prev;
+                else            b->tail = inst->prev;
+            }
+            inst = next;
+        }
+    }
+
+    // Recount use_count after aliasing and unlinking
+    for (int i = 0; i < f->nvalues; i++) f->values[i]->use_count = 0;
+    for (int bi = 0; bi < f->nblocks; bi++) {
+        Block *b = f->blocks[bi];
+        for (Inst *inst = b->head; inst; inst = inst->next) {
+            for (int j = 0; j < inst->nops; j++) {
+                if (inst->ops[j]) {
+                    inst->ops[j] = val_resolve(inst->ops[j]);
+                    inst->ops[j]->use_count++;
+                }
+            }
+        }
+    }
+}
+
+// ── Scalar Promotion (pre-OOS) ───────────────────────────────────────────
+//
+// For each leaf loop with a load-modify-store pattern to a loop-invariant
+// address, replace the load/store cycle with a register-carried accumulator
+// phi.  The init store in the pre-header seeds the phi; an exit store after
+// the loop writes the final value back to memory.
+//
+// This eliminates a load+store per iteration, freeing the address register
+// inside the loop body and reducing register pressure.
+
+void opt_scalar_promote(Function *f) {
+    if (f->nblocks < 2) return;
+
+    // Find loop headers + latch blocks via back-edge detection
+    struct { Block *h; Block *latch; } loops[32];
+    int nloops = 0;
+    for (int i = 0; i < f->nblocks; i++) {
+        Block *b = f->blocks[i];
+        for (int j = 0; j < b->nsuccs; j++) {
+            Block *h = b->succs[j];
+            if (h->rpo_index <= b->rpo_index && dominates(h, b)) {
+                int dup = 0;
+                for (int k = 0; k < nloops; k++)
+                    if (loops[k].h == h) { dup = 1; break; }
+                if (!dup && nloops < 32) {
+                    loops[nloops].h = h;
+                    loops[nloops].latch = b;
+                    nloops++;
+                }
+            }
+        }
+    }
+    if (!nloops) return;
+
+    int changed = 0;
+
+    for (int li = 0; li < nloops; li++) {
+        Block *h = loops[li].h;
+        Block *latch = loops[li].latch;
+
+        // Leaf loops only
+        int inner = 0;
+        for (int k = 0; k < nloops && !inner; k++)
+            if (k != li && dominates(h, loops[k].h)) inner = 1;
+        if (inner) continue;
+
+        // Pre-header + back-edge predecessor indices
+        Block *preh = NULL;
+        int pre_idx = -1, back_idx = -1, outside = 0;
+        for (int k = 0; k < h->npreds; k++) {
+            if (dominates(h, h->preds[k])) back_idx = k;
+            else { preh = h->preds[k]; pre_idx = k; outside++; }
+        }
+        if (outside != 1 || !preh || back_idx < 0) continue;
+
+        // Compute natural loop body via worklist
+        int mark_sz = f->next_blk_id;
+        int *in_body = calloc(mark_sz, sizeof(int));
+        if (!in_body) continue;
+        in_body[h->id] = 1;
+        Block *wl[256]; int wl_n = 0;
+        if (latch != h) { in_body[latch->id] = 1; wl[wl_n++] = latch; }
+        while (wl_n > 0) {
+            Block *c = wl[--wl_n];
+            for (int p = 0; p < c->npreds; p++) {
+                Block *pr = c->preds[p];
+                if (pr->id < mark_sz && !in_body[pr->id]) {
+                    in_body[pr->id] = 1;
+                    if (wl_n < 256) wl[wl_n++] = pr;
+                }
+            }
+        }
+
+        // Single exit block
+        Block *exit_blk = NULL;
+        int multi_exit = 0;
+        for (int bi = 0; bi < f->nblocks && !multi_exit; bi++) {
+            Block *b = f->blocks[bi];
+            if (!in_body[b->id]) continue;
+            for (int si = 0; si < b->nsuccs && !multi_exit; si++) {
+                Block *s = b->succs[si];
+                if (s->id < mark_sz && !in_body[s->id]) {
+                    if (!exit_blk) exit_blk = s;
+                    else if (exit_blk != s) multi_exit = 1;
+                }
+            }
+        }
+        if (multi_exit || !exit_blk) { free(in_body); continue; }
+
+        // Safety: no calls or memcpy in loop body
+        int unsafe = 0;
+        for (int bi = 0; bi < f->nblocks && !unsafe; bi++) {
+            Block *b = f->blocks[bi];
+            if (!in_body[b->id]) continue;
+            for (Inst *inst = b->head; inst && !unsafe; inst = inst->next) {
+                if (inst->is_dead) continue;
+                if (inst->kind == IK_CALL || inst->kind == IK_ICALL || inst->kind == IK_MEMCPY)
+                    unsafe = 1;
+            }
+        }
+        if (unsafe) { free(in_body); continue; }
+
+        // Find a promotable load-modify-store pattern
+        int promoted = 0;
+        for (int bi = 0; bi < f->nblocks && !promoted; bi++) {
+            Block *b = f->blocks[bi];
+            if (!in_body[b->id] || b == h) continue;
+
+            for (Inst *store = b->head; store && !promoted; store = store->next) {
+                if (store->is_dead || store->kind != IK_STORE) continue;
+
+                Value *addr = val_resolve(store->ops[0]);
+                int sz = store->size;
+                int imm = store->imm;
+
+                // Address must be loop-invariant (defined outside loop)
+                if (addr->kind == VAL_INST && addr->def && in_body[addr->def->block->id])
+                    continue;
+
+                // Find matching load before this store in same block
+                Inst *load = NULL;
+                for (Inst *i = b->head; i != store; i = i->next) {
+                    if (i->is_dead || i->kind != IK_LOAD) continue;
+                    if (i->size != sz || i->imm != imm) continue;
+                    if (val_resolve(i->ops[0]) == addr) { load = i; break; }
+                }
+                if (!load) continue;
+
+                // Store value must depend on load result (1-hop check)
+                Value *sv = val_resolve(store->ops[1]);
+                if (sv->kind != VAL_INST || !sv->def) continue;
+                int dep = 0;
+                for (int j = 0; j < sv->def->nops; j++)
+                    if (val_resolve(sv->def->ops[j]) == load->dst) { dep = 1; break; }
+                if (!dep) continue;
+
+                // No other stores in loop body (conservative: avoids aliasing issues)
+                int other_st = 0;
+                for (int bi2 = 0; bi2 < f->nblocks && !other_st; bi2++) {
+                    Block *bb = f->blocks[bi2];
+                    if (!in_body[bb->id]) continue;
+                    for (Inst *i = bb->head; i && !other_st; i = i->next) {
+                        if (!i->is_dead && i->kind == IK_STORE && i != store)
+                            other_st = 1;
+                    }
+                }
+                if (other_st) continue;
+
+                // Find init store in pre-header (same address, same size)
+                Inst *init_st = NULL;
+                for (Inst *i = preh->head; i; i = i->next) {
+                    if (i->is_dead || i->kind != IK_STORE) continue;
+                    if (i->size != sz || i->imm != imm) continue;
+                    if (val_resolve(i->ops[0]) == addr) { init_st = i; break; }
+                }
+                if (!init_st) continue;
+
+                // === Perform scalar promotion ===
+                Value *init_val = val_resolve(init_st->ops[1]);
+
+                // Create accumulator phi in header: acc = phi(init_val, sv)
+                Value *acc = new_value(f, VAL_INST, load->dst->vtype);
+                Inst *phi = new_inst(f, h, IK_PHI, acc);
+                for (int p = 0; p < h->npreds; p++) {
+                    if (p == pre_idx) inst_add_op(phi, init_val);
+                    else              inst_add_op(phi, sv);
+                }
+                // Insert after existing phis in header
+                Inst *ins_pt = h->head;
+                while (ins_pt && ins_pt->kind == IK_PHI) ins_pt = ins_pt->next;
+                if (ins_pt) inst_insert_before(ins_pt, phi);
+                else        inst_append(h, phi);
+
+                // Alias load result → accumulator phi
+                load->dst->alias = acc;
+                load->is_dead = 1;
+
+                // Kill loop store and init store
+                store->is_dead = 1;
+                init_st->is_dead = 1;
+
+                // Insert exit store: store [addr]:sz = acc
+                Inst *exit_st = new_inst(f, exit_blk, IK_STORE, NULL);
+                inst_add_op(exit_st, addr);
+                inst_add_op(exit_st, acc);
+                exit_st->imm = imm;
+                exit_st->size = sz;
+                if (exit_blk->head)
+                    inst_insert_before(exit_blk->head, exit_st);
+                else
+                    inst_append(exit_blk, exit_st);
+
+                promoted = 1;
+                changed = 1;
+            }
+        }
+        free(in_body);
+    }
+
+    if (!changed) return;
+
+    // Unlink dead instructions
+    for (int bi = 0; bi < f->nblocks; bi++) {
+        Block *b = f->blocks[bi];
+        Inst *inst = b->head;
+        while (inst) {
+            Inst *next = inst->next;
+            if (inst->is_dead) {
+                if (inst->prev) inst->prev->next = inst->next;
+                else            b->head = inst->next;
+                if (inst->next) inst->next->prev = inst->prev;
+                else            b->tail = inst->prev;
+            }
+            inst = next;
+        }
+    }
+
+    // Recount use_count after aliasing and unlinking
+    for (int i = 0; i < f->nvalues; i++) f->values[i]->use_count = 0;
+    for (int bi = 0; bi < f->nblocks; bi++) {
+        Block *b = f->blocks[bi];
+        for (Inst *inst = b->head; inst; inst = inst->next) {
+            for (int j = 0; j < inst->nops; j++) {
+                if (inst->ops[j]) {
+                    inst->ops[j] = val_resolve(inst->ops[j]);
+                    inst->ops[j]->use_count++;
+                }
+            }
+        }
+    }
+}
+
+// ── Address Induction Variables (pre-OOS) ────────────────────────────────
+//
+// For loads whose address is BASE + (OFFSET + f(iv)) << SHIFT, replace
+// the address chain with a pointer induction variable:
+//   ptr_phi = phi(BASE + OFFSET<<SHIFT, ptr_phi + step)
+// where step = iv_step << SHIFT (constant for simple IVs) or
+//              COEFF << SHIFT  (loop-invariant for MUL-derived IVs).
+//
+// Eliminates ADD+SHL+ADD (3 instr) or MUL+ADD+SHL+ADD (4 instr) from the
+// loop body, replacing with a single ADD in the latch.
+
+static int aiv_invariant(Value *v, int *in_body) {
+    v = val_resolve(v);
+    if (v->kind == VAL_CONST) return 1;
+    if (v->kind == VAL_INST && v->def && !in_body[v->def->block->id]) return 1;
+    return 0;
+}
+
+void opt_addr_iv(Function *f) {
+    if (f->nblocks < 2) return;
+
+    // Find loop headers + latch blocks via back-edge detection
+    struct { Block *h; Block *latch; } loops[32];
+    int nloops = 0;
+    for (int i = 0; i < f->nblocks; i++) {
+        Block *b = f->blocks[i];
+        for (int j = 0; j < b->nsuccs; j++) {
+            Block *h = b->succs[j];
+            if (h->rpo_index <= b->rpo_index && dominates(h, b)) {
+                int dup = 0;
+                for (int k = 0; k < nloops; k++)
+                    if (loops[k].h == h) { dup = 1; break; }
+                if (!dup && nloops < 32) {
+                    loops[nloops].h = h;
+                    loops[nloops].latch = b;
+                    nloops++;
+                }
+            }
+        }
+    }
+    if (!nloops) return;
+
+    int changed = 0;
+
+    for (int li = 0; li < nloops; li++) {
+        Block *h = loops[li].h;
+        Block *latch = loops[li].latch;
+
+        // Leaf loops only
+        int inner = 0;
+        for (int k = 0; k < nloops && !inner; k++)
+            if (k != li && dominates(h, loops[k].h)) inner = 1;
+        if (inner) continue;
+
+        // Pre-header + back-edge predecessor indices
+        Block *preh = NULL;
+        int pre_idx = -1, back_idx = -1, outside = 0;
+        for (int k = 0; k < h->npreds; k++) {
+            if (dominates(h, h->preds[k])) back_idx = k;
+            else { preh = h->preds[k]; pre_idx = k; outside++; }
+        }
+        if (outside != 1 || !preh || back_idx < 0) continue;
+
+        // Compute natural loop body
+        int mark_sz = f->next_blk_id;
+        int *in_body = calloc(mark_sz, sizeof(int));
+        if (!in_body) continue;
+        in_body[h->id] = 1;
+        Block *wl[256]; int wl_n = 0;
+        if (latch != h) { in_body[latch->id] = 1; wl[wl_n++] = latch; }
+        while (wl_n > 0) {
+            Block *c = wl[--wl_n];
+            for (int p = 0; p < c->npreds; p++) {
+                Block *pr = c->preds[p];
+                if (pr->id < mark_sz && !in_body[pr->id]) {
+                    in_body[pr->id] = 1;
+                    if (wl_n < 256) wl[wl_n++] = pr;
+                }
+            }
+        }
+
+        // Detect basic induction variables (same as LSR)
+        IVInfo ivs[LSR_MAX_IVS];
+        int niv = 0;
+        for (Inst *inst = h->head; inst; inst = inst->next) {
+            if (inst->is_dead || inst->kind != IK_PHI) continue;
+            if (inst->nops != h->npreds) continue;
+            if (niv >= LSR_MAX_IVS) break;
+
+            Value *init = val_resolve(inst->ops[pre_idx]);
+            Value *back = val_resolve(inst->ops[back_idx]);
+            if (back->kind != VAL_INST || !back->def) continue;
+            Inst *add = back->def;
+            if (add->kind != IK_ADD || add->nops != 2) continue;
+            if (!in_body[add->block->id]) continue;
+
+            Value *a0 = val_resolve(add->ops[0]);
+            Value *a1 = val_resolve(add->ops[1]);
+            Value *step = NULL;
+            if (a0 == inst->dst && (a1->kind == VAL_CONST ||
+                (a1->kind == VAL_INST && a1->def && a1->def->kind == IK_CONST)))
+                step = a1;
+            else if (a1 == inst->dst && (a0->kind == VAL_CONST ||
+                (a0->kind == VAL_INST && a0->def && a0->def->kind == IK_CONST)))
+                step = a0;
+            if (!step) continue;
+
+            ivs[niv].phi_val  = inst->dst;
+            ivs[niv].phi_inst = inst;
+            ivs[niv].init_idx = pre_idx;
+            ivs[niv].back_idx = back_idx;
+            ivs[niv].init_val = init;
+            ivs[niv].step_val = step;
+            ivs[niv].add_inst = add;
+            niv++;
+        }
+        if (niv == 0) { free(in_body); continue; }
+
+        // Scan loads in loop body for reducible address patterns
+        for (int bi = 0; bi < f->nblocks; bi++) {
+            Block *b = f->blocks[bi];
+            if (!in_body[b->id] || b == h) continue;
+
+            for (Inst *load = b->head; load; load = load->next) {
+                if (load->is_dead || load->kind != IK_LOAD || load->nops < 1) continue;
+                if (load->imm != 0) continue;
+
+                // Match: LOAD [ADD(base, SHL(sum, shift_c))]:sz
+                Value *addr = val_resolve(load->ops[0]);
+                if (addr->kind != VAL_INST || !addr->def) continue;
+                Inst *addr_i = addr->def;
+                if (addr_i->kind != IK_ADD || addr_i->nops != 2) continue;
+                if (!in_body[addr_i->block->id]) continue;
+
+                Value *op0 = val_resolve(addr_i->ops[0]);
+                Value *op1 = val_resolve(addr_i->ops[1]);
+
+                // One operand is loop-invariant base, other is SHL result
+                Value *base = NULL, *shl_v = NULL;
+                for (int sw = 0; sw < 2 && !base; sw++) {
+                    Value *mb = sw ? op1 : op0;
+                    Value *ms = sw ? op0 : op1;
+                    if (!aiv_invariant(mb, in_body)) continue;
+                    if (ms->kind != VAL_INST || !ms->def || ms->def->kind != IK_SHL) continue;
+                    base = mb; shl_v = ms;
+                }
+                if (!base) continue;
+
+                // Match SHL(sum, const_shift)
+                Inst *shl_i = shl_v->def;
+                if (shl_i->nops != 2) continue;
+                Value *sum_v = val_resolve(shl_i->ops[0]);
+                Value *shift_c = val_resolve(shl_i->ops[1]);
+                if (shift_c->kind != VAL_CONST) continue;
+                int shift = shift_c->iconst;
+                if (shift < 1 || shift > 4) continue;
+
+                // sum must be ADD defined inside loop
+                if (sum_v->kind != VAL_INST || !sum_v->def) continue;
+                Inst *sum_i = sum_v->def;
+                if (sum_i->kind != IK_ADD || sum_i->nops != 2) continue;
+                if (!in_body[sum_i->block->id]) continue;
+
+                Value *s0 = val_resolve(sum_i->ops[0]);
+                Value *s1 = val_resolve(sum_i->ops[1]);
+
+                // Match against basic IVs:
+                // Pattern A: ADD(inv, iv) — step = iv_step << shift
+                // Pattern B: ADD(MUL(iv, coeff), inv) — step = coeff << shift
+                IVInfo *miv = NULL;
+                Value *inv_offset = NULL;
+                Value *mul_coeff = NULL;
+
+                for (int iv_i = 0; iv_i < niv && !miv; iv_i++) {
+                    IVInfo *iv = &ivs[iv_i];
+
+                    // Pattern A: one operand is iv, other is invariant
+                    if (s0 == iv->phi_val && aiv_invariant(s1, in_body)) {
+                        miv = iv; inv_offset = s1;
+                    } else if (s1 == iv->phi_val && aiv_invariant(s0, in_body)) {
+                        miv = iv; inv_offset = s0;
+                    }
+                    if (miv) break;
+
+                    // Pattern B: one operand is MUL(iv, coeff), other is invariant
+                    for (int sw = 0; sw < 2 && !miv; sw++) {
+                        Value *mm = val_resolve(sw ? s1 : s0);
+                        Value *mi = sw ? s0 : s1;
+                        if (!aiv_invariant(mi, in_body)) continue;
+                        if (mm->kind != VAL_INST || !mm->def) continue;
+                        if (mm->def->kind != IK_MUL || mm->def->nops != 2) continue;
+                        if (!in_body[mm->def->block->id]) continue;
+                        Value *m0 = val_resolve(mm->def->ops[0]);
+                        Value *m1 = val_resolve(mm->def->ops[1]);
+                        if (m0 == iv->phi_val && aiv_invariant(m1, in_body)) {
+                            miv = iv; inv_offset = mi; mul_coeff = m1;
+                        } else if (m1 == iv->phi_val && aiv_invariant(m0, in_body)) {
+                            miv = iv; inv_offset = mi; mul_coeff = m0;
+                        }
+                    }
+                }
+                if (!miv) continue;
+
+                // Compute init pointer in pre-header
+                Value *iv_init = val_resolve(miv->init_val);
+                int init_zero = (iv_init->kind == VAL_CONST && iv_init->iconst == 0);
+                Value *init_ptr;
+
+                if (init_zero) {
+                    // Common case: init = base + (inv_offset << shift)
+                    Value *sv = new_value(f, VAL_INST, VT_I16);
+                    Inst *si = new_inst(f, preh, IK_SHL, sv);
+                    inst_add_op(si, inv_offset);
+                    inst_add_op(si, shift_c);
+                    inst_insert_before(preh->tail, si);
+
+                    init_ptr = new_value(f, VAL_INST, addr->vtype);
+                    Inst *ai = new_inst(f, preh, IK_ADD, init_ptr);
+                    inst_add_op(ai, base);
+                    inst_add_op(ai, sv);
+                    inst_insert_before(preh->tail, ai);
+                } else if (mul_coeff) {
+                    // Pattern B: init = base + (iv_init * coeff + inv_offset) << shift
+                    Value *mv = new_value(f, VAL_INST, VT_I16);
+                    Inst *mi = new_inst(f, preh, IK_MUL, mv);
+                    inst_add_op(mi, iv_init);
+                    inst_add_op(mi, mul_coeff);
+                    inst_insert_before(preh->tail, mi);
+
+                    Value *av = new_value(f, VAL_INST, VT_I16);
+                    Inst *ai = new_inst(f, preh, IK_ADD, av);
+                    inst_add_op(ai, mv);
+                    inst_add_op(ai, inv_offset);
+                    inst_insert_before(preh->tail, ai);
+
+                    Value *sv = new_value(f, VAL_INST, VT_I16);
+                    Inst *si = new_inst(f, preh, IK_SHL, sv);
+                    inst_add_op(si, av);
+                    inst_add_op(si, shift_c);
+                    inst_insert_before(preh->tail, si);
+
+                    init_ptr = new_value(f, VAL_INST, addr->vtype);
+                    Inst *pi = new_inst(f, preh, IK_ADD, init_ptr);
+                    inst_add_op(pi, base);
+                    inst_add_op(pi, sv);
+                    inst_insert_before(preh->tail, pi);
+                } else {
+                    // Pattern A, non-zero init: base + ((inv_offset + iv_init) << shift)
+                    Value *av = new_value(f, VAL_INST, VT_I16);
+                    Inst *ai = new_inst(f, preh, IK_ADD, av);
+                    inst_add_op(ai, inv_offset);
+                    inst_add_op(ai, iv_init);
+                    inst_insert_before(preh->tail, ai);
+
+                    Value *sv = new_value(f, VAL_INST, VT_I16);
+                    Inst *si = new_inst(f, preh, IK_SHL, sv);
+                    inst_add_op(si, av);
+                    inst_add_op(si, shift_c);
+                    inst_insert_before(preh->tail, si);
+
+                    init_ptr = new_value(f, VAL_INST, addr->vtype);
+                    Inst *pi = new_inst(f, preh, IK_ADD, init_ptr);
+                    inst_add_op(pi, base);
+                    inst_add_op(pi, sv);
+                    inst_insert_before(preh->tail, pi);
+                }
+
+                // Compute step value
+                Value *step_val;
+                if (mul_coeff) {
+                    // Pattern B: step = coeff << shift (loop-invariant)
+                    step_val = new_value(f, VAL_INST, VT_I16);
+                    Inst *si = new_inst(f, preh, IK_SHL, step_val);
+                    inst_add_op(si, mul_coeff);
+                    inst_add_op(si, shift_c);
+                    inst_insert_before(preh->tail, si);
+                } else {
+                    // Pattern A: step = iv_step << shift (compile-time constant)
+                    Value *sv = val_resolve(miv->step_val);
+                    if (sv->kind == VAL_CONST) {
+                        step_val = new_const(f, sv->iconst << shift, VT_I16);
+                    } else {
+                        step_val = new_value(f, VAL_INST, VT_I16);
+                        Inst *si = new_inst(f, preh, IK_SHL, step_val);
+                        inst_add_op(si, sv);
+                        inst_add_op(si, shift_c);
+                        inst_insert_before(preh->tail, si);
+                    }
+                }
+
+                // Create pointer phi: phi(init_ptr, ptr_next)
+                Value *phi_v = new_value(f, VAL_INST, addr->vtype);
+                Inst *phi = new_inst(f, h, IK_PHI, phi_v);
+                for (int p = 0; p < h->npreds; p++) {
+                    if (p == pre_idx) inst_add_op(phi, init_ptr);
+                    else              inst_add_op(phi, init_ptr); // placeholder
+                }
+                Inst *ins_pt = h->head;
+                while (ins_pt && ins_pt->kind == IK_PHI) ins_pt = ins_pt->next;
+                if (ins_pt) inst_insert_before(ins_pt, phi);
+                else        inst_append(h, phi);
+
+                // Create ptr_next = phi + step in latch
+                Value *next_v = new_value(f, VAL_INST, addr->vtype);
+                Inst *next_i = new_inst(f, latch, IK_ADD, next_v);
+                inst_add_op(next_i, phi_v);
+                inst_add_op(next_i, step_val);
+                inst_insert_before(latch->tail, next_i);
+
+                // Patch phi back-edge operand
+                phi->ops[back_idx] = next_v;
+                next_v->use_count++;
+                init_ptr->use_count--;
+
+                // Replace load address with pointer phi
+                load->ops[0] = phi_v;
+
+                changed = 1;
+            }
+        }
+        free(in_body);
+    }
+
+    if (!changed) return;
+
+    // Recount use_count (dead chain instructions naturally get use_count 0,
+    // removed later by IRC DCE)
+    for (int i = 0; i < f->nvalues; i++) f->values[i]->use_count = 0;
+    for (int bi = 0; bi < f->nblocks; bi++) {
+        Block *b = f->blocks[bi];
+        for (Inst *inst = b->head; inst; inst = inst->next) {
+            for (int j = 0; j < inst->nops; j++) {
+                if (inst->ops[j]) {
+                    inst->ops[j] = val_resolve(inst->ops[j]);
+                    inst->ops[j]->use_count++;
+                }
+            }
+        }
     }
 }

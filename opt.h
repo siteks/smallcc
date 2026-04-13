@@ -18,7 +18,7 @@
 #define OPT_CSE            (1u << 3)   // R2E: same-block CSE of pure ops
 #define OPT_REDUNDANT_BOOL (1u << 4)   // R2G: eliminate NE(cmp, 0)
 #define OPT_NARROW_LOADS   (1u << 5)   // R2H: AND(LOAD, mask) → narrower LOAD
-#define OPT_LICM_CONST     (1u << 6)   // R2F: hoist VAL_CONST out of loops
+#define OPT_LICM           (1u << 6)   // R2F: LICM — hoist constants + invariant expressions
 #define OPT_JUMP_THREAD    (1u << 7)   // R2I: thread jumps through thin blocks
 #define OPT_UNROLL         (1u << 8)   // R2J: MVE self-loop unrolling
 
@@ -52,6 +52,9 @@ void opt_copy_prop(Function *f);
 // R2E: Hash-based CSE; eliminates duplicate pure computations across dominating blocks.
 void opt_cse(Function *f);
 
+// Pre-OOS GVN: run CSE on true SSA form (before out_of_ssa) with relaxed cross-block policy.
+void opt_pre_oos_cse(Function *f);
+
 // R2G: Eliminate NE(cmp_result, 0) → cmp_result when input is a comparison.
 void opt_redundant_bool(Function *f);
 
@@ -61,10 +64,25 @@ void opt_narrow_loads(Function *f);
 // R2F: Hoist IK_CONST out of loop bodies into pre-headers.
 void opt_licm_const(Function *f);
 
+// R2K: General LICM — hoist loop-invariant pure instructions to pre-headers.
+void opt_licm(Function *f);
+
 // R2I: Thread IK_JMP→thin IK_BR blocks when condition is defined in jumping block.
 void opt_jump_thread(Function *f);
 
 // R2J: Unroll self-loop blocks with copy-rotation chains (modulo variable expansion).
 void opt_unroll_loops(Function *f);
+
+// Loop strength reduction: replace iv*invariant with an incrementing induction variable.
+// Runs pre-OOS on true SSA form where phis are explicit.
+void opt_lsr(Function *f);
+
+// Scalar promotion: hoist load-modify-store to loop-invariant address into a register
+// accumulator phi.  Runs pre-OOS after GVN (so addresses are CSE'd).
+void opt_scalar_promote(Function *f);
+
+// Address induction variables: replace address recomputations inside loops with
+// pointer IVs that increment each iteration.  Runs pre-OOS after scalar_promote.
+void opt_addr_iv(Function *f);
 
 #endif

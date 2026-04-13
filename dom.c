@@ -143,29 +143,54 @@ static void dom_dfs(Block *b) {
 // ============================================================
 
 static void mark_loop_depth(Block **rpo, int nrpo) {
-    // A back edge is one where the successor dominates the source (b -> h, h dom b)
-    // For each back edge, increment loop_depth of all blocks in the natural loop
-    // Simple approximation: walk up from b to h incrementing loop_depth
+    // A back edge is one where the successor dominates the source (b -> h, h dom b).
+    // For each back edge, find the natural loop (all blocks that can reach b without
+    // going through h) and increment their loop_depth.  Uses a worklist-based
+    // predecessor walk.
 
     for (int i = 0; i < nrpo; i++)
         rpo[i]->loop_depth = 0;
+
+    // Worklist for natural loop discovery (reused across back-edges)
+    Block **wl = malloc(nrpo * sizeof(Block *));
+    int *in_loop = calloc(nrpo, sizeof(int));   // per-back-edge membership
+    if (!wl || !in_loop) { free(wl); free(in_loop); return; }
+
+    int gen = 0;  // generation counter to avoid clearing in_loop each iteration
 
     for (int i = 0; i < nrpo; i++) {
         Block *b = rpo[i];
         for (int j = 0; j < b->nsuccs; j++) {
             Block *h = b->succs[j];
-            // Back edge: h RPO-before b, and h dominates b
             if (h->rpo_index <= b->rpo_index && dominates(h, b)) {
-                // Increment loop depth for all blocks from b up to h (inclusive)
-                Block *cur = b;
-                while (cur != h) {
-                    cur->loop_depth++;
-                    cur = cur->idom;
-                }
+                // Found back edge b → h.  Discover natural loop body.
+                gen++;
+                int wl_top = 0;
                 h->loop_depth++;
+                in_loop[h->rpo_index] = gen;
+                if (b != h && in_loop[b->rpo_index] != gen) {
+                    in_loop[b->rpo_index] = gen;
+                    b->loop_depth++;
+                    wl[wl_top++] = b;
+                }
+                while (wl_top > 0) {
+                    Block *cur = wl[--wl_top];
+                    for (int p = 0; p < cur->npreds; p++) {
+                        Block *pred = cur->preds[p];
+                        if (pred->rpo_index < 0 || pred->rpo_index >= nrpo)
+                            continue;  // unreachable block
+                        if (in_loop[pred->rpo_index] != gen) {
+                            in_loop[pred->rpo_index] = gen;
+                            pred->loop_depth++;
+                            wl[wl_top++] = pred;
+                        }
+                    }
+                }
             }
         }
     }
+    free(wl);
+    free(in_loop);
 }
 
 // ============================================================

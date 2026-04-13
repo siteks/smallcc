@@ -799,6 +799,26 @@ static void dce_pass(Function *f) {
         }
     }
 
+    // Pre-pass: unlink instructions already marked dead by earlier passes
+    // (e.g. CSE).  These must be removed before liveness analysis because
+    // their operand references create spurious live ranges and interference.
+    // Do NOT decrement use_counts here — CSE/copy_prop already recounted
+    // use_counts excluding dead instructions.
+    for (int bi = 0; bi < f->nblocks; bi++) {
+        Block *b = f->blocks[bi];
+        Inst *inst = b->head;
+        while (inst) {
+            Inst *next = inst->next;
+            if (inst->is_dead) {
+                if (inst->prev) inst->prev->next = inst->next;
+                else            b->head = inst->next;
+                if (inst->next) inst->next->prev = inst->prev;
+                else            b->tail = inst->prev;
+            }
+            inst = next;
+        }
+    }
+
     // Iteratively remove dead pure instructions
     int changed = 1;
     while (changed) {
