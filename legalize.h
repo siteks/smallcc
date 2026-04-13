@@ -18,4 +18,10 @@
  */
 void legalize_function(Function *f);
 
+// Post-legalize LICM: hoist IK_CONST out of loop bodies into pre-headers.
+// Runs after legalize_function() and before irc_allocate() to cover both
+// Braun-time constants materialized by Pass F and mask constants from Pass D.
+// Requires valid dominator info (compute_dominators must have been called).
+void legalize_hoist_const(Function *f);
+
 #endif // LEGALIZE_H

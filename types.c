@@ -1267,3 +1267,26 @@ Decl_spec to_typespec(Token_kind tk)
         return 0;
     }
 }
+
+// Return the assembly label for a global/static/extern symbol.
+const char *sym_label(Symbol *sym) {
+    if (!sym) return "_nil";
+    switch (sym->kind) {
+    case SYM_GLOBAL:
+    case SYM_EXTERN:
+    case SYM_BUILTIN:
+        return sym->name;
+    case SYM_STATIC_GLOBAL: {
+        char buf[256];
+        snprintf(buf, sizeof(buf), "_s%d_%s", sym->tu_index, sym->name);
+        return arena_strdup(buf);
+    }
+    case SYM_STATIC_LOCAL: {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "_ls%d", sym->offset);
+        return arena_strdup(buf);
+    }
+    default:
+        return sym->name;
+    }
+}

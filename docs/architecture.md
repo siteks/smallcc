@@ -445,7 +445,6 @@ struct Symbol {
 - `SYM_STATIC_LOCAL`: the `local_static_counter` ID; label = `_ls{offset}`.
 - `SYM_STATIC_GLOBAL`, `SYM_EXTERN`, `SYM_BUILTIN`: addressed by label name.
 
-`find_local_addr(node, name)` in `codegen.c` searches from `node->st` upward, returning `LocalAddr { int offset; bool is_param; }`. Returns `offset == -1` for globals and local statics (use label instead).
 
 ### Key Helper Functions
 
@@ -468,7 +467,7 @@ bool istype_intlike(Type *t)  // any integer or pointer type (for pointer arithm
 
 ---
 
-## Per-Translation-Unit Compilation (`smallcc.c` + `types.c` + `codegen.c` + `backend.c`)
+## Per-Translation-Unit Compilation (`smallcc.c` + `types.c`)
 
 The compiler supports true per-TU compilation. Each file is compiled independently with its own symbol table; the combined assembly is emitted as a single stream. The assembler resolves all label references, so cross-TU calls work without object files.
 
@@ -526,15 +525,7 @@ The net effect: globals defined in TU N are visible as `SYM_EXTERN` symbols in T
 
 ### Static Symbol Mangling
 
-File-scope `static` symbols are TU-private. The label name is mangled from `foo` to `_s{tu_index}_foo` at three IR-append sites in `codegen.c`:
-
-| Site | IR emitted |
-|---|---|
-| `gen_function` (function label) | `ir_append(IR_SYMLABEL, 0, "_s{tu_index}_{name}")` |
-| `gen_callfunction` (direct call) | `ir_append(IR_JL, 0, "_s{tu_index}_{name}")` |
-| `gen_varaddr_from_ident` (global address) | `ir_append(IR_IMM, 0, "_s{tu_index}_{name}")` |
-
-`backend_emit_asm` in `backend.c` turns these IR nodes into assembly text. `kind = SYM_STATIC_GLOBAL` and `tu_index` are set on the `Symbol` by `insert_ident()` in `types.c` when `sclass == SC_STATIC` at global scope.
+File-scope `static` symbols are TU-private. The label name is mangled from `foo` to `_s{tu_index}_foo` by `sym_label()` in `types.c`, which handles `SYM_STATIC_GLOBAL` (`_s{tu}_{name}`) and `SYM_STATIC_LOCAL` (`_ls{id}`). `kind = SYM_STATIC_GLOBAL` and `tu_index` are set on the `Symbol` by `insert_ident()` in `types.c` when `sclass == SC_STATIC` at global scope.
 
 ### Extern Declaration Handling
 
@@ -544,7 +535,7 @@ When `insert_ident()` sees `sclass == SC_EXTERN` at global scope it:
 
 When a real definition arrives for the same name (in the same or a later TU), `insert_ident()` finds the existing entry and upgrades it: sets `kind` to `SYM_GLOBAL`, updates the type, and allocates data offset.
 
-`gen_decl()` skips entire `extern` declarations (`sym->kind == SYM_EXTERN → return`) and bare function prototypes (`istype_function(sym->type) → continue`) so no spurious labels or data are emitted.
+The nanopass pipeline skips `extern` declarations and bare function prototypes so no spurious labels or data are emitted.
 
 ---
 
@@ -562,19 +553,19 @@ The compiler supports C89-style variadic functions using `...` in the parameter 
 
 ### Code Generation
 
-**va_start(ap, last_param)** (`codegen.c`):
+**va_start(ap, last_param)** (`braun.c`):
 - Calculates the offset immediately after the last named parameter
 - Emits: `ap = bp + last_param.offset + last_param.size`
 - This points `ap` to the first variadic argument on the stack
 
-**va_arg(ap, T)** (`codegen.c`):
+**va_arg(ap, T)** (`braun.c`):
 1. Saves the current `ap` value (old pointer)
 2. Advances `ap` by `sizeof(T)` bytes
 3. Loads the value from `*old_ap` with proper type size and sign extension
 - Works for `int`, `long`, `float`, `double`, and pointer types
 - **Not supported**: struct types (incompatible with struct-by-value ABI)
 
-**va_end(ap)** (`codegen.c`):
+**va_end(ap)** (`braun.c`):
 - No-op — the compiler generates no code
 
 ### Stack Layout for Variadic Calls

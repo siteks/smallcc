@@ -9,7 +9,6 @@ canonical reference is `cpu4/cpu.py`.
 | Register | Width | Role |
 |---|---|---|
 | `r0`–`r7` | 32-bit | General-purpose; r0 is the return value |
-| `r0` | 32-bit | Accumulator and function return value |
 | `r1`–`r3` | 32-bit | Scratch (caller-saved); available for register allocation |
 | `r4`–`r7` | 32-bit | Callee-saved; available for register allocation; saved/restored by callees |
 | `bp` | 16-bit | Frame pointer |
@@ -162,8 +161,7 @@ and pointer bumps by 1.
 `sxb`/`sxw` and `zxb`/`zxw` are the sign-extending and zero-extending counterparts.
 The in-place form covers the overwhelming majority of extension uses.
 
-`itof`/`ftoi`, `jlr`/`jr`, `ssp`, and `putchar` all operate on an arbitrary register
-(not just r0).
+`itof`/`ftoi`, `jlr`/`jr`, `ssp`, and `putchar` all operate on an arbitrary register.
 
 ---
 

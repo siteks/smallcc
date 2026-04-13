@@ -47,30 +47,12 @@ static const char *assign_strlit(const char *data, int len) {
 }
 
 // ============================================================
-// Symbol name helper
-// ============================================================
-
-// Return the assembly label for a global/static symbol.
-static const char *sym_label(int tu_index, Symbol *sym) {
-    if (!sym) return "_nil";
-    char buf[256];
-    switch (sym->kind) {
-    case SYM_GLOBAL:        snprintf(buf, sizeof(buf), "%s", sym->name); break;
-    case SYM_STATIC_GLOBAL: snprintf(buf, sizeof(buf), "_s%d_%s", tu_index, sym->name); break;
-    case SYM_STATIC_LOCAL:  snprintf(buf, sizeof(buf), "_ls%d", sym->offset); break;
-    case SYM_EXTERN:
-    case SYM_BUILTIN:       snprintf(buf, sizeof(buf), "%s", sym->name); break;
-    default:                snprintf(buf, sizeof(buf), "%s", sym->name); break;
-    }
-    return arena_strdup(buf);
-}
-
 // ============================================================
 // Global variable lowering
 // ============================================================
 
 static Sx *lower_global(int tu_index, Node *decl, Symbol *sym) {
-    const char *name = sym_label(tu_index, sym);
+    const char *name = sym_label(sym);
 
     // Find initializer node
     Node *init = NULL;
@@ -166,7 +148,7 @@ static Sx *lower_global(int tu_index, Node *decl, Symbol *sym) {
                 // &global_var element in pointer array
                 Node *operand = raw_el->ch[0];
                 Symbol *osym = (operand && operand->kind == ND_IDENT) ? operand->symbol : NULL;
-                const char *olabel = osym ? sym_label(tu_index, osym) : "_nil";
+                const char *olabel = osym ? sym_label(osym) : "_nil";
                 *gt = sx_cons(sx_list(2, sx_sym("strref"), sx_str(olabel)), NULL);
                 gt = &(*gt)->cdr;
             } else {

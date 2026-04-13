@@ -252,7 +252,6 @@ int main(int argc, char **argv)
     FILE *irc_out = NULL;  // -irc file: write post-IRC IR to this file
     int run_oos = 0;       // -runoos: interpret post-OOS IR
     int run_irc = 0;       // -runirc: interpret post-IRC IR
-    int opt_level = 0;     // -O / -O1 / -O2 (accepted; optimization passes TBD)
     IrSim *irsim = NULL;
     const char *cmdline_defines[256];
     int num_defines = 0;
@@ -283,7 +282,12 @@ int main(int argc, char **argv)
                 "\n"
                 "Debug:\n"
                 "  -ann               Annotate assembly output with source comments\n"
-                "  -O / -O1 / -O2    Optimization level (accepted; passes TBD)\n"
+                "  -O0                Disable all optional optimization passes\n"
+                "  -O1                Safe passes only (fold_br + dead_blocks + copy_prop)\n"
+                "  -O / -O2           All passes (default)\n"
+                "  -Opass=NAME        Enable single pass (additive)\n"
+                "  -Ono-pass=NAME     Disable single pass (subtractive)\n"
+                "  -Omask=0xNNNN      Set exact pass bitmask (hex)\n"
                 "\n"
                 "Diagnostics:\n"
                 "  -stats             Print per-TU arena usage to stderr\n"
@@ -371,8 +375,44 @@ int main(int argc, char **argv)
         }
         else if (strncmp(argv[file_start], "-O", 2) == 0)
         {
-            const char *n = argv[file_start] + 2;
-            opt_level = (*n == '\0') ? 1 : atoi(n);
+            const char *arg = argv[file_start] + 2;
+            if (strcmp(arg, "0") == 0)
+                opt_flags = OPT_NONE;
+            else if (strcmp(arg, "1") == 0)
+                opt_flags = OPT_SAFE;
+            else if (strcmp(arg, "2") == 0 || strcmp(arg, "") == 0)
+                opt_flags = OPT_ALL;
+            else if (strncmp(arg, "mask=", 5) == 0)
+                opt_flags = (unsigned)strtoul(arg + 5, NULL, 0);
+            else if (strncmp(arg, "pass=", 5) == 0 || strncmp(arg, "no-pass=", 8) == 0) {
+                int negate = (arg[0] == 'n');
+                const char *name = negate ? arg + 8 : arg + 5;
+                static const struct { const char *name; unsigned bit; } pass_tbl[] = {
+                    {"fold_br",        OPT_FOLD_BR},
+                    {"dead_blocks",    OPT_DEAD_BLOCKS},
+                    {"copy_prop",      OPT_COPY_PROP},
+                    {"cse",            OPT_CSE},
+                    {"redundant_bool", OPT_REDUNDANT_BOOL},
+                    {"narrow_loads",   OPT_NARROW_LOADS},
+                    {"licm_const",     OPT_LICM_CONST},
+                    {"jump_thread",    OPT_JUMP_THREAD},
+                    {"unroll",         OPT_UNROLL},
+                    {"leg_e",          OPT_LEG_E},
+                    {"leg_f",          OPT_LEG_F},
+                    {NULL, 0}
+                };
+                int found = 0;
+                for (int j = 0; pass_tbl[j].name; j++) {
+                    if (strcmp(name, pass_tbl[j].name) == 0) {
+                        if (negate) opt_flags &= ~pass_tbl[j].bit;
+                        else        opt_flags |= pass_tbl[j].bit;
+                        found = 1;
+                        break;
+                    }
+                }
+                if (!found)
+                    fprintf(stderr, "smallcc: unknown pass name: %s\n", name);
+            }
             file_start++;
         }
         else
@@ -388,8 +428,6 @@ int main(int argc, char **argv)
                         "Run 'smallcc -h' for full option list.\n");
         return 1;
     }
-
-    (void)out; // will be set via fopen -o or stdout below
 
     // Determine compiler binary directory for include/ and lib/ resolution
     char compiler_dir[4096];
@@ -534,6 +572,7 @@ int main(int argc, char **argv)
             for (Node *d = decls; d; d = d->next) {
                 if (d->kind != ND_DECLARATION || !d->u.declaration.is_func_defn) continue;
                 Function *f = braun_function(d, tu, &cpu4_strlit_id);
+                braun_register_inline_candidate(d, tu);
                 if (irsim) {
                     // Register function-body string literals with the irsim
                     // before braun_emit_strlits clears them.
@@ -550,13 +589,17 @@ int main(int argc, char **argv)
                     split_critical_edges(f);
                     compute_dominators(f);
                     out_of_ssa(f);
-                    opt_fold_branches(f);
-                    opt_remove_dead_blocks(f);
-                    opt_copy_prop(f);
-                    opt_cse(f);
-                    opt_redundant_bool(f);
-                    opt_narrow_loads(f);
-                    opt_licm_const(f);
+                    if (opt_flags & OPT_FOLD_BR)        opt_fold_branches(f);
+                    if (opt_flags & OPT_DEAD_BLOCKS)    opt_remove_dead_blocks(f);
+                    if (opt_flags & OPT_COPY_PROP)      opt_copy_prop(f);
+                    if (opt_flags & OPT_CSE)            opt_cse(f);
+                    if (opt_flags & OPT_REDUNDANT_BOOL) opt_redundant_bool(f);
+                    if (opt_flags & OPT_NARROW_LOADS)   opt_narrow_loads(f);
+                    if (opt_flags & OPT_LICM_CONST)     opt_licm_const(f);
+                    if (opt_flags & OPT_JUMP_THREAD)    opt_jump_thread(f);
+                    if (opt_flags & OPT_UNROLL)         opt_unroll_loops(f);
+                    if (opt_flags & OPT_COPY_PROP)      opt_copy_prop(f);
+                    compute_dominators(f);
                     if (oos_out) { fprintf(oos_out, "=== OOS: %s ===\n", f->name); print_function(f, oos_out); }
                     if (getenv("DUMP_IR")) { fprintf(stderr, "=== after oos ===\n"); print_function(f, stderr); }
                     if (run_oos && irsim) { irsim_add_function(irsim, f); continue; }

@@ -20,6 +20,7 @@
 
 Function *braun_function(Node *func_decl, int tu_index, int *strlit_id);
 void      braun_emit_strlits(FILE *out);
+void      braun_register_inline_candidate(Node *func_decl, int tu_index);
 
 /* Access pending strlits for callers (e.g. irsim) that need the raw bytes.
  * Must be called before braun_emit_strlits, which clears the list. */

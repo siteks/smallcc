@@ -231,6 +231,54 @@ static const char *fused_branch_mnemonic(InstKind kind) {
     }
 }
 
+// resolve_const: try to resolve a Value to a compile-time integer constant.
+// Handles VAL_CONST, IK_CONST-defined values, and AND(const, const) from
+// legalize TRUNC lowering (e.g. AND(LICM_hoisted_1, 0xFFFF) = 1).
+static int resolve_const(Value *v, int *out) {
+    v = val_resolve(v);
+    if (!v) return 0;
+    if (v->kind == VAL_CONST) { *out = v->iconst; return 1; }
+    if (v->kind != VAL_INST || !v->def) return 0;
+    if (v->def->kind == IK_CONST) { *out = v->def->imm; return 1; }
+    if (v->def->kind == IK_AND && v->def->nops >= 2) {
+        int a, b;
+        if (resolve_const(v->def->ops[0], &a) &&
+            resolve_const(v->def->ops[1], &b)) {
+            *out = a & b; return 1;
+        }
+    }
+    return 0;
+}
+
+// P15 helper: compute a bitmask of possibly-set bits for a value.
+// Returns a non-negative mask, or -1 if unknown.
+// Used to eliminate redundant AND(x, mask) when x's bits are already within mask.
+static int known_bits_mask(Value *v, int depth) {
+    if (depth <= 0) return -1;
+    v = val_resolve(v);
+    if (!v) return -1;
+    if (v->kind == VAL_CONST) return v->iconst >= 0 ? v->iconst : -1;
+    if (v->kind != VAL_INST || !v->def) return -1;
+    Inst *d = v->def;
+    if (d->is_dead) return -1;
+    if (d->kind == IK_CONST) return d->imm >= 0 ? d->imm : -1;
+    if (d->kind == IK_AND && d->nops >= 2) {
+        int m0 = known_bits_mask(d->ops[0], depth - 1);
+        int m1 = known_bits_mask(d->ops[1], depth - 1);
+        if (m0 >= 0 && m1 >= 0) return m0 & m1;
+        if (m0 >= 0) return m0;
+        if (m1 >= 0) return m1;
+        return -1;
+    }
+    if ((d->kind == IK_XOR || d->kind == IK_OR) && d->nops >= 2) {
+        int m0 = known_bits_mask(d->ops[0], depth - 1);
+        int m1 = known_bits_mask(d->ops[1], depth - 1);
+        if (m0 >= 0 && m1 >= 0) return m0 | m1;
+        return -1;
+    }
+    return -1;
+}
+
 // ============================================================
 // Emit one instruction
 // ============================================================
@@ -335,6 +383,26 @@ static void emit_inst(Inst *inst, FILE *out) {
             p7_no_fold:;
         }
 
+        // P15: Redundant AND elimination via known-bits analysis.
+        // AND(x, mask) is a no-op when all bits of x are already within mask.
+        // Common pattern: AND(XOR(AND(a,1),AND(b,1)), 0xFF) — the XOR of two
+        // 1-bit values is 1-bit, so the outer AND with 0xFF is redundant.
+        if (inst->kind == IK_AND && (k0 ^ k1)) {
+            int kv = k1 ? (c1 ? op1->iconst : op1->def->imm)
+                        : (c0 ? op0->iconst : op0->def->imm);
+            Value *src = k1 ? op0 : op1;
+            int ps = k1 ? p0 : p1;
+            if (kv > 0) {
+                int src_mask = known_bits_mask(src, 4);
+                if (src_mask >= 0 && (src_mask & ~kv) == 0) {
+                    // AND is redundant — just move source to dest
+                    if (ps != rd)
+                        fprintf(out, "    or %s, %s, %s\n", regname(rd), regname(ps), regname(ps));
+                    break;
+                }
+            }
+        }
+
         // P8: AND(x, 0xFF) → zxb; AND(x, 0xFFFF) → zxw
         // In-place (rd == preg(x)): just zxb/zxw rd (2 bytes).
         // Cross-register: or rd, ps, ps; zxb/zxw rd (4 bytes vs 5 for immw+and).
@@ -392,31 +460,40 @@ static void emit_inst(Inst *inst, FILE *out) {
         // P11: SHL with constant shift amount → shli (F2, in-place, 2 bytes)
         // In-place: shli rd, k (2 bytes vs 5 for immw+shl)
         // Cross-reg: or rd, ps, ps; shli rd, k (4 bytes vs 5 for immw+shl)
-        if (inst->kind == IK_SHL && c1 && !c0) {
-            int k = op1->iconst & 31;
-            if (k >= 0 && k <= 63) {
-                if (p0 != rd)
-                    fprintf(out, "    or %s, %s, %s\n", regname(rd), regname(p0), regname(p0));
-                fprintf(out, "    shli %s, %d\n", regname(rd), k);
-                break;
+        // Uses resolve_const to see through IK_CONST defs and AND(const,const)
+        // from legalize TRUNC lowering of LICM-hoisted constants.
+        if (inst->kind == IK_SHL && !k0) {
+            int shift_k;
+            if (resolve_const(op1, &shift_k)) {
+                int k = shift_k & 31;
+                if (k >= 0 && k <= 63) {
+                    if (p0 != rd)
+                        fprintf(out, "    or %s, %s, %s\n", regname(rd), regname(p0), regname(p0));
+                    fprintf(out, "    shli %s, %d\n", regname(rd), k);
+                    break;
+                }
             }
         }
 
         // P13: Right shift with constant amount → shrsi (F2, in-place, 2 bytes)
         // Signed: always safe (shrsi is arithmetic).
         // Unsigned: safe when operand is ≤16 bits (upper bits are 0, arith == logical).
-        if ((inst->kind == IK_SHR || inst->kind == IK_USHR) && c1 && !c0) {
-            int k = op1->iconst & 31;
-            int safe = is_signed;
-            if (!safe && inst->dst) {
-                ValType dvt = inst->dst->vtype;
-                safe = (dvt != VT_U32 && dvt != VT_I32);
-            }
-            if (safe && k >= 0 && k <= 63) {
-                if (p0 != rd)
-                    fprintf(out, "    or %s, %s, %s\n", regname(rd), regname(p0), regname(p0));
-                fprintf(out, "    shrsi %s, %d\n", regname(rd), k);
-                break;
+        // Uses resolve_const to see through IK_CONST defs and AND(const,const).
+        if ((inst->kind == IK_SHR || inst->kind == IK_USHR) && !k0) {
+            int shift_k;
+            if (resolve_const(op1, &shift_k)) {
+                int k = shift_k & 31;
+                int safe = is_signed;
+                if (!safe && inst->dst) {
+                    ValType dvt = inst->dst->vtype;
+                    safe = (dvt != VT_U32 && dvt != VT_I32);
+                }
+                if (safe && k >= 0 && k <= 63) {
+                    if (p0 != rd)
+                        fprintf(out, "    or %s, %s, %s\n", regname(rd), regname(p0), regname(p0));
+                    fprintf(out, "    shrsi %s, %d\n", regname(rd), k);
+                    break;
+                }
             }
         }
 
@@ -828,7 +905,7 @@ static void emit_inst(Inst *inst, FILE *out) {
 }
 
 // ============================================================
-// emit_function
+// emit_function — helpers
 // ============================================================
 
 typedef struct {
@@ -840,33 +917,10 @@ typedef struct {
     int         is_eq;     // P6: 1 for EQ(x,0)→jz, 0 for NE(x,0)→jnz
 } BranchFuse;
 
-void emit_function(Function *f, FILE *out) {
-    if (!f || f->nblocks == 0) return;
-
-    // Jump table tracking for IK_SWITCH
-    #define MAX_JT 16
-    struct { Inst *inst; int mn, mx; } jt_info[MAX_JT];
-    int jt_count = 0;
-
-    // DEBUG: dump IR to stderr for variadic functions
-    if (getenv("SMALLCC_DEBUG_IR")) {
-        fprintf(stderr, "=== IR dump for %s ===\n", f->name);
-        extern void print_function(Function *, FILE *);
-        print_function(f, stderr);
-    }
-
-    g_cur_func_name = f->name;
-    fprintf(out, "    align\n");
-    fprintf(out, "%s:\n", f->name);
-
-    // Frame: use frame_size rounded up to 4-byte alignment
-    int frame = f->frame_size;
-    if (frame % 4) frame += (4 - frame % 4);
-
-    // Callee-saved regs: find which r4-r7 are used by non-param values.
-    // Param values in r4-r7 are incoming arguments (not the callee's own work
-    // registers), so they don't need callee-save save/restore.
-    int callee_save[4] = {0, 0, 0, 0};
+// Emit function prologue: enter, callee-save stores.
+// Returns callee_frame (total bytes for callee-saved registers).
+static int emit_prologue(Function *f, FILE *out, int frame, int callee_save[4]) {
+    // Detect which r4-r7 are used by non-param values.
     for (int i = 0; i < f->nvalues; i++) {
         Value *v = f->values[i];
         if (v->phys_reg < 4 || v->phys_reg > 7) continue;
@@ -877,26 +931,25 @@ void emit_function(Function *f, FILE *out) {
         if (!is_param)
             callee_save[v->phys_reg - 4] = 1;
     }
-    // Count callee-save slots needed; include in frame so enter allocates space.
     int callee_frame = 0;
     for (int r = 4; r <= 7; r++)
         if (callee_save[r - 4]) callee_frame += 4;
 
     fprintf(out, "    enter %d\n", frame + callee_frame);
 
-    // Emit callee-save stores right after enter.
     int callee_tmp = 0;
     for (int r = 4; r <= 7; r++) {
         if (callee_save[r - 4]) {
             callee_tmp += 4;
-            // F2 sl: sl rx, scaled_imm7  (byte_off / 4)
             fprintf(out, "    sl r%d, %d\n", r, -(frame + callee_tmp) / 4);
         }
     }
+    return callee_frame;
+}
 
-    // P7/P8 pre-pass: mark IK_CONST instructions dead when their only consumer
-    // is an ALU op that P7 will fold (both operands constant) or P8 will replace
-    // with zxb/zxw (AND with mask 0xFF/0xFFFF).
+// Pre-pass: mark IK_CONST instructions dead when their only consumer
+// is an ALU op that a peephole will fold.
+static void mark_dead_consts(Function *f) {
     for (int bi = 0; bi < f->nblocks; bi++) {
         Block *b = f->blocks[bi];
         for (Inst *inst = b->head; inst; inst = inst->next) {
@@ -918,10 +971,23 @@ void emit_function(Function *f, FILE *out) {
             int is_k0 = (o0 && o0->kind == VAL_CONST) || ik0;
             int is_k1 = (o1 && o1->kind == VAL_CONST) || ik1;
 
-            // P7: both operands constant — fold eliminates entire ALU op
+            // P7: both operands constant — fold eliminates entire ALU op.
+            // Only mark IK_CONST dead for operations P7 actually folds;
+            // DIV/MOD/float ops fall through and need registers.
             if (is_k0 && is_k1) {
-                if (ik0 && o0->use_count <= 1) o0->def->is_dead = 1;
-                if (ik1 && o1->use_count <= 1) o1->def->is_dead = 1;
+                switch (inst->kind) {
+                case IK_ADD: case IK_SUB: case IK_MUL:
+                case IK_AND: case IK_OR:  case IK_XOR:
+                case IK_SHL: case IK_SHR: case IK_USHR:
+                case IK_EQ:  case IK_NE:
+                case IK_LT:  case IK_ULT:
+                case IK_LE:  case IK_ULE:
+                    if (ik0 && o0->use_count <= 1) o0->def->is_dead = 1;
+                    if (ik1 && o1->use_count <= 1) o1->def->is_dead = 1;
+                    break;
+                default:
+                    break;
+                }
                 continue;
             }
             // P8: AND(x, 0xFF/0xFFFF) → zxb/zxw; mask IK_CONST is not needed
@@ -932,30 +998,117 @@ void emit_function(Function *f, FILE *out) {
                 if ((mask == 0xff || mask == 0xffff) && is_ik && kv->use_count <= 1)
                     kv->def->is_dead = 1;
             }
+            // P11/P13: SHL/SHR/USHR with constant shift amount → shli/shrsi;
+            // the IK_CONST (or AND chain) holding the shift amount is not needed.
+            if ((inst->kind == IK_SHL || inst->kind == IK_SHR || inst->kind == IK_USHR) && !is_k0) {
+                int shift_k;
+                if (resolve_const(o1, &shift_k)) {
+                    int k = shift_k & 31;
+                    int will_fire = 0;
+                    if (inst->kind == IK_SHL && k >= 0 && k <= 63) {
+                        will_fire = 1;
+                    } else if (k >= 0 && k <= 63) {
+                        ValType dvt = inst->dst ? inst->dst->vtype : VT_I16;
+                        int safe = (dvt == VT_I8 || dvt == VT_I16 || dvt == VT_I32);
+                        if (!safe) safe = (dvt != VT_U32 && dvt != VT_I32);
+                        will_fire = safe;
+                    }
+                    if (will_fire && o1 && o1->kind == VAL_INST && o1->def && o1->use_count <= 1) {
+                        Inst *d = o1->def;
+                        if (d->kind == IK_CONST && !d->fname)
+                            d->is_dead = 1;
+                        else if (d->kind == IK_AND && d->nops >= 2) {
+                            d->is_dead = 1;
+                            for (int j2 = 0; j2 < d->nops; j2++) {
+                                Value *a = d->ops[j2] ? val_resolve(d->ops[j2]) : NULL;
+                                if (a && a->kind == VAL_INST && a->def &&
+                                    a->def->kind == IK_CONST && !a->def->fname &&
+                                    a->use_count <= 1)
+                                    a->def->is_dead = 1;
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
+}
 
-    // P5 pre-pass: detect comparison+branch pairs that can be fused into a single
-    // F3b branch instruction (beq/bne/blt/ble/blts/bles ra, rb, label).
-    // Criteria: tail is IK_BR, condition has use_count==1, defining instruction
-    // is a supported comparison in the same block, both operands have phys regs.
-    BranchFuse *fuse = arena_alloc(f->nblocks * sizeof(BranchFuse));
+// Detect comparison+branch pairs that can be fused into F3b branches.
+static void detect_branch_fusions(Function *f, BranchFuse *fuse) {
     memset(fuse, 0, f->nblocks * sizeof(BranchFuse));
     for (int fbi = 0; fbi < f->nblocks; fbi++) {
         Block *fb  = f->blocks[fbi];
         Inst  *term = fb->tail;
         if (!term || term->kind != IK_BR || term->nops < 1) continue;
         Value *cond = val_resolve(term->ops[0]);
-        if (!cond || cond->kind != VAL_INST || cond->use_count != 1) continue;
-        Inst *def = cond->def;
-        if (!def || def->block != fb || def->is_dead || def->nops < 2) continue;
+        if (!cond || cond->kind != VAL_INST) continue;
+        // Find the defining instruction for cond within THIS block.
+        Inst *def = NULL;
+        Value *seek = cond;
+        for (Inst *scan = term->prev; scan; scan = scan->prev) {
+            if (scan->dst != seek) { if (!scan->is_dead) continue; else continue; }
+            if (scan->is_dead && scan->kind == IK_COPY && scan->nops >= 1) {
+                Value *src = val_resolve(scan->ops[0]);
+                if (src && src->kind == VAL_INST) { seek = src; continue; }
+            }
+            if (scan->is_dead) continue;
+            def = scan;
+            break;
+        }
+        if (!def || def->nops < 2) continue;
+        // Look through IK_COPY: v_phi = copy v_cmp; br v_phi
+        if (def->kind == IK_COPY && def->nops >= 1) {
+            Value *src = val_resolve(def->ops[0]);
+            if (src && src->kind == VAL_INST) {
+                for (Inst *scan = def->prev; scan; scan = scan->prev) {
+                    if (scan->is_dead) continue;
+                    if (scan->dst == src) {
+                        if (scan->nops >= 2) def = scan;
+                        break;
+                    }
+                }
+            }
+        }
+        // Look through NE(SHL/MUL(cmp, k), 0) → use cmp for fusion
+        Inst *chain_ne = NULL, *chain_shift = NULL;
+        if (def->kind == IK_NE && def->nops >= 2) {
+            Value *a = val_resolve(def->ops[0]);
+            Value *b = val_resolve(def->ops[1]);
+            Value *zero_side = NULL, *other_side = NULL;
+            if (b && b->kind == VAL_CONST && b->iconst == 0) { zero_side = b; other_side = a; }
+            else if (a && a->kind == VAL_CONST && a->iconst == 0) { zero_side = a; other_side = b; }
+            (void)zero_side;
+            if (other_side && other_side->kind == VAL_INST && other_side->def &&
+                other_side->def->block == fb && !other_side->def->is_dead &&
+                (other_side->def->kind == IK_SHL || other_side->def->kind == IK_MUL) &&
+                other_side->def->nops >= 2) {
+                Inst *shift = other_side->def;
+                Value *sv0 = val_resolve(shift->ops[0]);
+                Value *sv1 = val_resolve(shift->ops[1]);
+                Value *inner = NULL;
+                if (sv1 && sv1->kind == VAL_CONST && sv1->iconst != 0) inner = sv0;
+                else if (sv0 && sv0->kind == VAL_CONST && sv0->iconst != 0) inner = sv1;
+                if (inner && inner->kind == VAL_INST) {
+                    for (Inst *scan = shift->prev; scan; scan = scan->prev) {
+                        if (scan->is_dead) continue;
+                        if (scan->dst == inner) {
+                            if (scan->nops >= 2 && fused_branch_mnemonic(scan->kind)) {
+                                chain_ne = def;
+                                chain_shift = shift;
+                                def = scan;
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
         const char *mnem = fused_branch_mnemonic(def->kind);
         if (!mnem) continue;
         Value *dop0 = def->ops[0] ? val_resolve(def->ops[0]) : NULL;
         Value *dop1 = def->ops[1] ? val_resolve(def->ops[1]) : NULL;
-        // F3b branches use a 10-bit PC-relative offset (±511 bytes).
-        // Estimate the byte distance to the true target block; skip fusion
-        // if it might overflow the signed 10-bit range.
+        // Estimate byte distance to true target; skip if out of F3b range.
         int target_bi = -1;
         for (int k = 0; k < f->nblocks; k++) {
             if (f->blocks[k] == term->target) { target_bi = k; break; }
@@ -966,7 +1119,7 @@ void emit_function(Function *f, FILE *out) {
         int est_bytes = 0;
         for (int k = lo; k < hi; k++) {
             for (Inst *ii = f->blocks[k]->head; ii; ii = ii->next)
-                if (!ii->is_dead) est_bytes += 3; // worst-case 3 bytes/instruction
+                if (!ii->is_dead) est_bytes += 3;
         }
         int in_range = (est_bytes <= 450);
 
@@ -975,6 +1128,8 @@ void emit_function(Function *f, FILE *out) {
             dop0 && dop0->kind == VAL_INST && dop0->phys_reg >= 0 &&
             dop1 && dop1->kind == VAL_INST && dop1->phys_reg >= 0) {
             def->is_dead     = 1;
+            if (chain_ne)    chain_ne->is_dead = 1;
+            if (chain_shift) chain_shift->is_dead = 1;
             fuse[fbi].fused  = 1;
             fuse[fbi].mnem   = mnem;
             fuse[fbi].p0     = dop0->phys_reg;
@@ -982,9 +1137,7 @@ void emit_function(Function *f, FILE *out) {
             continue;
         }
 
-        // P5+: one operand is VAL_CONST, the other has a phys_reg.
-        // Use cond->phys_reg (dead after this block, use_count==1) as scratch
-        // for materialising the constant, then emit a fused F3b branch.
+        // P5+: one operand is VAL_CONST, use cond's register as scratch
         if (in_range && cond->phys_reg >= 0) {
             Value *reg_op = NULL, *const_op = NULL;
             int const_is_lhs = 0;
@@ -998,9 +1151,6 @@ void emit_function(Function *f, FILE *out) {
             if (reg_op && const_op) {
                 int sc = cond->phys_reg;
                 int rp = reg_op->phys_reg;
-                // If scratch == reg_op's register, look through IK_COPY to find
-                // the source register (e.g. type-coercing copies u8→i16).  The
-                // source is still live at this point, so its register is valid.
                 Inst *looked_through = NULL;
                 if (sc == rp && reg_op->def && reg_op->def->kind == IK_COPY
                     && reg_op->def->nops >= 1) {
@@ -1014,6 +1164,8 @@ void emit_function(Function *f, FILE *out) {
                 }
                 if (sc != rp) {
                     def->is_dead       = 1;
+                    if (chain_ne)    chain_ne->is_dead = 1;
+                    if (chain_shift) chain_shift->is_dead = 1;
                     if (looked_through) looked_through->is_dead = 1;
                     fuse[fbi].fused     = 2;
                     fuse[fbi].mnem      = mnem;
@@ -1026,8 +1178,7 @@ void emit_function(Function *f, FILE *out) {
             }
         }
 
-        // P6: NE(x, 0) or EQ(x, 0) — eliminate comparison, use jnz/jz directly.
-        // jnz/jz (F3a) only test r0; if x is in another register, emit a MOV first.
+        // P6: NE(x, 0) or EQ(x, 0) → jnz/jz directly
         if ((def->kind == IK_NE || def->kind == IK_EQ) && def->nops >= 2) {
             Value *test_val = NULL;
             if (dop1 && dop1->kind == VAL_CONST && dop1->iconst == 0 &&
@@ -1044,24 +1195,121 @@ void emit_function(Function *f, FILE *out) {
             }
         }
     }
+}
+
+// Emit a rotated branch (P12): duplicate header's IK_BR at the end of a latch block.
+static int emit_rotated_branch(Function *f, FILE *out, Inst *inst,
+                               BranchFuse *fuse, Block *next_blk, int bi) {
+    Block *hdr = inst->target;
+    Inst *hdr_br = NULL;
+    int hdr_clean = 1;
+    for (Inst *hi = hdr->head; hi; hi = hi->next) {
+        if (hi->kind == IK_BR && !hi->is_dead && hi->nops >= 1) {
+            hdr_br = hi;
+        } else if (!hi->is_dead && hi->kind != IK_JMP) {
+            hdr_clean = 0;
+            break;
+        }
+    }
+    if (!hdr_clean || !hdr_br || hdr_br->nops < 1) return 0;
+    Value *cond = val_resolve(hdr_br->ops[0]);
+    if (!cond || cond->kind != VAL_INST || cond->phys_reg < 0) return 0;
+
+    int hbi = -1;
+    for (int hi = 0; hi < f->nblocks; hi++) {
+        if (f->blocks[hi] == hdr) { hbi = hi; break; }
+    }
+    if (hbi < 0) return 0;
+
+    int rotated = 0;
+    if (fuse[hbi].fused == 0) {
+        if (hdr_br->target)
+            fprintf(out, "    jnz %s, _%s_B%d\n",
+                    regname(cond->phys_reg), f->name, hdr_br->target->id);
+        rotated = 1;
+    } else if (fuse[hbi].fused == 1) {
+        if (hdr_br->target)
+            fprintf(out, "    %s %s, %s, _%s_B%d\n",
+                    fuse[hbi].mnem,
+                    regname(fuse[hbi].p0), regname(fuse[hbi].p1),
+                    f->name, hdr_br->target->id);
+        rotated = 1;
+    } else if (fuse[hbi].fused == 2) {
+        emit_imm(out, fuse[hbi].p1, fuse[hbi].const_val);
+        if (hdr_br->target) {
+            if (fuse[hbi].swap)
+                fprintf(out, "    %s %s, %s, _%s_B%d\n",
+                        fuse[hbi].mnem,
+                        regname(fuse[hbi].p1), regname(fuse[hbi].p0),
+                        f->name, hdr_br->target->id);
+            else
+                fprintf(out, "    %s %s, %s, _%s_B%d\n",
+                        fuse[hbi].mnem,
+                        regname(fuse[hbi].p0), regname(fuse[hbi].p1),
+                        f->name, hdr_br->target->id);
+        }
+        rotated = 1;
+    } else if (fuse[hbi].fused == 3) {
+        if (hdr_br->target)
+            fprintf(out, "    %s %s, _%s_B%d\n",
+                    fuse[hbi].is_eq ? "jz" : "jnz",
+                    regname(fuse[hbi].p0),
+                    f->name, hdr_br->target->id);
+        rotated = 1;
+    }
+    if (rotated) {
+        if (hdr_br->target2 && hdr_br->target2 != next_blk)
+            fprintf(out, "    j _%s_B%d\n", f->name, hdr_br->target2->id);
+    }
+    return rotated;
+}
+
+// ============================================================
+// emit_function — main entry point
+// ============================================================
+
+void emit_function(Function *f, FILE *out) {
+    if (!f || f->nblocks == 0) return;
+
+    #define MAX_JT 16
+    struct { Inst *inst; int mn, mx; } jt_info[MAX_JT];
+    int jt_count = 0;
+
+    if (getenv("SMALLCC_DEBUG_IR")) {
+        fprintf(stderr, "=== IR dump for %s ===\n", f->name);
+        extern void print_function(Function *, FILE *);
+        print_function(f, stderr);
+    }
+
+    g_cur_func_name = f->name;
+    fprintf(out, "    align\n");
+    fprintf(out, "%s:\n", f->name);
+
+    int frame = f->frame_size;
+    if (frame % 4) frame += (4 - frame % 4);
+
+    int callee_save[4] = {0, 0, 0, 0};
+    int callee_frame = emit_prologue(f, out, frame, callee_save);
+
+    mark_dead_consts(f);
+
+    BranchFuse *fuse = arena_alloc(f->nblocks * sizeof(BranchFuse));
+    detect_branch_fusions(f, fuse);
 
     // Emit blocks
     int ann_prev_line = 0;
     for (int bi = 0; bi < f->nblocks; bi++) {
         Block *b = f->blocks[bi];
 
-        // Emit block label (skip for entry block — the function label serves)
         if (bi > 0)
             fprintf(out, "_%s_B%d:\n", f->name, b->id);
         for (Inst *inst = b->head; inst; inst = inst->next) {
-            // Emit source-line comment when line changes
             if (flag_annotate && inst->line && inst->line != ann_prev_line) {
                 emit_src_comment(inst->line, out);
                 ann_prev_line = inst->line;
             }
             if (inst->kind == IK_RET && callee_frame > 0) {
-                // Full RET sequence when callee saves exist:
-                // 1. Move return value to r0 (before restoring callee regs)
+                // Full RET sequence: move retval to r0, restore callee saves, ret
                 if (inst->nops > 0) {
                     Value *rv = val_resolve(inst->ops[0]);
                     if (rv && rv->kind == VAL_CONST) {
@@ -1071,7 +1319,6 @@ void emit_function(Function *f, FILE *out) {
                                 regname(rv->phys_reg), regname(rv->phys_reg));
                     }
                 }
-                // 2. Restore callee-saved regs (in order, same offsets as save)
                 int tmp_frame = 0;
                 for (int r = 4; r <= 7; r++) {
                     if (callee_save[r - 4]) {
@@ -1079,23 +1326,17 @@ void emit_function(Function *f, FILE *out) {
                         fprintf(out, "    ll r%d, %d\n", r, -(frame + tmp_frame) / 4);
                     }
                 }
-                // 3. ret
                 fprintf(out, "    ret\n");
             } else if (inst->kind == IK_BR && !inst->is_dead && inst->nops >= 1) {
-                // P1 + P5 + P15: branch elimination, fusion, and branch inversion
                 Block *next_blk = (bi + 1 < f->nblocks) ? f->blocks[bi + 1] : NULL;
-                // P15: when true target is the next block, invert the branch to
-                // target false directly — saves the unconditional j instruction.
                 int inverted = 0;
                 if (fuse[bi].fused == 1) {
-                    // P5: fused compare+branch — single F3b instruction
                     if (inst->target)
                         fprintf(out, "    %s %s, %s, _%s_B%d\n",
                                 fuse[bi].mnem,
                                 regname(fuse[bi].p0), regname(fuse[bi].p1),
                                 f->name, inst->target->id);
                 } else if (fuse[bi].fused == 2) {
-                    // P5+: load constant into scratch, then F3b branch
                     emit_imm(out, fuse[bi].p1, fuse[bi].const_val);
                     if (inst->target) {
                         if (fuse[bi].swap)
@@ -1110,9 +1351,7 @@ void emit_function(Function *f, FILE *out) {
                                     f->name, inst->target->id);
                     }
                 } else if (fuse[bi].fused == 3) {
-                    // P6: NE(x,0)/EQ(x,0) → jnz/jz rX directly
                     if (inst->target == next_blk && inst->target2) {
-                        // P15: true is next block — invert sense, target false
                         fprintf(out, "    %s %s, _%s_B%d\n",
                                 fuse[bi].is_eq ? "jnz" : "jz",
                                 regname(fuse[bi].p0),
@@ -1125,10 +1364,8 @@ void emit_function(Function *f, FILE *out) {
                                 f->name, inst->target->id);
                     }
                 } else {
-                    // Standard: jnz/jz cond
                     int r1 = get_val_reg(out, inst->ops[0], 0);
                     if (inst->target == next_blk && inst->target2) {
-                        // P15: true is next block — invert to jz false_target
                         fprintf(out, "    jz %s, _%s_B%d\n",
                                 regname(r1), f->name, inst->target2->id);
                         inverted = 1;
@@ -1137,100 +1374,18 @@ void emit_function(Function *f, FILE *out) {
                                 regname(r1), f->name, inst->target->id);
                     }
                 }
-                // P1: omit j F when F is the immediately following block
-                // (skip entirely when P15 inverted — false was already targeted)
                 if (!inverted && inst->target2 && inst->target2 != next_blk)
                     fprintf(out, "    j _%s_B%d\n", f->name, inst->target2->id);
             } else if (inst->kind == IK_JMP && inst->target &&
                        inst->target == ((bi + 1 < f->nblocks) ? f->blocks[bi + 1] : NULL)) {
                 // P1: omit unconditional j to the immediately following block
             } else if (inst->kind == IK_JMP && inst->target) {
-                // P12: loop rotation — when jumping to a header that only
-                // contains IK_BR, duplicate the branch here to eliminate the
-                // unconditional jump per iteration.
-                Block *hdr = inst->target;
-                // Find the IK_BR terminator in the header and check that all
-                // other instructions are dead (OOS copies already executed here).
-                Inst *hdr_br = NULL;
-                int hdr_clean = 1;
-                for (Inst *hi = hdr->head; hi; hi = hi->next) {
-                    if (hi->kind == IK_BR && !hi->is_dead && hi->nops >= 1) {
-                        hdr_br = hi;
-                    } else if (!hi->is_dead && hi->kind != IK_JMP) {
-                        hdr_clean = 0;
-                        break;
-                    }
-                }
-                if (hdr_clean && hdr_br && hdr_br->nops >= 1) {
-                    Value *cond = val_resolve(hdr_br->ops[0]);
-                    if (cond && cond->kind == VAL_INST && cond->phys_reg >= 0) {
-                        // Find the header's block index for fuse table lookup
-                        int hbi = -1;
-                        for (int hi = 0; hi < f->nblocks; hi++) {
-                            if (f->blocks[hi] == hdr) { hbi = hi; break; }
-                        }
-                        Block *next_blk = (bi + 1 < f->nblocks) ? f->blocks[bi + 1] : NULL;
-                        int rotated = 0;
-                        if (hbi >= 0 && fuse[hbi].fused == 0) {
-                            // Standard branch: jnz cond, true_target
-                            if (hdr_br->target)
-                                fprintf(out, "    jnz %s, _%s_B%d\n",
-                                        regname(cond->phys_reg), f->name, hdr_br->target->id);
-                            rotated = 1;
-                        } else if (hbi >= 0 && fuse[hbi].fused == 1) {
-                            // P5 fused: two-reg compare+branch
-                            if (hdr_br->target)
-                                fprintf(out, "    %s %s, %s, _%s_B%d\n",
-                                        fuse[hbi].mnem,
-                                        regname(fuse[hbi].p0), regname(fuse[hbi].p1),
-                                        f->name, hdr_br->target->id);
-                            rotated = 1;
-                        } else if (hbi >= 0 && fuse[hbi].fused == 2) {
-                            // P5+ fused: constant-operand compare+branch
-                            emit_imm(out, fuse[hbi].p1, fuse[hbi].const_val);
-                            if (hdr_br->target) {
-                                if (fuse[hbi].swap)
-                                    fprintf(out, "    %s %s, %s, _%s_B%d\n",
-                                            fuse[hbi].mnem,
-                                            regname(fuse[hbi].p1), regname(fuse[hbi].p0),
-                                            f->name, hdr_br->target->id);
-                                else
-                                    fprintf(out, "    %s %s, %s, _%s_B%d\n",
-                                            fuse[hbi].mnem,
-                                            regname(fuse[hbi].p0), regname(fuse[hbi].p1),
-                                            f->name, hdr_br->target->id);
-                            }
-                            rotated = 1;
-                        } else if (hbi >= 0 && fuse[hbi].fused == 3) {
-                            // P6 fused: zero-test jnz/jz
-                            if (hdr_br->target)
-                                fprintf(out, "    %s %s, _%s_B%d\n",
-                                        fuse[hbi].is_eq ? "jz" : "jnz",
-                                        regname(fuse[hbi].p0),
-                                        f->name, hdr_br->target->id);
-                            rotated = 1;
-                        }
-                        if (rotated) {
-                            if (hdr_br->target2 && hdr_br->target2 != next_blk)
-                                fprintf(out, "    j _%s_B%d\n", f->name, hdr_br->target2->id);
-                        } else {
-                            emit_inst(inst, out);
-                        }
-                    } else {
-                        emit_inst(inst, out);
-                    }
-                } else {
+                // P12: loop rotation
+                Block *next_blk = (bi + 1 < f->nblocks) ? f->blocks[bi + 1] : NULL;
+                if (!emit_rotated_branch(f, out, inst, fuse, next_blk, bi))
                     emit_inst(inst, out);
-                }
             } else if (inst->kind == IK_SWITCH && inst->nops >= 1) {
-                // Jump table dispatch.
-                // Allocator adds phantom interference for r0 and r1 at IK_SWITCH,
-                // so live-through values avoid those two registers.
-                // We save sel_r on the stack (it may be live-through), use sel_r
-                // freely for computation, then copy the target address to scr,
-                // restore sel_r, and jr scr.
                 int sel_r = get_val_reg(out, inst->ops[0], 0);
-                // Pick scratch from {r0, r1} (guaranteed not live-through)
                 int scr = (sel_r == 0) ? 1 : 0;
                 int nc = inst->switch_ncase;
                 int mn = inst->switch_vals[0], mx = inst->switch_vals[0];
@@ -1239,17 +1394,13 @@ void emit_function(Function *f, FILE *out) {
                     if (inst->switch_vals[i] > mx) mx = inst->switch_vals[i];
                 }
                 int def_id = inst->switch_default->id;
-                // Save selector (might be live-through in a callee-saved reg)
                 fprintf(out, "    pushr %s\n", regname(sel_r));
-                // Range check: sel < min → default
                 emit_imm(out, scr, mn);
                 fprintf(out, "    blts %s, %s, _%s_sw%d\n",
                         regname(sel_r), regname(scr), f->name, jt_count);
-                // Range check: sel > max → default
                 emit_imm(out, scr, mx);
                 fprintf(out, "    blts %s, %s, _%s_sw%d\n",
                         regname(scr), regname(sel_r), f->name, jt_count);
-                // Compute target address: sel_r is saved, use freely
                 if (mn == 0) {
                     fprintf(out, "    add %s, %s, %s\n",
                             regname(scr), regname(sel_r), regname(sel_r));
@@ -1259,19 +1410,15 @@ void emit_function(Function *f, FILE *out) {
                             regname(scr), regname(sel_r), regname(scr));
                     fprintf(out, "    shli %s, 1\n", regname(scr));
                 }
-                // Load table base into sel_r (safe to clobber, saved on stack)
                 fprintf(out, "    immw %s, _%s_jt%d\n", regname(sel_r), f->name, jt_count);
                 fprintf(out, "    add %s, %s, %s\n",
                         regname(scr), regname(sel_r), regname(scr));
                 fprintf(out, "    llw %s, %s, 0\n", regname(scr), regname(scr));
-                // Restore selector, jump via scr
                 fprintf(out, "    popr %s\n", regname(sel_r));
                 fprintf(out, "    jr %s\n", regname(scr));
-                // Default path
                 fprintf(out, "_%s_sw%d:\n", f->name, jt_count);
                 fprintf(out, "    popr %s\n", regname(sel_r));
                 fprintf(out, "    j _%s_B%d\n", f->name, def_id);
-                // Record table for data emission
                 if (jt_count < MAX_JT) {
                     jt_info[jt_count].inst = inst;
                     jt_info[jt_count].mn = mn;
@@ -1283,6 +1430,7 @@ void emit_function(Function *f, FILE *out) {
             }
         }
     }
+
     // Emit jump tables after function body
     for (int ti = 0; ti < jt_count && ti < MAX_JT; ti++) {
         Inst *sw = jt_info[ti].inst;

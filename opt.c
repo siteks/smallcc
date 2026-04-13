@@ -4,6 +4,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+unsigned opt_flags = OPT_ALL;
+
 /*
  * opt.c — Post-OOS SSA-level optimisation passes
  *
@@ -663,6 +665,164 @@ void opt_licm_const(Function *f) {
     }
 }
 
+// ── R2I: Jump threading ──────────────────────────────────────────────────
+//
+// When block P ends with IK_JMP B, and B is a "thin" block whose only live
+// instructions are IK_COPY (OOS phi-copies) + a terminator IK_BR on a value
+// defined in P, thread the branch into P directly.
+//
+// After threading, P's IK_JMP becomes IK_BR with B's targets, B's copies
+// that define the branch condition are pulled into P, and P's edges are
+// updated.  If B becomes predecessor-less it will be cleaned up by
+// opt_remove_dead_blocks.
+//
+// This enables compare+branch fusion (P5) in emit.c for cases like
+// core_state_transition where a comparison is separated from its branch
+// by a phi-merge block.
+
+static int is_thin_branch_block(Block *b) {
+    // A block is "thin" if all non-dead instructions except the terminator
+    // are IK_COPY, and the terminator is IK_BR.
+    if (!b->tail || b->tail->kind != IK_BR) return 0;
+    for (Inst *inst = b->head; inst; inst = inst->next) {
+        if (inst->is_dead) continue;
+        if (inst == b->tail) continue;  // skip the BR terminator
+        if (inst->kind != IK_COPY) return 0;
+    }
+    return 1;
+}
+
+// Check if value v is defined in block b (directly or through val_resolve).
+static int value_defined_in(Value *v, Block *b) {
+    v = val_resolve(v);
+    if (!v || v->kind != VAL_INST || !v->def) return 0;
+    return v->def->block == b;
+}
+
+// Find an IK_COPY in block P that writes to the Value* cond.
+// Returns the resolved source value, or NULL if not found.
+static Value *find_copy_src_for(Block *p, Value *cond) {
+    for (Inst *inst = p->head; inst; inst = inst->next) {
+        if (inst->is_dead) continue;
+        if (inst->kind == IK_COPY && inst->dst == cond && inst->nops >= 1)
+            return val_resolve(inst->ops[0]);
+    }
+    return NULL;
+}
+
+void opt_jump_thread(Function *f) {
+    int changed = 0;
+    for (int bi = 0; bi < f->nblocks; bi++) {
+        Block *p = f->blocks[bi];
+        Inst  *term = p->tail;
+        if (!term || term->kind != IK_JMP || !term->target) continue;
+
+        Block *b = term->target;
+        if (!is_thin_branch_block(b)) continue;
+
+        Inst *br = b->tail;
+        Value *cond = val_resolve(br->ops[0]);
+
+        // Case 1: condition is defined (as a computation) in P — thread the branch.
+        // Case 2: P copies a constant into the condition (phi-variable) — fold to jump.
+        int defined_in_p = value_defined_in(cond, p);
+
+        if (!defined_in_p) {
+            // Check if P has an IK_COPY that writes a constant to cond
+            Value *src = find_copy_src_for(p, cond);
+            if (src && src->kind == VAL_CONST) {
+                // Fold: P's JMP → JMP to the taken target directly
+                Block *taken   = src->iconst ? br->target : br->target2;
+
+                term->target = taken;
+                // term stays IK_JMP — just retarget it
+
+                // Update edges: remove B from P's succs, add taken
+                for (int k = 0; k < p->nsuccs; k++) {
+                    if (p->succs[k] == b) { p->succs[k] = taken; break; }
+                }
+                // Remove P from B's preds
+                for (int k = 0; k < b->npreds; k++) {
+                    if (b->preds[k] == p) {
+                        b->preds[k] = b->preds[--b->npreds];
+                        break;
+                    }
+                }
+                // Add P to taken's preds
+                Block **np = arena_alloc((taken->npreds + 1) * sizeof(Block *));
+                for (int k = 0; k < taken->npreds; k++) np[k] = taken->preds[k];
+                np[taken->npreds++] = p;
+                taken->preds = np;
+
+                changed = 1;
+            }
+            continue;
+        }
+
+        Block *bt = br->target;   // true target
+        Block *bf = br->target2;  // false target
+
+        // Rewrite P's terminator: IK_JMP → IK_BR
+        term->kind    = IK_BR;
+        term->target  = bt;
+        term->target2 = bf;
+        term->ops     = br->ops;
+        term->nops    = br->nops;
+
+        // Update P's succs: remove B, add bt and bf
+        // First, remove B from P's succs
+        for (int k = 0; k < p->nsuccs; k++) {
+            if (p->succs[k] == b) {
+                p->succs[k] = p->succs[--p->nsuccs];
+                break;
+            }
+        }
+        // Add bt and bf (avoid duplicates if bt == bf)
+        {
+            int need = (bt == bf) ? 1 : 2;
+            Block **ns = arena_alloc((p->nsuccs + need) * sizeof(Block *));
+            for (int k = 0; k < p->nsuccs; k++) ns[k] = p->succs[k];
+            int already_bt = 0, already_bf = 0;
+            for (int k = 0; k < p->nsuccs; k++) {
+                if (ns[k] == bt) already_bt = 1;
+                if (ns[k] == bf) already_bf = 1;
+            }
+            if (!already_bt) ns[p->nsuccs++] = bt;
+            if (!already_bf && bf != bt) ns[p->nsuccs++] = bf;
+            p->succs = ns;
+        }
+
+        // Remove P from B's preds
+        for (int k = 0; k < b->npreds; k++) {
+            if (b->preds[k] == p) {
+                b->preds[k] = b->preds[--b->npreds];
+                break;
+            }
+        }
+
+        // Add P to bt's preds and bf's preds
+        {
+            Block **np = arena_alloc((bt->npreds + 1) * sizeof(Block *));
+            for (int k = 0; k < bt->npreds; k++) np[k] = bt->preds[k];
+            np[bt->npreds++] = p;
+            bt->preds = np;
+        }
+        if (bf != bt) {
+            Block **np = arena_alloc((bf->npreds + 1) * sizeof(Block *));
+            for (int k = 0; k < bf->npreds; k++) np[k] = bf->preds[k];
+            np[bf->npreds++] = p;
+            bf->preds = np;
+        }
+
+        changed = 1;
+    }
+
+    if (changed) {
+        // Remove blocks that became predecessor-less
+        opt_remove_dead_blocks(f);
+    }
+}
+
 // ── R2B: Dead block elimination ───────────────────────────────────────────
 
 void opt_remove_dead_blocks(Function *f) {
@@ -689,5 +849,285 @@ void opt_remove_dead_blocks(Function *f) {
             }
         }
         f->nblocks = new_n;
+    }
+}
+
+// ── R2J: Self-loop unrolling with modulo variable expansion ──────────────
+
+// Clone an instruction into block 'b' with operands remapped through vmap.
+// If an operand is not in vmap (its id slot is NULL), the original is kept.
+static Inst *clone_inst_mapped(Function *f, Block *b, Inst *orig, Value **vmap) {
+    Value *new_dst = NULL;
+    if (orig->dst) {
+        new_dst = new_value(f, orig->dst->kind, orig->dst->vtype);
+        vmap[orig->dst->id] = new_dst;
+    }
+    Inst *ci = new_inst(f, b, orig->kind, new_dst);
+    ci->imm   = orig->imm;
+    ci->size  = orig->size;
+    ci->fname = orig->fname;
+    ci->label = orig->label;
+    ci->line  = orig->line;
+    ci->calldesc = orig->calldesc;
+    for (int j = 0; j < orig->nops; j++) {
+        Value *op = orig->ops[j];
+        if (op) {
+            Value *r = val_resolve(op);
+            if (r && r->id < f->nvalues && vmap[r->id]) op = vmap[r->id];
+            else                                          op = r;
+        }
+        inst_add_op(ci, op);
+    }
+    inst_append(b, ci);
+    return ci;
+}
+
+void opt_unroll_loops(Function *f) {
+    if (!f || f->nblocks == 0) return;
+
+    for (int bi = 0; bi < f->nblocks; bi++) {
+        Block *b = f->blocks[bi];
+        Inst  *term = b->tail;
+        if (!term || term->kind != IK_BR) continue;
+
+        // 1. Check self-loop: true branch targets self
+        // Also check: false branch targets self (some loops are structured this way)
+        int self_is_true = (term->target == b);
+        int self_is_false = (term->target2 == b);
+        if (!self_is_true && !self_is_false) continue;
+        // Canonicalize: ensure self-loop is on true branch
+        if (self_is_false && !self_is_true) {
+            // Swap: make true=self, false=exit
+            Block *tmp = term->target;
+            term->target = term->target2;
+            term->target2 = tmp;
+        }
+        if (term->target != b) continue;
+        Block *exit_blk = term->target2;
+        if (!exit_blk) continue;
+
+        // Must have exactly 2 succs: self and exit
+        if (b->nsuccs != 2) continue;
+
+        // 2. Scan for trailing copy chain before terminator
+        // Collect copies in reverse order (closest to branch first)
+        Inst *copies[16];
+        int ncopy = 0;
+        for (Inst *inst = term->prev; inst; inst = inst->prev) {
+            if (inst->is_dead) continue;
+            if (inst->kind != IK_COPY) break;
+            if (ncopy >= 16) break;
+            copies[ncopy++] = inst;
+        }
+        if (ncopy < 2) continue;
+
+        // 3. Check no calls and reasonable size
+        int inst_count = 0;
+        int has_call = 0;
+        for (Inst *inst = b->head; inst; inst = inst->next) {
+            if (inst->is_dead) continue;
+            inst_count++;
+            if (inst->kind == IK_CALL || inst->kind == IK_ICALL) has_call = 1;
+        }
+        if (has_call || inst_count > 15) continue;
+
+        // 4. Build permutation from copy chain: perm[dst_id] = src_id
+        //    and check it forms a single cycle
+        //    copies[] are in reverse order (last copy first)
+        //    Reverse to get natural order
+        for (int i = 0; i < ncopy / 2; i++) {
+            Inst *tmp = copies[i];
+            copies[i] = copies[ncopy - 1 - i];
+            copies[ncopy - 1 - i] = tmp;
+        }
+
+        // Validate copies: each must have a valid dst and src
+        int valid = 1;
+        for (int i = 0; i < ncopy; i++) {
+            if (!copies[i]->dst || copies[i]->nops < 1 || !copies[i]->ops[0]) { valid = 0; break; }
+            Value *s = val_resolve(copies[i]->ops[0]);
+            if (!s || s->kind == VAL_CONST) { valid = 0; break; }
+        }
+        if (!valid) continue;
+
+        // Unroll factor: ncopy + 1 (the number of distinct values in the
+        // shift chain). For 2 copies involving 3 values, unroll 3x.
+        // Cap at a reasonable maximum to avoid code bloat.
+        int N = ncopy + 1;
+        if (N > 4) continue;
+
+        // 5. Collect phi-variables and their copy sources
+        Value *phi_vars[16];   // copy destinations (phi-variables)
+        Value *phi_srcs[16];   // copy sources (NOT val_resolved — the raw operand)
+        for (int i = 0; i < ncopy; i++) {
+            phi_vars[i] = copies[i]->dst;
+            phi_srcs[i] = copies[i]->ops[0];  // raw, not resolved
+        }
+
+        // The branch tests a phi-variable (the last copy's destination)
+        Value *br_cond = term->ops[0];
+        int br_copy_idx = -1;
+        for (int i = 0; i < ncopy; i++) {
+            if (phi_vars[i] == br_cond) { br_copy_idx = i; break; }
+        }
+        if (br_copy_idx < 0) continue;
+
+        // Collect "real" instructions: everything before the first copy
+        Inst *first_copy = copies[0];
+        Inst *real_insts[64];
+        int nreal = 0;
+        for (Inst *inst = b->head; inst && inst != first_copy; inst = inst->next) {
+            if (inst->is_dead) continue;
+            if (nreal >= 64) break;
+            real_insts[nreal++] = inst;
+        }
+
+        // 6. Perform the unrolling
+        //    Strategy: mark iteration 0's copies + branch dead, then append
+        //    N-1 fresh continuation blocks with cloned body+copies, where the
+        //    last iteration writes back to the original phi-variables.
+
+        // Generously-sized vmap: old value ID → new value for current iteration
+        int map_cap = f->nvalues + nreal * N + ncopy * N + 16;
+        Value **vmap = calloc(map_cap, sizeof(Value *));
+
+        // iter_vals[k][i] = the fresh value that replaces phi_vars[i] after
+        // iteration k's copies execute. For the last iteration (k=N-1),
+        // iter_vals[N-1][i] = phi_vars[i] (writes back to originals).
+        Value *iter_vals[8][16];
+        for (int k = 0; k < N - 1; k++) {
+            for (int i = 0; i < ncopy; i++)
+                iter_vals[k][i] = new_value(f, phi_vars[i]->kind, phi_vars[i]->vtype);
+        }
+        for (int i = 0; i < ncopy; i++)
+            iter_vals[N - 1][i] = phi_vars[i];
+
+        // Create new blocks
+        Block *cont_blks[8];   // cont_blks[k] for iteration k+1
+        Block *exit_fixups[8]; // exit fixup for iteration k (k = 0..N-2)
+        for (int k = 0; k < N - 1; k++) {
+            cont_blks[k] = new_block(f);
+            cont_blks[k]->sealed = 1; cont_blks[k]->filled = 1;
+            exit_fixups[k] = new_block(f);
+            exit_fixups[k]->sealed = 1; exit_fixups[k]->filled = 1;
+        }
+
+        // === Iteration 0: modify the original block B ===
+        // Remove original copies and branch; replace with fresh copies + new branch.
+        // Truncate the instruction list just before the first copy, then append
+        // new copies and a new branch.
+        {
+            Inst *cut = first_copy->prev;  // last real instruction
+            if (cut) { cut->next = NULL; b->tail = cut; }
+            else     { b->head = b->tail = NULL; }
+        }
+        for (int i = 0; i < ncopy; i++) {
+            Inst *ci = new_inst(f, b, IK_COPY, iter_vals[0][i]);
+            ci->line = copies[i]->line;
+            inst_add_op(ci, phi_srcs[i]);
+            inst_append(b, ci);
+        }
+        {
+            Inst *br = new_inst(f, b, IK_BR, NULL);
+            inst_add_op(br, iter_vals[0][br_copy_idx]);
+            br->target  = cont_blks[0];
+            br->target2 = exit_fixups[0];
+            inst_append(b, br);
+        }
+
+        // === Iterations 1..N-1: build continuation blocks ===
+        for (int k = 1; k < N; k++) {
+            Block *cb = (k < N - 1) ? cont_blks[k] : NULL;
+            Block *dst_blk = (k < N - 1) ? cont_blks[k - 1] : cont_blks[N - 2];
+            // Actually: iteration k's instructions go into cont_blks[k-1]
+            // (cont_blks[0] holds iteration 1, cont_blks[1] holds iteration 2, etc.)
+            Block *ib = cont_blks[k - 1];
+
+            memset(vmap, 0, map_cap * sizeof(Value *));
+            // Map phi-vars → previous iteration's output values
+            for (int i = 0; i < ncopy; i++)
+                vmap[phi_vars[i]->id] = iter_vals[k - 1][i];
+
+            // Clone real instructions
+            for (int ri = 0; ri < nreal; ri++)
+                clone_inst_mapped(f, ib, real_insts[ri], vmap);
+
+            // Emit copies: iter_vals[k][i] = mapped(phi_srcs[i])
+            for (int i = 0; i < ncopy; i++) {
+                Value *src = phi_srcs[i];
+                Value *ms = (src && src->id < map_cap && vmap[src->id]) ? vmap[src->id] : src;
+                Inst *ci = new_inst(f, ib, IK_COPY, iter_vals[k][i]);
+                ci->line = copies[i]->line;
+                inst_add_op(ci, ms);
+                inst_append(ib, ci);
+            }
+
+            // Branch
+            Value *test_val = iter_vals[k][br_copy_idx];
+            Inst *br = new_inst(f, ib, IK_BR, NULL);
+            inst_add_op(br, test_val);
+            if (k < N - 1) {
+                br->target  = cont_blks[k];      // next continuation
+                br->target2 = exit_fixups[k];     // early exit
+            } else {
+                br->target  = b;                  // loop back to iter 0
+                br->target2 = exit_blk;           // original exit
+            }
+            inst_append(ib, br);
+        }
+
+        // === Exit fixup blocks ===
+        for (int k = 0; k < N - 1; k++) {
+            Block *fb = exit_fixups[k];
+            for (int i = 0; i < ncopy; i++) {
+                Inst *ci = new_inst(f, fb, IK_COPY, phi_vars[i]);
+                ci->line = copies[0]->line;
+                inst_add_op(ci, iter_vals[k][i]);
+                inst_append(fb, ci);
+            }
+            Inst *jmp = new_inst(f, fb, IK_JMP, NULL);
+            jmp->target = exit_blk;
+            inst_append(fb, jmp);
+        }
+
+        // === Update CFG edges ===
+        // B: remove self-loop and exit edges; add cont_blks[0] and exit_fixups[0]
+        {
+            Block **ns = arena_alloc(2 * sizeof(Block *));
+            ns[0] = cont_blks[0]; ns[1] = exit_fixups[0];
+            b->succs = ns; b->nsuccs = 2;
+        }
+        for (int k = 0; k < b->npreds; k++) {
+            if (b->preds[k] == b) { b->preds[k] = b->preds[--b->npreds]; break; }
+        }
+        for (int k = 0; k < exit_blk->npreds; k++) {
+            if (exit_blk->preds[k] == b) { exit_blk->preds[k] = exit_blk->preds[--exit_blk->npreds]; break; }
+        }
+        // Last continuation block: back-edge to B and edge to exit_blk
+        block_add_pred(b, cont_blks[N - 2]);
+        block_add_pred(exit_blk, cont_blks[N - 2]);
+
+        // Wire continuation blocks: preds and succs
+        for (int k = 0; k < N - 1; k++) {
+            Block *ib = cont_blks[k];
+            block_add_pred(ib, (k == 0) ? b : cont_blks[k - 1]);
+            if (k < N - 2) {
+                block_add_succ(ib, cont_blks[k + 1]);
+                block_add_succ(ib, exit_fixups[k + 1]);
+            } else {
+                // Last cont block
+                block_add_succ(ib, b);
+                block_add_succ(ib, exit_blk);
+            }
+        }
+        // Wire exit fixups
+        for (int k = 0; k < N - 1; k++) {
+            block_add_pred(exit_fixups[k], (k == 0) ? b : cont_blks[k - 1]);
+            block_add_succ(exit_fixups[k], exit_blk);
+            block_add_pred(exit_blk, exit_fixups[k]);
+        }
+
+        free(vmap);
+        break;  // only unroll one loop per function per pass
     }
 }

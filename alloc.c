@@ -376,7 +376,7 @@ static IGraph *build_interference_graph(Function *f) {
 
 // Assign colors using a simple greedy graph coloring
 // Returns 1 if all values colored, 0 if spills needed
-static int assign_colors(IGraph *g, Function *f, int K) {
+static int assign_colors(IGraph *g, Function *f, int K, int pessimistic) {
     // Simplification order: build a stack using degree < K heuristic
     int nv = g->nv;
     int *stack    = arena_alloc(nv * sizeof(int));
@@ -441,6 +441,24 @@ static int assign_colors(IGraph *g, Function *f, int K) {
                 }
             }
             if (worst < 0) break;
+            if (pessimistic) {
+                // Pessimistic spilling: mark as spilled immediately.
+                // Used in tier 3 to break cascade growth by spilling all
+                // high-degree values at once rather than one per iteration.
+                g->spilled[worst] = 1;
+                removed[worst] = 1;
+                remaining--;
+                for (int w = 0; w < g->nwords; w++) {
+                    uint32_t word = g->adj[worst][w];
+                    while (word) {
+                        int bit = __builtin_ctz(word);
+                        int vid = w * 32 + bit;
+                        if (vid < nv && !removed[vid]) degree[vid]--;
+                        word &= word - 1;
+                    }
+                }
+                continue;
+            }
             // Optimistic spilling (Briggs): push onto stack instead of
             // immediately marking as spilled.  During select, we'll try to
             // color it; only if no color is available does it actually spill.
@@ -524,9 +542,17 @@ static int assign_colors(IGraph *g, Function *f, int K) {
         }
     }
 
-    // Check if any spills occurred
+    // Check if any NEW spills occurred (values that weren't pre-marked by
+    // the persistent set).  A pre-marked spill that stays spilled is expected;
+    // only a newly-failed coloring means we need another rewrite round.
     for (int i = 0; i < nv; i++) {
-        if (g->spilled[i]) return 0;
+        if (g->spilled[i] && g->color[i] < 0 && g->precolored[i] < 0) {
+            // Check if this is a genuinely new spill (not a persistent one
+            // that was force-marked before simplify).
+            Value *v = f->values[i];
+            if (v->spill_slot == -1)
+                return 0;  // new spill — need another round
+        }
     }
     return 1;
 }
@@ -629,16 +655,63 @@ static void insert_spill_store(Function *f, Block *b, Inst *after,
     }
 }
 
-// Rewrite function: replace spilled values with loads/stores
+// Can this value be rematerialized (recomputed) at each use site instead
+// of spilling to a stack slot?  Only trivial single-instruction values
+// with no operands qualify: IK_CONST and IK_GADDR.
+static int is_rematerializable(Value *v) {
+    if (!v || !v->def) return 0;
+    return v->def->kind == IK_CONST || v->def->kind == IK_GADDR;
+}
+
+// Insert a rematerialized copy of 'orig_def' before 'before' in block 'b'.
+// Returns the fresh value that replaces the spilled original.
+static Value *insert_remat(Function *f, Block *b, Inst *before, Value *orig) {
+    Inst *def = orig->def;
+    Value *tmp = new_value(f, VAL_INST, orig->vtype);
+    Inst *clone = new_inst(f, b, def->kind, tmp);
+    clone->imm   = def->imm;
+    clone->fname = def->fname;
+    clone->block = b;
+    if (before) clone->line = before->line;
+
+    // Insert before 'before'
+    if (!before) {
+        inst_append(b, clone);
+    } else {
+        clone->prev = before->prev;
+        clone->next = before;
+        if (before->prev) before->prev->next = clone;
+        else              b->head = clone;
+        before->prev = clone;
+    }
+    return tmp;
+}
+
+// Rewrite function: replace spilled values with loads/stores (or
+// rematerialization for IK_CONST/IK_GADDR).
 static void rewrite_spills(Function *f, IGraph *g) {
     int nv = g->nv;
 
-    // Assign spill slots
+    // Assign spill slots (skip rematerializable values — they don't need slots)
     int *spill_offset = arena_alloc(nv * sizeof(int));
+    // Track which values are NEWLY spilled this iteration (need load/store insertion).
+    // Values already spilled in a prior iteration have loads/stores in place.
+    uint8_t *newly_spilled = arena_alloc(nv * sizeof(uint8_t));
 
     for (int i = 0; i < nv; i++) {
         if (!g->spilled[i]) continue;
         Value *v = f->values[i];
+        if (is_rematerializable(v)) {
+            newly_spilled[i] = 1;  // remat values always need per-use insertion
+            continue;
+        }
+        if (v->spill_slot != -1) {
+            // Already spilled in a prior iteration — reuse existing slot,
+            // skip instruction rewriting (loads/stores already in place).
+            spill_offset[i] = v->spill_slot;
+            continue;
+        }
+        newly_spilled[i] = 1;
         int sz = (v->vtype == VT_F32 || v->vtype == VT_I32 || v->vtype == VT_U32) ? 4 : 2;
         f->frame_size += sz;
         // Align: 4-byte spills need 4-byte alignment, 2-byte spills need 2-byte alignment
@@ -650,8 +723,8 @@ static void rewrite_spills(Function *f, IGraph *g) {
         v->spill_slot = spill_offset[i];
     }
 
-    // For each instruction, replace uses of spilled values with loads,
-    // and insert stores after defs of spilled values.
+    // For each instruction, replace uses of spilled values with loads
+    // (or rematerializations), and insert stores after defs of spilled values.
     for (int bi = 0; bi < f->nblocks; bi++) {
         Block *b = f->blocks[bi];
         for (Inst *inst = b->head; inst; inst = inst->next) {
@@ -659,41 +732,32 @@ static void rewrite_spills(Function *f, IGraph *g) {
             for (int oi = 0; oi < inst->nops; oi++) {
                 Value *v = val_resolve(inst->ops[oi]);
                 if (!v || v->id >= nv) continue;
-                if (g->spilled[v->id]) {
-                    // When the use is inside a run of IK_COPY instructions
-                    // (OOS phi copies), insert the spill load before the entire
-                    // run.  Otherwise the emit-time scratch register for the lea
-                    // in an out-of-F2-range load can clobber an earlier phi-copy
-                    // destination that happens to share the same physical register.
-                    Inst *insert_before = inst;
-                    if (inst->kind == IK_COPY) {
-                        while (insert_before->prev &&
-                               insert_before->prev->kind == IK_COPY)
-                            insert_before = insert_before->prev;
+                if (g->spilled[v->id] && newly_spilled[v->id]) {
+                    if (is_rematerializable(v)) {
+                        // Rematerialize: clone the IK_CONST/IK_GADDR before this use
+                        Value *tmp = insert_remat(f, b, inst, v);
+                        inst->ops[oi] = tmp;
+                    } else {
+                        // Spill load from stack slot
+                        Inst *insert_before = inst;
+                        if (inst->kind == IK_COPY) {
+                            while (insert_before->prev &&
+                                   insert_before->prev->kind == IK_COPY)
+                                insert_before = insert_before->prev;
+                        }
+                        Value *tmp = insert_spill_load(f, b, insert_before, v, spill_offset[v->id]);
+                        inst->ops[oi] = tmp;
                     }
-                    Value *tmp = insert_spill_load(f, b, insert_before, v, spill_offset[v->id]);
-                    inst->ops[oi] = tmp;
                 }
             }
 
-            // Insert store after def.
-            // IMPORTANT: advance inst past the inserted store so that the loop's
-            // "inst = inst->next" doesn't re-process it.  If we did process it,
-            // its src operand (the spilled value) would trigger another LOAD
-            // insertion, creating a bogus LOAD-STORE pair with no actual store of
-            // the freshly computed value.
-            //
-            // For out-of-F2-range spill slots, insert_spill_store inserts an
-            // IK_ADDR *before* the IK_STORE (making copy->next = ADDR, not STORE).
-            // A single inst->next only reaches the ADDR; the for-loop increment
-            // would then land on the STORE and trigger the bogus LOAD above.
-            // Skip the IK_ADDR too so the for-loop increment lands on STORE->next.
+            // Insert store after def (skip rematerializable — no slot to store to)
             if (inst->dst) {
                 int id = inst->dst->id;
-                if (id < nv && g->spilled[id]) {
+                if (id < nv && g->spilled[id] && newly_spilled[id] && !is_rematerializable(inst->dst)) {
                     insert_spill_store(f, b, inst, inst->dst, spill_offset[id]);
-                    inst = inst->next; // skip to IK_ADDR (out-of-range) or IK_STORE (in-range)
-                    if (inst && inst->kind == IK_ADDR) inst = inst->next; // skip IK_ADDR → land on IK_STORE
+                    inst = inst->next;
+                    if (inst && inst->kind == IK_ADDR) inst = inst->next;
                 }
             }
         }
@@ -819,11 +883,10 @@ void irc_allocate(Function *f) {
 
     int K = IRC_K;
     int max_iter = 20;
-
     // Persistent spill set for Tier 3: once a value is spilled, it stays
-    // spilled.  Indexed by Value.id; only valid for ids < nv_at_entry.
-    int nv_at_entry = f->nvalues;
-    uint8_t *persist_spill = arena_alloc(nv_at_entry * sizeof(uint8_t));
+    // spilled.  Dynamically grown as rewrite_spills adds new values.
+    int persist_cap = f->nvalues + 64;  // initial capacity with headroom
+    uint8_t *persist_spill = arena_alloc(persist_cap * sizeof(uint8_t));
 
     for (int iter = 0; iter < max_iter; iter++) {
         // Reset is_dead on all still-linked IK_COPY instructions before each
@@ -842,7 +905,8 @@ void irc_allocate(Function *f) {
         // Mark these values as already spilled in the graph so assign_colors
         // skips them and rewrite_spills inserts load/store for them.
         if (iter >= 8) {
-            for (int i = 0; i < nv_at_entry && i < g->nv; i++) {
+            int lim = persist_cap < g->nv ? persist_cap : g->nv;
+            for (int i = 0; i < lim; i++) {
                 if (persist_spill[i])
                     g->spilled[i] = 1;
             }
@@ -854,7 +918,9 @@ void irc_allocate(Function *f) {
         if (iter < 5)
             coalesce_copies(g, f, K);
 
-        int ok = assign_colors(g, f, K);
+        // Tier 3 (iter >= 8): pessimistic spilling to break cascade
+        int pessimistic = (iter >= 8);
+        int ok = assign_colors(g, f, K, pessimistic);
 
         if (ok) {
             // Apply colors to values
@@ -866,9 +932,17 @@ void irc_allocate(Function *f) {
             break;
         }
 
-        // Tier 3: record newly spilled values into the persistent set
+        // Tier 3: record newly spilled values into the persistent set.
+        // Grow the set if needed to cover spill temps from rewrite_spills.
         if (iter >= 7) {
-            for (int i = 0; i < nv_at_entry && i < g->nv; i++) {
+            if (g->nv > persist_cap) {
+                uint8_t *old = persist_spill;
+                persist_spill = arena_alloc(g->nv * sizeof(uint8_t));
+                for (int i = 0; i < persist_cap; i++)
+                    persist_spill[i] = old[i];
+                persist_cap = g->nv;
+            }
+            for (int i = 0; i < g->nv; i++) {
                 if (g->spilled[i])
                     persist_spill[i] = 1;
             }
@@ -881,5 +955,9 @@ void irc_allocate(Function *f) {
         compute_liveness(f);
 
         ig_free(g);
+
+        if (iter == max_iter - 1)
+            fprintf(stderr, "IRC: %s EXHAUSTED %d iterations (nvalues=%d)\n",
+                    f->name, max_iter, f->nvalues);
     }
 }

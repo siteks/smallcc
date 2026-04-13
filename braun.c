@@ -114,6 +114,141 @@ void braun_emit_strlits(FILE *out) {
     g_nsl = 0;
 }
 
+
+// ============================================================
+// Inline candidate registry
+// ============================================================
+
+typedef struct {
+    const char *name;       // function name (mangled label)
+    Node       *func_decl;  // ND_DECLARATION with is_func_defn
+    Symbol    **param_syms; // callee's parameter Symbol* array
+    int         nparams;
+    Node       *ret_expr;   // the single return expression node
+} InlineCandidate;
+
+#define MAX_INLINE 256
+static InlineCandidate g_inline[MAX_INLINE];
+static int g_ninline;
+
+// Check whether a function qualifies for inlining.
+// Returns the return expression Node* if yes, NULL if no.
+static Node *inline_qualify(Node *func_decl) {
+    if (!func_decl || func_decl->kind != ND_DECLARATION) return NULL;
+    if (!func_decl->u.declaration.is_func_defn) return NULL;
+
+    Node *declarator = func_decl->ch[1];
+    Node *body = func_decl->ch[2];
+    if (!declarator || !body) return NULL;
+
+    Symbol *fsym = declarator->symbol;
+    if (!fsym || !fsym->type) return NULL;
+
+    Type *ftype = fsym->type;
+    if (ftype->base != TB_FUNCTION) return NULL;
+
+    // No variadic
+    if (ftype->u.fn.is_variadic) return NULL;
+
+    // Count params — must be ≤ 3
+    int nparams = 0;
+    if (body->symtable) {
+        for (Symbol *s = body->symtable->symbols; s; s = s->next)
+            if (s->kind == SYM_PARAM && s->ns == NS_IDENT)
+                nparams++;
+    }
+    if (nparams > 3) return NULL;
+
+    // Void return type — skip (no return value to substitute)
+    Type *ret_type = ftype->u.fn.ret;
+    if (ret_type && ret_type->base == TB_VOID) return NULL;
+
+    // Struct return — skip (hidden sret pointer)
+    if (ret_type && ret_type->base == TB_STRUCT) return NULL;
+
+    // Body must be ND_COMPSTMT with exactly one statement: ND_RETURNSTMT
+    if (body->kind != ND_COMPSTMT) return NULL;
+    Node *stmt = body->ch[0];
+    if (!stmt) return NULL;
+    if (stmt->next) return NULL;  // more than one statement
+    if (stmt->kind != ND_RETURNSTMT) return NULL;
+    Node *ret_expr = stmt->ch[0];
+    if (!ret_expr) return NULL;
+
+    // No locals (only params in scope)
+    if (body->symtable) {
+        for (Symbol *s = body->symtable->symbols; s; s = s->next) {
+            if (s->ns != NS_IDENT) continue;
+            if (s->kind == SYM_LOCAL) return NULL;
+            if (s->kind == SYM_STATIC_LOCAL) return NULL;
+        }
+    }
+
+    // No address-taken params (scan return expression for &param)
+    // Simple check: walk ret_expr for ND_UNARYOP '&' on a param ident
+    // We use a non-recursive stack to avoid complexity
+    // (the expression tree is small for qualifying functions)
+    {
+        Node *stack[64]; int sp = 0;
+        stack[sp++] = ret_expr;
+        while (sp > 0) {
+            Node *nd = stack[--sp];
+            if (!nd) continue;
+            if (nd->kind == ND_UNARYOP && nd->op_kind == TK_AMPERSAND) {
+                Node *operand = nd->ch[0];
+                if (operand && operand->kind == ND_IDENT && operand->symbol &&
+                    operand->symbol->kind == SYM_PARAM)
+                    return NULL;
+            }
+            // Check for recursive call (callee calls itself)
+            if (nd->kind == ND_IDENT && nd->u.ident.is_function && nd->symbol == fsym)
+                return NULL;
+            for (int i = 0; i < 4; i++)
+                if (nd->ch[i] && sp < 64) stack[sp++] = nd->ch[i];
+        }
+    }
+
+    return ret_expr;
+}
+
+void braun_register_inline_candidate(Node *func_decl, int tu_index) {
+    if (g_ninline >= MAX_INLINE) return;
+
+    Node *ret_expr = inline_qualify(func_decl);
+    if (!ret_expr) return;
+
+    Node *declarator = func_decl->ch[1];
+    Node *body = func_decl->ch[2];
+    Symbol *fsym = declarator->symbol;
+
+    const char *label = sym_label(fsym);
+
+    // Collect param symbols sorted by offset
+    Symbol *psyms[4]; int np = 0;
+    if (body->symtable) {
+        for (Symbol *s = body->symtable->symbols; s; s = s->next)
+            if (s->kind == SYM_PARAM && s->ns == NS_IDENT && np < 4)
+                psyms[np++] = s;
+        for (int i = 0; i < np - 1; i++)
+            for (int j = i + 1; j < np; j++)
+                if (psyms[i]->offset > psyms[j]->offset) {
+                    Symbol *tmp = psyms[i]; psyms[i] = psyms[j]; psyms[j] = tmp;
+                }
+    }
+
+    InlineCandidate *ic = &g_inline[g_ninline++];
+    ic->name = label;
+    ic->func_decl = func_decl;
+    ic->nparams = np;
+    ic->ret_expr = ret_expr;
+    if (np > 0) {
+        ic->param_syms = arena_alloc(np * sizeof(Symbol *));
+        memcpy(ic->param_syms, psyms, np * sizeof(Symbol *));
+    } else {
+        ic->param_syms = NULL;
+    }
+}
+
 // ============================================================
 // BraunCtx
 // ============================================================
@@ -197,24 +332,6 @@ static int vparam_off(BraunCtx *ctx, Symbol *sym) {
 // Helper: assembly label for a symbol
 // ============================================================
 
-static const char *sym_label(int tu_index, Symbol *sym) {
-    static char buf[512];
-    switch (sym->kind) {
-    case SYM_GLOBAL:
-    case SYM_EXTERN:
-    case SYM_BUILTIN:
-        return sym->name;
-    case SYM_STATIC_GLOBAL:
-        snprintf(buf, sizeof(buf), "_s%d_%s", sym->tu_index, sym->name);
-        return arena_strdup(buf);
-    case SYM_STATIC_LOCAL:
-        snprintf(buf, sizeof(buf), "_ls%d", sym->offset);
-        return arena_strdup(buf);
-    default:
-        return sym->name;
-    }
-    (void)tu_index;
-}
 
 // ============================================================
 // scan_addr_taken — pre-scan function body
@@ -736,7 +853,7 @@ static Value *cg_addr(BraunCtx *ctx, Block **cur, Node *n) {
             sym->kind == SYM_BUILTIN) {
             Value *dst = new_value(ctx->f, VAL_INST, VT_PTR);
             Inst  *inst = bi(ctx, b, IK_GADDR, dst);
-            inst->fname = (char *)sym_label(ctx->tu_index, sym);
+            inst->fname = (char *)sym_label(sym);
             inst_append(b, inst);
             return dst;
         }
@@ -805,6 +922,42 @@ static Value *cg_addr(BraunCtx *ctx, Block **cur, Node *n) {
 }
 
 // ============================================================
+// braun_try_inline — attempt to inline a direct call
+// Returns non-NULL SSA value if inlined, NULL if not.
+// ============================================================
+
+static Value *braun_try_inline(BraunCtx *ctx, Block **cur, Symbol *fsym,
+                               Node *args_head, ValType call_vt) {
+    if (!istype_function(fsym->type)) return NULL;
+
+    const char *label = sym_label(fsym);
+
+    // Look up in registry
+    InlineCandidate *ic = NULL;
+    for (int i = 0; i < g_ninline; i++) {
+        if (strcmp(g_inline[i].name, label) == 0) {
+            ic = &g_inline[i]; break;
+        }
+    }
+    if (!ic) return NULL;
+
+    Block *b = *cur;
+
+    // Evaluate arguments and write to callee's param symbols
+    Node *arg = args_head;
+    for (int i = 0; i < ic->nparams; i++) {
+        if (!arg) break;
+        Value *av = cg_expr(ctx, cur, arg);
+        b = *cur;
+        write_var(b, ic->param_syms[i], av);
+        arg = arg->next;
+    }
+
+    // Generate code for the callee's return expression in the caller's context
+    return cg_expr(ctx, cur, ic->ret_expr);
+}
+
+// ============================================================
 // cg_expr — generate SSA value for expression Node*
 // ============================================================
 
@@ -866,10 +1019,14 @@ static Value *cg_expr(BraunCtx *ctx, Block **cur, Node *n) {
             }
 
             if (istype_function(sym->type)) {
+                // Try inlining first
+                Value *inlined = braun_try_inline(ctx, cur, sym, args_head, call_vt);
+                if (inlined) return inlined;
+                b = *cur;
                 // Direct call
                 Value *landing = new_value(ctx->f, VAL_INST, call_vt);
                 Inst  *call = bi(ctx, b, IK_CALL, landing);
-                call->fname    = (char *)sym_label(ctx->tu_index, sym);
+                call->fname    = (char *)sym_label(sym);
                 call->calldesc = make_calldesc(sym->type);
                 cg_call_args(ctx, cur, call, args_head); b = *cur;
                 return emit_call_result(ctx, b, call, n->type);
@@ -899,7 +1056,7 @@ static Value *cg_expr(BraunCtx *ctx, Block **cur, Node *n) {
             sym->kind == SYM_STATIC_GLOBAL || sym->kind == SYM_STATIC_LOCAL) {
             Value *addr = new_value(ctx->f, VAL_INST, VT_PTR);
             Inst  *ga = bi(ctx, b, IK_GADDR, addr);
-            ga->fname = (char *)sym_label(ctx->tu_index, sym);
+            ga->fname = (char *)sym_label(sym);
             inst_append(b, ga);
             int sz = sym->type ? sym->type->size : 2;
             return emit_load(ctx, b, addr, sz, 0, vt);
@@ -1901,7 +2058,7 @@ Function *braun_function(Node *func_decl, int tu_index, int *strlit_id) {
     Symbol *fsym = func_decl_node->symbol;
     if (!fsym) return NULL;
 
-    const char *fname = sym_label(tu_index, fsym);
+    const char *fname = sym_label(fsym);
 
     Type *fn_type = fsym->type;
     if (!fn_type || fn_type->base != TB_FUNCTION) return NULL;

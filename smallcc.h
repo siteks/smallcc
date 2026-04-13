@@ -1,5 +1,5 @@
-#ifndef _MYCC_H
-#define _MYCC_H
+#ifndef SMALLCC_H
+#define SMALLCC_H
 
 #include <ctype.h>
 #include <stdarg.h>
@@ -114,8 +114,6 @@ void  pp_define(const char *name, const char *body);
 void  add_include_dir(const char *dir);
 char *preprocess(const char *src, const char *filename);
 
-// bool consume(char *op);
-// bool consume_tk(Token_kind tk);
 char *expect(Token_kind tk);
 int expect_number();
 char *expect_ident();
@@ -321,7 +319,7 @@ typedef struct Node Node;
 struct Node
 {
     Node_kind       kind;
-    // Positional child slots — all Node* children live here (see slot assignments in codegen.md).
+    // Positional child slots — all Node* children live here.
     // ch[0..3] are NULL by default (arena_alloc zeroes memory).
     Node            *ch[4];
     union {
@@ -474,6 +472,9 @@ Symbol *insert_tag(Symbol_table *st, char *ident);
 Symbol *insert_enum_const(Symbol_table *st, Type *ety, char *ident, int value);
 Symbol *find_symbol_st(Symbol_table *st, const char *name, Namespace nspace);
 
+// Return the assembly label for a global/static/extern symbol.
+const char *sym_label(Symbol *sym);
+
 // ===============================================================
 // Capacity constants for fixed-size arrays in context structs
 #define MAX_STRLITS         512
@@ -548,7 +549,7 @@ extern ParserContext parser_ctx;
 #define t_float  (type_ctx.t_float)
 #define t_double (type_ctx.t_double)
 
-// Convenience alias used throughout codegen and types.
+// Convenience alias used throughout braun.c and types.c.
 #define current_global_tu (type_ctx.current_tu)
 
 // Preprocessor
