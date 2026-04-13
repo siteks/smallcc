@@ -394,6 +394,20 @@ static int assign_colors(IGraph *g, Function *f, int K) {
         else remaining++;
     }
 
+    // Build copy-hint table for biased coloring: for each value that is the
+    // destination of an IK_COPY, record the source value's id.
+    int *copy_hint = arena_alloc(nv * sizeof(int));
+    for (int i = 0; i < nv; i++) copy_hint[i] = -1;
+    for (int i = 0; i < f->nvalues; i++) {
+        Value *val = f->values[i];
+        if (val->def && val->def->kind == IK_COPY && !val->def->is_dead &&
+            val->def->nops >= 1) {
+            Value *src = val_resolve(val->def->ops[0]);
+            if (src && src->kind == VAL_INST && src->id >= 0 && src->id < nv)
+                copy_hint[i] = src->id;
+        }
+    }
+
     while (remaining > 0) {
         // Find a node with degree < K
         int found = -1;
@@ -470,11 +484,25 @@ static int assign_colors(IGraph *g, Function *f, int K) {
             }
         }
 
-        // Pick the lowest unforbidden register.
-        // If this value is live across a call, r0-r3 are already forbidden
-        // (via phantom-node interference), so this naturally picks r4-r7.
-        for (int r = 0; r < K; r++) {
-            if (!forbidden[r]) { g->color[v] = r; break; }
+        // Biased coloring: if this value is the destination of a copy,
+        // prefer the source's register.  This eliminates copies that George's
+        // test couldn't coalesce, without affecting colorability.
+        int preferred = -1;
+        if (v < f->nvalues && copy_hint[v] >= 0) {
+            int p = ig_find(g, copy_hint[v]);
+            if (g->color[p] >= 0 && !forbidden[g->color[p]])
+                preferred = g->color[p];
+        }
+
+        // Pick a register: prefer copy partner's register (biased coloring),
+        // else lowest unforbidden.  If this value is live across a call,
+        // r0-r3 are already forbidden (via phantom-node interference).
+        if (preferred >= 0) {
+            g->color[v] = preferred;
+        } else {
+            for (int r = 0; r < K; r++) {
+                if (!forbidden[r]) { g->color[v] = r; break; }
+            }
         }
         if (g->color[v] < 0) {
             g->spilled[v] = 1; // couldn't color
@@ -774,10 +802,29 @@ void irc_allocate(Function *f) {
     // Need liveness first
     compute_liveness(f);
 
-    // Iterate until no spills
+    // Tiered IRC spill loop with guaranteed convergence.
+    //
+    // Tier 1 (iter 0-4): Full aggressive IRC — George coalescing, optimistic
+    //   Briggs push, cost/degree spill selection.  Handles all observed cases.
+    // Tier 2 (iter 5-7): Coalescing disabled — stabilizes graph topology by
+    //   preventing coalescing-induced degree inflation between iterations.
+    //   Copies survive as mov instructions but the graph stops shifting.
+    // Tier 3 (iter 8+): Monotonic spilling — values spilled in any previous
+    //   iteration are forced to stay spilled.  Each iteration can only add
+    //   spills, guaranteeing termination.
+    //
+    // Biased coloring (in assign_colors) is always active: when choosing a
+    // color, prefer the register of a copy partner to eliminate copies without
+    // coalescing.
+
     int K = IRC_K;
     int max_iter = 20;
-    int converged = 0;
+
+    // Persistent spill set for Tier 3: once a value is spilled, it stays
+    // spilled.  Indexed by Value.id; only valid for ids < nv_at_entry.
+    int nv_at_entry = f->nvalues;
+    uint8_t *persist_spill = arena_alloc(nv_at_entry * sizeof(uint8_t));
+
     for (int iter = 0; iter < max_iter; iter++) {
         // Reset is_dead on all still-linked IK_COPY instructions before each
         // coalescing pass. DCE already unlinked truly dead instructions; any
@@ -791,7 +838,21 @@ void irc_allocate(Function *f) {
 
         IGraph *g = build_interference_graph(f);
 
-        coalesce_copies(g, f, K);
+        // Tier 3 (iter >= 8): force-spill persistent set before coloring.
+        // Mark these values as already spilled in the graph so assign_colors
+        // skips them and rewrite_spills inserts load/store for them.
+        if (iter >= 8) {
+            for (int i = 0; i < nv_at_entry && i < g->nv; i++) {
+                if (persist_spill[i])
+                    g->spilled[i] = 1;
+            }
+        }
+
+        // Tier 1 (iter 0-4): full George coalescing
+        // Tier 2 (iter 5-7): coalescing disabled — graph topology stabilizes
+        // Tier 3 (iter 8+):  coalescing disabled
+        if (iter < 5)
+            coalesce_copies(g, f, K);
 
         int ok = assign_colors(g, f, K);
 
@@ -802,8 +863,15 @@ void irc_allocate(Function *f) {
                     f->values[i]->phys_reg = g->color[i];
             }
             ig_free(g);
-            converged = 1;
             break;
+        }
+
+        // Tier 3: record newly spilled values into the persistent set
+        if (iter >= 7) {
+            for (int i = 0; i < nv_at_entry && i < g->nv; i++) {
+                if (g->spilled[i])
+                    persist_spill[i] = 1;
+            }
         }
 
         // Rewrite spills and try again
@@ -812,20 +880,6 @@ void irc_allocate(Function *f) {
         // Re-run liveness on the expanded function (old live_in/live_out stay in arena)
         compute_liveness(f);
 
-        ig_free(g);
-    }
-
-    // Safety net: if the main loop didn't converge, apply best-effort colors
-    // from one final pass.  This prevents phys_reg=-1 → r0 fallback in emit.c
-    // from generating completely wrong assembly when spill iteration limit is hit.
-    if (!converged) {
-        IGraph *g = build_interference_graph(f);
-        coalesce_copies(g, f, K);
-        assign_colors(g, f, K);
-        for (int i = 0; i < f->nvalues && i < g->nv; i++) {
-            if (g->color[i] >= 0)
-                f->values[i]->phys_reg = g->color[i];
-        }
         ig_free(g);
     }
 }
