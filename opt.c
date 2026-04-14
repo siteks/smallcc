@@ -2012,8 +2012,35 @@ void opt_scalar_promote(Function *f) {
 static int aiv_invariant(Value *v, int *in_body) {
     v = val_resolve(v);
     if (v->kind == VAL_CONST) return 1;
-    if (v->kind == VAL_INST && v->def && !in_body[v->def->block->id]) return 1;
-    return 0;
+    if (v->kind != VAL_INST || !v->def) return 0;
+    if (!in_body[v->def->block->id]) return 1;
+    // Recursively check: pure computation of invariant operands
+    // (e.g. MUL(outer_iv, N) inside inner loop where both are invariant)
+    Inst *d = v->def;
+    if (d->kind == IK_PHI) return 0;
+    if (!is_cse_pure(d->kind)) return 0;
+    for (int i = 0; i < d->nops; i++)
+        if (!aiv_invariant(d->ops[i], in_body)) return 0;
+    return 1;
+}
+
+// Clone a loop-invariant value (possibly defined inside the loop) into the
+// pre-header so it can be used by init-pointer / step computations.
+static Value *aiv_materialize(Value *v, int *in_body, Function *f, Block *preh) {
+    v = val_resolve(v);
+    if (v->kind == VAL_CONST) return v;
+    if (v->kind != VAL_INST || !v->def) return v;
+    if (!in_body[v->def->block->id]) return v;  // already outside loop
+    // Clone the instruction into the pre-header
+    Inst *orig = v->def;
+    Value *dst = new_value(f, VAL_INST, v->vtype);
+    Inst *ni = new_inst(f, preh, orig->kind, dst);
+    ni->imm = orig->imm;
+    ni->fname = orig->fname;
+    for (int i = 0; i < orig->nops; i++)
+        inst_add_op(ni, aiv_materialize(orig->ops[i], in_body, f, preh));
+    inst_insert_before(preh->tail, ni);
+    return dst;
 }
 
 void opt_addr_iv(Function *f) {
@@ -2200,6 +2227,13 @@ void opt_addr_iv(Function *f) {
                     }
                 }
                 if (!miv) continue;
+
+                // Materialize invariant values that may be defined inside the
+                // loop (e.g. i*N in the j-loop) into the pre-header.
+                inv_offset = aiv_materialize(inv_offset, in_body, f, preh);
+                base = aiv_materialize(base, in_body, f, preh);
+                if (mul_coeff)
+                    mul_coeff = aiv_materialize(mul_coeff, in_body, f, preh);
 
                 // Compute init pointer in pre-header
                 Value *iv_init = val_resolve(miv->init_val);
