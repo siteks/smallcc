@@ -33,7 +33,7 @@ Memory is 65536 bytes. Data is little-endian. The stack starts at `sp = 0xF000` 
 
 ## Instruction Encoding
 
-Nine formats with variable widths (1, 2, or 3 bytes). The format is determined by the top
+Ten formats with variable widths (1, 2, or 3 bytes). The format is determined by the top
 bits of the first byte:
 
 | Format | Width | First-byte pattern | Used for |
@@ -44,13 +44,15 @@ bits of the first byte:
 | F2 | 2 bytes | `10 oooo xxx iiiiiii` | One reg + imm7; bp-relative load/store/addi (16 slots) |
 | F3a | 3 bytes | `11000 ooo iiiiiiiiiiiiiiii` | Zero reg + imm16 (8 slots) |
 | F3b | 3 bytes | `11001 oo ddd iiiiiiiiiiiiii` | One reg + imm14 (4 slots) |
-| F3c | 3 bytes | `1101 oooo xxx yyy iiiiiiiiii` | Two reg + imm10 (15 usable slots; `1111` is F3d escape) |
+| F3c | 3 bytes | `1101 oooo xxx yyy iiiiiiiiii` | Two reg + imm10 (14 usable slots; `1110` is F3f escape, `1111` is F3d escape) |
 | F3d | 3 bytes | `11011111 xxx ooo iiiiiiiiii` | One reg + imm10 (8 slots; triggered when F3c opcode = `1111`) |
 | F3e | 3 bytes | `111 oo xxx iiiiiiiiiiiiiiii` | One reg + imm16 (4 slots) |
+| F3f | 3 bytes | `11011110 xxx yyy o iiiiiiiii` | Two reg + imm9 (2 slots; triggered when F3c opcode = `1110`) |
 
 F1b is an escape from F1a: when the F1a opcode field is all-ones (`11111`), the remaining bits
-select a 1-register operation from a 64-slot space. Similarly, F3d escapes from F3c when
-the F3c opcode field is `1111`.
+select a 1-register operation from a 64-slot space. F3d escapes from F3c when the F3c opcode
+field is `1111`. F3f escapes from F3c when the F3c opcode field is `1110`, splitting the 10-bit
+immediate into a 1-bit sub-opcode and a 9-bit immediate.
 
 ---
 
@@ -260,7 +262,7 @@ stack frame.
 
 `1101 oooo xxx yyy iiiiiiiiii` — 4-bit opcode, 3-bit rx, 3-bit ry, 10-bit signed immediate.
 Memory accesses are register-relative (ry is the base; rx is source/destination). Opcode
-`1111` (0xdf) is the F3d escape.
+`1110` (0xde) is the F3f escape; opcode `1111` (0xdf) is the F3d escape.
 
 | Opcode | Mnemonic | Semantics |
 |---|---|---|
@@ -278,15 +280,13 @@ Memory accesses are register-relative (ry is the base; rx is source/destination)
 | 0xdb | `ble rx, ry, imm10` | if rx <= ry (unsigned): pc += sext10(imm10) |
 | 0xdc | `blts rx, ry, imm10` | if signed(rx) < signed(ry): pc += sext10(imm10) |
 | 0xdd | `bles rx, ry, imm10` | if signed(rx) <= signed(ry): pc += sext10(imm10) |
-| 0xde | `addli rx, ry, imm10` | rx = ry + sext10(imm10) (separate source and destination) |
+
+*(1 slot available: 0xde is F3f escape, 0xdf is F3d escape.)*
 
 Branch offsets are **PC-relative** — the offset is added to `pc` (which has already been
 advanced past the current instruction). `llbx`/`llwx` make F3c symmetric with F2: both
 formats provide sign-extending load variants, so a signed `char` or `short` read through any
 pointer costs one instruction regardless of whether the base is `bp` or a general register.
-
-`addli` complements F2 `addi`: `addi` is in-place with a 7-bit immediate; `addli` allows a
-separate destination register and a wider 10-bit immediate.
 
 **Pseudo-ops:**
 
@@ -296,6 +296,27 @@ separate destination register and a wider 10-bit immediate.
 | `bge rx, ry, imm10` | `ble ry, rx, imm10` |
 | `bgts rx, ry, imm10` | `blts ry, rx, imm10` |
 | `bges rx, ry, imm10` | `bles ry, rx, imm10` |
+
+---
+
+## Format F3f — Two-Register + imm9 (3 bytes)
+
+`11011110 xxx yyy o iiiiiiiii` — triggered when F3c opcode field = `1110` (byte 0xde). The
+`xxx` bits encode the destination register, `yyy` the source register, `o` is a 1-bit
+subopcode (2 slots), and the remaining 9 bits are an immediate.
+
+| Subopcode | Mnemonic | Semantics |
+|---|---|---|
+| 0 | `addli rx, ry, imm9` | rx = ry + sext9(imm9) |
+| 1 | `bitex rx, ry, imm9` | rx = (ry >> (imm9 & 0x1f)) & ((2 << ((imm9 >> 5) & 0xf)) - 1) |
+
+`addli` complements F2 `addi`: `addi` is in-place with a 7-bit immediate; `addli` allows a
+separate destination register and a wider 9-bit signed immediate (range −256 to +255).
+
+`bitex` (bit extract) extracts a bitfield from `ry` into `rx`. The 9-bit immediate encodes
+two fields: bits [4:0] = shift amount (0–31), bits [8:5] = width code (0–15). The width code
+`w` produces a mask of `w+1` ones, extracting 1 to 16 bits. Equivalent to
+`rx = (ry >> shift) & ((1 << (width+1)) - 1)`.
 
 ---
 

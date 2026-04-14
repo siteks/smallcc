@@ -327,15 +327,23 @@ static IGraph *build_interference_graph(Function *f) {
         memcpy(live, b->live_out, nw * sizeof(uint32_t));
 
         for (Inst *inst = b->tail; inst; inst = inst->prev) {
-            // Def interferes with all currently live values
+            // Def interferes with all currently live values.
+            // Exception (Appel & George §11.3): for IK_COPY dst←src,
+            // dst does NOT interfere with src.  Both can share a register.
             if (inst->dst && inst->dst->id >= 0 && inst->dst->id < nv) {
                 int d = inst->dst->id;
+                int copy_src = -1;
+                if (inst->kind == IK_COPY && inst->nops >= 1) {
+                    Value *sv = val_resolve(inst->ops[0]);
+                    if (sv && sv->kind == VAL_INST && sv->id >= 0 && sv->id < nv)
+                        copy_src = sv->id;
+                }
                 for (int w = 0; w < nw; w++) {
                     uint32_t word = live[w];
                     while (word) {
                         int bit = __builtin_ctz(word); word &= word - 1;
                         int vid = w * 32 + bit;
-                        if (vid != d && vid < nv)
+                        if (vid != d && vid < nv && vid != copy_src)
                             ig_add_edge(g, d, vid);
                     }
                 }
@@ -396,13 +404,45 @@ static int assign_colors(IGraph *g, Function *f, int K, int pessimistic) {
 
     // Build copy-hint table for biased coloring: for each value that is the
     // destination of an IK_COPY, record the source value's id.
+    // Also hint in-place ISA operations (shrsi/shli/andi/sxb/sxw/inc/dec/addi)
+    // so IRC prefers assigning dst the same register as the non-const operand,
+    // eliminating the mov that emit.c must insert for cross-register cases.
     int *copy_hint = arena_alloc(nv * sizeof(int));
     for (int i = 0; i < nv; i++) copy_hint[i] = -1;
     for (int i = 0; i < f->nvalues; i++) {
         Value *val = f->values[i];
-        if (val->def && val->def->kind == IK_COPY && !val->def->is_dead &&
-            val->def->nops >= 1) {
-            Value *src = val_resolve(val->def->ops[0]);
+        if (!val->def || val->def->is_dead) continue;
+        Inst *def = val->def;
+        if (def->kind == IK_COPY && def->nops >= 1) {
+            Value *src = val_resolve(def->ops[0]);
+            if (src && src->kind == VAL_INST && src->id >= 0 && src->id < nv)
+                copy_hint[i] = src->id;
+            continue;
+        }
+        // In-place peephole candidates: hint dst → non-const operand.
+        // IK_SEXT8/IK_SEXT16: always in-place on ops[0].
+        if ((def->kind == IK_SEXT8 || def->kind == IK_SEXT16) && def->nops >= 1) {
+            Value *src = val_resolve(def->ops[0]);
+            if (src && src->kind == VAL_INST && src->id >= 0 && src->id < nv)
+                copy_hint[i] = src->id;
+            continue;
+        }
+        // IK_SHL/IK_SHR/IK_USHR with const shift → shli/shrsi: in-place on ops[0].
+        // IK_AND with const mask → andi/zxb/zxw: in-place on non-const operand.
+        // IK_ADD/IK_SUB with small const → inc/dec/addi: in-place on non-const operand.
+        if ((def->kind == IK_SHL || def->kind == IK_SHR || def->kind == IK_USHR ||
+             def->kind == IK_AND || def->kind == IK_ADD || def->kind == IK_SUB) &&
+            def->nops >= 2) {
+            Value *o0 = val_resolve(def->ops[0]);
+            Value *o1 = val_resolve(def->ops[1]);
+            int c0 = o0 && (o0->kind == VAL_CONST ||
+                           (o0->kind == VAL_INST && o0->def && o0->def->kind == IK_CONST));
+            int c1 = o1 && (o1->kind == VAL_CONST ||
+                           (o1->kind == VAL_INST && o1->def && o1->def->kind == IK_CONST));
+            // Exactly one const operand → hint the non-const one.
+            Value *src = NULL;
+            if (c1 && !c0) src = o0;
+            else if (c0 && !c1) src = o1;
             if (src && src->kind == VAL_INST && src->id >= 0 && src->id < nv)
                 copy_hint[i] = src->id;
         }
@@ -417,10 +457,13 @@ static int assign_colors(IGraph *g, Function *f, int K, int pessimistic) {
 
         if (found < 0) {
             // All remaining have degree >= K: spill one.
-            // Heuristic: minimize spill_cost/degree where
-            //   spill_cost = use_count * 2^loop_depth
-            // Values used heavily in inner loops are expensive to spill; high
-            // degree means removing the node gives the most coloring benefit.
+            // Heuristic: minimize spill_cost/degree.
+            // spill_cost = max(def_cost, use_cost) where:
+            //   def_cost  = use_count * 2^def_block_loop_depth
+            //   use_cost  = sum over uses of 2^use_block_loop_depth
+            // The max ensures outer-loop defs with inner-loop uses get
+            // high cost (use_cost dominates) while values with many uses
+            // in their def block also stay protected (def_cost dominates).
             int worst = -1;
             long long cost_worst = 0;
             for (int i = 0; i < nv; i++) {
@@ -428,7 +471,7 @@ static int assign_colors(IGraph *g, Function *f, int K, int pessimistic) {
                 Value *vi = f->values[i];
                 int depth = (vi->def && vi->def->block)
                             ? vi->def->block->loop_depth : 0;
-                if (depth > 20) depth = 20;  // clamp: 2^20 * use_count fits long long
+                if (depth > 20) depth = 20;
                 long long cost_i = (long long)vi->use_count << depth;
                 // Prefer minimum cost_i/degree[i]; compare via cross-multiply
                 // to avoid division: cost_i/deg_i < cost_w/deg_w
@@ -502,14 +545,21 @@ static int assign_colors(IGraph *g, Function *f, int K, int pessimistic) {
             }
         }
 
-        // Biased coloring: if this value is the destination of a copy,
-        // prefer the source's register.  This eliminates copies that George's
-        // test couldn't coalesce, without affecting colorability.
+        // Biased coloring: prefer the hint source's register.
+        // If the direct hint target isn't colored yet, chase one level
+        // through the hint chain (transitive hint).  This handles chains
+        // like SHR→AND where both hint to the same source register but
+        // the intermediate value hasn't been colored yet.
         int preferred = -1;
         if (v < f->nvalues && copy_hint[v] >= 0) {
             int p = ig_find(g, copy_hint[v]);
             if (g->color[p] >= 0 && !forbidden[g->color[p]])
                 preferred = g->color[p];
+            else if (p < f->nvalues && copy_hint[p] >= 0) {
+                int pp = ig_find(g, copy_hint[p]);
+                if (g->color[pp] >= 0 && !forbidden[g->color[pp]])
+                    preferred = g->color[pp];
+            }
         }
 
         // Pick a register: prefer copy partner's register (biased coloring),

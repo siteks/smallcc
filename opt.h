@@ -37,6 +37,39 @@
 extern unsigned opt_flags;
 
 // ============================================================
+// Speculative optimization profiles
+// ============================================================
+// Heuristic parameters that control register-pressure-sensitive
+// decisions.  The speculative pipeline tries both profiles and
+// picks the one that produces cheaper code after IRC.
+
+typedef struct {
+    // opt_licm_const — VAL_CONST hoisting
+    int licm_const_budget_small;   // budget when body_insts <= 16
+    int licm_const_budget_large;   // budget when body_insts > 16
+    int licm_const_hard_cap;       // max nlive for loop-bound const hoist
+    int licm_const_max_hoist;      // max constants hoisted per loop
+    int licm_const_use_threshold;  // min uses - 1 (best_uses init; >= threshold+1 to hoist)
+
+    // opt_licm — general invariant hoisting
+    int licm_gen_reserve;          // registers reserved for in-body temps (K - reserve - nlive = budget)
+    int licm_gen_max;              // cap on hoists per loop
+    int licm_gen_dense_hi;         // nloop_defs threshold for budget=1
+    int licm_gen_dense_lo;         // nloop_defs threshold for budget=min(budget,2)
+
+    // opt_cse — post-OOS cross-block policy
+    int cse_xblock_dom;            // 1 = allow any dominator (not just direct pred)
+    int cse_xblock_samedelta;      // 1 = allow same loop depth (not just depth 0)
+
+    // opt_copy_prop
+    int copyprop_typecoerce;       // 1 = propagate type-coercing copies (vtype mismatch)
+} OptProfile;
+
+extern const OptProfile opt_profile_conservative;
+extern const OptProfile opt_profile_aggressive;
+extern const OptProfile *opt_profile;   // points to active profile
+
+// ============================================================
 // Pass declarations
 // ============================================================
 
@@ -60,6 +93,14 @@ void opt_redundant_bool(Function *f);
 
 // R2H: Narrow AND(LOAD(addr, sz), mask) → LOAD(addr, smaller_sz) when possible.
 void opt_narrow_loads(Function *f);
+
+// R2K: Known-bits simplification: eliminate redundant AND/TRUNC/ZEXT using
+// forward known-bits analysis + unwrap_for_mask.
+void opt_known_bits(Function *f);
+
+// R2L: Bitwise distribution: OP(AND(a,c),AND(b,c)) → AND(OP(a,b),c).
+// Uses unwrap_for_mask to see through casts invisible to the mask.
+void opt_bitwise_dist(Function *f);
 
 // R2F: Hoist IK_CONST out of loop bodies into pre-headers.
 void opt_licm_const(Function *f);

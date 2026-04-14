@@ -21,15 +21,17 @@ import sys
 #   h
 #   r0-r7
 #
-#   F0  00oooooo
-#   F1a 01ooooodddxxxyyy
-#   F1b 0111111dddoooooo
-#   F2  10ooooxxxiiiiiii
-#   F3a 11000oooiiiiiiiiiiiiiiii
-#   F3b 11001oodddiiiiiiiiiiiiii
-#   F3c 1101ooooxxxyyyiiiiiiiiii
-#   F3d 11011111xxxoooiiiiiiiiii
-#   F3e 111ooxxxiiiiiiiiiiiiiiii
+#   F0      00oooooo
+#   F1a     01ooooodddxxxyyy
+#   F1b     0111111dddoooooo
+#   F2      10ooooxxxiiiiiii
+#   F3a     11000oooiiiiiiiiiiiiiiii
+#   F3b     11001oodddiiiiiiiiiiiiii
+#   F3c     1101ooooxxxyyyiiiiiiiiii
+#   F3c0    11011110xxxyyy0iiiiiiiii
+#   F3c1    11011110xxxyyy1iiiiiiiii
+#   F3d     11011111xxxoooiiiiiiiiii
+#   F3e     111ooxxxiiiiiiiiiiiiiiii
 #
 #   Format 0 implicit or special hotspot (64 slots)
 #   halt
@@ -102,7 +104,7 @@ import sys
 #   adjw    sp += (imm14 << 2)
 #   lea     rx = bp + (imm14 << 2)
 #
-#   Format 3c - two op + imm10 (15 slots)
+#   Format 3c - two op + imm10 (14 slots)
 #   llb     rx = [ry+sxt(imm10)]   
 #   llw     rx = [ry+sxt(imm10*2)]   
 #   lll     rx = [ry+sxt(imm10*4)]   
@@ -117,9 +119,12 @@ import sys
 #   bgt     pc = rx>ry ? (pc + sxt(imm10)) : pc
 #   blts    pc = rx<ry ? (pc + sxt(imm10)) : pc
 #   bgts    pc = rx>ry ? (pc + sxt(imm10)) : pc
-#   addli   rx = ry + sxt(imm10)
+#   
+#   Format 3f - two op + imm9 (2 slots) (escape from 3c with op=0xe)
+#   addli   rx = ry + sxt(imm9)
+#   bitex   rx = (ry >> (imm9 & 0x1f)) & ~(-2 << (imm9 >> 5));  
 #
-#   Format 3d - one op + imm10 (8 slots)
+#   Format 3d - one op + imm10 (8 slots) (escape from 3c with op=0xf)
 #   beqz    pc = rx==0 ? (pc + sxt(imm10)) : pc
 #   bnez    pc = rx!=0 ? (pc + sxt(imm10)) : pc
 #
@@ -148,7 +153,7 @@ class G:
         'allocb':   1,
         'allocw':   2,
         'allocl':   4,
-        'align':   1,
+        'align':    1,
     }
 
     # Fields are a) first byte b) num extra bytes c) subformat d) subopcode
@@ -234,7 +239,6 @@ class G:
         'ble'   :   (0xdb, 2, 2, 0),
         'blts'  :   (0xdc, 2, 2, 0),
         'bles'  :   (0xdd, 2, 2, 0),
-        'addli' :   (0xde, 2, 2, 0),
         # format 3d - one op + imm10    11011111xxxoooiiiiiiiiii
         'beqz'  :   (0xdf, 2, 3, 0x00),
         'bnez'  :   (0xdf, 2, 3, 0x01),
@@ -243,6 +247,9 @@ class G:
         'immwh' :   (0xe8, 2, 4, 0),
         'jz'    :   (0xf0, 2, 4, 0),
         'jnz'   :   (0xf8, 2, 4, 0),
+        # format 3f - two op + imm9     11011110xxxyyyoiiiiiiiii
+        'addli' :   (0xde, 2, 5, 0),
+        'bitex' :   (0xde, 2, 5, 1),
     }
 
     # The key becomes (first byte, subop). the value is (instr, length, subfmt, subopcode)
@@ -420,6 +427,10 @@ class CPU:
             # This is a f3d instruction
             subop = (ins & 0x1c00) >> 10
             i, _, _ = G.rptable[(lookupins, subop)]
+        if lookupins == 0xde:
+            # This is a f3f instruction
+            subop = (ins & 0x200) >> 9
+            i, _, _ = G.rptable[(lookupins, subop)]
 
 
         imm     = 0
@@ -455,6 +466,10 @@ class CPU:
         elif fmt == 3 and subfmt == 4:
             dst = src0 = (ins & 0x70000) >> 16
             imm = ins & 0xffff
+        elif fmt == 3 and subfmt == 5:
+            dst = src0 = (ins & 0xe000) >> 13
+            src1 = (ins & 0x1c00) >> 10
+            imm = ins & 0x1ff
 
         # noinspection PyUnreachableCode
         m = self.mem
@@ -539,7 +554,6 @@ class CPU:
         elif    i == 'ble':     s.pc = s.pc + sext(imm, 10) if s.r[src0] <= s.r[src1] else s.pc
         elif    i == 'blts':    s.pc = s.pc + sext(imm, 10) if sext(s.r[src0], 32) < sext(s.r[src1], 32) else s.pc
         elif    i == 'bles':    s.pc = s.pc + sext(imm, 10) if sext(s.r[src0], 32) <= sext(s.r[src1], 32) else s.pc
-        elif    i == 'addli':   s.r[dst] = s.r[src1] + sext(imm, 10)
         # f3d
         elif    i == 'beqz':    s.pc = s.pc + sext(imm, 10) if s.r[src0] == 0 else s.pc
         elif    i == 'bnez':    s.pc = s.pc + sext(imm, 10) if s.r[src0] != 0 else s.pc
@@ -548,6 +562,9 @@ class CPU:
         elif    i == 'immwh':   s.r[dst] = (s.r[dst] & 0xffff) | (imm << 16)
         elif    i == 'jz':      s.pc = imm if s.r[src0] == 0 else s.pc
         elif    i == 'jnz':     s.pc = imm if s.r[src0] != 0 else s.pc
+        # f3f
+        elif    i == 'addli':   s.r[dst] = s.r[src1] + sext(imm, 9)
+        elif    i == 'bitex':   s.r[dst] = (s.r[src1] >> (imm & 0x1f)) & ((2 << ((imm >> 5) & 0x0f)) - 1)
 
         # clean up state
         for i in range(8): s.r[i] &= 0xffffffff

@@ -304,6 +304,10 @@ static int known_bits_mask(Value *v, int depth) {
     return -1;
 }
 
+// P16: bitex fusion tables (populated by detect_bitex_fusions, read by emit_inst)
+static int *g_bitex_src;   // [value_id] → phys reg of SHR source, or -1
+static int *g_bitex_imm;   // [value_id] → bitex imm9 encoding
+
 // ============================================================
 // Emit one instruction
 // ============================================================
@@ -408,6 +412,15 @@ static void emit_inst(Inst *inst, FILE *out) {
             p7_no_fold:;
         }
 
+        // P16: bitex fusion — AND(SHR(x, k_shift), k_mask) → bitex rd, src, imm9
+        // Detected by detect_bitex_fusions pre-pass; the SHR is already marked dead.
+        if (inst->kind == IK_AND && dst && g_bitex_src && g_bitex_src[dst->id] >= 0) {
+            fprintf(out, "    bitex %s, %s, %d\n",
+                    regname(rd), regname(g_bitex_src[dst->id]),
+                    g_bitex_imm[dst->id]);
+            break;
+        }
+
         // P15: Redundant AND elimination via known-bits analysis.
         // AND(x, mask) is a no-op when all bits of x are already within mask.
         // Common pattern: AND(XOR(AND(a,1),AND(b,1)), 0xFF) — the XOR of two
@@ -477,7 +490,7 @@ static void emit_inst(Inst *inst, FILE *out) {
                     { fprintf(out, "    dec %s\n", regname(rd)); break; }
                 if (k >= -64 && k <= 63 && ps == rd)
                     { fprintf(out, "    addi %s, %d\n", regname(rd), k); break; }
-                if (k >= -512 && k <= 511)
+                if (k >= -256 && k <= 255)
                     { fprintf(out, "    addli %s, %s, %d\n", regname(rd), regname(ps), k); break; }
             }
         }
@@ -1152,12 +1165,14 @@ static void mark_dead_consts(Function *f) {
                 }
                 continue;
             }
-            // P8: AND(x, 0xFF/0xFFFF) → zxb/zxw; mask IK_CONST is not needed
+            // P8/P14: AND(x, k) → zxb/zxw/andi; mask IK_CONST is not needed
+            // P8 fires for k == 0xFF/0xFFFF; P14 fires for k in [0,127].
             if (inst->kind == IK_AND && (is_k0 ^ is_k1)) {
                 Value *kv = is_k1 ? o1 : o0;
                 int mask = (kv->kind == VAL_CONST) ? kv->iconst : kv->def->imm;
                 int is_ik = is_k1 ? ik1 : ik0;
-                if ((mask == 0xff || mask == 0xffff) && is_ik && kv->use_count <= 1)
+                if (is_ik && kv->use_count <= 1 &&
+                    ((mask >= 0 && mask <= 127) || mask == 0xff || mask == 0xffff))
                     kv->def->is_dead = 1;
             }
             // P11/P13: SHL/SHR/USHR with constant shift amount → shli/shrsi;
@@ -1192,6 +1207,112 @@ static void mark_dead_consts(Function *f) {
                     }
                 }
             }
+        }
+    }
+}
+
+// P16: Detect SHR(x, k_shift) + AND(result, k_mask) pairs that can be fused
+// into a single bitex instruction.  bitex rd, ry, imm9 computes
+// rd = (ry >> shift) & ((1 << width) - 1) in one F3f instruction (3 bytes),
+// replacing mov+shrsi+andi (6 bytes) or shrsi+andi (4 bytes).
+// Table indexed by AND destination value id; g_bitex_src[id] = -1 means no fusion.
+
+static int bitex_width(int mask) {
+    // Check if mask is (1 << n) - 1 for n in 1..16.
+    // Returns n (the extraction width), or 0 if not a valid bitex mask.
+    if (mask <= 0) return 0;
+    unsigned m = (unsigned)mask + 1;
+    if ((m & (m - 1)) != 0) return 0;  // not a power of 2
+    int n = __builtin_ctz(m);
+    return (n >= 1 && n <= 16) ? n : 0;
+}
+
+static void detect_bitex_fusions(Function *f) {
+    g_bitex_src = arena_alloc(f->nvalues * sizeof(int));
+    g_bitex_imm = arena_alloc(f->nvalues * sizeof(int));
+    for (int i = 0; i < f->nvalues; i++) g_bitex_src[i] = -1;
+
+    for (int bi = 0; bi < f->nblocks; bi++) {
+        Block *b = f->blocks[bi];
+        for (Inst *inst = b->head; inst; inst = inst->next) {
+            if (inst->is_dead || inst->kind != IK_AND || inst->nops < 2 || !inst->dst)
+                continue;
+
+            Value *o0 = inst->ops[0] ? val_resolve(inst->ops[0]) : NULL;
+            Value *o1 = inst->ops[1] ? val_resolve(inst->ops[1]) : NULL;
+
+            // Identify which operand is the mask constant and which is the SHR result
+            int mask_val;
+            Value *shr_val;
+            if (o1 && resolve_const(o1, &mask_val) && o0 && o0->kind == VAL_INST) {
+                shr_val = o0;
+            } else if (o0 && resolve_const(o0, &mask_val) && o1 && o1->kind == VAL_INST) {
+                shr_val = o1;
+            } else {
+                continue;
+            }
+
+            int width = bitex_width(mask_val);
+            if (!width) continue;
+
+            // SHR result must come from IK_SHR or IK_USHR
+            Inst *shr_def = shr_val->def;
+            if (!shr_def || (shr_def->kind != IK_SHR && shr_def->kind != IK_USHR))
+                continue;
+            if (shr_def->nops < 2 || shr_def->block != b) continue;
+
+            // SHR must have a constant shift amount
+            int shift_val;
+            if (!resolve_const(shr_def->ops[1] ? val_resolve(shr_def->ops[1]) : NULL, &shift_val))
+                continue;
+            shift_val &= 31;
+
+            // For arithmetic SHR (IK_SHR), ensure extracted bits are within the
+            // original word so sign-extension bits don't leak into the result.
+            if (shr_def->kind == IK_SHR && shift_val + width > 32) continue;
+
+            // SHR result used only by this AND
+            if (shr_val->use_count > 1) continue;
+
+            // SHR source must be in a physical register
+            Value *shr_src = shr_def->ops[0] ? val_resolve(shr_def->ops[0]) : NULL;
+            if (!shr_src || shr_src->kind != VAL_INST || shr_src->phys_reg < 0)
+                continue;
+            int src_preg = shr_src->phys_reg;
+
+            // Verify source register is not clobbered between SHR and AND
+            int clobbered = 0;
+            for (Inst *scan = shr_def->next; scan && scan != inst; scan = scan->next) {
+                if (scan->is_dead) continue;
+                if (scan->dst && scan->dst->phys_reg == src_preg) {
+                    clobbered = 1;
+                    break;
+                }
+            }
+            if (clobbered) continue;
+
+            // Record fusion
+            int width_code = width - 1;  // 0..15
+            int vid = inst->dst->id;
+            g_bitex_src[vid] = src_preg;
+            g_bitex_imm[vid] = shift_val | (width_code << 5);
+
+            // Mark the SHR instruction dead
+            shr_def->is_dead = 1;
+
+            // Mark the SHR's shift constant dead if it's an IK_CONST with single use
+            Value *shift_op = shr_def->ops[1] ? val_resolve(shr_def->ops[1]) : NULL;
+            if (shift_op && shift_op->kind == VAL_INST && shift_op->def &&
+                shift_op->def->kind == IK_CONST && !shift_op->def->fname &&
+                shift_op->use_count <= 1)
+                shift_op->def->is_dead = 1;
+
+            // Mark the AND's mask constant dead if it's an IK_CONST with single use
+            Value *mask_op = (shr_val == o0) ? o1 : o0;
+            if (mask_op && mask_op->kind == VAL_INST && mask_op->def &&
+                mask_op->def->kind == IK_CONST && !mask_op->def->fname &&
+                mask_op->use_count <= 1)
+                mask_op->def->is_dead = 1;
         }
     }
 }
@@ -1299,6 +1420,25 @@ static void detect_branch_fusions(Function *f, BranchFuse *fuse) {
             continue;
         }
 
+        // P6: NE(x, 0) or EQ(x, 0) → jnz/jz directly (checked before P5+
+        // because P6 needs no scratch register and saves the immw entirely)
+        if ((def->kind == IK_NE || def->kind == IK_EQ) && def->nops >= 2) {
+            Value *test_val = NULL;
+            if (dop1 && dop1->kind == VAL_CONST && dop1->iconst == 0 &&
+                dop0 && dop0->kind == VAL_INST && dop0->phys_reg >= 0)
+                test_val = dop0;
+            else if (dop0 && dop0->kind == VAL_CONST && dop0->iconst == 0 &&
+                     dop1 && dop1->kind == VAL_INST && dop1->phys_reg >= 0)
+                test_val = dop1;
+            if (test_val) {
+                def->is_dead     = 1;
+                fuse[fbi].fused  = 3;
+                fuse[fbi].p0     = test_val->phys_reg;
+                fuse[fbi].is_eq  = (def->kind == IK_EQ);
+                continue;
+            }
+        }
+
         // P5+: one operand is VAL_CONST, use cond's register as scratch
         if (in_range && cond->phys_reg >= 0) {
             Value *reg_op = NULL, *const_op = NULL;
@@ -1337,23 +1477,6 @@ static void detect_branch_fusions(Function *f, BranchFuse *fuse) {
                     fuse[fbi].swap      = const_is_lhs;
                     continue;
                 }
-            }
-        }
-
-        // P6: NE(x, 0) or EQ(x, 0) → jnz/jz directly
-        if ((def->kind == IK_NE || def->kind == IK_EQ) && def->nops >= 2) {
-            Value *test_val = NULL;
-            if (dop1 && dop1->kind == VAL_CONST && dop1->iconst == 0 &&
-                dop0 && dop0->kind == VAL_INST && dop0->phys_reg >= 0)
-                test_val = dop0;
-            else if (dop0 && dop0->kind == VAL_CONST && dop0->iconst == 0 &&
-                     dop1 && dop1->kind == VAL_INST && dop1->phys_reg >= 0)
-                test_val = dop1;
-            if (test_val) {
-                def->is_dead     = 1;
-                fuse[fbi].fused  = 3;
-                fuse[fbi].p0     = test_val->phys_reg;
-                fuse[fbi].is_eq  = (def->kind == IK_EQ);
             }
         }
     }
@@ -1455,6 +1578,7 @@ void emit_function(Function *f, FILE *out) {
 
     mark_dead_consts(f);
     remap_single_use_values(f);
+    detect_bitex_fusions(f);
 
     BranchFuse *fuse = arena_alloc(f->nblocks * sizeof(BranchFuse));
     detect_branch_fusions(f, fuse);
@@ -1484,16 +1608,48 @@ void emit_function(Function *f, FILE *out) {
 
     // Emit blocks
     int ann_prev_line = 0;
+    int ann_live = (getenv("LIVE_REGS") != NULL);
     for (int bi = 0; bi < f->nblocks; bi++) {
         Block *b = f->blocks[bi];
         g_blk_live_out_regs = blk_live_regs[bi];
 
+        // Per-instruction live register mask (backward dataflow)
+        uint8_t *inst_live = NULL;
+        if (ann_live) {
+            int ninst = 0;
+            for (Inst *p = b->head; p; p = p->next) ninst++;
+            inst_live = arena_alloc(ninst * sizeof(uint8_t));
+            uint8_t live = blk_live_regs[bi];
+            int idx = ninst;
+            for (Inst *p = b->tail; p; p = p->prev) {
+                inst_live[--idx] = live;
+                if (!p->is_dead && p->dst && p->dst->phys_reg >= 0 && p->dst->phys_reg < 8)
+                    live &= ~(1u << p->dst->phys_reg);
+                if (!p->is_dead) {
+                    for (int i = 0; i < p->nops; i++) {
+                        Value *v = val_resolve(p->ops[i]);
+                        if (v && v->kind == VAL_INST && v->phys_reg >= 0 && v->phys_reg < 8)
+                            live |= (1u << v->phys_reg);
+                    }
+                }
+            }
+        }
+        int inst_idx = 0;
+
         if (bi > 0)
             fprintf(out, "_%s_B%d:\n", f->name, b->id);
+        FILE *real_out = out;
         for (Inst *inst = b->head; inst; inst = inst->next) {
             if (flag_annotate && inst->line && inst->line != ann_prev_line) {
-                emit_src_comment(inst->line, out);
+                emit_src_comment(inst->line, real_out);
                 ann_prev_line = inst->line;
+            }
+            // Redirect output to buffer so we can append live annotation
+            char *membuf = NULL; size_t memlen = 0;
+            FILE *memf = NULL;
+            if (inst_live && !inst->is_dead) {
+                memf = open_memstream(&membuf, &memlen);
+                out = memf;
             }
             if (inst->kind == IK_RET && callee_frame > 0) {
                 // Full RET sequence: move retval to r0, restore callee saves, ret
@@ -1615,6 +1771,38 @@ void emit_function(Function *f, FILE *out) {
             } else {
                 emit_inst(inst, out);
             }
+            if (memf) {
+                fclose(memf);
+                out = real_out;
+                if (memlen > 0) {
+                    uint8_t m = inst_live[inst_idx];
+                    char ann[32];
+                    snprintf(ann, sizeof(ann), " ; live:%c%c%c%c%c%c%c%c",
+                        (m&0x80)?'1':'0', (m&0x40)?'1':'0', (m&0x20)?'1':'0', (m&0x10)?'1':'0',
+                        (m&0x08)?'1':'0', (m&0x04)?'1':'0', (m&0x02)?'1':'0', (m&0x01)?'1':'0');
+                    // Find last newline, insert annotation at fixed column
+                    char *last_nl = NULL;
+                    for (size_t i = memlen; i > 0; i--)
+                        if (membuf[i-1] == '\n') { last_nl = &membuf[i-1]; break; }
+                    if (last_nl) {
+                        // Measure columns on the last line (from prev newline or start)
+                        char *line_start = membuf;
+                        for (char *p = last_nl - 1; p >= membuf; p--)
+                            if (*p == '\n') { line_start = p + 1; break; }
+                        int col = (int)(last_nl - line_start);
+                        fwrite(membuf, 1, last_nl - membuf, out);
+                        for (int i = col; i < 40; i++) fputc(' ', out);
+                        fputs(ann, out);
+                        fwrite(last_nl, 1, memlen - (last_nl - membuf), out);
+                    } else {
+                        fwrite(membuf, 1, memlen, out);
+                        fputs(ann, out);
+                        fputc('\n', out);
+                    }
+                }
+                free(membuf);
+            }
+            inst_idx++;
         }
     }
 

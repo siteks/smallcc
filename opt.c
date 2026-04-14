@@ -6,6 +6,50 @@
 
 unsigned opt_flags = OPT_ALL;
 
+// ============================================================
+// Speculative profiles — conservative matches current hardcoded values
+// ============================================================
+
+const OptProfile opt_profile_conservative = {
+    // licm_const
+    .licm_const_budget_small  = 6,
+    .licm_const_budget_large  = 3,
+    .licm_const_hard_cap      = 6,
+    .licm_const_max_hoist     = 4,
+    .licm_const_use_threshold = 2,   // hoist when uses > 2 (i.e. >= 3)
+    // licm_gen
+    .licm_gen_reserve         = 4,
+    .licm_gen_max             = 4,
+    .licm_gen_dense_hi        = 10,
+    .licm_gen_dense_lo        = 6,
+    // cse post-OOS
+    .cse_xblock_dom           = 0,
+    .cse_xblock_samedelta     = 0,
+    // copy_prop
+    .copyprop_typecoerce      = 0,
+};
+
+const OptProfile opt_profile_aggressive = {
+    // licm_const — more generous budgets
+    .licm_const_budget_small  = 7,
+    .licm_const_budget_large  = 5,
+    .licm_const_hard_cap      = 7,
+    .licm_const_max_hoist     = 6,
+    .licm_const_use_threshold = 1,   // hoist when uses > 1 (i.e. >= 2)
+    // licm_gen — less reserved, higher cap
+    .licm_gen_reserve         = 3,
+    .licm_gen_max             = 6,
+    .licm_gen_dense_hi        = 14,
+    .licm_gen_dense_lo        = 10,
+    // cse post-OOS — same as conservative (wider CSE can break P12)
+    .cse_xblock_dom           = 0,
+    .cse_xblock_samedelta     = 0,
+    // copy_prop — same as conservative (type-coercing prop can break P12)
+    .copyprop_typecoerce      = 0,
+};
+
+const OptProfile *opt_profile = &opt_profile_conservative;
+
 /*
  * opt.c — Post-OOS SSA-level optimisation passes
  *
@@ -106,7 +150,8 @@ void opt_copy_prop(Function *f) {
             Value *dst = inst->dst;
             if (copy_count[dst->id] > 1) continue;  // phi-variable: multiple defs
             Value *src = val_resolve(inst->ops[0]);
-            if (src->vtype != dst->vtype) continue;  // type-coercion copy (e.g. i32↔u32)
+            if (!opt_profile->copyprop_typecoerce && src->vtype != dst->vtype)
+                continue;  // type-coercion copy (e.g. i32↔u32)
             if (!src->def) continue;                 // VAL_CONST or VAL_UNDEF source
             if (src->def->kind == IK_CALL   ||
                 src->def->kind == IK_ICALL  ||
@@ -274,10 +319,22 @@ static void gvn_walk(Block *b, Function *f) {
                         if (!crosses) xblock_ok = 1;
                     }
                 } else {
-                    if (gvn_ops_safe(inst) &&
-                        b->loop_depth == 0 && e->inst->block->loop_depth == 0) {
-                        for (int p = 0; p < b->npreds; p++)
-                            if (b->preds[p] == e->inst->block) { xblock_ok = 1; break; }
+                    if (gvn_ops_safe(inst)) {
+                        Block *cb = e->inst->block;
+                        if (opt_profile->cse_xblock_dom) {
+                            // Aggressive: any dominator at same or shallower depth
+                            if (dominates(cb, b) &&
+                                (opt_profile->cse_xblock_samedelta
+                                    ? cb->loop_depth <= b->loop_depth
+                                    : (b->loop_depth == 0 && cb->loop_depth == 0)))
+                                xblock_ok = 1;
+                        } else {
+                            // Conservative: direct predecessor, both at depth 0
+                            if (b->loop_depth == 0 && cb->loop_depth == 0) {
+                                for (int p = 0; p < b->npreds; p++)
+                                    if (b->preds[p] == cb) { xblock_ok = 1; break; }
+                            }
+                        }
                     }
                 }
                 if (inst->dst != canon &&
@@ -523,6 +580,375 @@ void opt_narrow_loads(Function *f) {
     }
 }
 
+// ── Known-bits analysis ──────────────────────────────────────────────────
+//
+// Forward analysis computing which bits of each SSA value are provably
+// 0 or 1.  Drives multiple simplifications from one mechanism instead of
+// ad-hoc pattern matches for TRUNC look-through, AND-chain folding, etc.
+//
+// Per-value state: known_zero (bits provably 0), known_one (bits provably 1).
+// A bit may be in neither set (unknown) but never in both.
+
+typedef struct { uint32_t zero, one; } KnownBits;
+
+static KnownBits *kb_table;   // indexed by Value.id
+
+static KnownBits kb_get(Value *v) {
+    v = val_resolve(v);
+    if (v->kind == VAL_CONST)
+        return (KnownBits){ ~(uint32_t)v->iconst, (uint32_t)v->iconst };
+    if (v->kind == VAL_INST && v->id >= 0)
+        return kb_table[v->id];
+    return (KnownBits){ 0, 0 };
+}
+
+static uint32_t kb_trunc_mask(ValType vt) {
+    if (vt == VT_U8  || vt == VT_I8)  return 0xFFu;
+    if (vt == VT_U16 || vt == VT_I16 || vt == VT_PTR) return 0xFFFFu;
+    return 0xFFFFFFFFu;
+}
+
+static void compute_known_bits(Function *f) {
+    kb_table = arena_alloc(f->nvalues * sizeof(KnownBits));
+    memset(kb_table, 0, f->nvalues * sizeof(KnownBits));
+
+    for (int bi = 0; bi < f->nblocks; bi++) {
+        Block *b = f->blocks[bi];
+        for (Inst *inst = b->head; inst; inst = inst->next) {
+            if (inst->is_dead || !inst->dst) continue;
+            int id = inst->dst->id;
+            if (id < 0 || id >= f->nvalues) continue;
+
+            KnownBits r = { 0, 0 };
+            switch (inst->kind) {
+            case IK_CONST:
+                r.zero = ~(uint32_t)inst->dst->iconst;
+                r.one  =  (uint32_t)inst->dst->iconst;
+                break;
+            case IK_COPY:
+                if (inst->nops >= 1) r = kb_get(inst->ops[0]);
+                break;
+            case IK_AND:
+                if (inst->nops >= 2) {
+                    KnownBits a = kb_get(inst->ops[0]);
+                    KnownBits b2 = kb_get(inst->ops[1]);
+                    r.zero = a.zero | b2.zero;  // 0 if either is 0
+                    r.one  = a.one  & b2.one;   // 1 only if both are 1
+                }
+                break;
+            case IK_OR:
+                if (inst->nops >= 2) {
+                    KnownBits a = kb_get(inst->ops[0]);
+                    KnownBits b2 = kb_get(inst->ops[1]);
+                    r.zero = a.zero & b2.zero;  // 0 only if both are 0
+                    r.one  = a.one  | b2.one;   // 1 if either is 1
+                }
+                break;
+            case IK_XOR:
+                if (inst->nops >= 2) {
+                    KnownBits a = kb_get(inst->ops[0]);
+                    KnownBits b2 = kb_get(inst->ops[1]);
+                    r.zero = (a.zero & b2.zero) | (a.one & b2.one);
+                    r.one  = (a.zero & b2.one)  | (a.one & b2.zero);
+                }
+                break;
+            case IK_SHL:
+                if (inst->nops >= 2) {
+                    Value *sh = val_resolve(inst->ops[1]);
+                    if (sh->kind == VAL_CONST && sh->iconst >= 0 && sh->iconst < 32) {
+                        KnownBits a = kb_get(inst->ops[0]);
+                        int n = sh->iconst;
+                        r.zero = (a.zero << n) | ((1u << n) - 1);
+                        r.one  = a.one << n;
+                    }
+                }
+                break;
+            case IK_USHR:
+                if (inst->nops >= 2) {
+                    Value *sh = val_resolve(inst->ops[1]);
+                    if (sh->kind == VAL_CONST && sh->iconst > 0 && sh->iconst < 32) {
+                        KnownBits a = kb_get(inst->ops[0]);
+                        int n = sh->iconst;
+                        r.zero = (a.zero >> n) | (~0u << (32 - n));
+                        r.one  = a.one >> n;
+                    }
+                }
+                break;
+            case IK_SHR:  // arithmetic: sign bit fills, not zero
+                // Conservative: we don't track which bit is the sign bit
+                // (bit 15 for i16, bit 31 for i32), so we can't determine
+                // the fill bits.  Leave result unknown.
+                break;
+            case IK_TRUNC: case IK_ZEXT:
+                if (inst->nops >= 1) {
+                    KnownBits a = kb_get(inst->ops[0]);
+                    uint32_t mask = kb_trunc_mask(inst->dst->vtype);
+                    r.zero = a.zero | ~mask;   // bits above width known 0
+                    r.one  = a.one  &  mask;
+                }
+                break;
+            case IK_SEXT8:
+                if (inst->nops >= 1) {
+                    KnownBits a = kb_get(inst->ops[0]);
+                    if (a.one & 0x80)       { r.zero = a.zero & 0x7F; r.one = a.one | ~0xFFu; }
+                    else if (a.zero & 0x80) { r.zero = a.zero | ~0xFFu; r.one = a.one & 0x7F; }
+                    else                    { r.zero = a.zero & 0xFF; r.one = a.one & 0xFF; }
+                }
+                break;
+            case IK_SEXT16:
+                if (inst->nops >= 1) {
+                    KnownBits a = kb_get(inst->ops[0]);
+                    if (a.one & 0x8000)       { r.zero = a.zero & 0x7FFF; r.one = a.one | ~0xFFFFu; }
+                    else if (a.zero & 0x8000) { r.zero = a.zero | ~0xFFFFu; r.one = a.one & 0x7FFF; }
+                    else                      { r.zero = a.zero & 0xFFFF; r.one = a.one & 0xFFFF; }
+                }
+                break;
+            case IK_LOAD:
+                // Unsigned loads produce zero-extended results
+                if (inst->size == 1) r.zero = ~0xFFu;
+                else if (inst->size == 2) r.zero = ~0xFFFFu;
+                break;
+            // Comparisons produce 0 or 1
+            case IK_LT: case IK_LE: case IK_EQ: case IK_NE:
+            case IK_ULT: case IK_ULE:
+            case IK_FLT: case IK_FLE: case IK_FEQ: case IK_FNE:
+                r.zero = ~1u;
+                break;
+            case IK_PHI:
+                if (inst->nops > 0) {
+                    r = kb_get(inst->ops[0]);
+                    for (int i = 1; i < inst->nops; i++) {
+                        KnownBits p = kb_get(inst->ops[i]);
+                        r.zero &= p.zero;  // known 0 only if ALL paths agree
+                        r.one  &= p.one;   // known 1 only if ALL paths agree
+                    }
+                }
+                break;
+            default:
+                break;
+            }
+            kb_table[id] = r;
+        }
+    }
+}
+
+// ── Unwrap for mask ─────────────────────────────────────────────────────
+//
+// Given a value v and a bitmask, walk backwards through operations that
+// only affect bits outside the mask (COPY, TRUNC, ZEXT, AND with wider
+// mask).  Returns the "unwrapped" source — the deepest value whose bits
+// within `mask` are identical to v's.
+//
+// This is the core known-bits utility: it answers "can I use a simpler
+// value here, given that I only care about these bits?"
+
+static Value *unwrap_for_mask(Value *v, uint32_t mask) {
+    for (int i = 0; i < 8; i++) {
+        v = val_resolve(v);
+        if (v->kind != VAL_INST || !v->def || v->def->nops < 1) break;
+        Inst *d = v->def;
+        if (d->kind == IK_COPY) {
+            v = d->ops[0]; continue;
+        }
+        if (d->kind == IK_TRUNC || d->kind == IK_ZEXT) {
+            // TRUNC/ZEXT clears bits above its width; if mask doesn't
+            // touch those bits, the operation is invisible.
+            uint32_t width_mask = kb_trunc_mask(d->dst->vtype);
+            if ((mask & ~width_mask) == 0) { v = d->ops[0]; continue; }
+        }
+        if (d->kind == IK_AND && d->nops >= 2) {
+            // AND(x, c) clears bits outside c; if mask is a subset of c,
+            // the AND is invisible.
+            Value *c = val_resolve(d->ops[1]);
+            Value *x = d->ops[0];
+            if (c->kind != VAL_CONST) { c = val_resolve(d->ops[0]); x = d->ops[1]; }
+            if (c->kind == VAL_CONST && (mask & ~(uint32_t)c->iconst) == 0) {
+                v = x; continue;
+            }
+        }
+        break;
+    }
+    return val_resolve(v);
+}
+
+// ── R2K: Known-bits simplification ──────────────────────────────────────
+//
+// Uses computed known bits to eliminate redundant operations:
+//   - AND(x, mask) where all bits outside mask are already known zero → x
+//   - TRUNC/ZEXT(x) where high bits are already known zero → x
+//   - AND(x, mask) with TRUNC/ZEXT/AND chain → AND(unwrapped_x, mask)
+
+void opt_known_bits(Function *f) {
+    compute_known_bits(f);
+    int changed = 0;
+
+    for (int bi = 0; bi < f->nblocks; bi++) {
+        Block *b = f->blocks[bi];
+        for (Inst *inst = b->head; inst; inst = inst->next) {
+            if (inst->is_dead || !inst->dst) continue;
+
+            if (inst->kind == IK_AND && inst->nops == 2) {
+                Value *v0 = val_resolve(inst->ops[0]);
+                Value *v1 = val_resolve(inst->ops[1]);
+                Value *mask_v = NULL, *src = NULL;
+                if (v1->kind == VAL_CONST) { mask_v = v1; src = v0; }
+                else if (v0->kind == VAL_CONST) { mask_v = v0; src = v1; }
+                if (!mask_v) continue;
+                uint32_t mask = (uint32_t)mask_v->iconst;
+
+                // If all bits outside mask are already known zero, AND is a no-op.
+                // Only safe when source and dest have the same vtype —
+                // aliasing across different types loses signedness information
+                // that affects downstream widening (sign-extend vs zero-extend).
+                KnownBits kb = kb_get(src);
+                if ((~mask & ~kb.zero) == 0 &&
+                    src->vtype == inst->dst->vtype) {
+                    inst->dst->alias = src;
+                    inst->is_dead = 1;
+                    changed = 1;
+                    continue;
+                }
+
+                // Try to unwrap the source through TRUNC/ZEXT/AND/COPY
+                Value *unwrapped = unwrap_for_mask(src, mask);
+                if (unwrapped != src) {
+                    if (v1->kind == VAL_CONST) inst->ops[0] = unwrapped;
+                    else                       inst->ops[1] = unwrapped;
+                    changed = 1;
+                }
+            }
+
+            // Boolean branch fusion: EQ(x, 1) → NE(x, 0) and NE(x, 1) → EQ(x, 0)
+            // when x is known-boolean (bits 1-31 zero).  This enables P6 (jnz/jz)
+            // in emit.c, eliminating the immw r, 1 needed for the beq/bne.
+            if ((inst->kind == IK_EQ || inst->kind == IK_NE) && inst->nops == 2) {
+                Value *v0 = val_resolve(inst->ops[0]);
+                Value *v1 = val_resolve(inst->ops[1]);
+                // Find which operand is const 1, which is the boolean source
+                Value *src = NULL;
+                int const_idx = -1;
+                if (v1->kind == VAL_CONST && v1->iconst == 1) { src = v0; const_idx = 1; }
+                else if (v0->kind == VAL_CONST && v0->iconst == 1) { src = v1; const_idx = 0; }
+                if (src) {
+                    KnownBits kb = kb_get(src);
+                    if ((kb.zero & ~1u) == ~1u) {   // bits 1-31 known zero
+                        Value *zero = new_const(f, 0, src->vtype);
+                        inst->ops[const_idx] = zero;
+                        zero->use_count++;
+                        inst->kind = (inst->kind == IK_EQ) ? IK_NE : IK_EQ;
+                        changed = 1;
+                    }
+                }
+            }
+
+            // Note: TRUNC/ZEXT elimination is intentionally omitted.
+            // Aliasing across vtypes loses signedness that downstream
+            // widening depends on.  The important case — TRUNC under AND —
+            // is handled by unwrap_for_mask above.
+        }
+    }
+
+    if (!changed) return;
+    for (int i = 0; i < f->nvalues; i++) f->values[i]->use_count = 0;
+    for (int bi = 0; bi < f->nblocks; bi++) {
+        Block *b = f->blocks[bi];
+        for (Inst *inst = b->head; inst; inst = inst->next) {
+            if (inst->is_dead) continue;
+            for (int j = 0; j < inst->nops; j++) {
+                if (inst->ops[j]) {
+                    inst->ops[j] = val_resolve(inst->ops[j]);
+                    inst->ops[j]->use_count++;
+                }
+            }
+        }
+    }
+}
+
+// ── R2L: Bitwise distribution ────────────────────────────────────────────
+//
+// OP(AND(a, c), AND(b, c)) → AND(OP(a, b), c)  where OP ∈ {XOR, OR, AND}.
+// Uses unwrap_for_mask to see through TRUNC/ZEXT/COPY chains on the inner
+// AND operands, so (data & 1) ^ ((unsigned char)crc & 1) becomes
+// (data ^ crc) & 1 — the cast is irrelevant because mask 1 is narrower
+// than the truncation width.
+
+void opt_bitwise_dist(Function *f) {
+    int changed = 0;
+    for (int bi = 0; bi < f->nblocks; bi++) {
+        Block *b = f->blocks[bi];
+        for (Inst *inst = b->head; inst; inst = inst->next) {
+            if (inst->is_dead || !inst->dst || inst->nops != 2) continue;
+            if (inst->kind != IK_XOR && inst->kind != IK_OR &&
+                inst->kind != IK_AND) continue;
+
+            Value *lhs = val_resolve(inst->ops[0]);
+            Value *rhs = val_resolve(inst->ops[1]);
+            if (!lhs || !rhs) continue;
+            if (lhs->kind != VAL_INST || rhs->kind != VAL_INST) continue;
+            Inst *li = lhs->def, *ri = rhs->def;
+            if (!li || !ri) continue;
+            if (li->kind != IK_AND || ri->kind != IK_AND) continue;
+            if (li->nops != 2 || ri->nops != 2) continue;
+
+            // Find the common constant mask
+            Value *la0 = val_resolve(li->ops[0]), *la1 = val_resolve(li->ops[1]);
+            Value *ra0 = val_resolve(ri->ops[0]), *ra1 = val_resolve(ri->ops[1]);
+            if (!la0 || !la1 || !ra0 || !ra1) continue;
+
+            Value *lc = NULL, *lv = NULL, *rc = NULL, *rv = NULL;
+            if (la1->kind == VAL_CONST) { lc = la1; lv = la0; }
+            else if (la0->kind == VAL_CONST) { lc = la0; lv = la1; }
+            else continue;
+            if (ra1->kind == VAL_CONST) { rc = ra1; rv = ra0; }
+            else if (ra0->kind == VAL_CONST) { rc = ra0; rv = ra1; }
+            else continue;
+
+            if (lc->iconst != rc->iconst) continue;
+            if (lhs->use_count > 1 || rhs->use_count > 1) continue;
+
+            // Unwrap operands through operations invisible to the mask
+            uint32_t mask = (uint32_t)lc->iconst;
+            lv = unwrap_for_mask(lv, mask);
+            rv = unwrap_for_mask(rv, mask);
+
+            // Create OP(lv, rv) before inst
+            Value *nv = new_value(f, VAL_INST, inst->dst->vtype);
+            Inst *ni = new_inst(f, b, inst->kind, nv);
+            ni->ops = arena_alloc(2 * sizeof(Value *));
+            ni->nops = 2;
+            ni->ops[0] = lv;
+            ni->ops[1] = rv;
+            nv->def = ni;
+            ni->prev = inst->prev;
+            ni->next = inst;
+            if (inst->prev) inst->prev->next = ni;
+            else b->head = ni;
+            inst->prev = ni;
+
+            // Rewrite inst to AND(nv, c)
+            inst->kind = IK_AND;
+            inst->ops[0] = nv;
+            inst->ops[1] = lc;
+            changed = 1;
+        }
+    }
+
+    if (!changed) return;
+    for (int i = 0; i < f->nvalues; i++) f->values[i]->use_count = 0;
+    for (int bi = 0; bi < f->nblocks; bi++) {
+        Block *b = f->blocks[bi];
+        for (Inst *inst = b->head; inst; inst = inst->next) {
+            if (inst->is_dead) continue;
+            for (int j = 0; j < inst->nops; j++) {
+                if (inst->ops[j]) {
+                    inst->ops[j] = val_resolve(inst->ops[j]);
+                    inst->ops[j]->use_count++;
+                }
+            }
+        }
+    }
+}
+
 // ── R2F: LICM for IK_CONST (loop-invariant constant hoisting) ────────────
 //
 // Constants used inside loop bodies are materialized (immw) on every iteration.
@@ -533,7 +959,6 @@ void opt_narrow_loads(Function *f) {
 // Cap at LICM_MAX_HOIST constants per loop to avoid register pressure explosion
 // (K=8; typical loops already use 4-5 registers for variables).
 
-#define LICM_MAX_HOIST 4
 #define LICM_MAX_CANDS 32
 
 typedef struct {
@@ -662,13 +1087,53 @@ void opt_licm_const(Function *f) {
                 if (!inst->is_dead) body_insts++;
         }
 
-        // K=8; complex loop bodies need more in-body registers for temporaries.
-        // Default: leave 2 free. For loops with >16 instructions, the address
-        // computation chains create high peak pressure — leave more headroom.
-        int budget = (body_insts > 16) ? 3 : 6;
-        if (nlive + 1 > budget) continue;
+        int budget = (body_insts > 16)
+            ? opt_profile->licm_const_budget_large
+            : opt_profile->licm_const_budget_small;
+        if (nlive + 1 > budget) {
+            // Budget exceeded for general hoisting.  Still try to hoist the
+            // loop-bound constant (VAL_CONST operand of the header's
+            // terminator comparison).  P12 (emit_rotated_branch) duplicates
+            // the comparison in the latch, so the constant is materialized
+            // twice per iteration.  Allow one hoist with a relaxed cap.
+            if (nlive + 1 > opt_profile->licm_const_hard_cap) continue;
+            Inst *hdr_term = h->tail;
+            if (!hdr_term || hdr_term->kind != IK_BR || hdr_term->nops < 1)
+                continue;
+            Value *hdr_cond = val_resolve(hdr_term->ops[0]);
+            if (!hdr_cond || hdr_cond->kind != VAL_INST || !hdr_cond->def
+                || hdr_cond->def->block != h)
+                continue;
+            Inst *cmp = hdr_cond->def;
+            int did_hoist = 0;
+            for (int j = 0; j < cmp->nops && !did_hoist; j++) {
+                Value *v = val_resolve(cmp->ops[j]);
+                if (!v || v->kind != VAL_CONST) continue;
+                Value *nv = new_value(f, VAL_INST, v->vtype);
+                Inst *ni = new_inst(f, preheader, IK_CONST, nv);
+                ni->imm = v->iconst;
+                nv->iconst = v->iconst;
+                inst_insert_before(preheader->tail, ni);
+                for (int bi2 = 0; bi2 < f->nblocks; bi2++) {
+                    Block *b2 = f->blocks[bi2];
+                    if (!dominates(h, b2)) continue;
+                    for (Inst *inst = b2->head; inst; inst = inst->next) {
+                        if (inst->is_dead) continue;
+                        for (int k = 0; k < inst->nops; k++) {
+                            Value *op = val_resolve(inst->ops[k]);
+                            if (op && op->kind == VAL_CONST &&
+                                op->iconst == v->iconst && op->vtype == v->vtype)
+                                inst->ops[k] = nv;
+                        }
+                    }
+                }
+                did_hoist = 1;
+                changed = 1;
+            }
+            continue;
+        }
 
-        int max_hoist = LICM_MAX_HOIST;
+        int max_hoist = opt_profile->licm_const_max_hoist;
 
         // Step 4: Count VAL_CONST operand uses inside the loop body.
         LicmCand cands[LICM_MAX_CANDS];
@@ -704,12 +1169,12 @@ void opt_licm_const(Function *f) {
         }
 
         // Step 5: Sort candidates by use count (descending) and pick top N.
-        // Simple selection: find the top max_hoist by uses.
+        // Step 5: Sort candidates by use count (descending) and pick top N.
         // Only hoist constants with uses >= 3 (enough savings to justify the
         // register cost across the loop body).
         int nhoisted = 0;
         for (int pass = 0; pass < max_hoist; pass++) {
-            int best = -1, best_uses = 2; // threshold: >= 3 uses
+            int best = -1, best_uses = opt_profile->licm_const_use_threshold;
             for (int k = 0; k < ncands; k++) {
                 if (!cands[k].hoisted && cands[k].uses > best_uses) {
                     best = k;
@@ -781,8 +1246,6 @@ void opt_licm_const(Function *f) {
 // constants, defined outside the loop, or themselves loop-invariant.
 // Only processes leaf loops with a single pre-header.
 // Excludes division/mod (potential traps if loop executes 0 times).
-
-#define LICM_GEN_MAX 4  // max instructions to hoist per loop
 
 void opt_licm(Function *f) {
     if (f->nblocks < 2) return;
@@ -881,11 +1344,13 @@ void opt_licm(Function *f) {
         // temporaries (address computations, intermediate values), and each
         // hoist adds 1 to the cross-loop pressure.  Cap budget when loop-
         // internal definitions are high (tight loops with many values).
-        int budget = 8 - 4 - nlive;
+        int budget = 8 - opt_profile->licm_gen_reserve - nlive;
         if (budget <= 0) continue;
-        if (nloop_defs > 10) budget = budget < 1 ? 0 : 1;
-        else if (nloop_defs > 6) budget = budget < 2 ? budget : 2;
-        if (budget > LICM_GEN_MAX) budget = LICM_GEN_MAX;
+        if (nloop_defs > opt_profile->licm_gen_dense_hi)
+            budget = budget < 1 ? 0 : 1;
+        else if (nloop_defs > opt_profile->licm_gen_dense_lo)
+            budget = budget < 2 ? budget : 2;
+        if (budget > opt_profile->licm_gen_max) budget = opt_profile->licm_gen_max;
 
         // Build def-count per value inside the loop.
         int nv = f->nvalues;

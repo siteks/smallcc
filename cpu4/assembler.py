@@ -344,6 +344,18 @@ class Assembler:
                     i.ins = [byte0, byte1, byte2]
                     i.length = 3
 
+                elif extra_bytes == 2 and subfmt == 5:
+                    # F3f: two registers + 9-bit immediate (addli, bitex)
+                    # Encoding: byte0=0xde; byte1=(rx<<5)|(ry<<2)|(subop<<1)|((imm9>>8)&1); byte2=imm9&0xff
+                    rx = reg_num(operands[0])
+                    ry = reg_num(operands[1])
+                    imm9 = resolve(operands[2]) & 0x1ff
+                    byte0 = 0xde
+                    byte1 = (rx << 5) | (ry << 2) | (subop_val << 1) | ((imm9 >> 8) & 1)
+                    byte2 = imm9 & 0xff
+                    i.ins = [byte0, byte1, byte2]
+                    i.length = 3
+
                 else:
                     print('Error line %d: unknown encoding for %s (extra=%d subfmt=%d)' % (
                         lineno, mnemonic, extra_bytes, subfmt), file=sys.stderr)
