@@ -80,6 +80,31 @@ static const char *regname(int r) {
 }
 
 static const char *g_cur_func_name = "";
+static uint8_t     g_blk_live_out_regs = 0xff; // conservative default: all busy
+
+// Find a caller-saved scratch register (r0-r3) that is genuinely dead at `inst`.
+// `exclude` is a bitmask of registers that must not be chosen (operands of inst).
+// Returns register number 0-3, or -1 if none is provably free.
+static int find_free_scratch(Inst *inst, int exclude) {
+    // Build bitmask of busy registers: live-out + forward-referenced + excluded
+    unsigned busy = g_blk_live_out_regs | (unsigned)exclude;
+
+    // Forward scan: mark registers read by remaining instructions in this block.
+    // Do NOT skip is_dead instructions — P5 fusion marks comparisons dead but
+    // the fused branch still needs their operand registers.
+    for (Inst *p = inst->next; p; p = p->next) {
+        for (int i = 0; i < p->nops; i++) {
+            Value *v = val_resolve(p->ops[i]);
+            if (v && v->kind == VAL_INST && v->phys_reg >= 0 && v->phys_reg < 8)
+                busy |= (1u << v->phys_reg);
+        }
+    }
+
+    // Pick first free caller-saved register
+    for (int r = 0; r <= 3; r++)
+        if (!(busy & (1u << r))) return r;
+    return -1;
+}
 
 // Pick a scratch register that is not in forbidden (combined already_used|blocked).
 // Falls back to r0 if nothing is clean.
@@ -511,13 +536,21 @@ static void emit_inst(Inst *inst, FILE *out) {
             }
             if (p0 == rd) {
                 // ops[0] occupies rd — can't use rd for the constant.
-                int sc = (rd == 0) ? 1 : 0;
-                fprintf(out, "    pushr %s\n", regname(sc));
-                emit_imm(out, sc, op1->iconst);
-                fprintf(out, "    %s %s, %s, %s\n",
-                        alu_mnemonic(inst->kind, is_signed),
-                        regname(rd), regname(rd), regname(sc));
-                fprintf(out, "    popr %s\n", regname(sc));
+                int sc = find_free_scratch(inst, 1u << rd);
+                if (sc >= 0) {
+                    emit_imm(out, sc, op1->iconst);
+                    fprintf(out, "    %s %s, %s, %s\n",
+                            alu_mnemonic(inst->kind, is_signed),
+                            regname(rd), regname(rd), regname(sc));
+                } else {
+                    sc = (rd == 0) ? 1 : 0;
+                    fprintf(out, "    pushr %s\n", regname(sc));
+                    emit_imm(out, sc, op1->iconst);
+                    fprintf(out, "    %s %s, %s, %s\n",
+                            alu_mnemonic(inst->kind, is_signed),
+                            regname(rd), regname(rd), regname(sc));
+                    fprintf(out, "    popr %s\n", regname(sc));
+                }
             } else {
                 // ops[0] is in p0 != rd: load const into rd, emit op(p0, rd).
                 emit_imm(out, rd, op1->iconst);
@@ -529,13 +562,21 @@ static void emit_inst(Inst *inst, FILE *out) {
             // ops[0] is const, ops[1] is VAL_INST.
             if (p1 == rd) {
                 // ops[1] occupies rd — can't use rd for the constant.
-                int sc = (rd == 0) ? 1 : 0;
-                fprintf(out, "    pushr %s\n", regname(sc));
-                emit_imm(out, sc, op0->iconst);
-                fprintf(out, "    %s %s, %s, %s\n",
-                        alu_mnemonic(inst->kind, is_signed),
-                        regname(rd), regname(sc), regname(rd));
-                fprintf(out, "    popr %s\n", regname(sc));
+                int sc = find_free_scratch(inst, 1u << rd);
+                if (sc >= 0) {
+                    emit_imm(out, sc, op0->iconst);
+                    fprintf(out, "    %s %s, %s, %s\n",
+                            alu_mnemonic(inst->kind, is_signed),
+                            regname(rd), regname(sc), regname(rd));
+                } else {
+                    sc = (rd == 0) ? 1 : 0;
+                    fprintf(out, "    pushr %s\n", regname(sc));
+                    emit_imm(out, sc, op0->iconst);
+                    fprintf(out, "    %s %s, %s, %s\n",
+                            alu_mnemonic(inst->kind, is_signed),
+                            regname(rd), regname(sc), regname(rd));
+                    fprintf(out, "    popr %s\n", regname(sc));
+                }
             } else {
                 // ops[1] in p1 != rd: load const into rd, emit op(rd, p1).
                 emit_imm(out, rd, op0->iconst);
@@ -917,6 +958,127 @@ typedef struct {
     int         is_eq;     // P6: 1 for EQ(x,0)→jz, 0 for NE(x,0)→jnz
 } BranchFuse;
 
+// Post-IRC register remapping: when a single-use value feeds directly into
+// an instruction whose destination register is different, remap the value's
+// register to match — eliminating a copy at emission time.
+//
+// Common pattern: SHR(x,2)→r0, COPY→r0, AND(r0,15)→r7 generates
+//   or r0,r6,r6; shrsi r0,2; or r7,r0,r0; andi r7,15
+// After remapping SHR result to r7:
+//   or r7,r6,r6; shrsi r7,2; andi r7,15
+//
+// Processed in reverse order so copy chains resolve naturally.
+static void remap_single_use_values(Function *f) {
+    for (int bi = 0; bi < f->nblocks; bi++) {
+        Block *b = f->blocks[bi];
+
+        // Physical register live_in mask
+        uint8_t live_in_regs = 0;
+        if (b->live_in) {
+            for (int w = 0; w < b->nwords; w++) {
+                uint32_t bits = b->live_in[w];
+                while (bits) {
+                    int bit = __builtin_ctz(bits);
+                    int vid = w * 32 + bit;
+                    if (vid < f->nvalues) {
+                        int pr = f->values[vid]->phys_reg;
+                        if (pr >= 0 && pr < 8)
+                            live_in_regs |= (1u << pr);
+                    }
+                    bits &= bits - 1;
+                }
+            }
+        }
+
+        for (Inst *inst = b->tail; inst; inst = inst->prev) {
+            if (inst->is_dead || !inst->dst) continue;
+            Value *v = inst->dst;
+            if (v->use_count != 1 || v->phys_reg < 0) continue;
+            // Don't remap call results (must be r0) or params
+            if (inst->kind == IK_CALL || inst->kind == IK_ICALL ||
+                inst->kind == IK_PARAM || inst->kind == IK_PUTCHAR)
+                continue;
+
+            int rd = v->phys_reg;
+
+            // Find single user: scan forward, following through dead copies
+            // that chain from v (e.g. dead type-coercing copies left by IRC).
+            Inst *user = NULL;
+            Value *search_val = v;
+            int steps = 0;
+            for (Inst *p = inst->next; p && steps < 4; p = p->next) {
+                if (p->is_dead) {
+                    if (p->kind == IK_COPY && p->dst && p->nops >= 1 &&
+                        val_resolve(p->ops[0]) == search_val)
+                        search_val = p->dst;
+                    continue;
+                }
+                steps++;
+                for (int i = 0; i < p->nops; i++) {
+                    if (val_resolve(p->ops[i]) == search_val) { user = p; goto found; }
+                }
+            }
+            found:
+            if (!user || !user->dst) continue;
+            // Don't remap to match call/putchar destinations — their dst
+            // register (r0) is ABI-fixed and unrelated to operand placement.
+            if (user->kind == IK_CALL || user->kind == IK_ICALL ||
+                user->kind == IK_PUTCHAR)
+                continue;
+
+            int target = user->dst->phys_reg;
+            if (target < 0 || target == rd) continue;
+
+            // Safety 1: target not live-in to block
+            if (live_in_regs & (1u << target)) continue;
+
+            // Safety 2: target not an operand of inst
+            int conflict = 0;
+            for (int i = 0; i < inst->nops; i++) {
+                Value *op = val_resolve(inst->ops[i]);
+                if (op && op->kind == VAL_INST && op->phys_reg == target)
+                    { conflict = 1; break; }
+            }
+            if (conflict) continue;
+
+            // Safety 3: target not written by any earlier inst in block
+            int prior = 0;
+            for (Inst *p = b->head; p != inst; p = p->next) {
+                if (p->is_dead) continue;
+                if (p->dst && p->dst->phys_reg == target)
+                    { prior = 1; break; }
+            }
+            if (prior) continue;
+
+            // Safety 4: target not read/written between inst and user
+            int between = 0;
+            for (Inst *p = inst->next; p != user; p = p->next) {
+                if (p->is_dead) continue;
+                if (p->dst && p->dst->phys_reg == target)
+                    { between = 1; break; }
+                for (int i = 0; i < p->nops; i++) {
+                    Value *op = val_resolve(p->ops[i]);
+                    if (op && op->kind == VAL_INST && op->phys_reg == target)
+                        { between = 1; break; }
+                }
+                if (between) break;
+            }
+            if (between) continue;
+
+            v->phys_reg = target;
+            // Also remap dead copies that chain from v to user
+            Value *cv = v;
+            for (Inst *p = inst->next; p && p != user; p = p->next) {
+                if (p->is_dead && p->kind == IK_COPY && p->dst && p->nops >= 1 &&
+                    val_resolve(p->ops[0]) == cv) {
+                    p->dst->phys_reg = target;
+                    cv = p->dst;
+                }
+            }
+        }
+    }
+}
+
 // Emit function prologue: enter, callee-save stores.
 // Returns callee_frame (total bytes for callee-saved registers).
 static int emit_prologue(Function *f, FILE *out, int frame, int callee_save[4]) {
@@ -1292,14 +1454,39 @@ void emit_function(Function *f, FILE *out) {
     int callee_frame = emit_prologue(f, out, frame, callee_save);
 
     mark_dead_consts(f);
+    remap_single_use_values(f);
 
     BranchFuse *fuse = arena_alloc(f->nblocks * sizeof(BranchFuse));
     detect_branch_fusions(f, fuse);
+
+    // Precompute per-block physical-register live_out masks for scratch selection
+    uint8_t *blk_live_regs = arena_alloc(f->nblocks * sizeof(uint8_t));
+    for (int bi = 0; bi < f->nblocks; bi++) {
+        Block *b = f->blocks[bi];
+        uint8_t mask = 0;
+        if (b->live_out) {
+            for (int w = 0; w < b->nwords; w++) {
+                uint32_t bits = b->live_out[w];
+                while (bits) {
+                    int bit = __builtin_ctz(bits);
+                    int vid = w * 32 + bit;
+                    if (vid < f->nvalues) {
+                        int pr = f->values[vid]->phys_reg;
+                        if (pr >= 0 && pr < 8)
+                            mask |= (1u << pr);
+                    }
+                    bits &= bits - 1;
+                }
+            }
+        }
+        blk_live_regs[bi] = mask;
+    }
 
     // Emit blocks
     int ann_prev_line = 0;
     for (int bi = 0; bi < f->nblocks; bi++) {
         Block *b = f->blocks[bi];
+        g_blk_live_out_regs = blk_live_regs[bi];
 
         if (bi > 0)
             fprintf(out, "_%s_B%d:\n", f->name, b->id);

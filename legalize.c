@@ -230,7 +230,7 @@ void legalize_function(Function *f) {
     // Compact encodings that CAN handle VAL_CONST in emit.c:
     //   ADD/SUB: P2 (±1 inc/dec), P3 (addi ±64), P4 (addli ±511)
     //   AND:     P14 (andi 0..127), P8 (zxb 0xFF, zxw 0xFFFF)
-    //   CMP:     P5+ uses the dead cond register as scratch
+    //   CMP=0:   P6 (jz/jnz) — only EQ/NE against zero
     // Everything else must be materialized into a register.
     for (int bi = 0; bi < f->nblocks; bi++) {
         Block *b = f->blocks[bi];

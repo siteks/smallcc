@@ -912,6 +912,23 @@ void opt_licm(Function *f) {
             }
         }
 
+        // Check if loop body has no memory-modifying instructions.
+        // When true, loads from invariant addresses can be hoisted.
+        int loop_store_free = 1;
+        for (int bi = 0; bi < f->nblocks && loop_store_free; bi++) {
+            if (!dominates(h, f->blocks[bi])) continue;
+            Block *b = f->blocks[bi];
+            for (Inst *inst = b->head; inst; inst = inst->next) {
+                if (inst->is_dead) continue;
+                if (inst->kind == IK_STORE || inst->kind == IK_MEMCPY ||
+                    inst->kind == IK_CALL  || inst->kind == IK_ICALL  ||
+                    inst->kind == IK_PUTCHAR) {
+                    loop_store_free = 0;
+                    break;
+                }
+            }
+        }
+
         // Iterative invariance marking.
         int *inv = calloc(nv, sizeof(int));
         if (!inv) goto next_loop;
@@ -926,7 +943,8 @@ void opt_licm(Function *f) {
                     if (inst->is_dead || !inst->dst) continue;
                     int did = val_resolve(inst->dst)->id;
                     if (inv[did]) continue;
-                    if (!is_cse_pure(inst->kind)) continue;
+                    if (!is_cse_pure(inst->kind) &&
+                        !(inst->kind == IK_LOAD && loop_store_free)) continue;
                     // Exclude division/mod — could trap if loop runs 0 times
                     if (inst->kind == IK_DIV  || inst->kind == IK_UDIV ||
                         inst->kind == IK_MOD  || inst->kind == IK_UMOD ||
