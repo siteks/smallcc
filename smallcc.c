@@ -587,18 +587,23 @@ int main(int argc, char **argv)
                 if (f) {
                     if (ssa_out) { fprintf(ssa_out, "=== SSA: %s ===\n", f->name); print_function(f, ssa_out); }
                     split_critical_edges(f);
+                    // Pre-OOS cleanup: CFG-structural, no phis/copies needed
+                    if (opt_flags & OPT_FOLD_BR)        opt_fold_branches(f);
+                    if (opt_flags & OPT_DEAD_BLOCKS)    opt_remove_dead_blocks(f);
                     compute_dominators(f);
+                    // Pre-OOS pattern simplification: feed cleaner IR to GVN
+                    if (opt_flags & OPT_REDUNDANT_BOOL) opt_redundant_bool(f);
+                    if (opt_flags & OPT_NARROW_LOADS)   opt_narrow_loads(f);
                     if (opt_flags & OPT_CSE) opt_pre_oos_cse(f);
                     opt_scalar_promote(f);
                     opt_addr_iv(f);
                     opt_lsr(f);
                     out_of_ssa(f);
+                    // Post-OOS: re-run CFG cleanup (OOS may expose new constants)
                     if (opt_flags & OPT_FOLD_BR)        opt_fold_branches(f);
                     if (opt_flags & OPT_DEAD_BLOCKS)    opt_remove_dead_blocks(f);
                     if (opt_flags & OPT_COPY_PROP)      opt_copy_prop(f);
                     if (opt_flags & OPT_CSE)            { compute_dominators(f); opt_cse(f); }
-                    if (opt_flags & OPT_REDUNDANT_BOOL) opt_redundant_bool(f);
-                    if (opt_flags & OPT_NARROW_LOADS)   opt_narrow_loads(f);
                     if (opt_flags & OPT_LICM)           opt_licm_const(f);
                     if (opt_flags & OPT_LICM)           opt_licm(f);
                     if (opt_flags & OPT_JUMP_THREAD)    opt_jump_thread(f);
