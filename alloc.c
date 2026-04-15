@@ -409,7 +409,64 @@ static int assign_colors(IGraph *g, Function *f, int K, int pessimistic) {
     // eliminating the mov that emit.c must insert for cross-register cases.
     int *copy_hint = arena_alloc(nv * sizeof(int));
     for (int i = 0; i < nv; i++) copy_hint[i] = -1;
+
+    // Pre-scan (leaf functions only): OOS phi elimination creates multiple defs
+    // for loop-carried values.  val->def points to the last def (typically the
+    // back-edge copy), missing the entry copy from a precolored param register.
+    // Scan all instructions for IK_COPY whose source traces (through at most
+    // one intermediate non-coalesced copy) to a precolored value.  These hints
+    // get priority — matching the param register avoids entry-block shuffles.
+    //
+    // Restricted to leaf functions: in non-leaf functions, call-site phantom
+    // interference already constrains register choice, and pre-scan hints can
+    // interfere with pressure dynamics around calls.
+    //
+    // Phase 1: copies directly from precolored (or coalesced-with-precolored).
+    // Phase 2: copies from a value that phase 1 already hinted to precolored.
+    // This covers the common param→working→loop chain (IK_PARAM→IK_COPY→IK_COPY).
+    int is_leaf = 1;
+    for (int bi = 0; bi < f->nblocks && is_leaf; bi++)
+        for (Inst *inst = f->blocks[bi]->head; inst; inst = inst->next)
+            if (inst->kind == IK_CALL || inst->kind == IK_ICALL)
+                { is_leaf = 0; break; }
+    for (int phase = 0; phase < 2 && is_leaf; phase++) {
+        for (int bi = 0; bi < f->nblocks; bi++) {
+            for (Inst *inst = f->blocks[bi]->head; inst; inst = inst->next) {
+                if (inst->is_dead || inst->kind != IK_COPY || inst->nops < 1) continue;
+                if (!inst->dst || inst->dst->kind != VAL_INST) continue;
+                int did = inst->dst->id;
+                if (did < 0 || did >= nv) continue;
+                // Resolve to canonical (coalescing may have merged dst away)
+                int did_canon = ig_find(g, did);
+                if (did_canon < 0 || did_canon >= nv || copy_hint[did_canon] >= 0) continue;
+                Value *src = val_resolve(inst->ops[0]);
+                if (!src || src->kind != VAL_INST || src->id < 0 || src->id >= nv) continue;
+                int sid = src->id;
+                int src_canon = ig_find(g, sid);
+                int precolored_src = -1;
+                if (g->precolored[src_canon] >= 0) {
+                    precolored_src = src_canon;
+                } else if (phase == 1) {
+                    // Phase 2: check if source's canonical has a hint
+                    // that chains to a precolored value
+                    int sh = copy_hint[src_canon];
+                    if (sh < 0 && sid != src_canon)
+                        sh = copy_hint[sid];
+                    if (sh >= 0 && g->precolored[ig_find(g, sh)] >= 0)
+                        precolored_src = ig_find(g, sh);
+                }
+                // Store the precolored value directly as the hint so that
+                // the coloring phase can resolve it immediately (precolored
+                // values are always colored), without needing intermediate
+                // values to be colored first.
+                if (precolored_src >= 0)
+                    copy_hint[did_canon] = precolored_src;
+            }
+        }
+    }
+
     for (int i = 0; i < f->nvalues; i++) {
+        if (copy_hint[i] >= 0) continue;  // preserve precolored-source hint
         Value *val = f->values[i];
         if (!val->def || val->def->is_dead) continue;
         Inst *def = val->def;
@@ -448,11 +505,39 @@ static int assign_colors(IGraph *g, Function *f, int K, int pessimistic) {
         }
     }
 
+    // Check if function has any loops (for simplification heuristic).
+    int has_loops = 0;
+    for (int bi = 0; bi < f->nblocks && !has_loops; bi++)
+        if (f->blocks[bi]->loop_depth > 0) has_loops = 1;
+
     while (remaining > 0) {
-        // Find a node with degree < K
+        // Find a node with degree < K.
+        // In loop-free leaf functions, defer pre-scan-hinted values so
+        // they are pushed later (and thus colored earlier during select).
+        // This ensures param-linked values get first pick at their
+        // hinted register, eliminating unnecessary prologue shuffles.
+        // Restricted to loop-free functions because in loop-heavy code,
+        // keeping params in their original registers can force worse
+        // loop-body allocation (loop constants can't live in param regs).
         int found = -1;
-        for (int i = 0; i < nv; i++) {
-            if (!removed[i] && degree[i] < K) { found = i; break; }
+        if (is_leaf && !has_loops) {
+            int hinted_fallback = -1;
+            for (int i = 0; i < nv; i++) {
+                if (removed[i] || degree[i] >= K) continue;
+                if (copy_hint[i] >= 0 && i < f->nvalues) {
+                    int hc = ig_find(g, copy_hint[i]);
+                    if (g->precolored[hc] >= 0) {
+                        if (hinted_fallback < 0) hinted_fallback = i;
+                        continue;
+                    }
+                }
+                found = i; break;
+            }
+            if (found < 0) found = hinted_fallback;
+        } else {
+            for (int i = 0; i < nv; i++) {
+                if (!removed[i] && degree[i] < K) { found = i; break; }
+            }
         }
 
         if (found < 0) {
@@ -563,8 +648,7 @@ static int assign_colors(IGraph *g, Function *f, int K, int pessimistic) {
         }
 
         // Pick a register: prefer copy partner's register (biased coloring),
-        // else lowest unforbidden.  If this value is live across a call,
-        // r0-r3 are already forbidden (via phantom-node interference).
+        // else lowest unforbidden.
         if (preferred >= 0) {
             g->color[v] = preferred;
         } else {

@@ -215,13 +215,16 @@ typedef struct {
     const char *name;
     uint8_t     first_byte;
     int         extra;   /* extra bytes: 0, 1, or 2 */
-    int         subfmt;  /* 0=F0/F1a/F2/F3a, 1=F1b/F3b, 2=F3c */
+    int         subfmt;  /* 0=F0/F1a/F2/F3a, 1=F1b/F3b, 2=F3e, 3=adjw/lea,
+                            4=F3d(beqz/bnez), 5=F3f(addli/bitex), 7=F0b(cbeq/cbne) */
     int         subop;   /* F1b: subopcode in byte1[5:0] */
 } Instr4;
 
 static const Instr4 itab4[] = {
-    /* F0 — 1 byte, no operands */
+    /* F0a — 1 byte, no operands */
     {"halt",   0x00,0,0,0}, {"ret",    0x01,0,0,0},
+    /* F0b — 3 bytes, rx + imm8 + disp9 (compare-and-branch); subfmt=7 */
+    {"cbeq",   0x20,2,7,0}, {"cbne",   0x30,2,7,0},
     /* F1a — 2 bytes, rd rx ry */
     {"add",    0x40,1,0,0}, {"sub",    0x42,1,0,0},
     {"mul",    0x44,1,0,0}, {"div",    0x46,1,0,0},
@@ -256,9 +259,10 @@ static const Instr4 itab4[] = {
     /* F3a — 3 bytes, imm16 only */
     {"j",      0xc0,2,0,0}, {"jl",     0xc1,2,0,0},
     {"enter",  0xc2,2,0,0},
-    /* new F3b — 3 bytes, rd + imm14 (byte offset / 4); subfmt=3 */
-    {"adjw",   0xc8,2,3,0}, {"lea",    0xca,2,3,0},
-    /* F3b — 3 bytes, rx ry imm10 */
+    /* F3b — 3 bytes, rd + imm14 (byte offset / 4); subfmt=3 */
+    {"adjw",   0xc4,2,3,0}, {"lea",    0xc6,2,3,0},
+    /* F3c — reserved (cbeq/cbne moved to F0b) */
+    /* F3d — 3 bytes, rx ry imm10 */
     {"llb",    0xd0,2,1,0}, {"llw",    0xd1,2,1,0},
     {"lll",    0xd2,2,1,0}, {"slb",    0xd3,2,1,0},
     {"slw",    0xd4,2,1,0}, {"sll",    0xd5,2,1,0},
@@ -287,6 +291,11 @@ static int is_branch4(const char *n)
 {
     return !strcmp(n,"beq") || !strcmp(n,"bne") || !strcmp(n,"blt") ||
            !strcmp(n,"ble") || !strcmp(n,"blts") || !strcmp(n,"bles");
+}
+
+static int is_cbranch4(const char *n)
+{
+    return !strcmp(n,"cbeq") || !strcmp(n,"cbne");
 }
 
 static int parse_reg4(const char *s)
@@ -562,6 +571,11 @@ static void assemble_cpu4(const char *src)
                 if (is_branch4(real_mnem)) {
                     uint16_t tgt = (pass == 2 && nops > 2) ? (uint16_t)parse_tok(ops[2], pass) : 0;
                     imm10 = (int32_t)tgt - (instr_addr + instr_len);
+                    if (pass == 2 && (imm10 < -512 || imm10 > 511)) {
+                        fprintf(stderr, "error: %s displacement %d out of range at 0x%04x\n",
+                                real_mnem, (int)imm10, (unsigned)instr_addr);
+                        exit(1);
+                    }
                 } else {
                     imm10 = (nops > 2) ? (int32_t)strtol(ops[2], NULL, 0) : 0;
                 }
@@ -606,6 +620,34 @@ static void assemble_cpu4(const char *src)
                     write8((uint16_t)(cur+2), b2);
                 }
                 cur += 3;
+            } else if (instr->extra == 2 && instr->subfmt == 7) {
+                /* F0b: cbeq/cbne — rx, imm8, label; encoding: 001odddiiiiiiiiiiiiiiiiii
+                   imm17 = (imm8 << 9) | (disp9 & 0x1ff) */
+                int rx2 = (nops > 0) ? parse_reg4(ops[0]) : 0;
+                int32_t imm8 = (nops > 1) ? (int32_t)strtol(ops[1], NULL, 0) : 0;
+                uint16_t tgt = (pass == 2 && nops > 2) ? (uint16_t)parse_tok(ops[2], pass) : 0;
+                int32_t disp9 = (int32_t)tgt - (instr_addr + instr_len);
+                if (pass == 2 && (disp9 < -256 || disp9 > 255)) {
+                    fprintf(stderr, "error: %s displacement %d out of range at 0x%04x\n",
+                            instr->name, (int)disp9, (unsigned)instr_addr);
+                    exit(1);
+                }
+                int32_t imm17 = ((imm8 & 0xff) << 9) | (disp9 & 0x1ff);
+                /* Encoding: 001o ddd i iiiiiiiiiiiiiiii into 24 bits.
+                   byte0[7:5] = 001, byte0[4] = opcode bit (0=cbeq, 1=cbne),
+                   byte0[3:1] = rx[2:0], byte0[0] = imm17[16]
+                   byte1[7:0] = imm17[15:8]
+                   byte2[7:0] = imm17[7:0] */
+                uint8_t b0 = (instr->first_byte & 0xf0) | (uint8_t)((rx2 & 7) << 1)
+                             | (uint8_t)((imm17 >> 16) & 1);
+                uint8_t b1 = (uint8_t)((imm17 >> 8) & 0xff);
+                uint8_t b2 = (uint8_t)(imm17 & 0xff);
+                if (pass == 2) {
+                    write8((uint16_t)cur,   b0);
+                    write8((uint16_t)(cur+1), b1);
+                    write8((uint16_t)(cur+2), b2);
+                }
+                cur += 3;
             } else if (instr->extra == 2 && instr->subfmt == 5) {
                 /* F3f: rx, ry, imm9 (addli/bitex); subop in bit 9 */
                 int rx2 = (nops > 0) ? parse_reg4(ops[0]) : 0;
@@ -626,6 +668,11 @@ static void assemble_cpu4(const char *src)
                 int rx2 = (nops > 0) ? parse_reg4(ops[0]) : 0;
                 uint16_t tgt = (pass == 2 && nops > 1) ? (uint16_t)parse_tok(ops[1], pass) : 0;
                 int32_t imm10 = (int32_t)tgt - (instr_addr + instr_len);
+                if (pass == 2 && (imm10 < -512 || imm10 > 511)) {
+                    fprintf(stderr, "error: %s displacement %d out of range at 0x%04x\n",
+                            instr->name, (int)imm10, (unsigned)instr_addr);
+                    exit(1);
+                }
                 imm10 &= 0x3ff;
                 uint8_t b0 = 0xdf;
                 uint8_t b1 = (uint8_t)((rx2 << 5) | (instr->subop << 2) | ((imm10 >> 8) & 3));
@@ -689,6 +736,8 @@ static int sym_cmp(const void *a, const void *b)
     return strcmp(sa->name, sb->name);
 }
 
+static int32_t sx9(int32_t v);  /* forward decl — defined with other sign-ext helpers below */
+
 static void print_dump(uint16_t code_end, uint16_t data_end)
 {
     FILE *out = stderr;
@@ -722,8 +771,17 @@ static void print_dump(uint16_t code_end, uint16_t data_end)
         int      len = 1;
         uint8_t  fmt2 = b0 >> 6;
 
-        if (fmt2 == 0) {
-            /* F0: 1 byte */
+        if (fmt2 == 0 && (b0 & 0xe0) == 0x20) {
+            /* F0b: cbeq/cbne — 3 bytes */
+            b1 = mem[(uint16_t)(pc+1)];
+            b2 = mem[(uint16_t)(pc+2)];
+            uint32_t ins24 = ((uint32_t)b0 << 16) | ((uint32_t)b1 << 8) | b2;
+            lookupop = b0 & 0xf0;
+            rd = rx = (int)((ins24 >> 17) & 0x7);
+            imm = (int32_t)(ins24 & 0x1ffff);
+            len = 3;
+        } else if (fmt2 == 0) {
+            /* F0a: 1 byte */
             lookupop = b0;
             len = 1;
         } else if (fmt2 == 1) {
@@ -756,15 +814,15 @@ static void print_dump(uint16_t code_end, uint16_t data_end)
             uint32_t ins24 = ((uint32_t)b0 << 16) | ((uint32_t)b1 << 8) | b2;
             len = 3;
 
-            if ((b0 & 0xf8) == 0xc0) {
-                /* F3a */
-                lookupop = b0;
-                imm = (int32_t)(uint32_t)(((uint16_t)b1 << 8) | b2);
-            } else if ((b0 & 0xf8) == 0xc8) {
-                /* new F3b: adjw, lea */
+            if ((b0 & 0xfc) == 0xc4) {
+                /* F3b: adjw, lea (0xc4-0xc7) */
                 lookupop = b0 & 0xfe;
                 rd = rx = (int)((ins24 >> 14) & 0x7);
                 imm = (int32_t)(ins24 & 0x3fff);
+            } else if ((b0 & 0xfc) == 0xc0) {
+                /* F3a: j, jl, enter (0xc0-0xc3) */
+                lookupop = b0;
+                imm = (int32_t)(uint32_t)(((uint16_t)b1 << 8) | b2);
             } else if (b0 == 0xdf) {
                 /* F3d: beqz, bnez */
                 lookupop = 0xdf;
@@ -805,8 +863,16 @@ static void print_dump(uint16_t code_end, uint16_t data_end)
         if (!mnem) {
             snprintf(operands, sizeof(operands), "???");
             mnem = ".byte";
+        } else if (fmt2 == 0 && (b0 & 0xe0) == 0x20) {
+            /* F0b: cbeq/cbne — rx, imm8, target */
+            int32_t imm8_val = (imm >> 9) & 0xff;
+            int32_t disp9 = sx9(imm & 0x1ff);
+            uint16_t target = (uint16_t)((int)(pc + len) + disp9);
+            const char *tgt = sym_for_target(target);
+            if (*tgt) snprintf(operands, sizeof(operands), "r%d, %d, %s", rx, (int)imm8_val, tgt);
+            else snprintf(operands, sizeof(operands), "r%d, %d, 0x%04x", rx, (int)imm8_val, (unsigned)target);
         } else if (fmt2 == 0) {
-            /* F0: no operands */
+            /* F0a: no operands */
         } else if (fmt2 == 1 && (b0 & 0xfe) == 0x7e) {
             /* F1b: single register */
             snprintf(operands, sizeof(operands), "r%d", rd);
@@ -817,7 +883,17 @@ static void print_dump(uint16_t code_end, uint16_t data_end)
             /* F2: register + signed imm7 */
             int32_t simm7 = (imm >= 64) ? imm - 128 : imm;
             snprintf(operands, sizeof(operands), "r%d, %d", rx, (int)simm7);
-        } else if ((b0 & 0xf8) == 0xc0) {
+        } else if ((b0 & 0xfc) == 0xc4) {
+            /* F3b: adjw/lea */
+            int32_t byte_off = (int32_t)(int16_t)((int16_t)(imm << 2));
+            if (lookupop == 0xc4) {
+                /* adjw: show byte offset */
+                snprintf(operands, sizeof(operands), "%d", (int)byte_off);
+            } else {
+                /* lea: rd, byte_offset */
+                snprintf(operands, sizeof(operands), "r%d, %d", rd, (int)byte_off);
+            }
+        } else if ((b0 & 0xfc) == 0xc0) {
             /* F3a: j/jl → target, enter → frame size */
             if (lookupop == 0xc2) {
                 /* enter: show decimal frame size */
@@ -826,16 +902,6 @@ static void print_dump(uint16_t code_end, uint16_t data_end)
                 const char *tgt = sym_for_target((uint16_t)imm);
                 if (*tgt) snprintf(operands, sizeof(operands), "%s", tgt);
                 else snprintf(operands, sizeof(operands), "0x%04x", (unsigned)(imm & 0xffff));
-            }
-        } else if ((b0 & 0xf8) == 0xc8) {
-            /* new F3b: adjw/lea */
-            int32_t byte_off = (int32_t)(int16_t)((int16_t)(imm << 2));
-            if (lookupop == 0xc8) {
-                /* adjw: show byte offset */
-                snprintf(operands, sizeof(operands), "%d", (int)byte_off);
-            } else {
-                /* lea: rd, byte_offset */
-                snprintf(operands, sizeof(operands), "r%d, %d", rd, (int)byte_off);
             }
         } else if (b0 == 0xdf) {
             /* F3d: beqz/bnez — rx, target */
@@ -928,6 +994,7 @@ static void print_dump(uint16_t code_end, uint16_t data_end)
 static int g_max_steps = MAX_STEPS;
 
 static int32_t sx7 (int32_t v) { v &= 0x7f;   return (v >= 64)   ? v - 128   : v; }
+static int32_t sx9 (int32_t v) { v &= 0x1ff;  return (v >= 256)  ? v - 512   : v; }
 static int32_t sx10(int32_t v) { v &= 0x3ff;  return (v >= 512)  ? v - 1024  : v; }
 static int32_t sx14(int32_t v) { v &= 0x3fff; return (v >= 8192) ? v - 16384 : v; }
 static int32_t sx16(int32_t v) { return (int32_t)(int16_t)(v & 0xffff); }
@@ -960,8 +1027,16 @@ static void run_cpu4(int verbose)
         int      subop = 0;
         uint8_t  fmt2 = b0 >> 6;
 
-        if (fmt2 == 0) {
-            /* F0: 1 byte */
+        if (fmt2 == 0 && (b0 & 0xe0) == 0x20) {
+            /* F0b: cbeq/cbne — 3 bytes, 001odddiiiiiiiiiiiiiiiiii */
+            b1 = read8(pc); pc++;
+            b2 = read8(pc); pc++;
+            uint32_t ins24 = ((uint32_t)b0 << 16) | ((uint32_t)b1 << 8) | b2;
+            lookupop = b0 & 0xf0;           /* 0x20=cbeq, 0x30=cbne */
+            rd = rx  = (int)((ins24 >> 17) & 0x7);
+            imm      = (int32_t)(ins24 & 0x1ffff);  /* raw imm17 */
+        } else if (fmt2 == 0) {
+            /* F0a: 1 byte */
             lookupop = b0;
         } else if (fmt2 == 1) {
             /* F1a or F1b: 2 bytes */
@@ -991,15 +1066,15 @@ static void run_cpu4(int verbose)
             b1 = read8(pc); pc++;
             b2 = read8(pc); pc++;
             uint32_t ins24 = ((uint32_t)b0 << 16) | ((uint32_t)b1 << 8) | b2;
-            if ((b0 & 0xf8) == 0xc0) {
-                /* F3a: j, jl, enter (0xc0–0xc7) */
-                lookupop = b0;
-                imm      = (int32_t)(uint32_t)(((uint16_t)b1 << 8) | b2);
-            } else if ((b0 & 0xf8) == 0xc8) {
-                /* new F3b: adjw, lea (0xc8–0xcf); rd + imm14 */
+            if ((b0 & 0xfc) == 0xc4) {
+                /* F3b: adjw, lea (0xc4–0xc7); rd + imm14 */
                 lookupop = b0 & 0xfe;
                 rd = rx  = (int)((ins24 >> 14) & 0x7);
                 imm      = (int32_t)(ins24 & 0x3fff);  /* raw imm14 */
+            } else if ((b0 & 0xfc) == 0xc0) {
+                /* F3a: j, jl, enter (0xc0–0xc3) */
+                lookupop = b0;
+                imm      = (int32_t)(uint32_t)(((uint16_t)b1 << 8) | b2);
             } else if (b0 == 0xdf) {
                 /* F3d: beqz, bnez */
                 lookupop = 0xdf;
@@ -1109,10 +1184,13 @@ static void run_cpu4(int verbose)
             write32((uint16_t)(sp-4), ((uint32_t)lr << 16) | (uint32_t)bp);
             bp=(uint16_t)(sp-4); sp=(uint16_t)(sp-(uint16_t)imm-4);
             break;
-        /* new F3b: adjw=0xc8, lea=0xca */
-        case 0xc8: sp=(uint16_t)(sp+(uint16_t)(sx14(imm)<<2)); break; /* adjw */
-        case 0xca: r[rd]=(uint32_t)((int32_t)bp+(sx14(imm)<<2)); break; /* lea */
-        /* F3b — register-relative */
+        /* F3b: adjw=0xc4, lea=0xc6 */
+        case 0xc4: sp=(uint16_t)(sp+(uint16_t)(sx14(imm)<<2)); break; /* adjw */
+        case 0xc6: r[rd]=(uint32_t)((int32_t)bp+(sx14(imm)<<2)); break; /* lea */
+        /* F0b: cbeq=0x20, cbne=0x30 — compare rx with imm8 and branch */
+        case 0x20: if(r[rx]==(uint32_t)(imm>>9))  pc=(uint16_t)(pc+sx9(imm&0x1ff)); break; /* cbeq */
+        case 0x30: if(r[rx]!=(uint32_t)(imm>>9))  pc=(uint16_t)(pc+sx9(imm&0x1ff)); break; /* cbne */
+        /* F3d — register-relative */
         case 0xd0: r[rx]=read8 ((uint16_t)((int32_t)r[ry]+sx10(imm)));     break; /* llb  */
         case 0xd1: { uint16_t a = (uint16_t)((int32_t)r[ry]+sx10(imm)*2); check_align16(a, oldpc); r[rx]=read16(a); } break; /* llw  */
         case 0xd2: { uint16_t a = (uint16_t)((int32_t)r[ry]+sx10(imm)*4); check_align32(a, oldpc); r[rx]=read32(a); } break; /* lll  */

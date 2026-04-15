@@ -89,8 +89,9 @@ Node* parse tree  (output of resolve_symbols / derive_types / insert_coercions)
       └─ emit_function()    emit.c       physical-reg IR → CPU4 assembly text
                                          P1: branch-to-next elimination
                                          P2–P4: inc/dec, addi, addli compact encodings
-                                         P5: compare+branch fusion (F3b)
-                                         P16: SHR+AND → bitex fusion (F3f)
+                                         P5: compare+branch fusion (F3d)
+                                         P16: SHR+AND → bitex fusion (F3e)
+                                         P17: EQ/NE(x, const8) → cbeq/cbne (F0b)
 ```
 
 **Regime 1 (Sexp tree) optimisation passes are not implemented.** The pipeline goes
@@ -744,6 +745,26 @@ After:  bitex rd, src, 98                            (3 bytes, 1 instruction)
 For `IK_SHR` (arithmetic), an additional safety check ensures `shift + width <= 32` so
 that sign-extended bits do not leak into the extracted field.
 
+**P17 — cbeq/cbne fusion (EQ/NE with 8-bit constant)**
+
+Replaces `IK_EQ(x, const)` or `IK_NE(x, const)` followed by `IK_BR` — where `const` is
+an unsigned 8-bit value (0–255) and the branch target is within the F0b 9-bit signed
+displacement range (±255 bytes) — with a single `cbeq`/`cbne` instruction (F0b, 3 bytes).
+
+This replaces the P5+ pattern (`immw scratch, const; beq/bne rx, scratch, target`,
+5 bytes) with a single 3-byte instruction. Checked after P6 (which handles the `const == 0`
+case with `jz`/`jnz` at unlimited range) and before P5+ (which handles out-of-range or
+non-EQ/NE comparisons).
+
+```
+Before: immw r0, 44; beq r6, r0, _f_B7     (6 bytes, 2 instructions)
+After:  cbeq r6, 44, _f_B7                  (3 bytes, 1 instruction)
+```
+
+Supports branch inversion: when the true target is the fall-through block, emits the
+inverted instruction (`cbeq` ↔ `cbne`) branching to the false target, eliminating the
+trailing `j` instruction.
+
 ---
 
 ## Pass Summary (Implemented)
@@ -782,7 +803,7 @@ See **@docs/optimization-passes.md** for the full catalog with dependencies and 
 | legalize Pass E | `legalize.c` | AND-chain constant folding |
 | legalize Pass F | `legalize.c` | Materialize large VAL_CONST operands |
 | IRC | `alloc.c` | Appel & George 1996; K=8; phantom-node ABI; George coalescing; spill support |
-| emission P1–P16 | `emit.c` | CPU4 assembly; branch-to-next; compact encodings; compare+branch fusion; loop rotation; bitex fusion |
+| emission P1–P17 | `emit.c` | CPU4 assembly; branch-to-next; compact encodings; compare+branch fusion; loop rotation; bitex fusion; cbeq/cbne fusion |
 | speculative pipeline | `smallcc.c` | Try conservative + aggressive profiles, pick cheaper (`-speculative`) |
 
 ---
