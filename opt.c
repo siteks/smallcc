@@ -311,12 +311,29 @@ static void gvn_walk(Block *b, Function *f) {
                     // is already live at the outer level, so reusing it
                     // inside the inner loop is free.  Same-depth cross-block
                     // CSE extends live ranges and increases pressure.
+                    //
+                    // Exception: skip cross-depth CSE when all operands are
+                    // VAL_CONST (the instruction is trivially rematerializable).
+                    // Eliminating such an instruction extends the canonical's
+                    // live range from the preheader through the loop body,
+                    // wasting a register for a value that costs only an immw
+                    // to recreate locally.
                     if (dominates(cb, b) &&
                         b->loop_depth > cb->loop_depth) {
-                        int crosses = 0;
-                        for (Block *w = b; w && w != cb; w = w->idom)
-                            if (w->loop_depth > b->loop_depth) { crosses = 1; break; }
-                        if (!crosses) xblock_ok = 1;
+                        int all_const = 1;
+                        for (int oi = 0; oi < inst->nops; oi++) {
+                            Value *ov = inst->ops[oi];
+                            if (ov) ov = val_resolve(ov);
+                            if (ov && ov->kind != VAL_CONST) { all_const = 0; break; }
+                        }
+                        if (all_const && inst->nops >= 0) {
+                            /* rematerializable — keep the local copy */
+                        } else {
+                            int crosses = 0;
+                            for (Block *w = b; w && w != cb; w = w->idom)
+                                if (w->loop_depth > b->loop_depth) { crosses = 1; break; }
+                            if (!crosses) xblock_ok = 1;
+                        }
                     }
                 } else {
                     if (gvn_ops_safe(inst)) {

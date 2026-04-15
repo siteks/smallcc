@@ -963,7 +963,7 @@ static void emit_inst(Inst *inst, FILE *out) {
 // ============================================================
 
 typedef struct {
-    int         fused;     // 0=none, 1=P5 two-reg, 2=P5+ const-operand, 3=P6 zero-test
+    int         fused;     // 0=none, 1=P5 two-reg, 2=P5+ const-operand, 3=P6 zero-test, 4=P17 cbeq/cbne
     const char *mnem;      // F3b branch mnemonic (beq/bne/blt/ble/blts/bles)
     int         p0, p1;    // physical registers of the comparison operands
     int         const_val; // P5+: the constant operand's value
@@ -1006,7 +1006,12 @@ static void remap_single_use_values(Function *f) {
         for (Inst *inst = b->tail; inst; inst = inst->prev) {
             if (inst->is_dead || !inst->dst) continue;
             Value *v = inst->dst;
-            if (v->use_count != 1 || v->phys_reg < 0) continue;
+            if (v->use_count != 1 || v->phys_reg < 0) {
+                if (inst->kind == IK_CONST && v->phys_reg >= 0 && getenv("DEBUG_REMAP"))
+                    fprintf(stderr, "remap skip: %s v%d r%d use_count=%d\n",
+                            f->name, v->id, v->phys_reg, v->use_count);
+                continue;
+            }
             // Don't remap call results (must be r0) or params
             if (inst->kind == IK_CALL || inst->kind == IK_ICALL ||
                 inst->kind == IK_PARAM || inst->kind == IK_PUTCHAR)
@@ -1120,6 +1125,94 @@ static int emit_prologue(Function *f, FILE *out, int frame, int callee_save[4]) 
         }
     }
     return callee_frame;
+}
+
+// Pre-pass: sink IK_CONST instructions within each block to just before
+// their first use, reducing register pressure from early materialization.
+//
+// Example: braun.c emits `C[i*N+j] = 0` as `IK_CONST 0` at source order,
+// but scalar promotion turns it into an accumulator init whose first use
+// is 10+ instructions later.  Sinking the const frees the register during
+// the intervening address-setup code.
+static void sink_consts(Function *f) {
+    // Two-pass approach to avoid linked-list mutation during iteration.
+    // Pass 1: collect (IK_CONST inst, first_use inst) pairs.
+    // Pass 2: perform all unlink/insert operations.
+    typedef struct { Inst *konst; Inst *before; } SinkPair;
+    for (int bi = 0; bi < f->nblocks; bi++) {
+        Block *b = f->blocks[bi];
+        SinkPair pairs[64];
+        int npairs = 0;
+
+        // Pass 1: collect sinkable IK_CONST → first_use pairs
+        for (Inst *inst = b->head; inst; inst = inst->next) {
+            if (npairs >= 64) break;
+            if (inst->is_dead || inst->kind != IK_CONST || !inst->dst ||
+                inst->dst->phys_reg < 0)
+                continue;
+
+            int reg = inst->dst->phys_reg;
+            Value *val = inst->dst;
+
+            // Find first non-dead use of val in this block
+            Inst *first_use = NULL;
+            for (Inst *scan = inst->next; scan; scan = scan->next) {
+                if (scan->is_dead) continue;
+                for (int j = 0; j < scan->nops; j++) {
+                    Value *v = scan->ops[j] ? val_resolve(scan->ops[j]) : NULL;
+                    if (v == val) { first_use = scan; goto sink_found; }
+                }
+            }
+            sink_found:
+
+            if (!first_use || first_use == inst->next)
+                continue;
+
+            // Safety: no intermediate (non-dead) instruction may define or
+            // read the same physical register.
+            int safe = 1;
+            for (Inst *scan = inst->next; scan && scan != first_use; scan = scan->next) {
+                if (scan->is_dead) continue;
+                if (scan->dst && scan->dst->phys_reg == reg) { safe = 0; break; }
+                for (int j = 0; j < scan->nops; j++) {
+                    Value *v = scan->ops[j] ? val_resolve(scan->ops[j]) : NULL;
+                    if (v && v->kind == VAL_INST && v->phys_reg == reg)
+                        { safe = 0; break; }
+                }
+                if (!safe) break;
+            }
+            if (!safe) continue;
+
+            pairs[npairs++] = (SinkPair){inst, first_use};
+        }
+
+        // Pass 2: perform all sinks
+        for (int i = 0; i < npairs; i++) {
+            Inst *inst = pairs[i].konst;
+            Inst *before = pairs[i].before;
+
+            // Re-check: inst must still be before `before` in the list
+            // (a prior sink in this batch may have moved things around)
+            int still_before = 0;
+            for (Inst *scan = inst->next; scan; scan = scan->next) {
+                if (scan == before) { still_before = 1; break; }
+            }
+            if (!still_before || before == inst->next) continue;
+
+            // Unlink from current position
+            if (inst->prev) inst->prev->next = inst->next;
+            else b->head = inst->next;
+            if (inst->next) inst->next->prev = inst->prev;
+            else b->tail = inst->prev;
+
+            // Insert before target
+            inst->prev = before->prev;
+            inst->next = before;
+            if (before->prev) before->prev->next = inst;
+            else b->head = inst;
+            before->prev = inst;
+        }
+    }
 }
 
 // Pre-pass: mark IK_CONST instructions dead when their only consumer
@@ -1241,13 +1334,13 @@ static void detect_bitex_fusions(Function *f) {
             Value *o0 = inst->ops[0] ? val_resolve(inst->ops[0]) : NULL;
             Value *o1 = inst->ops[1] ? val_resolve(inst->ops[1]) : NULL;
 
-            // Identify which operand is the mask constant and which is the SHR result
+            // Identify which operand is the mask constant and which is the data
             int mask_val;
-            Value *shr_val;
+            Value *data_val;
             if (o1 && resolve_const(o1, &mask_val) && o0 && o0->kind == VAL_INST) {
-                shr_val = o0;
+                data_val = o0;
             } else if (o0 && resolve_const(o0, &mask_val) && o1 && o1->kind == VAL_INST) {
-                shr_val = o1;
+                data_val = o1;
             } else {
                 continue;
             }
@@ -1255,66 +1348,104 @@ static void detect_bitex_fusions(Function *f) {
             int width = bitex_width(mask_val);
             if (!width) continue;
 
-            // SHR result must come from IK_SHR or IK_USHR
-            Inst *shr_def = shr_val->def;
-            if (!shr_def || (shr_def->kind != IK_SHR && shr_def->kind != IK_USHR))
-                continue;
-            if (shr_def->nops < 2 || shr_def->block != b) continue;
+            // Try SHR+AND → bitex fusion (shift > 0): data must come from
+            // IK_SHR/IK_USHR in the same block with constant shift amount.
+            Inst *shr_def = data_val->def;
+            if (shr_def &&
+                (shr_def->kind == IK_SHR || shr_def->kind == IK_USHR) &&
+                shr_def->nops >= 2 && shr_def->block == b &&
+                data_val->use_count == 1) {
+                int shift_val;
+                if (resolve_const(shr_def->ops[1] ? val_resolve(shr_def->ops[1]) : NULL, &shift_val)) {
+                    shift_val &= 31;
+                    if (shr_def->kind == IK_SHR && shift_val + width > 32)
+                        goto try_standalone;
+                    Value *shr_src = shr_def->ops[0] ? val_resolve(shr_def->ops[0]) : NULL;
+                    if (!shr_src || shr_src->kind != VAL_INST || shr_src->phys_reg < 0)
+                        goto try_standalone;
+                    int src_preg = shr_src->phys_reg;
+                    int clobbered = 0;
+                    for (Inst *scan = shr_def->next; scan && scan != inst; scan = scan->next) {
+                        if (scan->is_dead) continue;
+                        if (scan->dst && scan->dst->phys_reg == src_preg)
+                            { clobbered = 1; break; }
+                    }
+                    if (clobbered) goto try_standalone;
 
-            // SHR must have a constant shift amount
-            int shift_val;
-            if (!resolve_const(shr_def->ops[1] ? val_resolve(shr_def->ops[1]) : NULL, &shift_val))
-                continue;
-            shift_val &= 31;
-
-            // For arithmetic SHR (IK_SHR), ensure extracted bits are within the
-            // original word so sign-extension bits don't leak into the result.
-            if (shr_def->kind == IK_SHR && shift_val + width > 32) continue;
-
-            // SHR result used only by this AND
-            if (shr_val->use_count > 1) continue;
-
-            // SHR source must be in a physical register
-            Value *shr_src = shr_def->ops[0] ? val_resolve(shr_def->ops[0]) : NULL;
-            if (!shr_src || shr_src->kind != VAL_INST || shr_src->phys_reg < 0)
-                continue;
-            int src_preg = shr_src->phys_reg;
-
-            // Verify source register is not clobbered between SHR and AND
-            int clobbered = 0;
-            for (Inst *scan = shr_def->next; scan && scan != inst; scan = scan->next) {
-                if (scan->is_dead) continue;
-                if (scan->dst && scan->dst->phys_reg == src_preg) {
-                    clobbered = 1;
-                    break;
+                    // Record SHR+AND fusion
+                    int width_code = width - 1;
+                    int vid = inst->dst->id;
+                    g_bitex_src[vid] = src_preg;
+                    g_bitex_imm[vid] = shift_val | (width_code << 5);
+                    shr_def->is_dead = 1;
+                    // Mark SHR's shift constant dead if single use
+                    Value *shift_op = shr_def->ops[1] ? val_resolve(shr_def->ops[1]) : NULL;
+                    if (shift_op && shift_op->kind == VAL_INST && shift_op->def &&
+                        shift_op->def->kind == IK_CONST && !shift_op->def->fname &&
+                        shift_op->use_count <= 1)
+                        shift_op->def->is_dead = 1;
+                    // Mark AND's mask constant dead if single use
+                    Value *mask_op = (data_val == o0) ? o1 : o0;
+                    if (mask_op && mask_op->kind == VAL_INST && mask_op->def &&
+                        mask_op->def->kind == IK_CONST && !mask_op->def->fname &&
+                        mask_op->use_count <= 1)
+                        mask_op->def->is_dead = 1;
+                    continue;
                 }
             }
-            if (clobbered) continue;
 
-            // Record fusion
-            int width_code = width - 1;  // 0..15
-            int vid = inst->dst->id;
-            g_bitex_src[vid] = src_preg;
-            g_bitex_imm[vid] = shift_val | (width_code << 5);
-
-            // Mark the SHR instruction dead
-            shr_def->is_dead = 1;
-
-            // Mark the SHR's shift constant dead if it's an IK_CONST with single use
-            Value *shift_op = shr_def->ops[1] ? val_resolve(shr_def->ops[1]) : NULL;
-            if (shift_op && shift_op->kind == VAL_INST && shift_op->def &&
-                shift_op->def->kind == IK_CONST && !shift_op->def->fname &&
-                shift_op->use_count <= 1)
-                shift_op->def->is_dead = 1;
-
-            // Mark the AND's mask constant dead if it's an IK_CONST with single use
-            Value *mask_op = (shr_val == o0) ? o1 : o0;
-            if (mask_op && mask_op->kind == VAL_INST && mask_op->def &&
-                mask_op->def->kind == IK_CONST && !mask_op->def->fname &&
-                mask_op->use_count <= 1)
-                mask_op->def->is_dead = 1;
+            // Standalone AND → bitex with shift=0.  Only for masks not
+            // already handled by cheaper peepholes:
+            //   P14 andi:  masks 0–127 (2 bytes)
+            //   P8  zxb:   mask 0xFF   (2 bytes)
+            //   P8  zxw:   mask 0xFFFF (2 bytes)
+            // bitex is 3 bytes, so only beneficial for masks 256–32767.
+            try_standalone:
+            if (mask_val <= 0xFF || mask_val == 0xFFFF) continue;
+            if (data_val->phys_reg < 0) continue;
+            {
+                int width_code = width - 1;
+                int vid = inst->dst->id;
+                g_bitex_src[vid] = data_val->phys_reg;
+                g_bitex_imm[vid] = width_code << 5;  // shift=0
+                // Mark AND's mask value dead if single use.  The mask may
+                // be an IK_CONST or an IK_AND(const, const) from legalize
+                // TRUNC lowering.  Cascade to operands if they become unused.
+                Value *mask_op = (data_val == o0) ? o1 : o0;
+                if (mask_op && mask_op->kind == VAL_INST && mask_op->def &&
+                    !mask_op->def->fname && mask_op->use_count <= 1) {
+                    Inst *md = mask_op->def;
+                    md->is_dead = 1;
+                    // Cascade: mark single-use IK_CONST operands dead too
+                    for (int oi = 0; oi < md->nops; oi++) {
+                        Value *mop = md->ops[oi] ? val_resolve(md->ops[oi]) : NULL;
+                        if (mop && mop->kind == VAL_INST && mop->def &&
+                            mop->def->kind == IK_CONST && !mop->def->fname &&
+                            mop->use_count <= 1)
+                            mop->def->is_dead = 1;
+                    }
+                }
+            }
         }
     }
+}
+
+// Check if a value is a known zero: VAL_CONST 0, IK_CONST 0, or
+// SEXT8/SEXT16 of a zero source (e.g. sext16 of NULL pointer literal).
+static int is_known_zero(Value *v) {
+    if (!v) return 0;
+    if (v->kind == VAL_CONST && v->iconst == 0) return 1;
+    if (v->kind != VAL_INST || !v->def) return 0;
+    Inst *d = v->def;
+    if (d->kind == IK_CONST && !d->fname && d->imm == 0) return 1;
+    if ((d->kind == IK_SEXT8 || d->kind == IK_SEXT16) && d->nops >= 1) {
+        Value *src = d->ops[0] ? val_resolve(d->ops[0]) : NULL;
+        if (src && src->kind == VAL_CONST && src->iconst == 0) return 1;
+        if (src && src->kind == VAL_INST && src->def &&
+            src->def->kind == IK_CONST && !src->def->fname && src->def->imm == 0)
+            return 1;
+    }
+    return 0;
 }
 
 // Detect comparison+branch pairs that can be fused into F3b branches.
@@ -1406,6 +1537,33 @@ static void detect_branch_fusions(Function *f, BranchFuse *fuse) {
         }
         int in_range = (est_bytes <= 450);
 
+        // P6: NE(x, 0) or EQ(x, 0) → jnz/jz directly (checked before P5
+        // because P6 needs no scratch register and saves the immw entirely).
+        // Must also recognise IK_CONST-materialised zeros (VAL_INST from
+        // legalize Pass F), not just raw VAL_CONST.
+        if ((def->kind == IK_NE || def->kind == IK_EQ) && def->nops >= 2) {
+            int d0_zero = is_known_zero(dop0);
+            int d1_zero = is_known_zero(dop1);
+            Value *test_val = NULL;
+            if (d1_zero && dop0 && dop0->kind == VAL_INST && dop0->phys_reg >= 0)
+                test_val = dop0;
+            else if (d0_zero && dop1 && dop1->kind == VAL_INST && dop1->phys_reg >= 0)
+                test_val = dop1;
+            if (test_val) {
+                def->is_dead     = 1;
+                // Mark the zero-producing instruction dead if it has no
+                // other live uses (saves the immw instruction).
+                Value *zero_v = (test_val == dop0) ? dop1 : dop0;
+                if (zero_v && zero_v->kind == VAL_INST && zero_v->def &&
+                    zero_v->use_count <= 1)
+                    zero_v->def->is_dead = 1;
+                fuse[fbi].fused  = 3;
+                fuse[fbi].p0     = test_val->phys_reg;
+                fuse[fbi].is_eq  = (def->kind == IK_EQ);
+                continue;
+            }
+        }
+
         // P5: both operands are registers
         if (in_range &&
             dop0 && dop0->kind == VAL_INST && dop0->phys_reg >= 0 &&
@@ -1420,22 +1578,39 @@ static void detect_branch_fusions(Function *f, BranchFuse *fuse) {
             continue;
         }
 
-        // P6: NE(x, 0) or EQ(x, 0) → jnz/jz directly (checked before P5+
-        // because P6 needs no scratch register and saves the immw entirely)
-        if ((def->kind == IK_NE || def->kind == IK_EQ) && def->nops >= 2) {
-            Value *test_val = NULL;
-            if (dop1 && dop1->kind == VAL_CONST && dop1->iconst == 0 &&
+        // P17: cbeq/cbne — EQ/NE with 8-bit unsigned const, short-range
+        if ((def->kind == IK_EQ || def->kind == IK_NE) && def->nops >= 2) {
+            Value *cb_reg = NULL, *cb_const = NULL;
+            if (dop1 && dop1->kind == VAL_CONST && dop1->iconst >= 0 && dop1->iconst <= 255 &&
                 dop0 && dop0->kind == VAL_INST && dop0->phys_reg >= 0)
-                test_val = dop0;
-            else if (dop0 && dop0->kind == VAL_CONST && dop0->iconst == 0 &&
+                { cb_reg = dop0; cb_const = dop1; }
+            else if (dop0 && dop0->kind == VAL_CONST && dop0->iconst >= 0 && dop0->iconst <= 255 &&
                      dop1 && dop1->kind == VAL_INST && dop1->phys_reg >= 0)
-                test_val = dop1;
-            if (test_val) {
-                def->is_dead     = 1;
-                fuse[fbi].fused  = 3;
-                fuse[fbi].p0     = test_val->phys_reg;
-                fuse[fbi].is_eq  = (def->kind == IK_EQ);
-                continue;
+                { cb_reg = dop1; cb_const = dop0; }
+            if (cb_reg && cb_const) {
+                // Determine which target we'll actually branch to
+                Block *next_det = (fbi + 1 < f->nblocks) ? f->blocks[fbi + 1] : NULL;
+                int will_inv = (term->target == next_det && term->target2 != NULL);
+                Block *cb_tgt = will_inv ? term->target2 : term->target;
+                int cb_tbi = -1;
+                for (int k = 0; k < f->nblocks; k++)
+                    if (f->blocks[k] == cb_tgt) { cb_tbi = k; break; }
+                if (cb_tbi >= 0) {
+                    int cb_lo = (fbi < cb_tbi) ? fbi + 1 : cb_tbi;
+                    int cb_hi = (fbi < cb_tbi) ? cb_tbi : fbi;
+                    int cb_est = 0;
+                    for (int k = cb_lo; k < cb_hi; k++)
+                        for (Inst *ii = f->blocks[k]->head; ii; ii = ii->next)
+                            if (!ii->is_dead) cb_est += 5;
+                    if (cb_est <= 200) {
+                        def->is_dead        = 1;
+                        fuse[fbi].fused     = 4;
+                        fuse[fbi].p0        = cb_reg->phys_reg;
+                        fuse[fbi].const_val = cb_const->iconst;
+                        fuse[fbi].is_eq     = (def->kind == IK_EQ);
+                        continue;
+                    }
+                }
             }
         }
 
@@ -1578,6 +1753,7 @@ void emit_function(Function *f, FILE *out) {
 
     mark_dead_consts(f);
     remap_single_use_values(f);
+    sink_consts(f);
     detect_bitex_fusions(f);
 
     BranchFuse *fuse = arena_alloc(f->nblocks * sizeof(BranchFuse));
@@ -1704,6 +1880,19 @@ void emit_function(Function *f, FILE *out) {
                         fprintf(out, "    %s %s, _%s_B%d\n",
                                 fuse[bi].is_eq ? "jz" : "jnz",
                                 regname(fuse[bi].p0),
+                                f->name, inst->target->id);
+                    }
+                } else if (fuse[bi].fused == 4) {
+                    if (inst->target == next_blk && inst->target2) {
+                        fprintf(out, "    %s %s, %d, _%s_B%d\n",
+                                fuse[bi].is_eq ? "cbne" : "cbeq",
+                                regname(fuse[bi].p0), fuse[bi].const_val,
+                                f->name, inst->target2->id);
+                        inverted = 1;
+                    } else if (inst->target) {
+                        fprintf(out, "    %s %s, %d, _%s_B%d\n",
+                                fuse[bi].is_eq ? "cbeq" : "cbne",
+                                regname(fuse[bi].p0), fuse[bi].const_val,
                                 f->name, inst->target->id);
                     }
                 } else {

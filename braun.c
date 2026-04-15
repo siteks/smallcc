@@ -664,14 +664,15 @@ static Value *emit_binop(BraunCtx *ctx, Block *b, InstKind kind, Value *lhs, Val
         default: break;
         }
     }
-    // Check lhs-is-const for commutative ops (MUL identity/power-of-2)
-    if (lhs && lhs->kind == VAL_CONST && kind == IK_MUL) {
-        int32_t k = lhs->iconst;
-        // Note: k==1 fold (return rhs) is intentionally skipped. It changes the
-        // IRC interference graph in core_init_state and triggers a latent
-        // coalescing bug (same family as the TRUNC constant-fold IRC bug).
-        if (k > 1 && alg_is_pow2(k))
-            return emit_binop(ctx, b, IK_SHL, rhs, new_const(ctx->f, alg_log2(k), VT_I16), vt);
+    // Canonicalize: for commutative ops, put const on the right so the
+    // rhs-const rules above handle all identity/strength-reduction cases.
+    if (lhs && lhs->kind == VAL_CONST && rhs && rhs->kind != VAL_CONST) {
+        switch (kind) {
+        case IK_ADD: case IK_MUL: case IK_AND: case IK_OR: case IK_XOR:
+        case IK_EQ: case IK_NE:
+            return emit_binop(ctx, b, kind, rhs, lhs, vt);
+        default: break;
+        }
     }
     // ── End algebraic simplification ────────────────────────────────────────
 
@@ -1363,7 +1364,7 @@ static Value *cg_expr(BraunCtx *ctx, Block **cur, Node *n) {
         else if (src_vt == VT_I8)                                  kind = IK_SEXT8;
         else if (src_vt == VT_I16)                                 kind = IK_SEXT16;
 
-        // Fold SEXT of constants at construction time.
+        // Fold casts of constants at construction time.
         // Skip pointer types: VAL_CONST can't be used as a memory base
         // address (no phys_reg), so pointer-typed constants must remain
         // as VAL_INST to get a register from IRC.
@@ -1371,6 +1372,16 @@ static Value *cg_expr(BraunCtx *ctx, Block **cur, Node *n) {
             int32_t k = v->iconst;
             if (kind == IK_SEXT8)  return new_const(ctx->f, (int8_t)(k & 0xff), vt);
             if (kind == IK_SEXT16) return new_const(ctx->f, (int16_t)(k & 0xffff), vt);
+            if (kind == IK_ITOF) {
+                float fv = (float)k;
+                uint32_t bits; memcpy(&bits, &fv, sizeof bits);
+                return new_const(ctx->f, (int32_t)bits, vt);
+            }
+            if (kind == IK_FTOI) {
+                float fv; uint32_t uk = (uint32_t)k;
+                memcpy(&fv, &uk, sizeof fv);
+                return new_const(ctx->f, (int32_t)fv, vt);
+            }
         }
 
         Value *dst = new_value(ctx->f, VAL_INST, vt);
