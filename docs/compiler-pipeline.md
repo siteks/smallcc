@@ -80,8 +80,9 @@ Node* parse tree  (output of resolve_symbols / derive_types / insert_coercions)
       │   ├─ Pass C: lower IK_NEG/IK_NOT → IK_SUB(0,src)/IK_EQ(src,0) + explicit IK_CONST(0)
       │   ├─ Pass D: lower IK_ZEXT/IK_TRUNC → IK_CONST(mask) + IK_AND
       │   │           fast-path: TRUNC(VAL_CONST(k)) → IK_CONST(k & 0xff) for 8-bit truncation
-      │   └─ Pass E: AND-chain constant folding — AND(AND(x,c1),c2) → AND(x,c1&c2);
-      │               also looks through type-coercing IK_COPY chains
+      │   ├─ Pass E: AND-chain constant folding — AND(AND(x,c1),c2) → AND(x,c1&c2);
+      │   │           also looks through type-coercing IK_COPY chains
+      │   └─ Pass F: materialize VAL_CONST operands outside F0b range (|k| > 255)
       │
       ├─ irc_allocate()     alloc.c      IRC register allocation (Appel & George 1996)
       │                                  vregs → physical r0–r7; spills if needed
@@ -89,9 +90,11 @@ Node* parse tree  (output of resolve_symbols / derive_types / insert_coercions)
       └─ emit_function()    emit.c       physical-reg IR → CPU4 assembly text
                                          P1: branch-to-next elimination
                                          P2–P4: inc/dec, addi, addli compact encodings
-                                         P5: compare+branch fusion (F3d)
-                                         P16: SHR+AND → bitex fusion (F3e)
-                                         P17: EQ/NE(x, const8) → cbeq/cbne (F0b)
+                                         P5: compare+branch fusion (F3c)
+                                         P16: SHR+AND → bitex fusion (F0b)
+                                         P17: EQ/NE(x, const8) → cbeq/cbne (F0c)
+                                         P18: MUL(x, const) → mulli (F0b)
+                                         P19: general F0b immediate ALU (cmp/div/mod/or/xor)
 ```
 
 **Regime 1 (Sexp tree) optimisation passes are not implemented.** The pipeline goes
@@ -669,7 +672,7 @@ immediately before each `ret`. Uses bp-relative F2 instructions when in range.
 Float operations (`IK_FADD` etc.) are emitted as CPU4 float instructions (`fadd`, etc.)
 or lowered to libcalls if needed. The target ISA has native float instructions.
 
-### Peephole passes (P1–P5)
+### Peephole passes (P1–P18)
 
 These run inside `emit_function` on the physical-register IR. They fire during emission
 with no IR mutations — each fires only when the exact structural condition is met.
@@ -698,7 +701,7 @@ emits `addi rd, k` (F2, 2 bytes) instead of `immw + add` (5 bytes).
 **P4 — Addli for cross-register medium constants**
 
 When `IK_ADD` has one constant operand `k` with `|k| ≤ 255` and `rd ≠ preg(other_operand)`:
-emits `addli rd, src, k` (F3f, 3 bytes) instead of `immw rd, k; add rd, src, rd` (5 bytes).
+emits `addli rd, src, k` (F0b, 3 bytes) instead of `immw rd, k; add rd, src, rd` (5 bytes).
 P2/P3/P4 are checked in order: P2 first (smallest), then P3 (in-place), then P4 (cross-reg).
 Negative-constant subtraction is canonicalized: `sub rd, ra, k` → `add rd, ra, -k` before
 the P2–P4 range checks.
@@ -706,7 +709,7 @@ the P2–P4 range checks.
 **P5 — Compare+branch fusion**
 
 Replaces a comparison instruction immediately followed by `IK_BR` using that comparison's
-result (with `use_count == 1`) by a single F3b branch instruction.
+result (with `use_count == 1`) by a single F3c branch instruction.
 
 A pre-pass over all blocks marks fuseable pairs by recording `(mnemonic, op0, op1)` in
 a per-block side table. During emission, the comparison is suppressed and the `IK_BR` emits
@@ -720,16 +723,16 @@ After:  blts ra, rb, T_label; j F        (6 bytes, otherwise)
 ```
 
 Supported fused comparisons: `IK_LT/LE/EQ/NE` (signed: `blts/bles/beq/bne`) and
-`IK_ULT/ULE` (unsigned: `blt/ble`). Float comparisons are not fused (no F3b float-branch).
+`IK_ULT/ULE` (unsigned: `blt/ble`). Float comparisons are not fused (no F3c float-branch).
 
-Fusion is skipped when the estimated byte distance to the true target exceeds the F3b
+Fusion is skipped when the estimated byte distance to the true target exceeds the F3c
 signed 10-bit offset range (±511 bytes from the instruction end).
 
 **P16 — Bitex fusion (SHR + AND → bitex)**
 
 Replaces `SHR(x, k_shift)` followed by `AND(result, k_mask)` — where `k_mask` is
 `(1 << width) - 1` for `width` in 1..16 and `k_shift` in 0..31 — with a single
-`bitex rd, src, imm9` instruction (F3f, 3 bytes).
+`bitex rd, src, imm9` instruction (F0b, 3 bytes).
 
 A pre-pass (`detect_bitex_fusions`) scans for the pattern: the AND has one constant
 mask operand that is a valid bitex mask, the other operand is defined by `IK_SHR`/`IK_USHR`
@@ -748,8 +751,8 @@ that sign-extended bits do not leak into the extracted field.
 **P17 — cbeq/cbne fusion (EQ/NE with 8-bit constant)**
 
 Replaces `IK_EQ(x, const)` or `IK_NE(x, const)` followed by `IK_BR` — where `const` is
-an unsigned 8-bit value (0–255) and the branch target is within the F0b 9-bit signed
-displacement range (±255 bytes) — with a single `cbeq`/`cbne` instruction (F0b, 3 bytes).
+an unsigned 8-bit value (0–255) and the branch target is within the F0c 9-bit signed
+displacement range (±255 bytes) — with a single `cbeq`/`cbne` instruction (F0c, 3 bytes).
 
 This replaces the P5+ pattern (`immw scratch, const; beq/bne rx, scratch, target`,
 5 bytes) with a single 3-byte instruction. Checked after P6 (which handles the `const == 0`
@@ -764,6 +767,28 @@ After:  cbeq r6, 44, _f_B7                  (3 bytes, 1 instruction)
 Supports branch inversion: when the true target is the fall-through block, emits the
 inverted instruction (`cbeq` ↔ `cbne`) branching to the false target, eliminating the
 trailing `j` instruction.
+
+**P18 — MUL(x, const) → mulli**
+
+When `IK_MUL` has one constant operand `k ∈ [−256, 255]`, emits `mulli rd, src, k`
+(F0b, 3 bytes) instead of `immw tmp, k; mul rd, src, tmp` (5 bytes).
+
+**P19 — General F0b immediate ALU**
+
+Replaces `immw + alu` sequences with F0b two-op+imm9 instructions (3 bytes vs 5) for
+operations not covered by P2–P18. Handles:
+
+- **Comparisons**: `EQ/NE(x, k)` → `eqli`/`neli`; `LE/ULE(x, k)` → `lesli`/`leli`;
+  `LT/ULT(k, x)` → `gtsli`/`gtli`. For `LT(x, k)` the const-1 trick transforms
+  `x < k` into `x <= k-1` → `lesli`/`leli` (guarded against sext9 underflow).
+- **Reverse SUB**: `SUB(k, x)` → `rsubli` (forward SUB handled by P4).
+- **Division/modulo**: `DIV(x, k)` → `divsli`; `UDIV(x, k)` → `divli`;
+  `MOD(x, k)` → `modsli`; `UMOD(x, k)` → `modli`. Reverse forms: `DIV(k, x)` →
+  `rdivsli`; `UDIV(k, x)` → `rdivli`; `UMOD(k, x)` → `rmodli`.
+- **Bitwise**: `OR(x, k)` → `orli`; `XOR(x, k)` → `xorli`.
+
+All require `k ∈ [−256, 255]` (sext9 range). Legalize Pass F is updated to preserve
+`VAL_CONST` operands in this range so P19 can consume them directly.
 
 ---
 
@@ -803,7 +828,7 @@ See **@docs/optimization-passes.md** for the full catalog with dependencies and 
 | legalize Pass E | `legalize.c` | AND-chain constant folding |
 | legalize Pass F | `legalize.c` | Materialize large VAL_CONST operands |
 | IRC | `alloc.c` | Appel & George 1996; K=8; phantom-node ABI; George coalescing; spill support |
-| emission P1–P17 | `emit.c` | CPU4 assembly; branch-to-next; compact encodings; compare+branch fusion; loop rotation; bitex fusion; cbeq/cbne fusion |
+| emission P1–P18 | `emit.c` | CPU4 assembly; branch-to-next; compact encodings; compare+branch fusion; loop rotation; bitex fusion; cbeq/cbne fusion; mulli |
 | speculative pipeline | `smallcc.c` | Try conservative + aggressive profiles, pick cheaper (`-speculative`) |
 
 ---
@@ -842,7 +867,7 @@ Jump table optimisation is future work.
 | `opt.h` / `opt.c` | Post-OOS + pre-OOS optimisation passes; `OptProfile`; speculative profiles |
 | `legalize.h` / `legalize.c` | ISA/ABI legalization: Passes A–F |
 | `alloc.h` / `alloc.c` | Liveness + IRC |
-| `emit.h` / `emit.c` | CPU4 emission (globals + functions); peepholes P1–P15 |
+| `emit.h` / `emit.c` | CPU4 emission (globals + functions); peepholes P1–P18 |
 
 **Variable identity:** Braun variable maps are keyed on `Symbol*` directly. No
 alpha-renaming is needed — each `Symbol*` is already unique within the compilation.

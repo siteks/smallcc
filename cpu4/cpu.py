@@ -22,24 +22,49 @@ import sys
 #   r0-r7
 #
 #   Format  Pattern                      Codes           Ops     Imm
-#   F0      000ooooo                     32              0       0
-#   F0      001odddi iiiiiiiiiiiiiiii    2               1       17
+#   F0a     0000oooo                     16              0       0
+#   F0b     0001oooo odddxxxiiiiiiiii    32              2       9
+#   F0c     001odddi iiiiiiiiiiiiiiii    2               1       17
 #   F1a     01oooood ddxxxyyy            31 + escape     3       0
 #   F1b     0111111d ddoooooo            64              1       0
 #   F2      10ooooxx xiiiiiii            16              1       7
 #   F3a     110000oo iiiiiiiiiiiiiiii    4               0       16
 #   F3b     110001od ddiiiiiiiiiiiiii    2               1       14
-#   F3c     11001odd diiiiiiiiiiiiiii    2               1       15
-#   F3d     1101oooo xxxyyyiiiiiiiiii    14 + 2 escape   2       10
-#   F3e     11011110 xxxyyyoiiiiiiiii    2               2       9
-#   F3f     11011111 xxxoooiiiiiiiiii    8               1       10
-#   F3g     111ooxxx iiiiiiiiiiiiiiii    4               1       16
+#   F3c     1101oooo xxxyyyiiiiiiiiii    15 + 1 escape   2       10
+#   F3d     11011111 xxxoooiiiiiiiiii    8               1       10
+#   F3e     111ooxxx iiiiiiiiiiiiiiii    4               1       16
 #
-#   Format 0a implicit or special hotspot (32 slots)
+#   Format 0a implicit or special hotspot (16 slots)
 #   halt
 #   ret     sp = bp; bp = [sp]&0xffff; pc = [sp]>>16; sp += 4
 #
-#   Format 0b - one op + imm17 (2 slots)
+#   Format 0b - two op + imm9 (32 slots)
+#   addli   rx = ry + sxt(imm9)
+#   subli   rx = ry - sxt(imm9)
+#   mulli
+#   divli
+#   modli
+#   shlli
+#   shrli
+#   leli    le and gt, may revisit??
+#   gtli
+#   eqli
+#   neli
+#   andli
+#   orli
+#   xorli
+#   lesli
+#   gtsli
+#   divsli
+#   modsli
+#   shrsli
+#   bitex   rx = (ry >> (imm9 & 0x1f)) & ~(-2 << (imm9 >> 5))   could use cleverer encoding to get all combos
+#   rsubli
+#   rdivli
+#   rmodli
+#   rdivsli
+#
+#   Format 0c - one op + imm17 (2 slots)
 #   cbeq    pc = rx==imm17>>9 ? (pc + sxt(imm17&0x1ff)): pc
 #   cbne    pc = rx!=imm17>>9 ? (pc + sxt(imm17&0x1ff)): pc
 #
@@ -52,14 +77,14 @@ import sys
 #   shl
 #   shr
 #   lt
-#   gt
+#   le
 #   eq
 #   ne
 #   and
 #   or
 #   xor
 #   lts
-#   gts
+#   les
 #   divs
 #   mods
 #   shrs
@@ -68,7 +93,7 @@ import sys
 #   fmul
 #   fdiv
 #   flt
-#   fgt
+#   fle
 #   (6 left)
 #
 #   Format 1b - single op, (64 slots)
@@ -110,9 +135,7 @@ import sys
 #   adjw    sp += (imm14 << 2)          this could move to F3a if needed
 #   lea     rx = bp + (imm14 << 2)
 #
-#   Format 3c - reserved (0 slots used; cbeq/cbne moved to F0b)
-#
-#   Format 3d - two op + imm10 (14 slots + 2 escape)
+#   Format 3c - two op + imm10 (14 slots + 2 escape)
 #   llb     rx = [ry+sxt(imm10)]   
 #   llw     rx = [ry+sxt(imm10*2)]   
 #   lll     rx = [ry+sxt(imm10*4)]   
@@ -124,19 +147,15 @@ import sys
 #   beq     pc = rx==ry ? (pc + sxt(imm10)) : pc
 #   bne     pc = rx!=ry ? (pc + sxt(imm10)) : pc
 #   blt     pc = rx<ry ? (pc + sxt(imm10)) : pc
-#   bgt     pc = rx>ry ? (pc + sxt(imm10)) : pc
+#   ble     pc = rx<=ry ? (pc + sxt(imm10)) : pc
 #   blts    pc = rx<ry ? (pc + sxt(imm10)) : pc
-#   bgts    pc = rx>ry ? (pc + sxt(imm10)) : pc
+#   bles    pc = rx<=ry ? (pc + sxt(imm10)) : pc
 #   
-#   Format 3e - two op + imm9 (2 slots) (escape from 3d with op=0xe)
-#   addli   rx = ry + sxt(imm9)
-#   bitex   rx = (ry >> (imm9 & 0x1f)) & ~(-2 << (imm9 >> 5))   could use cleverer encoding to get all combos
-#
-#   Format 3f - one op + imm10 (8 slots) (escape from 3d with op=0xf)
+#   Format 3d - one op + imm10 (8 slots) (escape from 3d with op=0xf)
 #   beqz    pc = rx==0 ? (pc + sxt(imm10)) : pc
 #   bnez    pc = rx!=0 ? (pc + sxt(imm10)) : pc
 #
-#   Format 3g - one op + imm16 (4 slots)
+#   Format 3e - one op + imm16 (4 slots)
 #   immw    rd = imm16
 #   immwh   rd = (rd & 0xffff) | (imm16 << 16)
 #   jz      pc = rd==0 ? imm16 : pc
@@ -166,13 +185,38 @@ class G:
 
     # Fields are a) first byte b) num extra bytes c) subformat d) subopcode
     ptable = {
-        # format 0a - zero op, 8 bits   000ooooo
+        # format 0a - zero op, 8 bits   0000oooo
         # This space will be used for hot code ops after analysis
         'halt'  :   (0x00, 0, 0, 0),
         'ret'   :   (0x01, 0, 0, 0),
-        # format 0b - one op + imm17    001odddiiiiiiiiiiiiiiiii
-        'cbeq'  :   (0x20, 2, 1, 0),
-        'cbne'  :   (0x30, 2, 1, 0),
+        # format 0b - two op + imm9     0001ooooodddxxxiiiiiiiii
+        'addli' :   (0x10, 2, 1, 0),
+        'subli' :   (0x10, 2, 1, 1),
+        'mulli' :   (0x11, 2, 1, 0),
+        'divli' :   (0x11, 2, 1, 1),
+        'modli' :   (0x12, 2, 1, 0),
+        'shlli' :   (0x12, 2, 1, 1),
+        'shrli' :   (0x13, 2, 1, 0),
+        'leli'  :   (0x13, 2, 1, 1),
+        'gtli'  :   (0x14, 2, 1, 0),
+        'eqli'  :   (0x14, 2, 1, 1),
+        'neli'  :   (0x15, 2, 1, 0),
+        'andli' :   (0x15, 2, 1, 1),
+        'orli'  :   (0x16, 2, 1, 0),
+        'xorli' :   (0x16, 2, 1, 1),
+        'lesli' :   (0x17, 2, 1, 0),
+        'gtsli' :   (0x17, 2, 1, 1),
+        'divsli':   (0x18, 2, 1, 0),
+        'modsli':   (0x18, 2, 1, 1),
+        'shrsli':   (0x19, 2, 1, 0),
+        'bitex' :   (0x19, 2, 1, 1),
+        'rsubli':   (0x1a, 2, 1, 0),
+        'rdivli':   (0x1a, 2, 1, 1),
+        'rmodli':   (0x1b, 2, 1, 0),
+        'rdivsli':  (0x1b, 2, 1, 1),
+        # format 0c - one op + imm17    001odddiiiiiiiiiiiiiiiii
+        'cbeq'  :   (0x20, 2, 2, 0),
+        'cbne'  :   (0x30, 2, 2, 0),
         # format 1a - three op, 16 bits 01ooooodddxxxyyy
         'add'   :   (0x40, 1, 0, 0),
         'sub'   :   (0x42, 1, 0, 0),
@@ -235,35 +279,29 @@ class G:
         # format 3b - one op + imm14    110001odddiiiiiiiiiiiiii
         'adjw'  :   (0xc4, 2, 1, 0),
         'lea'   :   (0xc6, 2, 1, 0),
-        # # format 3c - one op + imm15  11001odddiiiiiiiiiiiiiii
-        # 'cbeq'  :   (0xc8, 2, 2, 0),
-        # 'cbne'  :   (0xcc, 2, 2, 0),
-        # format 3d - two op + imm10    1101ooooxxxyyyiiiiiiiiii
-        'llb'   :   (0xd0, 2, 3, 0),
-        'llw'   :   (0xd1, 2, 3, 0),
-        'lll'   :   (0xd2, 2, 3, 0),
-        'slb'   :   (0xd3, 2, 3, 0),
-        'slw'   :   (0xd4, 2, 3, 0),
-        'sll'   :   (0xd5, 2, 3, 0),
-        'llbx'  :   (0xd6, 2, 3, 0),
-        'llwx'  :   (0xd7, 2, 3, 0),
-        'beq'   :   (0xd8, 2, 3, 0),
-        'bne'   :   (0xd9, 2, 3, 0),
-        'blt'   :   (0xda, 2, 3, 0),
-        'ble'   :   (0xdb, 2, 3, 0),
-        'blts'  :   (0xdc, 2, 3, 0),
-        'bles'  :   (0xdd, 2, 3, 0),
-        # format 3e - two op + imm9     11011110xxxyyyoiiiiiiiii
-        'addli' :   (0xde, 2, 6, 0),
-        'bitex' :   (0xde, 2, 6, 1),
-        # format 3f - one op + imm10    11011111xxxoooiiiiiiiiii
-        'beqz'  :   (0xdf, 2, 4, 0x00),
-        'bnez'  :   (0xdf, 2, 4, 0x01),
-        # format 3g - one op + imm16    111ooxxxiiiiiiiiiiiiiiii
-        'immw'  :   (0xe0, 2, 5, 0),
-        'immwh' :   (0xe8, 2, 5, 0),
-        'jz'    :   (0xf0, 2, 5, 0),
-        'jnz'   :   (0xf8, 2, 5, 0),
+        # format 3c - two op + imm10    1101ooooxxxyyyiiiiiiiiii
+        'llb'   :   (0xd0, 2, 2, 0),
+        'llw'   :   (0xd1, 2, 2, 0),
+        'lll'   :   (0xd2, 2, 2, 0),
+        'slb'   :   (0xd3, 2, 2, 0),
+        'slw'   :   (0xd4, 2, 2, 0),
+        'sll'   :   (0xd5, 2, 2, 0),
+        'llbx'  :   (0xd6, 2, 2, 0),
+        'llwx'  :   (0xd7, 2, 2, 0),
+        'beq'   :   (0xd8, 2, 2, 0),
+        'bne'   :   (0xd9, 2, 2, 0),
+        'blt'   :   (0xda, 2, 2, 0),
+        'ble'   :   (0xdb, 2, 2, 0),
+        'blts'  :   (0xdc, 2, 2, 0),
+        'bles'  :   (0xdd, 2, 2, 0),
+        # format 3d - one op + imm10    11011111xxxoooiiiiiiiiii
+        'beqz'  :   (0xdf, 2, 3, 0x00),
+        'bnez'  :   (0xdf, 2, 3, 0x01),
+        # format 3e - one op + imm16    111ooxxxiiiiiiiiiiiiiiii
+        'immw'  :   (0xe0, 2, 4, 0),
+        'immwh' :   (0xe8, 2, 4, 0),
+        'jz'    :   (0xf0, 2, 4, 0),
+        'jnz'   :   (0xf8, 2, 4, 0),
     }
 
     # The key becomes (first byte, subop). the value is (instr, length, subfmt, subopcode)
@@ -420,17 +458,16 @@ class CPU:
         oldpc   = s.pc
 
         # get format, length, subformat, we need to read more to get subop if it exists
-        lookupins = ins & (     0xff if ins & 0xe0 == 0x00  # f0a
-                           else 0xf0 if ins & 0xe0 == 0x20  # f0b
+        lookupins = ins & (     0xff if ins & 0xf0 == 0x00  # f0a
+                           else 0xff if ins & 0xf0 == 0x10  # f0b
+                           else 0xf0 if ins & 0xe0 == 0x20  # f0c
                            else 0xfe if ins & 0xc0 == 0x40  # f1a, f1b
                            else 0xfc if ins & 0xc0 == 0x80  # f2
                            else 0xff if ins & 0xfc == 0xc0  # f3a
                            else 0xfe if ins & 0xfc == 0xc4  # f3b
-                           else 0xfc if ins & 0xf8 == 0xc8  # f3c
-                           else 0xff if ins & 0xf0 == 0xd0  # f3d
-                           else 0xff if ins & 0xff == 0xde  # f3e
-                           else 0xff if ins & 0xff == 0xdf  # f3f
-                           else 0xf8 if ins & 0xe0 == 0xe0  # f3g
+                           else 0xff if ins & 0xf0 == 0xd0  # f3c
+                           else 0xff if ins & 0xff == 0xdf  # f3d
+                           else 0xf8 if ins & 0xe0 == 0xe0  # f3e
                            else 0xff)                       # 
         i, ilen, subfmt = G.rptable[(lookupins, 0)]
         fmt     = (ins & 0xc0) >> 6
@@ -440,16 +477,16 @@ class CPU:
         s.pc    += ilen + 1
 
         # Extract the subopcode when it is not in the first byte
+        if 0x10 <= lookupins <= 0x1f:
+            # This is a f0b instruction
+            subop = (ins & 0x8000) >> 15
+            i, _, _ = G.rptable[(lookupins, subop)]
         if lookupins == 0x7e:
             # This is a f1b instruction
             subop = ins & 0x3f
             i, _, _ = G.rptable[(lookupins, subop)]
-        if lookupins == 0xde:
-            # This is a f3e instruction
-            subop = (ins & 0x200) >> 9
-            i, _, _ = G.rptable[(lookupins, subop)]
         if lookupins == 0xdf:
-            # This is a f3f instruction
+            # This is a f3d instruction
             subop = (ins & 0x1c00) >> 10
             i, _, _ = G.rptable[(lookupins, subop)]
 
@@ -464,6 +501,10 @@ class CPU:
             # irregular decode for op here
             pass
         elif fmt == 0 and subfmt == 1:
+            dst = src0 = (ins & 0x7000) >> 12
+            src1 = (ins & 0xe00) >> 9
+            imm = ins & 0x1ff
+        elif fmt == 0 and subfmt == 2:
             dst = src0 = (ins & 0xe0000) >> 17
             imm = ins & 0x1ffff
         elif fmt == 1 and subfmt == 0:
@@ -480,23 +521,16 @@ class CPU:
         elif fmt == 3 and subfmt == 1:
             dst = src0 = (ins & 0x1c000) >> 14
             imm = ins & 0x3fff
-        # elif fmt == 3 and subfmt == 2:
-        #     dst = src0 = (ins & 0x38000) >> 15
-        #     imm = ins & 0x7fff
+        elif fmt == 3 and subfmt == 2:
+            dst = src0 = (ins & 0xe000) >> 13
+            src1 = (ins & 0x1c00) >> 10
+            imm = ins & 0x3ff
         elif fmt == 3 and subfmt == 3:
             dst = src0 = (ins & 0xe000) >> 13
-            src1 = (ins & 0x1c00) >> 10
             imm = ins & 0x3ff
         elif fmt == 3 and subfmt == 4:
-            dst = src0 = (ins & 0xe000) >> 13
-            imm = ins & 0x3ff
-        elif fmt == 3 and subfmt == 5:
             dst = src0 = (ins & 0x70000) >> 16
             imm = ins & 0xffff
-        elif fmt == 3 and subfmt == 6:
-            dst = src0 = (ins & 0xe000) >> 13
-            src1 = (ins & 0x1c00) >> 10
-            imm = ins & 0x1ff
 
         # noinspection PyUnreachableCode
         m = self.mem
@@ -506,6 +540,31 @@ class CPU:
         if      i == 'halt':    s.H = 1
         elif    i == 'ret':     s.sp = s.bp; s.bp = m.read32(s.sp) & 0xffff; s.pc = m.read32(s.sp) >> 16; s.sp += 4
         # f0b
+        elif    i == 'addli':   s.r[dst] = s.r[src1] + sext(imm, 9)
+        elif    i == 'subli':   s.r[dst] = s.r[src1] - sext(imm, 9)
+        elif    i == 'mulli':   s.r[dst] = s.r[src1] * sext(imm, 9)
+        elif    i == 'divli':   s.r[dst] = int(s.r[src1] / sext(imm, 9)) if imm != 0 else 0
+        elif    i == 'modli':   s.r[dst] = s.r[src1] % sext(imm, 9) if imm != 0 else 0
+        elif    i == 'shlli':   s.r[dst] = s.r[src1] << (imm & 31)
+        elif    i == 'shrli':   s.r[dst] = s.r[src1] >> (imm & 31)
+        elif    i == 'leli':    s.r[dst] = s.r[src1] <= (sext(imm, 9) & 0xffffffff)
+        elif    i == 'gtli':    s.r[dst] = s.r[src1] > (sext(imm, 9) & 0xffffffff)
+        elif    i == 'eqli':    s.r[dst] = s.r[src1] == (sext(imm, 9) & 0xffffffff)
+        elif    i == 'neli':    s.r[dst] = s.r[src1] != (sext(imm, 9) & 0xffffffff)
+        elif    i == 'andli':   s.r[dst] = s.r[src1] & sext(imm, 9)
+        elif    i == 'orli':    s.r[dst] = s.r[src1] | sext(imm, 9)
+        elif    i == 'xorli':   s.r[dst] = s.r[src1] ^ sext(imm, 9)
+        elif    i == 'lesli':   s.r[dst] = sext(s.r[src1], 32) <= sext(imm, 9)
+        elif    i == 'gtsli':   s.r[dst] = sext(s.r[src1], 32) > sext(imm, 9)
+        elif    i == 'divsli':  s.r[dst] = int(sext(s.r[src1], 32) / sext(imm, 9)) if imm != 0 else 0
+        elif    i == 'modsli':  s.r[dst] = sext(s.r[src1], 32) % sext(imm, 9) if imm != 0 else 0
+        elif    i == 'shrsli':  s.r[dst] = sext(s.r[src1], 32) >> (imm & 31)
+        elif    i == 'bitex':   s.r[dst] = (s.r[src1] >> (imm & 0x1f)) & ((2 << ((imm >> 5) & 0x0f)) - 1)
+        elif    i == 'rsubli':  s.r[dst] = sext(imm, 9) - s.r[src1]
+        elif    i == 'rdivli':  s.r[dst] = int(sext(imm, 9) / s.r[src1]) if s.r[src1] != 0 else 0
+        elif    i == 'rmodli':  s.r[dst] = sext(imm, 9) % s.r[src1] if s.r[src1] != 0 else 0
+        elif    i == 'rdivsli': s.r[dst] = int(sext(imm, 9) / sext(s.r[src1], 32)) if s.r[src1] != 0 else 0
+        # f0c
         elif    i == 'cbeq':    s.pc = s.pc + sext(imm & 0x1ff, 9) if s.r[src0] == imm >> 9 else s.pc
         elif    i == 'cbne':    s.pc = s.pc + sext(imm & 0x1ff, 9) if s.r[src0] != imm >> 9 else s.pc
         # f1a
@@ -513,7 +572,7 @@ class CPU:
         elif    i == 'sub':     s.r[dst] = s.r[src0] - s.r[src1]
         elif    i == 'mul':     s.r[dst] = s.r[src0] * s.r[src1]
         elif    i == 'div':     s.r[dst] = int(s.r[src0] / s.r[src1])
-        elif    i == 'mod':     s.r[dst] = s.r[src0] % s.r[src1]
+        elif    i == 'mod':     s.r[dst] = s.r[src0] % s.r[src1] if s.r[src1] != 0 else 0
         elif    i == 'shl':     s.r[dst] = s.r[src0] << s.r[src1]
         elif    i == 'shr':     s.r[dst] = s.r[src0] >> s.r[src1]
         elif    i == 'lt':      s.r[dst] = s.r[src0] < s.r[src1]
@@ -523,8 +582,8 @@ class CPU:
         elif    i == 'and':     s.r[dst] = s.r[src0] & s.r[src1]
         elif    i == 'or':      s.r[dst] = s.r[src0] | s.r[src1]
         elif    i == 'xor':     s.r[dst] = s.r[src0] ^ s.r[src1]
-        elif    i == 'lts':     s.r[dst] = 1 if sext(s.r[src0], 32) < sext(s.r[src1], 32) else 0
-        elif    i == 'les':     s.r[dst] = 1 if sext(s.r[src0], 32) <= sext(s.r[src1], 32) else 0
+        elif    i == 'lts':     s.r[dst] = sext(s.r[src0], 32) < sext(s.r[src1], 32)
+        elif    i == 'les':     s.r[dst] = sext(s.r[src0], 32) <= sext(s.r[src1], 32)
         elif    i == 'divs':    s.r[dst] = int(sext(s.r[src0], 32) / sext(s.r[src1], 32)) if s.r[src1] != 0 else 0
         elif    i == 'mods':    s.r[dst] = sext(s.r[src0], 32) % sext(s.r[src1], 32) if s.r[src1] != 0 else 0
         elif    i == 'shrs':    s.r[dst] = sext(s.r[src0], 32) >> (s.r[src1] & 31)
@@ -532,8 +591,8 @@ class CPU:
         elif    i == 'fsub':    s.r[dst] = f2b(b2f(s.r[src0]) - b2f(s.r[src1]))
         elif    i == 'fmul':    s.r[dst] = f2b(b2f(s.r[src0]) * b2f(s.r[src1]))
         elif    i == 'fdiv':    s.r[dst] = f2b(b2f(s.r[src0]) / b2f(s.r[src1]))
-        elif    i == 'flt':     s.r[dst] = 1 if b2f(s.r[src0]) < b2f(s.r[src1]) else 0
-        elif    i == 'fle':     s.r[dst] = 1 if b2f(s.r[src0]) <= b2f(s.r[src1]) else 0
+        elif    i == 'flt':     s.r[dst] = b2f(s.r[src0]) < b2f(s.r[src1])
+        elif    i == 'fle':     s.r[dst] = b2f(s.r[src0]) <= b2f(s.r[src1])
         # f1b
         elif    i == 'sxb':     s.r[dst] = 0xffffff00 | s.r[src0] if s.r[src0] & 0x80 else 0xff & s.r[src0]
         elif    i == 'sxw':     s.r[dst] = 0xffff0000 | s.r[src0] if s.r[src0] & 0x8000 else 0xffff & s.r[src0]
@@ -569,7 +628,7 @@ class CPU:
         # f3b
         elif    i == 'adjw':    s.sp += sext((imm << 2), 16)
         elif    i == 'lea':     s.r[dst] = s.bp + sext((imm << 2), 16)
-        # f3d
+        # f3c
         elif    i == 'llb':     s.r[dst] = m.read8(s.r[src1] + sext(imm, 10))
         elif    i == 'llw':     s.r[dst] = m.read16(s.r[src1] + sext(imm<<1, 11))
         elif    i == 'lll':     s.r[dst] = m.read32(s.r[src1] + sext(imm<<2, 12))
@@ -584,13 +643,10 @@ class CPU:
         elif    i == 'ble':     s.pc = s.pc + sext(imm, 10) if s.r[src0] <= s.r[src1] else s.pc
         elif    i == 'blts':    s.pc = s.pc + sext(imm, 10) if sext(s.r[src0], 32) < sext(s.r[src1], 32) else s.pc
         elif    i == 'bles':    s.pc = s.pc + sext(imm, 10) if sext(s.r[src0], 32) <= sext(s.r[src1], 32) else s.pc
-        # f3e
-        elif    i == 'addli':   s.r[dst] = s.r[src1] + sext(imm, 9)
-        elif    i == 'bitex':   s.r[dst] = (s.r[src1] >> (imm & 0x1f)) & ((2 << ((imm >> 5) & 0x0f)) - 1)
-        # f3f
+        # f3d
         elif    i == 'beqz':    s.pc = s.pc + sext(imm, 10) if s.r[src0] == 0 else s.pc
         elif    i == 'bnez':    s.pc = s.pc + sext(imm, 10) if s.r[src0] != 0 else s.pc
-        # f3g
+        # f3e
         elif    i == 'immw':    s.r[dst] = imm
         elif    i == 'immwh':   s.r[dst] = (s.r[dst] & 0xffff) | (imm << 16)
         elif    i == 'jz':      s.pc = imm if s.r[src0] == 0 else s.pc

@@ -243,10 +243,14 @@ void legalize_function(Function *f) {
             case IK_MOD: case IK_UMOD:
             case IK_SHL: case IK_SHR: case IK_USHR:
             case IK_FADD: case IK_FSUB: case IK_FMUL: case IK_FDIV:
-                // These have no compact encoding — always materialize VAL_CONST
+                // F0b immediate handles |k| ≤ 255 (P18 mulli, P19 general);
+                // P11/P13 handle SHL/SHR/USHR shifts via resolve_const.
+                // Only materialize constants outside those ranges.
                 for (int j = 0; j < inst->nops; j++) {
                     Value *v = inst->ops[j] ? val_resolve(inst->ops[j]) : NULL;
                     if (!v || v->kind != VAL_CONST) continue;
+                    int k = v->iconst;
+                    if (k >= -256 && k <= 255) continue;  // F0b immediate range
                     Value *cv = new_value(f, VAL_INST, inst->dst->vtype);
                     Inst  *ci = new_inst(f, b, IK_CONST, cv);
                     ci->imm  = v->iconst;
@@ -272,13 +276,13 @@ void legalize_function(Function *f) {
                 }
                 break;
             case IK_AND:
-                // P14 handles 0..127; P8 handles 0xFF/0xFFFF
+                // P14 handles 0..255 (andi 0..127, andli 128..255); P8 handles 0xFFFF
                 for (int j = 0; j < inst->nops; j++) {
                     Value *v = inst->ops[j] ? val_resolve(inst->ops[j]) : NULL;
                     if (!v || v->kind != VAL_CONST) continue;
                     int k = v->iconst;
-                    if (k >= 0 && k <= 127) continue;  // P14 andi
-                    if (k == 0xff || k == 0xffff) continue;  // P8 zxb/zxw
+                    if (k >= 0 && k <= 255) continue;  // P14 andi/andli
+                    if (k == 0xffff) continue;  // P8 zxw
                     Value *cv = new_value(f, VAL_INST, inst->dst->vtype);
                     Inst  *ci = new_inst(f, b, IK_CONST, cv);
                     ci->imm  = v->iconst;

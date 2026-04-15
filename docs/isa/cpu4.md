@@ -33,36 +33,35 @@ Memory is 65536 bytes. Data is little-endian. The stack starts at `sp = 0xF000` 
 
 ## Instruction Encoding
 
-Twelve formats with variable widths (1, 2, or 3 bytes). The format is determined by the top
+Eleven formats with variable widths (1, 2, or 3 bytes). The format is determined by the top
 bits of the first byte:
 
 | Format | Width | First-byte pattern | Used for |
 |---|---|---|---|
-| F0a | 1 byte | `000 ooooo` | No-operand (32 slots) |
-| F0b | 3 bytes | `001 o ddd iiiiiiiiiiiiiiiii` | Compare-and-branch: one reg + imm8 + disp9 (2 slots) |
+| F0a | 1 byte | `0000 oooo` | No-operand (16 slots) |
+| F0b | 3 bytes | `0001 oooo odddxxxiiiiiiiii` | Two reg + imm9 ALU (32 slots via 16 first-bytes × 2 subops) |
+| F0c | 3 bytes | `001 o ddd iiiiiiiiiiiiiiiii` | Compare-and-branch: one reg + imm8 + disp9 (2 slots) |
 | F1a | 2 bytes | `01ooooo ddd xxx yyy` | Three-register ALU (31 usable slots; `11111` is F1b escape) |
 | F1b | 2 bytes | `0111111 ddd oooooo` | One-register ops (64 slots; triggered when F1a opcode = `11111`) |
 | F2 | 2 bytes | `10 oooo xxx iiiiiii` | One reg + imm7; bp-relative load/store/addi (16 slots) |
-| F3a | 3 bytes | `11000 ooo iiiiiiiiiiiiiiii` | Zero reg + imm16 (4 slots) |
+| F3a | 3 bytes | `110000 oo iiiiiiiiiiiiiiii` | Zero reg + imm16 (4 slots) |
 | F3b | 3 bytes | `110001 o ddd iiiiiiiiiiiiii` | One reg + imm14 (2 slots) |
-| F3c | 3 bytes | — | Reserved (0 slots; cbeq/cbne moved to F0b) |
-| F3d | 3 bytes | `1101 oooo xxx yyy iiiiiiiiii` | Two reg + imm10 (14 usable slots; `1110` is F3e escape, `1111` is F3f escape) |
-| F3e | 3 bytes | `11011110 xxx yyy o iiiiiiiii` | Two reg + imm9 (2 slots; triggered when F3d opcode = `1110`) |
-| F3f | 3 bytes | `11011111 xxx ooo iiiiiiiiii` | One reg + imm10 (8 slots; triggered when F3d opcode = `1111`) |
-| F3g | 3 bytes | `111 oo xxx iiiiiiiiiiiiiiii` | One reg + imm16 (4 slots) |
+| F3c | 3 bytes | `1101 oooo xxx yyy iiiiiiiiii` | Two reg + imm10 (15 usable slots; `1111` is F3d escape) |
+| F3d | 3 bytes | `11011111 xxx ooo iiiiiiiiii` | One reg + imm10 (8 slots; triggered when F3c opcode = `1111`) |
+| F3e | 3 bytes | `111 oo xxx iiiiiiiiiiiiiiii` | One reg + imm16 (4 slots) |
 
-F0b uses the upper half of the `00xxxxxx` byte range (0x20–0x3f) for 3-byte compare-and-branch
-instructions, while F0a uses the lower half (0x00–0x1f) for 1-byte no-operand instructions.
+F0a occupies the first-byte range 0x00–0x0f (16 one-byte instructions). F0b occupies
+0x10–0x1f: each first-byte encodes two instructions via a subopcode bit in the second byte,
+giving 32 two-register + 9-bit-immediate instructions. F0c uses 0x20–0x3f for compare-and-branch.
 F1b is an escape from F1a: when the F1a opcode field is all-ones (`11111`), the remaining bits
-select a 1-register operation from a 64-slot space. F3e escapes from F3d when the F3d opcode
-field is `1110`, splitting the 10-bit immediate into a 1-bit sub-opcode and a 9-bit immediate.
-F3f escapes from F3d when the F3d opcode field is `1111`.
+select a 1-register operation from a 64-slot space. F3d escapes from F3c when the F3c opcode
+field is `1111`.
 
 ---
 
 ## Format F0a — No Operand (1 byte)
 
-`000 ooooo` — 5-bit opcode (0x00–0x1f). Operates on special registers implicitly.
+`0000 oooo` — 4-bit opcode (0x00–0x0f). Operates on special registers implicitly.
 
 | Opcode | Mnemonic | Semantics |
 |---|---|---|
@@ -71,11 +70,54 @@ F3f escapes from F3d when the F3d opcode field is `1111`.
 
 `ret` unpacks the saved `(lr << 16) | bp` word written by `enter`.
 
-*(30 slots reserved for future hotspot encodings.)*
+*(14 slots reserved for future hotspot encodings.)*
 
 ---
 
-## Format F0b — Compare-and-Branch (3 bytes)
+## Format F0b — Two-Register + Immediate9 ALU (3 bytes)
+
+`0001 oooo odddxxxiiiiiiiii` — 4-bit opcode in first byte (0x10–0x1b), 1-bit subopcode,
+3-bit destination (`rd`), 3-bit source (`rx`), 9-bit signed immediate.
+
+Each first-byte value encodes two instructions via the subopcode bit (bit 15 of the 24-bit
+instruction): subop=0 and subop=1. This gives 32 instructions across 12 first-byte values.
+
+Field extraction from the 24-bit instruction word:
+- `subop = (ins >> 15) & 1`
+- `rd = (ins >> 12) & 7`
+- `rx = (ins >> 9) & 7`
+- `imm9 = ins & 0x1ff` (sign-extended to 32 bits for arithmetic operations)
+
+| First byte | Sub=0 | Sub=1 | Semantics (sub=0 / sub=1) |
+|---|---|---|---|
+| 0x10 | `addli rd, rx, imm9` | `subli rd, rx, imm9` | rd = rx + sext9 / rd = rx − sext9 |
+| 0x11 | `mulli rd, rx, imm9` | `divli rd, rx, imm9` | rd = rx × sext9 / rd = rx / sext9 (unsigned, 0 if imm=0) |
+| 0x12 | `modli rd, rx, imm9` | `shlli rd, rx, imm9` | rd = rx % sext9 (unsigned, 0 if imm=0) / rd = rx << (imm & 31) |
+| 0x13 | `shrli rd, rx, imm9` | `leli rd, rx, imm9` | rd = rx >> (imm & 31) (logical) / rd = (rx <= sext9) unsigned |
+| 0x14 | `gtli rd, rx, imm9` | `eqli rd, rx, imm9` | rd = (rx > sext9) unsigned / rd = (rx == sext9) |
+| 0x15 | `neli rd, rx, imm9` | `andli rd, rx, imm9` | rd = (rx != sext9) / rd = rx & sext9 |
+| 0x16 | `orli rd, rx, imm9` | `xorli rd, rx, imm9` | rd = rx \| sext9 / rd = rx ^ sext9 |
+| 0x17 | `lesli rd, rx, imm9` | `gtsli rd, rx, imm9` | rd = (signed(rx) <= sext9) / rd = (signed(rx) > sext9) |
+| 0x18 | `divsli rd, rx, imm9` | `modsli rd, rx, imm9` | rd = signed(rx) / sext9 (0 if imm=0) / rd = signed(rx) % sext9 (0 if imm=0) |
+| 0x19 | `shrsli rd, rx, imm9` | `bitex rd, rx, imm9` | rd = signed(rx) >> (imm & 31) (arithmetic) / bit extract (see below) |
+| 0x1a | `rsubli rd, rx, imm9` | `rdivli rd, rx, imm9` | rd = sext9 − rx / rd = sext9 / rx (0 if rx=0) |
+| 0x1b | `rmodli rd, rx, imm9` | `rdivsli rd, rx, imm9` | rd = sext9 % rx (0 if rx=0) / rd = sext9 / signed(rx) (0 if rx=0) |
+
+**`bitex` (bit extract):** extracts a bitfield from `rx` into `rd`. The 9-bit immediate
+encodes two fields: bits [4:0] = shift amount (0–31), bits [8:5] = width code (0–15). The
+width code `w` produces a mask of `w+1` ones, extracting 1 to 16 bits. Equivalent to
+`rd = (rx >> shift) & ((1 << (width+1)) - 1)`.
+
+**`r`-prefix instructions** (`rsubli`, `rdivli`, `rmodli`, `rdivsli`): reverse the operand
+order — the immediate is the dividend/minuend and the register is the divisor/subtrahend.
+Useful for expressions like `N - x` or `N / x` where N is a small constant.
+
+**Assembly encoding:** `b0 = first_byte`, `b1 = (subop << 7) | (rd << 4) | (rx << 1) | (imm9 >> 8)`,
+`b2 = imm9 & 0xff`.
+
+---
+
+## Format F0c — Compare-and-Branch (3 bytes)
 
 `001 o ddd i iiiiiiiiiiiiiiii` — 1-bit opcode, 3-bit register (`rx`), 17-bit immediate.
 The 17-bit immediate encodes two fields: bits [16:9] = 8-bit unsigned comparison value
@@ -287,19 +329,11 @@ stack frame.
 
 ---
 
-## Format F3c — Reserved
-
-The F3c encoding space (first bytes 0xc8–0xcf) is reserved. The compare-and-branch
-instructions (`cbeq`/`cbne`) formerly assigned here have been moved to F0b for a wider
-9-bit displacement range.
-
----
-
-## Format F3d — Two-Register + imm10 (3 bytes)
+## Format F3c — Two-Register + imm10 (3 bytes)
 
 `1101 oooo xxx yyy iiiiiiiiii` — 4-bit opcode, 3-bit rx, 3-bit ry, 10-bit signed immediate.
 Memory accesses are register-relative (ry is the base; rx is source/destination). Opcode
-`1110` (0xde) is the F3f escape; opcode `1111` (0xdf) is the F3d escape.
+`1111` (0xdf) is the F3d escape.
 
 | Opcode | Mnemonic | Semantics |
 |---|---|---|
@@ -318,10 +352,10 @@ Memory accesses are register-relative (ry is the base; rx is source/destination)
 | 0xdc | `blts rx, ry, imm10` | if signed(rx) < signed(ry): pc += sext10(imm10) |
 | 0xdd | `bles rx, ry, imm10` | if signed(rx) <= signed(ry): pc += sext10(imm10) |
 
-*(0 slots available: 0xde is F3e escape, 0xdf is F3f escape.)*
+*(1 slot available: 0xde. 0xdf is the F3d escape.)*
 
 Branch offsets are **PC-relative** — the offset is added to `pc` (which has already been
-advanced past the current instruction). `llbx`/`llwx` make F3d symmetric with F2: both
+advanced past the current instruction). `llbx`/`llwx` make F3c symmetric with F2: both
 formats provide sign-extending load variants, so a signed `char` or `short` read through any
 pointer costs one instruction regardless of whether the base is `bp` or a general register.
 
@@ -336,30 +370,9 @@ pointer costs one instruction regardless of whether the base is `bp` or a genera
 
 ---
 
-## Format F3e — Two-Register + imm9 (3 bytes)
+## Format F3d — One-Register + imm10 (3 bytes)
 
-`11011110 xxx yyy o iiiiiiiii` — triggered when F3d opcode field = `1110` (byte 0xde). The
-`xxx` bits encode the destination register, `yyy` the source register, `o` is a 1-bit
-subopcode (2 slots), and the remaining 9 bits are an immediate.
-
-| Subopcode | Mnemonic | Semantics |
-|---|---|---|
-| 0 | `addli rx, ry, imm9` | rx = ry + sext9(imm9) |
-| 1 | `bitex rx, ry, imm9` | rx = (ry >> (imm9 & 0x1f)) & ((2 << ((imm9 >> 5) & 0xf)) - 1) |
-
-`addli` complements F2 `addi`: `addi` is in-place with a 7-bit immediate; `addli` allows a
-separate destination register and a wider 9-bit signed immediate (range −256 to +255).
-
-`bitex` (bit extract) extracts a bitfield from `ry` into `rx`. The 9-bit immediate encodes
-two fields: bits [4:0] = shift amount (0–31), bits [8:5] = width code (0–15). The width code
-`w` produces a mask of `w+1` ones, extracting 1 to 16 bits. Equivalent to
-`rx = (ry >> shift) & ((1 << (width+1)) - 1)`.
-
----
-
-## Format F3f — One-Register + imm10 (3 bytes)
-
-`11011111 xxx ooo iiiiiiiiii` — triggered when F3d opcode field = `1111` (byte 0xdf). The
+`11011111 xxx ooo iiiiiiiiii` — triggered when F3c opcode field = `1111` (byte 0xdf). The
 `xxx` bits encode the register, `ooo` is a 3-bit subopcode (8 slots), and the remaining
 10 bits are a signed immediate.
 
@@ -371,12 +384,12 @@ two fields: bits [4:0] = shift amount (0–31), bits [8:5] = width code (0–15)
 *(6 slots available.)*
 
 `beqz`/`bnez` are PC-relative branches that test a single register against zero. They are
-the short-range (10-bit offset) counterpart to `jz`/`jnz` (F3g, 16-bit absolute address).
+the short-range (10-bit offset) counterpart to `jz`/`jnz` (F3e, 16-bit absolute address).
 Both test any register, not just r0.
 
 ---
 
-## Format F3g — One-Register + imm16 (3 bytes)
+## Format F3e — One-Register + imm16 (3 bytes)
 
 `111 oo xxx iiiiiiiiiiiiiiii` — 2-bit opcode, 3-bit register, 16-bit immediate.
 
@@ -391,7 +404,7 @@ Both test any register, not just r0.
 bits are written first (zeroing the upper half), then `immwh` fills the upper half.
 
 `jz`/`jnz` test any register (not just r0) and jump to an absolute 16-bit address. For
-short-range branches, use `beqz`/`bnez` (F3e) which are PC-relative with a 10-bit offset.
+short-range branches, use `beqz`/`bnez` (F3d) which are PC-relative with a 10-bit offset.
 
 ---
 

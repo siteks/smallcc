@@ -65,7 +65,7 @@ emit_function()
   remap_single_use_values()   register assignment refinement
   detect_bitex_fusions()      P16 detection (SHR+AND → bitex)
   detect_branch_fusions()     P5/P5+/P6/P17 detection
-  emit_inst()                 P2/P3/P4/P7/P8/P9/P10/P11/P13/P14/P15/P16
+  emit_inst()                 P2/P3/P4/P7/P8/P9/P10/P11/P13/P14/P15/P16/P18/P19
   emit_rotated_branch()       P12
   inline IK_BR dispatch       P1/P15 (branch inversion)/P17 (cbeq/cbne)
 ```
@@ -170,21 +170,23 @@ Pass F after E        (F should see folded AND chains from E)
 | P1 | Skip `j` to next block | — | 3 per fall-through |
 | P2 | `ADD(x,±1)` in-place → `inc`/`dec` | F1b | 3 (5→2) |
 | P3 | `ADD(x,±64)` in-place → `addi` | F2 | 3 (5→2) |
-| P4 | `ADD(x,±255)` cross-reg → `addli` | F3f | 2 (5→3) |
-| P5 | Compare+branch fusion (2 regs) | F3d | 5 (8→3) |
-| P5+ | Compare+branch fusion (1 const) | F3g+F3d | 2-3 |
+| P4 | `ADD(x,±255)` cross-reg → `addli` | F0b | 2 (5→3) |
+| P5 | Compare+branch fusion (2 regs) | F3c | 5 (8→3) |
+| P5+ | Compare+branch fusion (1 const) | F3e+F3c | 2-3 |
 | P6 | `NE/EQ(x,0)` → `jnz`/`jz` | F3e | 5 (8→3) |
 | P7 | Fold `OP(const, const)` at emit | — | 3-5 per fold |
 | P8 | `AND(x, 0xFF/0xFFFF)` → `zxb`/`zxw` | F1b | 3 (5→2) |
-| P9 | `SEXT(const)` → `immw` | F3e | 2 (4→2 in-place) |
+| P9 | `SEXT(const)` → `immw` | F3e | 2 (4→2) |
 | P10 | Redundant SEXT after sign-ext load | — | 2 per elim |
-| P11 | `SHL(x, k)` → `shli` | F2 | 3 (5→2) |
+| P11 | `SHL(x, k)` → `shli`/`shlli` | F2/F0b | 3/2 (5→2/3) |
 | P12 | Loop rotation (duplicate header BR) | — | 3 per loop iter |
-| P13 | `SHR/USHR(x, k)` → `shrsi` | F2 | 3 (5→2) |
-| P14 | `AND(x, 0-127)` → `andi` | F2 | 3 (5→2) |
+| P13 | `SHR/USHR(x, k)` → `shrsi`/`shrsli`/`shrli` | F2/F0b | 3/2 (5→2/3) |
+| P14 | `AND(x, 0-255)` → `andi`/`andli` | F2/F0b | 3/2 (5→2/3) |
 | P15 | Redundant AND via known-bits | — | 2-5 per elim |
-| P16 | `SHR(x,k)+AND(r,mask)` → `bitex` | F3f | 1-3 (4-6→3) |
-| P17 | `EQ/NE(x,const8)+BR` → `cbeq`/`cbne` | F0b | 2-3 (5-6→3) |
+| P16 | `SHR(x,k)+AND(r,mask)` → `bitex` | F0b | 1-3 (4-6→3) |
+| P17 | `EQ/NE(x,const8)+BR` → `cbeq`/`cbne` | F0c | 2-3 (5-6→3) |
+| P18 | `MUL(x, const)` → `mulli` | F0b | 2 (5→3) |
+| P19 | General F0b imm ALU (cmp/div/mod/or/xor) | F0b | 2 (5→3) |
 
 Peepholes are purely local and have no ordering dependencies on each other.
 They fire during the single emission walk based on pattern matching.
@@ -247,7 +249,7 @@ speculative mode to avoid arena exhaustion from IRC spill rewriting on large fun
 
 `score_function` counts live (non-dead) instructions per block, weighted by
 `4^loop_depth`. This heavily penalises spill code inside loops. The score is
-an IR-level estimate — it does not account for emission peepholes (P1–P15), so
+an IR-level estimate — it does not account for emission peepholes (P1–P18), so
 it may mis-predict when peephole effects differ between profiles.
 
 ### clone_function
@@ -381,7 +383,7 @@ each use site regardless of whether copy prop has run.
 
 ## Emission Peepholes (Not Bitmask-Gated)
 
-The emit.c peepholes (P1–P15) are not included in the bitmask because:
+The emit.c peepholes (P1–P18) are not included in the bitmask because:
 
 1. They have zero risk of producing incorrect code (pattern-match on final IR)
 2. They always reduce code size (never pessimize)

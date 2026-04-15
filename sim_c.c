@@ -215,15 +215,28 @@ typedef struct {
     const char *name;
     uint8_t     first_byte;
     int         extra;   /* extra bytes: 0, 1, or 2 */
-    int         subfmt;  /* 0=F0/F1a/F2/F3a, 1=F1b/F3b, 2=F3e, 3=adjw/lea,
-                            4=F3d(beqz/bnez), 5=F3f(addli/bitex), 7=F0b(cbeq/cbne) */
+    int         subfmt;  /* 0=F0a/F1a/F2/F3a, 1=F1b/F3c, 2=F3e, 3=adjw/lea,
+                            4=F3d(beqz/bnez), 7=F0c(cbeq/cbne), 8=F0b(two-op+imm9) */
     int         subop;   /* F1b: subopcode in byte1[5:0] */
 } Instr4;
 
 static const Instr4 itab4[] = {
     /* F0a — 1 byte, no operands */
     {"halt",   0x00,0,0,0}, {"ret",    0x01,0,0,0},
-    /* F0b — 3 bytes, rx + imm8 + disp9 (compare-and-branch); subfmt=7 */
+    /* F0b — 3 bytes, rd rx imm9 (two-op+imm9); subfmt=8; subop=0/1 per first_byte */
+    {"addli",  0x10,2,8,0}, {"subli",  0x10,2,8,1},
+    {"mulli",  0x11,2,8,0}, {"divli",  0x11,2,8,1},
+    {"modli",  0x12,2,8,0}, {"shlli",  0x12,2,8,1},
+    {"shrli",  0x13,2,8,0}, {"leli",   0x13,2,8,1},
+    {"gtli",   0x14,2,8,0}, {"eqli",   0x14,2,8,1},
+    {"neli",   0x15,2,8,0}, {"andli",  0x15,2,8,1},
+    {"orli",   0x16,2,8,0}, {"xorli",  0x16,2,8,1},
+    {"lesli",  0x17,2,8,0}, {"gtsli",  0x17,2,8,1},
+    {"divsli", 0x18,2,8,0}, {"modsli", 0x18,2,8,1},
+    {"shrsli", 0x19,2,8,0}, {"bitex",  0x19,2,8,1},
+    {"rsubli", 0x1a,2,8,0}, {"rdivli", 0x1a,2,8,1},
+    {"rmodli", 0x1b,2,8,0}, {"rdivsli",0x1b,2,8,1},
+    /* F0c — 3 bytes, rx + imm8 + disp9 (compare-and-branch); subfmt=7 */
     {"cbeq",   0x20,2,7,0}, {"cbne",   0x30,2,7,0},
     /* F1a — 2 bytes, rd rx ry */
     {"add",    0x40,1,0,0}, {"sub",    0x42,1,0,0},
@@ -261,8 +274,7 @@ static const Instr4 itab4[] = {
     {"enter",  0xc2,2,0,0},
     /* F3b — 3 bytes, rd + imm14 (byte offset / 4); subfmt=3 */
     {"adjw",   0xc4,2,3,0}, {"lea",    0xc6,2,3,0},
-    /* F3c — reserved (cbeq/cbne moved to F0b) */
-    /* F3d — 3 bytes, rx ry imm10 */
+    /* F3c — 3 bytes, rx ry imm10 (0xd0-0xdd) */
     {"llb",    0xd0,2,1,0}, {"llw",    0xd1,2,1,0},
     {"lll",    0xd2,2,1,0}, {"slb",    0xd3,2,1,0},
     {"slw",    0xd4,2,1,0}, {"sll",    0xd5,2,1,0},
@@ -270,8 +282,6 @@ static const Instr4 itab4[] = {
     {"beq",    0xd8,2,1,0}, {"bne",    0xd9,2,1,0},
     {"blt",    0xda,2,1,0}, {"ble",    0xdb,2,1,0},
     {"blts",   0xdc,2,1,0}, {"bles",   0xdd,2,1,0},
-    /* F3f — 3 bytes, rx ry + imm9; subfmt=5; subop in bit 9 */
-    {"addli",  0xde,2,5,0}, {"bitex",  0xde,2,5,1},
     /* F3d — 3 bytes, rx + PC-relative imm10; subfmt=4 */
     {"beqz",   0xdf,2,4,0x00}, {"bnez",  0xdf,2,4,0x01},
     /* F3e — 3 bytes, rd imm16 */
@@ -648,14 +658,17 @@ static void assemble_cpu4(const char *src)
                     write8((uint16_t)(cur+2), b2);
                 }
                 cur += 3;
-            } else if (instr->extra == 2 && instr->subfmt == 5) {
-                /* F3f: rx, ry, imm9 (addli/bitex); subop in bit 9 */
-                int rx2 = (nops > 0) ? parse_reg4(ops[0]) : 0;
-                int ry2 = (nops > 1) ? parse_reg4(ops[1]) : 0;
+            } else if (instr->extra == 2 && instr->subfmt == 8) {
+                /* F0b: rd, rx, imm9 — encoding: 0001oooo odddxxxiiiiiiiii
+                   b0 = first_byte (0x10-0x1b)
+                   b1 = subop:1 | rd:3 | rx:3 | imm9[8]:1
+                   b2 = imm9[7:0] */
+                int rd2 = (nops > 0) ? parse_reg4(ops[0]) : 0;
+                int rx2 = (nops > 1) ? parse_reg4(ops[1]) : 0;
                 int32_t imm9 = (nops > 2) ? (int32_t)strtol(ops[2], NULL, 0) : 0;
                 imm9 &= 0x1ff;
-                uint8_t b0 = 0xde;
-                uint8_t b1 = (uint8_t)((rx2 << 5) | (ry2 << 2) | (instr->subop << 1) | ((imm9 >> 8) & 1));
+                uint8_t b0 = instr->first_byte;
+                uint8_t b1 = (uint8_t)((instr->subop << 7) | (rd2 << 4) | (rx2 << 1) | ((imm9 >> 8) & 1));
                 uint8_t b2 = (uint8_t)(imm9 & 0xff);
                 if (pass == 2) {
                     write8((uint16_t)cur,   b0);
@@ -703,7 +716,8 @@ static const char *lookup_mnemonic(uint8_t lookupop, int subop)
 {
     for (int i = 0; itab4[i].name; i++) {
         if (itab4[i].first_byte == lookupop) {
-            if (lookupop == 0x7e || lookupop == 0xdf || lookupop == 0xde) {
+            if (lookupop == 0x7e || lookupop == 0xdf
+                || (lookupop >= 0x10 && lookupop <= 0x1b)) {
                 if (itab4[i].subop == subop) return itab4[i].name;
             } else {
                 return itab4[i].name;
@@ -771,8 +785,19 @@ static void print_dump(uint16_t code_end, uint16_t data_end)
         int      len = 1;
         uint8_t  fmt2 = b0 >> 6;
 
-        if (fmt2 == 0 && (b0 & 0xe0) == 0x20) {
-            /* F0b: cbeq/cbne — 3 bytes */
+        if (fmt2 == 0 && (b0 & 0xf0) == 0x10) {
+            /* F0b: two-op + imm9 — 3 bytes */
+            b1 = mem[(uint16_t)(pc+1)];
+            b2 = mem[(uint16_t)(pc+2)];
+            uint32_t ins24 = ((uint32_t)b0 << 16) | ((uint32_t)b1 << 8) | b2;
+            lookupop = b0;  /* 0x10-0x1b */
+            subop = (int)((ins24 >> 15) & 1);
+            rd = rx = (int)((ins24 >> 12) & 0x7);
+            ry = (int)((ins24 >> 9) & 0x7);
+            imm = (int32_t)(ins24 & 0x1ff);
+            len = 3;
+        } else if (fmt2 == 0 && (b0 & 0xe0) == 0x20) {
+            /* F0c: cbeq/cbne — 3 bytes */
             b1 = mem[(uint16_t)(pc+1)];
             b2 = mem[(uint16_t)(pc+2)];
             uint32_t ins24 = ((uint32_t)b0 << 16) | ((uint32_t)b1 << 8) | b2;
@@ -829,15 +854,8 @@ static void print_dump(uint16_t code_end, uint16_t data_end)
                 rd = rx = (int)((ins24 >> 13) & 0x7);
                 subop = (int)((ins24 >> 10) & 0x7);
                 imm = (int32_t)(ins24 & 0x3ff);
-            } else if (b0 == 0xde) {
-                /* F3f: addli/bitex */
-                lookupop = 0xde;
-                rd = rx = (int)((ins24 >> 13) & 0x7);
-                ry = (int)((ins24 >> 10) & 0x7);
-                subop = (int)((ins24 >> 9) & 0x1);
-                imm = (int32_t)(ins24 & 0x1ff);
             } else if ((b0 & 0xf0) == 0xd0) {
-                /* F3c */
+                /* F3c (0xd0-0xdd) */
                 lookupop = b0;
                 rd = rx = (int)((ins24 >> 13) & 0x7);
                 ry = (int)((ins24 >> 10) & 0x7);
@@ -863,8 +881,12 @@ static void print_dump(uint16_t code_end, uint16_t data_end)
         if (!mnem) {
             snprintf(operands, sizeof(operands), "???");
             mnem = ".byte";
+        } else if (fmt2 == 0 && (b0 & 0xf0) == 0x10) {
+            /* F0b: two-op + imm9 — rd, rx, imm9 */
+            int32_t simm9 = sx9(imm);
+            snprintf(operands, sizeof(operands), "r%d, r%d, %d", rd, ry, (int)simm9);
         } else if (fmt2 == 0 && (b0 & 0xe0) == 0x20) {
-            /* F0b: cbeq/cbne — rx, imm8, target */
+            /* F0c: cbeq/cbne — rx, imm8, target */
             int32_t imm8_val = (imm >> 9) & 0xff;
             int32_t disp9 = sx9(imm & 0x1ff);
             uint16_t target = (uint16_t)((int)(pc + len) + disp9);
@@ -910,14 +932,6 @@ static void print_dump(uint16_t code_end, uint16_t data_end)
             const char *tgt = sym_for_target(target);
             if (*tgt) snprintf(operands, sizeof(operands), "r%d, %s", rx, tgt);
             else snprintf(operands, sizeof(operands), "r%d, 0x%04x", rx, (unsigned)target);
-        } else if (b0 == 0xde) {
-            /* F3f: addli/bitex — rx, ry, imm9 */
-            if (subop == 0) {
-                int32_t simm9 = (imm >= 256) ? imm - 512 : imm;
-                snprintf(operands, sizeof(operands), "r%d, r%d, %d", rx, ry, (int)simm9);
-            } else {
-                snprintf(operands, sizeof(operands), "r%d, r%d, %d", rx, ry, (int)imm);
-            }
         } else if ((b0 & 0xf0) == 0xd0) {
             /* F3c: loads/stores/branches */
             int32_t simm10 = (imm >= 512) ? imm - 1024 : imm;
@@ -1027,8 +1041,18 @@ static void run_cpu4(int verbose)
         int      subop = 0;
         uint8_t  fmt2 = b0 >> 6;
 
-        if (fmt2 == 0 && (b0 & 0xe0) == 0x20) {
-            /* F0b: cbeq/cbne — 3 bytes, 001odddiiiiiiiiiiiiiiiiii */
+        if (fmt2 == 0 && (b0 & 0xf0) == 0x10) {
+            /* F0b: two-op + imm9 — 3 bytes, 0001oooo odddxxxiiiiiiiii */
+            b1 = read8(pc); pc++;
+            b2 = read8(pc); pc++;
+            uint32_t ins24 = ((uint32_t)b0 << 16) | ((uint32_t)b1 << 8) | b2;
+            lookupop = b0;                  /* 0x10-0x1b */
+            subop    = (int)((ins24 >> 15) & 1);
+            rd = rx  = (int)((ins24 >> 12) & 0x7);
+            ry       = (int)((ins24 >> 9) & 0x7);
+            imm      = (int32_t)(ins24 & 0x1ff);
+        } else if (fmt2 == 0 && (b0 & 0xe0) == 0x20) {
+            /* F0c: cbeq/cbne — 3 bytes, 001odddiiiiiiiiiiiiiiiiii */
             b1 = read8(pc); pc++;
             b2 = read8(pc); pc++;
             uint32_t ins24 = ((uint32_t)b0 << 16) | ((uint32_t)b1 << 8) | b2;
@@ -1062,7 +1086,7 @@ static void run_cpu4(int verbose)
             rd = rx  = (ins16 >> 7) & 0x7;
             imm      =  ins16       & 0x7f;  /* raw 7-bit; scaled per instruction */
         } else {
-            /* F3a / new-F3b / F3b / F3d / F3e: 3 bytes */
+            /* F3a / F3b / F3c / F3d / F3e: 3 bytes */
             b1 = read8(pc); pc++;
             b2 = read8(pc); pc++;
             uint32_t ins24 = ((uint32_t)b0 << 16) | ((uint32_t)b1 << 8) | b2;
@@ -1081,13 +1105,6 @@ static void run_cpu4(int verbose)
                 rd = rx  = (int)((ins24 >> 13) & 0x7);
                 subop    = (int)((ins24 >> 10) & 0x7);
                 imm      = (int32_t)(ins24 & 0x3ff);
-            } else if (b0 == 0xde) {
-                /* F3f: addli/bitex — two-reg + imm9, subop in bit 9 */
-                lookupop = 0xde;
-                rd = rx  = (int)((ins24 >> 13) & 0x7);
-                ry       = (int)((ins24 >> 10) & 0x7);
-                subop    = (int)((ins24 >> 9) & 0x1);
-                imm      = (int32_t)(ins24 & 0x1ff);
             } else if ((b0 & 0xf0) == 0xd0) {
                 /* F3c: two-reg + imm10 (0xd0–0xdd) */
                 lookupop = b0;
@@ -1187,10 +1204,10 @@ static void run_cpu4(int verbose)
         /* F3b: adjw=0xc4, lea=0xc6 */
         case 0xc4: sp=(uint16_t)(sp+(uint16_t)(sx14(imm)<<2)); break; /* adjw */
         case 0xc6: r[rd]=(uint32_t)((int32_t)bp+(sx14(imm)<<2)); break; /* lea */
-        /* F0b: cbeq=0x20, cbne=0x30 — compare rx with imm8 and branch */
+        /* F0c: cbeq=0x20, cbne=0x30 — compare rx with imm8 and branch */
         case 0x20: if(r[rx]==(uint32_t)(imm>>9))  pc=(uint16_t)(pc+sx9(imm&0x1ff)); break; /* cbeq */
         case 0x30: if(r[rx]!=(uint32_t)(imm>>9))  pc=(uint16_t)(pc+sx9(imm&0x1ff)); break; /* cbne */
-        /* F3d — register-relative */
+        /* F3c — register-relative */
         case 0xd0: r[rx]=read8 ((uint16_t)((int32_t)r[ry]+sx10(imm)));     break; /* llb  */
         case 0xd1: { uint16_t a = (uint16_t)((int32_t)r[ry]+sx10(imm)*2); check_align16(a, oldpc); r[rx]=read16(a); } break; /* llw  */
         case 0xd2: { uint16_t a = (uint16_t)((int32_t)r[ry]+sx10(imm)*4); check_align32(a, oldpc); r[rx]=read32(a); } break; /* lll  */
@@ -1205,18 +1222,59 @@ static void run_cpu4(int verbose)
         case 0xdb: if(r[rx]<=r[ry]) pc=(uint16_t)(pc+sx10(imm)); break; /* ble  */
         case 0xdc: if((int32_t)r[rx]<(int32_t)r[ry]) pc=(uint16_t)(pc+sx10(imm)); break; /* blts */
         case 0xdd: if((int32_t)r[rx]<=(int32_t)r[ry]) pc=(uint16_t)(pc+sx10(imm)); break; /* bles */
-        case 0xde: /* F3f: addli (subop=0) / bitex (subop=1) */
-            if (subop == 0) {
-                /* addli: rx = ry + sext9(imm) */
-                int32_t si = (imm >= 256) ? imm - 512 : imm;
-                r[rx] = r[ry] + (uint32_t)si;
-            } else {
-                /* bitex: rx = (ry >> shift) & mask, where shift=imm[4:0], width=imm[8:5] */
+        /* F0b: two-op + imm9 (0x10-0x1b) */
+        case 0x10: /* addli (sub=0) / subli (sub=1) */
+            if (subop == 0) r[rd] = r[ry] + (uint32_t)sx9(imm);
+            else            r[rd] = r[ry] - (uint32_t)sx9(imm);
+            break;
+        case 0x11: /* mulli (sub=0) / divli (sub=1) */
+            if (subop == 0) r[rd] = r[ry] * (uint32_t)sx9(imm);
+            else            r[rd] = (imm & 0x1ff) ? r[ry] / (uint32_t)sx9(imm) : 0;
+            break;
+        case 0x12: /* modli (sub=0) / shlli (sub=1) */
+            if (subop == 0) r[rd] = (imm & 0x1ff) ? r[ry] % (uint32_t)sx9(imm) : 0;
+            else            r[rd] = r[ry] << (imm & 31);
+            break;
+        case 0x13: /* shrli (sub=0) / leli (sub=1) */
+            if (subop == 0) r[rd] = r[ry] >> (imm & 31);
+            else            r[rd] = (r[ry] <= (uint32_t)sx9(imm)) ? 1 : 0;
+            break;
+        case 0x14: /* gtli (sub=0) / eqli (sub=1) */
+            if (subop == 0) r[rd] = (r[ry] > (uint32_t)sx9(imm)) ? 1 : 0;
+            else            r[rd] = (r[ry] == (uint32_t)sx9(imm)) ? 1 : 0;
+            break;
+        case 0x15: /* neli (sub=0) / andli (sub=1) */
+            if (subop == 0) r[rd] = (r[ry] != (uint32_t)sx9(imm)) ? 1 : 0;
+            else            r[rd] = r[ry] & (uint32_t)sx9(imm);
+            break;
+        case 0x16: /* orli (sub=0) / xorli (sub=1) */
+            if (subop == 0) r[rd] = r[ry] | (uint32_t)sx9(imm);
+            else            r[rd] = r[ry] ^ (uint32_t)sx9(imm);
+            break;
+        case 0x17: /* lesli (sub=0) / gtsli (sub=1) */
+            if (subop == 0) r[rd] = ((int32_t)r[ry] <= sx9(imm)) ? 1 : 0;
+            else            r[rd] = ((int32_t)r[ry] > sx9(imm)) ? 1 : 0;
+            break;
+        case 0x18: /* divsli (sub=0) / modsli (sub=1) */
+            if (subop == 0) r[rd] = (uint32_t)((imm & 0x1ff) ? (int32_t)r[ry] / sx9(imm) : 0);
+            else            r[rd] = (uint32_t)((imm & 0x1ff) ? (int32_t)r[ry] % sx9(imm) : 0);
+            break;
+        case 0x19: /* shrsli (sub=0) / bitex (sub=1) */
+            if (subop == 0) r[rd] = (uint32_t)((int32_t)r[ry] >> (imm & 31));
+            else {
                 int shift = imm & 0x1f;
                 int width = (imm >> 5) & 0x0f;
-                uint32_t mask = (2u << width) - 1; /* (1 << (width+1)) - 1 */
-                r[rx] = (r[ry] >> shift) & mask;
+                uint32_t mask = (2u << width) - 1;
+                r[rd] = (r[ry] >> shift) & mask;
             }
+            break;
+        case 0x1a: /* rsubli (sub=0) / rdivli (sub=1) */
+            if (subop == 0) r[rd] = (uint32_t)sx9(imm) - r[ry];
+            else            r[rd] = r[ry] ? (uint32_t)(sx9(imm) / (int32_t)r[ry]) : 0;
+            break;
+        case 0x1b: /* rmodli (sub=0) / rdivsli (sub=1) */
+            if (subop == 0) r[rd] = r[ry] ? (uint32_t)(sx9(imm) % (int32_t)r[ry]) : 0;
+            else            r[rd] = r[ry] ? (uint32_t)(sx9(imm) / (int32_t)r[ry]) : 0;
             break;
         /* F3d: beqz/bnez */
         case 0xdf:

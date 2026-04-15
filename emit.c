@@ -458,6 +458,7 @@ static void emit_inst(Inst *inst, FILE *out) {
         }
 
         // P14: AND(x, k) where k in 0..127 → andi (F2, in-place, 2 bytes)
+        //       AND(x, k) where k in 128..255 → andli (F0b, 3 bytes vs 5 for immw+and)
         if (inst->kind == IK_AND && (k0 ^ k1)) {
             int kv = k1 ? (c1 ? op1->iconst : op1->def->imm)
                         : (c0 ? op0->iconst : op0->def->imm);
@@ -466,6 +467,10 @@ static void emit_inst(Inst *inst, FILE *out) {
                 if (ps != rd)
                     fprintf(out, "    or %s, %s, %s\n", regname(rd), regname(ps), regname(ps));
                 fprintf(out, "    andi %s, %d\n", regname(rd), kv);
+                break;
+            }
+            if (kv >= 128 && kv <= 255) {
+                fprintf(out, "    andli %s, %s, %d\n", regname(rd), regname(ps), kv);
                 break;
             }
         }
@@ -495,28 +500,34 @@ static void emit_inst(Inst *inst, FILE *out) {
             }
         }
 
-        // P11: SHL with constant shift amount → shli (F2, in-place, 2 bytes)
-        // In-place: shli rd, k (2 bytes vs 5 for immw+shl)
-        // Cross-reg: or rd, ps, ps; shli rd, k (4 bytes vs 5 for immw+shl)
-        // Uses resolve_const to see through IK_CONST defs and AND(const,const)
-        // from legalize TRUNC lowering of LICM-hoisted constants.
+        // P18: MUL(x, k) where k fits sext9 → mulli (F0b, 3 bytes vs 5 for immw+mul)
+        if (inst->kind == IK_MUL && (c0 ^ c1)) {
+            int kv = c1 ? op1->iconst : op0->iconst;
+            int ps = c1 ? p0 : p1;
+            if (kv >= -256 && kv <= 255)
+                { fprintf(out, "    mulli %s, %s, %d\n", regname(rd), regname(ps), kv); break; }
+        }
+
+        // P11: SHL with constant shift amount
+        // In-place: shli rd, k (F2, 2 bytes)
+        // Cross-reg: shlli rd, ps, k (F0b, 3 bytes vs 4 for or+shli)
         if (inst->kind == IK_SHL && !k0) {
             int shift_k;
             if (resolve_const(op1, &shift_k)) {
                 int k = shift_k & 31;
                 if (k >= 0 && k <= 63) {
-                    if (p0 != rd)
-                        fprintf(out, "    or %s, %s, %s\n", regname(rd), regname(p0), regname(p0));
-                    fprintf(out, "    shli %s, %d\n", regname(rd), k);
+                    if (p0 == rd)
+                        fprintf(out, "    shli %s, %d\n", regname(rd), k);
+                    else
+                        fprintf(out, "    shlli %s, %s, %d\n", regname(rd), regname(p0), k);
                     break;
                 }
             }
         }
 
-        // P13: Right shift with constant amount → shrsi (F2, in-place, 2 bytes)
-        // Signed: always safe (shrsi is arithmetic).
-        // Unsigned: safe when operand is ≤16 bits (upper bits are 0, arith == logical).
-        // Uses resolve_const to see through IK_CONST defs and AND(const,const).
+        // P13: Right shift with constant amount
+        // Signed: shrsi (F2 in-place, 2 bytes) or shrsli (F0b cross-reg, 3 bytes)
+        // Unsigned: shrsi safe when ≤16 bits; else shrli (F0b, 3 bytes, logical)
         if ((inst->kind == IK_SHR || inst->kind == IK_USHR) && !k0) {
             int shift_k;
             if (resolve_const(op1, &shift_k)) {
@@ -527,9 +538,67 @@ static void emit_inst(Inst *inst, FILE *out) {
                     safe = (dvt != VT_U32 && dvt != VT_I32);
                 }
                 if (safe && k >= 0 && k <= 63) {
-                    if (p0 != rd)
-                        fprintf(out, "    or %s, %s, %s\n", regname(rd), regname(p0), regname(p0));
-                    fprintf(out, "    shrsi %s, %d\n", regname(rd), k);
+                    if (p0 == rd)
+                        fprintf(out, "    shrsi %s, %d\n", regname(rd), k);
+                    else
+                        fprintf(out, "    shrsli %s, %s, %d\n", regname(rd), regname(p0), k);
+                    break;
+                }
+                if (!safe && k >= 0 && k <= 31) {
+                    // Unsigned 32-bit: use shrli (F0b, logical right shift)
+                    fprintf(out, "    shrli %s, %s, %d\n", regname(rd), regname(p0), k);
+                    break;
+                }
+            }
+        }
+
+        // P19: F0b immediate ALU (3 bytes vs 5 for immw+alu)
+        // Covers comparisons, div/mod, or/xor, reverse-sub not handled by P2-P18.
+        if ((c0 ^ c1)) {
+            int kv = c1 ? op1->iconst : op0->iconst;
+            if (kv >= -256 && kv <= 255) {
+                const char *mnem = NULL;
+                int ps = c1 ? p0 : p1;
+                switch (inst->kind) {
+                // Comparisons: EQ/NE are commutative
+                case IK_EQ:   mnem = "eqli"; break;
+                case IK_NE:   mnem = "neli"; break;
+                // LE with const on right → lesli/leli
+                // LE with const on left → a > const-1 → gtsli/gtli
+                case IK_LE:
+                    if (c1) { mnem = is_signed ? "lesli" : "leli"; }
+                    else if (kv > (is_signed ? -256 : 0))
+                        { mnem = is_signed ? "gtsli" : "gtli"; kv--; }
+                    break;
+                case IK_ULE:
+                    if (c1) { mnem = "leli"; }
+                    else if (kv > 0) { mnem = "gtli"; kv--; }
+                    break;
+                // LT with const on left → a > const → gtsli/gtli
+                // LT with const on right → a <= const-1 → lesli/leli
+                case IK_LT:
+                    if (c0) { mnem = is_signed ? "gtsli" : "gtli"; }
+                    else if (kv > (is_signed ? -256 : 0))
+                        { mnem = is_signed ? "lesli" : "leli"; kv--; }
+                    break;
+                case IK_ULT:
+                    if (c0) { mnem = "gtli"; }
+                    else if (kv > 0) { mnem = "leli"; kv--; }
+                    break;
+                // SUB with const on left → rsubli (SUB(a,const) handled by P4)
+                case IK_SUB:  if (c0) mnem = "rsubli"; break;
+                // Division and modulo
+                case IK_DIV:  mnem = c1 ? "divsli" : "rdivsli"; break;
+                case IK_UDIV: mnem = c1 ? "divli"  : "rdivli";  break;
+                case IK_MOD:  if (c1) mnem = "modsli"; break;
+                case IK_UMOD: mnem = c1 ? "modli"  : "rmodli";  break;
+                // Commutative bitwise ops
+                case IK_OR:   mnem = "orli"; break;
+                case IK_XOR:  mnem = "xorli"; break;
+                default: break;
+                }
+                if (mnem) {
+                    fprintf(out, "    %s %s, %s, %d\n", mnem, regname(rd), regname(ps), kv);
                     break;
                 }
             }
@@ -1265,7 +1334,7 @@ static void mark_dead_consts(Function *f) {
                 int mask = (kv->kind == VAL_CONST) ? kv->iconst : kv->def->imm;
                 int is_ik = is_k1 ? ik1 : ik0;
                 if (is_ik && kv->use_count <= 1 &&
-                    ((mask >= 0 && mask <= 127) || mask == 0xff || mask == 0xffff))
+                    ((mask >= 0 && mask <= 255) || mask == 0xffff))
                     kv->def->is_dead = 1;
             }
             // P11/P13: SHL/SHR/USHR with constant shift amount → shli/shrsi;
@@ -1306,7 +1375,7 @@ static void mark_dead_consts(Function *f) {
 
 // P16: Detect SHR(x, k_shift) + AND(result, k_mask) pairs that can be fused
 // into a single bitex instruction.  bitex rd, ry, imm9 computes
-// rd = (ry >> shift) & ((1 << width) - 1) in one F3f instruction (3 bytes),
+// rd = (ry >> shift) & ((1 << width) - 1) in one F0b instruction (3 bytes),
 // replacing mov+shrsi+andi (6 bytes) or shrsi+andi (4 bytes).
 // Table indexed by AND destination value id; g_bitex_src[id] = -1 means no fusion.
 
