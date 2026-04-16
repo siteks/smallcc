@@ -81,6 +81,107 @@ static void recount_uses(Function *f) {
     }
 }
 
+/*
+ * Natural-loop info: one entry per loop header.  Shared across opt_licm,
+ * opt_licm_const, opt_lsr, opt_scalar_promote, opt_addr_iv.  All five passes
+ * skip loops without a single preheader and most also skip non-leaf loops.
+ *
+ *   header:    the loop header block (entry via non-back edge).
+ *   preheader: the unique non-back-edge predecessor of header.  NULL when
+ *              outside_count != 1 — callers must check and skip.
+ *   latch:     one back-edge predecessor (first-seen in block order).  Used
+ *              by scalar_promote/addr_iv to seed the natural-loop worklist.
+ *   pre_idx:   index of preheader in header->preds[], or -1 when absent.
+ *   back_idx:  index of a latch in header->preds[] (last one if multiple).
+ *              Used by LSR/scalar_promote/addr_iv to read phi back-edge operands.
+ *   has_inner: 1 iff another recorded header is strictly dominated by this
+ *              one — callers restricting to leaf loops skip when set.
+ */
+typedef struct {
+    Block *header;
+    Block *preheader;
+    Block *latch;
+    int    pre_idx;
+    int    back_idx;
+    int    has_inner;
+} LoopInfo;
+
+/*
+ * Discover natural loops via back-edge detection and populate LoopInfo.
+ * Requires compute_dominators(f) to have been called so rpo_index and
+ * dominates() are valid.  Returns the number of loops and writes an
+ * arena-allocated array to *out; returns 0 with *out = NULL when there
+ * are no back edges.
+ */
+static int find_loops(Function *f, LoopInfo **out) {
+    *out = NULL;
+    if (f->nblocks < 2) return 0;
+
+    LoopInfo *loops = NULL;
+    int nloops = 0, cap = 0;
+
+    // Step 1: discover unique headers, recording first-seen latch.
+    for (int i = 0; i < f->nblocks; i++) {
+        Block *b = f->blocks[i];
+        for (int j = 0; j < b->nsuccs; j++) {
+            Block *h = b->succs[j];
+            if (h->rpo_index <= b->rpo_index && dominates(h, b)) {
+                int dup = 0;
+                for (int k = 0; k < nloops; k++)
+                    if (loops[k].header == h) { dup = 1; break; }
+                if (dup) continue;
+                if (nloops >= cap) {
+                    int nc = cap ? cap * 2 : 4;
+                    LoopInfo *nl = arena_alloc(nc * sizeof(LoopInfo));
+                    if (loops) memcpy(nl, loops, nloops * sizeof(LoopInfo));
+                    loops = nl;
+                    cap   = nc;
+                }
+                loops[nloops].header    = h;
+                loops[nloops].latch     = b;
+                loops[nloops].preheader = NULL;
+                loops[nloops].pre_idx   = -1;
+                loops[nloops].back_idx  = -1;
+                loops[nloops].has_inner = 0;
+                nloops++;
+            }
+        }
+    }
+    if (nloops == 0) return 0;
+
+    // Step 2: per-header preheader + back_idx + has_inner.
+    for (int li = 0; li < nloops; li++) {
+        Block *h = loops[li].header;
+        Block *ph = NULL;
+        int pre_idx = -1, back_idx = -1, outside = 0;
+        for (int k = 0; k < h->npreds; k++) {
+            Block *p = h->preds[k];
+            if (dominates(h, p)) {
+                back_idx = k;    // last-seen back-edge pred
+            } else {
+                ph      = p;
+                pre_idx = k;
+                outside++;
+            }
+        }
+        if (outside == 1) {
+            loops[li].preheader = ph;
+            loops[li].pre_idx   = pre_idx;
+        }
+        loops[li].back_idx = back_idx;
+
+        for (int k = 0; k < nloops; k++) {
+            if (k != li && dominates(h, loops[k].header)) {
+                loops[li].has_inner = 1;
+                break;
+            }
+        }
+    }
+
+    *out = loops;
+    return nloops;
+}
+
 // ── R2A: Constant-condition branch folding ────────────────────────────────
 
 void opt_fold_branches(Function *f) {
@@ -1013,62 +1114,22 @@ typedef struct {
 } LicmCand;
 
 void opt_licm_const(Function *f) {
-    if (f->nblocks < 2) return;
-    // Step 1: Find loop headers via back edges.
-    Block **headers = NULL;
-    int nheaders = 0, hdr_cap = 0;
-
-    for (int i = 0; i < f->nblocks; i++) {
-        Block *b = f->blocks[i];
-        for (int j = 0; j < b->nsuccs; j++) {
-            Block *h = b->succs[j];
-            if (h->rpo_index <= b->rpo_index && dominates(h, b)) {
-                int dup = 0;
-                for (int k = 0; k < nheaders; k++)
-                    if (headers[k] == h) { dup = 1; break; }
-                if (!dup) {
-                    if (nheaders >= hdr_cap) {
-                        hdr_cap = hdr_cap ? hdr_cap * 2 : 4;
-                        Block **nh = arena_alloc(hdr_cap * sizeof(Block *));
-                        if (headers) memcpy(nh, headers, nheaders * sizeof(Block *));
-                        headers = nh;
-                    }
-                    headers[nheaders++] = h;
-                }
-            }
-        }
-    }
-    if (nheaders == 0) return;
+    LoopInfo *loops;
+    int nloops = find_loops(f, &loops);
+    if (nloops == 0) return;
 
     int changed = 0;
 
-    for (int li = 0; li < nheaders; li++) {
-        Block *h = headers[li];
+    for (int li = 0; li < nloops; li++) {
+        Block *h         = loops[li].header;
+        Block *preheader = loops[li].preheader;
 
         // Only hoist in leaf loops (no inner loop headers dominated by h).
         // Hoisting in outer loops with nested inner loops makes constants live
         // across the entire function, causing register pressure > K and spill
         // cascades that can produce incorrect code.
-        int has_inner = 0;
-        for (int k = 0; k < nheaders; k++) {
-            if (k != li && dominates(h, headers[k])) {
-                has_inner = 1;
-                break;
-            }
-        }
-        if (has_inner) continue;
-
-        // Step 2: Find the pre-header.
-        Block *preheader = NULL;
-        int outside_count = 0;
-        for (int k = 0; k < h->npreds; k++) {
-            Block *p = h->preds[k];
-            if (!dominates(h, p)) {
-                preheader = p;
-                outside_count++;
-            }
-        }
-        if (outside_count != 1 || !preheader) continue;
+        if (loops[li].has_inner) continue;
+        if (!preheader) continue;
         if (!preheader->tail) continue;
 
         // Guard: estimate how many values are already live across the loop.
@@ -1278,58 +1339,19 @@ void opt_licm_const(Function *f) {
 // Excludes division/mod (potential traps if loop executes 0 times).
 
 void opt_licm(Function *f) {
-    if (f->nblocks < 2) return;
-
-    // Step 1: Find loop headers via back edges.
-    Block **headers = NULL;
-    int nheaders = 0, hdr_cap = 0;
-    for (int i = 0; i < f->nblocks; i++) {
-        Block *b = f->blocks[i];
-        for (int j = 0; j < b->nsuccs; j++) {
-            Block *h = b->succs[j];
-            if (h->rpo_index <= b->rpo_index && dominates(h, b)) {
-                int dup = 0;
-                for (int k = 0; k < nheaders; k++)
-                    if (headers[k] == h) { dup = 1; break; }
-                if (!dup) {
-                    if (nheaders >= hdr_cap) {
-                        hdr_cap = hdr_cap ? hdr_cap * 2 : 4;
-                        Block **nh = arena_alloc(hdr_cap * sizeof(Block *));
-                        if (headers) memcpy(nh, headers, nheaders * sizeof(Block *));
-                        headers = nh;
-                    }
-                    headers[nheaders++] = h;
-                }
-            }
-        }
-    }
-    if (nheaders == 0) return;
+    LoopInfo *loops;
+    int nloops = find_loops(f, &loops);
+    if (nloops == 0) return;
 
     int changed = 0;
 
-    for (int li = 0; li < nheaders; li++) {
-        Block *h = headers[li];
+    for (int li = 0; li < nloops; li++) {
+        Block *h         = loops[li].header;
+        Block *preheader = loops[li].preheader;
 
         // Only leaf loops (no inner loop headers dominated by h).
-        int has_inner = 0;
-        for (int k = 0; k < nheaders; k++) {
-            if (k != li && dominates(h, headers[k])) {
-                has_inner = 1; break;
-            }
-        }
-        if (has_inner) continue;
-
-        // Find pre-header (single outside predecessor).
-        Block *preheader = NULL;
-        int outside_count = 0;
-        for (int k = 0; k < h->npreds; k++) {
-            Block *p = h->preds[k];
-            if (!dominates(h, p)) {
-                preheader = p;
-                outside_count++;
-            }
-        }
-        if (outside_count != 1 || !preheader || !preheader->tail) continue;
+        if (loops[li].has_inner) continue;
+        if (!preheader || !preheader->tail) continue;
 
         // Register pressure guard: count distinct VAL_INST values used
         // inside the loop body that are defined OUTSIDE the loop.  Each
@@ -2015,62 +2037,21 @@ typedef struct {
 } IVInfo;
 
 void opt_lsr(Function *f) {
-    if (f->nblocks < 2) return;
-
-    // Step 1: Find loop headers via back edges.
-    Block **headers = NULL;
-    int nheaders = 0, hdr_cap = 0;
-    for (int i = 0; i < f->nblocks; i++) {
-        Block *b = f->blocks[i];
-        for (int j = 0; j < b->nsuccs; j++) {
-            Block *h = b->succs[j];
-            if (h->rpo_index <= b->rpo_index && dominates(h, b)) {
-                int dup = 0;
-                for (int k = 0; k < nheaders; k++)
-                    if (headers[k] == h) { dup = 1; break; }
-                if (!dup) {
-                    if (nheaders >= hdr_cap) {
-                        hdr_cap = hdr_cap ? hdr_cap * 2 : 4;
-                        Block **nh = malloc(hdr_cap * sizeof(Block *));
-                        if (headers) { memcpy(nh, headers, nheaders * sizeof(Block *)); free(headers); }
-                        headers = nh;
-                    }
-                    headers[nheaders++] = h;
-                }
-            }
-        }
-    }
-    if (nheaders == 0) return;
+    LoopInfo *loops;
+    int nloops = find_loops(f, &loops);
+    if (nloops == 0) return;
 
     int changed = 0;
 
-    for (int li = 0; li < nheaders; li++) {
-        Block *h = headers[li];
+    for (int li = 0; li < nloops; li++) {
+        Block *h         = loops[li].header;
+        Block *preheader = loops[li].preheader;
+        int    pre_idx   = loops[li].pre_idx;
+        int    back_idx  = loops[li].back_idx;
 
         // Only leaf loops (no inner loop headers dominated by h).
-        int has_inner = 0;
-        for (int k = 0; k < nheaders; k++) {
-            if (k != li && dominates(h, headers[k])) {
-                has_inner = 1; break;
-            }
-        }
-        if (has_inner) continue;
-
-        // Find pre-header (single non-back-edge predecessor) and back-edge pred.
-        Block *preheader = NULL;
-        int pre_idx = -1, back_idx = -1;
-        int outside_count = 0;
-        for (int k = 0; k < h->npreds; k++) {
-            Block *p = h->preds[k];
-            if (dominates(h, p)) {
-                back_idx = k;
-            } else {
-                preheader = p;
-                pre_idx = k;
-                outside_count++;
-            }
-        }
-        if (outside_count != 1 || !preheader || pre_idx < 0 || back_idx < 0) continue;
+        if (loops[li].has_inner) continue;
+        if (!preheader || pre_idx < 0 || back_idx < 0) continue;
 
         // Register pressure guard: count values defined outside the loop
         // that are used inside (cross-loop live-ins), plus header phis.
@@ -2244,8 +2225,6 @@ void opt_lsr(Function *f) {
         }
     }
 
-    free(headers);
-
     if (!changed) return;
 
     // Physically unlink dead instructions (the reduced MULs) so they don't
@@ -2281,49 +2260,22 @@ void opt_lsr(Function *f) {
 // inside the loop body and reducing register pressure.
 
 void opt_scalar_promote(Function *f) {
-    if (f->nblocks < 2) return;
-
-    // Find loop headers + latch blocks via back-edge detection
-    struct { Block *h; Block *latch; } loops[32];
-    int nloops = 0;
-    for (int i = 0; i < f->nblocks; i++) {
-        Block *b = f->blocks[i];
-        for (int j = 0; j < b->nsuccs; j++) {
-            Block *h = b->succs[j];
-            if (h->rpo_index <= b->rpo_index && dominates(h, b)) {
-                int dup = 0;
-                for (int k = 0; k < nloops; k++)
-                    if (loops[k].h == h) { dup = 1; break; }
-                if (!dup && nloops < 32) {
-                    loops[nloops].h = h;
-                    loops[nloops].latch = b;
-                    nloops++;
-                }
-            }
-        }
-    }
-    if (!nloops) return;
+    LoopInfo *loops;
+    int nloops = find_loops(f, &loops);
+    if (nloops == 0) return;
 
     int changed = 0;
 
     for (int li = 0; li < nloops; li++) {
-        Block *h = loops[li].h;
-        Block *latch = loops[li].latch;
+        Block *h        = loops[li].header;
+        Block *latch    = loops[li].latch;
+        Block *preh     = loops[li].preheader;
+        int    pre_idx  = loops[li].pre_idx;
+        int    back_idx = loops[li].back_idx;
 
         // Leaf loops only
-        int inner = 0;
-        for (int k = 0; k < nloops && !inner; k++)
-            if (k != li && dominates(h, loops[k].h)) inner = 1;
-        if (inner) continue;
-
-        // Pre-header + back-edge predecessor indices
-        Block *preh = NULL;
-        int pre_idx = -1, back_idx = -1, outside = 0;
-        for (int k = 0; k < h->npreds; k++) {
-            if (dominates(h, h->preds[k])) back_idx = k;
-            else { preh = h->preds[k]; pre_idx = k; outside++; }
-        }
-        if (outside != 1 || !preh || back_idx < 0) continue;
+        if (loops[li].has_inner) continue;
+        if (!preh || back_idx < 0) continue;
 
         // Compute natural loop body via worklist
         int mark_sz = f->next_blk_id;
@@ -2538,49 +2490,22 @@ static Value *aiv_materialize(Value *v, int *in_body, Function *f, Block *preh) 
 }
 
 void opt_addr_iv(Function *f) {
-    if (f->nblocks < 2) return;
-
-    // Find loop headers + latch blocks via back-edge detection
-    struct { Block *h; Block *latch; } loops[32];
-    int nloops = 0;
-    for (int i = 0; i < f->nblocks; i++) {
-        Block *b = f->blocks[i];
-        for (int j = 0; j < b->nsuccs; j++) {
-            Block *h = b->succs[j];
-            if (h->rpo_index <= b->rpo_index && dominates(h, b)) {
-                int dup = 0;
-                for (int k = 0; k < nloops; k++)
-                    if (loops[k].h == h) { dup = 1; break; }
-                if (!dup && nloops < 32) {
-                    loops[nloops].h = h;
-                    loops[nloops].latch = b;
-                    nloops++;
-                }
-            }
-        }
-    }
-    if (!nloops) return;
+    LoopInfo *loops;
+    int nloops = find_loops(f, &loops);
+    if (nloops == 0) return;
 
     int changed = 0;
 
     for (int li = 0; li < nloops; li++) {
-        Block *h = loops[li].h;
-        Block *latch = loops[li].latch;
+        Block *h        = loops[li].header;
+        Block *latch    = loops[li].latch;
+        Block *preh     = loops[li].preheader;
+        int    pre_idx  = loops[li].pre_idx;
+        int    back_idx = loops[li].back_idx;
 
         // Leaf loops only
-        int inner = 0;
-        for (int k = 0; k < nloops && !inner; k++)
-            if (k != li && dominates(h, loops[k].h)) inner = 1;
-        if (inner) continue;
-
-        // Pre-header + back-edge predecessor indices
-        Block *preh = NULL;
-        int pre_idx = -1, back_idx = -1, outside = 0;
-        for (int k = 0; k < h->npreds; k++) {
-            if (dominates(h, h->preds[k])) back_idx = k;
-            else { preh = h->preds[k]; pre_idx = k; outside++; }
-        }
-        if (outside != 1 || !preh || back_idx < 0) continue;
+        if (loops[li].has_inner) continue;
+        if (!preh || back_idx < 0) continue;
 
         // Compute natural loop body
         int mark_sz = f->next_blk_id;
