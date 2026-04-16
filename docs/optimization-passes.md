@@ -34,8 +34,6 @@ out_of_ssa()                 phi elimination (Boissinot 2009)
 
 ── Post-OOS passes (run_post_oos_pipeline, profile-parameterised) ─
 
-opt_fold_branches()          R2A   OPT_FOLD_BR            (2nd call)
-opt_remove_dead_blocks()     R2B   OPT_DEAD_BLOCKS        (2nd call)
 opt_copy_prop()              R2D   OPT_COPY_PROP          (1st call)
 compute_dominators()                                       (for CSE)
 opt_cse()                    R2E   OPT_CSE
@@ -106,8 +104,12 @@ detection and accumulator promotion.
 | — | — | `opt_lsr` | Loop strength reduction: `iv*invariant` → ADD chain |
 
 R2A+R2B run as a pre-OOS cleanup pass (before `compute_dominators`) to reduce the
-block count for all subsequent passes. They run again post-OOS because OOS may
-introduce new constant-condition branches.
+block count for all subsequent passes. They are **not** re-run post-OOS: OOS only
+inserts `IK_COPY` into existing blocks, so it cannot create new const-condition
+branches or unreachable blocks. A corpus measurement (Phase 1 OPT_STATS) confirmed
+0 fires for the post-OOS calls and they were removed. `opt_jump_thread` internally
+calls `opt_remove_dead_blocks` when it rewrites CFG edges, so any orphans it creates
+are still cleaned up.
 
 ### Post-OOS Passes (opt.c)
 
@@ -116,8 +118,6 @@ encapsulated in `run_post_oos_pipeline()`.
 
 | ID | Bit | Function | What | Depends on |
 |----|-----|----------|------|------------|
-| R2A | `OPT_FOLD_BR` | `opt_fold_branches` | Fold `IK_BR(const)` → `IK_JMP` | — |
-| R2B | `OPT_DEAD_BLOCKS` | `opt_remove_dead_blocks` | Remove zero-predecessor blocks | R2A (creates dead blocks) |
 | R2D | `OPT_COPY_PROP` | `opt_copy_prop` | Collapse single-def copy chains | — |
 | R2E | `OPT_CSE` | `opt_cse` | Dominator-tree scoped GVN | dominators (block ordering) |
 | R2F | `OPT_LICM` | `opt_licm_const` | Hoist `VAL_CONST` out of loops | dominators, loop depth |
@@ -129,16 +129,17 @@ encapsulated in `run_post_oos_pipeline()`.
 functions because constant hoisting uses a different budget model (count-based)
 than general invariant hoisting (register-pressure-based).
 
-**Dependency graph:**
+**Dependency graph** (post-OOS):
 
 ```
-R2A ──→ R2B           (R2A creates dead blocks for R2B to remove)
 R2D ──→ R2E           (copy prop resolves operands for CSE matching)
 R2D ──→ R2I           (copy prop resolves jump thread targets)
 dom ──→ R2E           (CSE uses dominator pre-order)
 dom ──→ R2F           (LICM needs loop depth)
 R2J ──→ R2D(2nd)      (unroll creates copies that need propagation)
 ```
+
+(Pre-OOS: `R2A ──→ R2B` — R2A creates dead blocks for R2B to remove.)
 
 ### Legalization Passes (legalize.c)
 

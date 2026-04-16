@@ -46,6 +46,12 @@ Node* parse tree  (output of resolve_symbols / derive_types / insert_coercions)
       │   └─ accumulates function-body string literals and static locals
       │       (flushed to data section via braun_emit_strlits() after each function)
       │
+      │  ── Pre-OOS cleanup (CFG-structural, before dominators) ────────────────
+      │
+      ├─ split_critical_edges() ssa.c    structural prerequisite for OOS
+      ├─ opt_fold_branches()  opt.c      R2A: fold IK_BR with VAL_CONST condition → IK_JMP
+      ├─ opt_remove_dead_blocks() opt.c  R2B: remove blocks with npreds==0 (iterates to fixpoint)
+      │
       ├─ compute_dominators() dom.c      idom, dom_children, dom_pre/post, loop_depth
       │
       │  ── Pre-OOS passes (true SSA form, phis still present) ──────────────────
@@ -63,8 +69,6 @@ Node* parse tree  (output of resolve_symbols / derive_types / insert_coercions)
       │
       │  ── Post-OOS passes (run_post_oos_pipeline, profile-parameterised) ──────
       │
-      ├─ opt_fold_branches()  opt.c      R2A: fold IK_BR with VAL_CONST condition → IK_JMP
-      ├─ opt_remove_dead_blocks() opt.c  R2B: remove blocks with npreds==0 (iterates to fixpoint)
       ├─ opt_copy_prop()      opt.c      R2D: collapse IK_COPY chains; alias single-def copies
       ├─ opt_cse()            opt.c      R2E: hash-based CSE (dominator-tree scoped GVN)
       ├─ opt_licm_const()     opt.c      R2F: hoist IK_CONST out of loop bodies
@@ -107,10 +111,15 @@ Pre-OOS GVN uses a relaxed cross-block policy (any dominating block, not just sa
 Loop transforms (scalar promotion, address IVs, strength reduction) exploit the explicit
 phi structure.
 
-**Post-OOS passes** (R2A–R2J) run after `out_of_ssa`, before legalize. These are
+**Post-OOS passes** (R2D–R2J) run after `out_of_ssa`, before legalize. These are
 encapsulated in `run_post_oos_pipeline()`. The pass ordering is fixed:
-fold branches → dead blocks → copy prop → CSE → LICM const → LICM general →
-jump threading → unroll → copy prop (cleanup) → dominators → legalize → IRC.
+copy prop → CSE → LICM const → LICM general → jump threading → unroll →
+copy prop (cleanup) → dominators → legalize → IRC.
+
+R2A (`opt_fold_branches`) and R2B (`opt_remove_dead_blocks`) run only as pre-OOS
+cleanup — OOS cannot introduce new const-condition branches or unreachable blocks
+(it only inserts `IK_COPY` into existing blocks), and a corpus measurement confirmed
+0 fires for the post-OOS second call.
 
 ---
 
@@ -345,14 +354,16 @@ bitmask system, CLI interface, and LICM/CSE tuning constants.
 
 Brief summary of the post-OOS pass order (encapsulated in `run_post_oos_pipeline`):
 
-1. **R2A** `opt_fold_branches` — fold `IK_BR(const)` → `IK_JMP`
-2. **R2B** `opt_remove_dead_blocks` — remove zero-predecessor blocks
-3. **R2D** `opt_copy_prop` — collapse single-def `IK_COPY` chains
-4. **R2E** `opt_cse` — dominator-tree scoped GVN (hash-based CSE)
-5. **R2F** `opt_licm_const` + `opt_licm` — hoist constants and invariants out of loops
-6. **R2I** `opt_jump_thread` — thread jumps through thin blocks
-7. **R2J** `opt_unroll_loops` — MVE self-loop unrolling
-8. **R2D** `opt_copy_prop` — cleanup pass after LICM/unroll
+1. **R2D** `opt_copy_prop` — collapse single-def `IK_COPY` chains
+2. **R2E** `opt_cse` — dominator-tree scoped GVN (hash-based CSE)
+3. **R2F** `opt_licm_const` + `opt_licm` — hoist constants and invariants out of loops
+4. **R2I** `opt_jump_thread` — thread jumps through thin blocks
+5. **R2J** `opt_unroll_loops` — MVE self-loop unrolling
+6. **R2D** `opt_copy_prop` — cleanup pass after LICM/unroll
+
+**R2A** (`opt_fold_branches`) and **R2B** (`opt_remove_dead_blocks`) run only as
+pre-OOS CFG-structural cleanup — they are not re-invoked post-OOS because OOS
+cannot create new const-condition branches or unreachable blocks.
 
 Pre-OOS passes (R2G, R2H, R2K, R2L, GVN, scalar promotion, address IVs, LSR) run
 between `compute_dominators` and `out_of_ssa` on true SSA form. See the pipeline

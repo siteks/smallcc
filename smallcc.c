@@ -240,18 +240,39 @@ static int collect_needed_libs(char **user_files, int user_count,
     return lib_count;
 }
 
+// Phase 1 measurement: log per-call fire counts when OPT_STATS is set.
+// STAT(tag, counter, call) resets the counter, runs the call, then emits
+// one line to stderr — only when OPT_STATS is set AND the count is > 0.
+// The tag disambiguates call sites (e.g. "pre" vs "post1" vs "post5").
+#define STAT(tag, counter, call) do { \
+    if (getenv("OPT_STATS")) { \
+        counter = 0; \
+        call; \
+        if (counter > 0) \
+            fprintf(stderr, "[STATS] %s %s " #counter "=%d\n", f->name, tag, counter); \
+    } else { \
+        call; \
+    } \
+} while (0)
+
 // Run post-OOS optimization passes + legalize + IRC on a Function.
 // Does NOT emit; the caller decides what to do with the result.
+//
+// opt_fold_branches / opt_remove_dead_blocks are NOT re-run here: the pre-OOS
+// cleanup already handled them, and OOS only inserts IK_COPY (it doesn't
+// create new const-condition branches or unreachable blocks).  Measured 0
+// fires corpus-wide (see Phase 1 measurement).  opt_jump_thread internally
+// calls opt_remove_dead_blocks when it changes anything, so any jump-threaded
+// orphans are still cleaned up.
 static void run_post_oos_pipeline(Function *f) {
-    if (opt_flags & OPT_FOLD_BR)        opt_fold_branches(f);
-    if (opt_flags & OPT_DEAD_BLOCKS)    opt_remove_dead_blocks(f);
-    if (opt_flags & OPT_COPY_PROP)      opt_copy_prop(f);
-    if (opt_flags & OPT_CSE)            { compute_dominators(f); opt_cse(f); }
+    if (opt_flags & OPT_COPY_PROP)      STAT("post3", opt_stat_copy_alias, opt_copy_prop(f));
+    if (opt_flags & OPT_CSE)            { compute_dominators(f);
+                                          STAT("post4", opt_stat_cse_alias, opt_cse(f)); }
     if (opt_flags & OPT_LICM)           opt_licm_const(f);
     if (opt_flags & OPT_LICM)           opt_licm(f);
     if (opt_flags & OPT_JUMP_THREAD)    opt_jump_thread(f);
     if (opt_flags & OPT_UNROLL)         opt_unroll_loops(f);
-    if (opt_flags & OPT_COPY_PROP)      opt_copy_prop(f);
+    if (opt_flags & OPT_COPY_PROP)      STAT("post5", opt_stat_copy_alias, opt_copy_prop(f));
     compute_dominators(f);
     legalize_function(f);
     irc_allocate(f);
@@ -605,15 +626,19 @@ int main(int argc, char **argv)
                     if (ssa_out) { fprintf(ssa_out, "=== SSA: %s ===\n", f->name); print_function(f, ssa_out); }
                     split_critical_edges(f);
                     // Pre-OOS cleanup: CFG-structural, no phis/copies needed
-                    if (opt_flags & OPT_FOLD_BR)        opt_fold_branches(f);
-                    if (opt_flags & OPT_DEAD_BLOCKS)    opt_remove_dead_blocks(f);
+                    if (opt_flags & OPT_FOLD_BR)        STAT("pre", opt_stat_fold_br,  opt_fold_branches(f));
+                    if (opt_flags & OPT_DEAD_BLOCKS)    STAT("pre", opt_stat_dead_blk, opt_remove_dead_blocks(f));
                     compute_dominators(f);
                     // Pre-OOS pattern simplification: feed cleaner IR to GVN
                     if (opt_flags & OPT_REDUNDANT_BOOL) opt_redundant_bool(f);
                     if (opt_flags & OPT_NARROW_LOADS)   opt_narrow_loads(f);
-                    opt_known_bits(f);
-                    opt_bitwise_dist(f);
-                    if (opt_flags & OPT_CSE) opt_pre_oos_cse(f);
+                    STAT("pre",  opt_stat_kb_change, opt_known_bits(f));
+                    STAT("pre",  opt_stat_bd_change, opt_bitwise_dist(f));
+                    // R2K-retry probe: re-run known_bits after bitwise_dist to
+                    // measure whether fusing them into a fixpoint would help.
+                    if (getenv("OPT_STATS"))
+                        STAT("r2k-retry", opt_stat_kb_change, opt_known_bits(f));
+                    if (opt_flags & OPT_CSE) STAT("pre-cse", opt_stat_cse_alias, opt_pre_oos_cse(f));
                     opt_scalar_promote(f);
                     opt_addr_iv(f);
                     opt_lsr(f);

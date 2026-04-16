@@ -6,6 +6,14 @@
 
 unsigned opt_flags = OPT_ALL;
 
+// Phase 1 measurement counters (see opt.h)
+int opt_stat_fold_br    = 0;
+int opt_stat_dead_blk   = 0;
+int opt_stat_copy_alias = 0;
+int opt_stat_cse_alias  = 0;
+int opt_stat_kb_change  = 0;
+int opt_stat_bd_change  = 0;
+
 /*
  * opt.c — Post-OOS SSA-level optimisation passes
  *
@@ -107,6 +115,7 @@ void opt_fold_branches(Function *f) {
         term->target  = taken;
         term->target2 = NULL;
         term->nops    = 0;  // drop the condition operand reference
+        opt_stat_fold_br++;
     }
 }
 
@@ -144,6 +153,7 @@ void opt_copy_prop(Function *f) {
                 src->def->kind == IK_PARAM  ||
                 src->def->kind == IK_COPY) continue; // constrained or swap-cycle source
             dst->alias = src;
+            opt_stat_copy_alias++;
         }
     }
     free(copy_count);
@@ -331,6 +341,7 @@ static void gvn_walk(Block *b, Function *f) {
                     inst->dst->alias = canon;
                     inst->is_dead    = 1;
                     gvn_changed      = 1;
+                    opt_stat_cse_alias++;
                 }
                 done = 1;
             }
@@ -803,6 +814,7 @@ void opt_known_bits(Function *f) {
                                         inst->dst->alias = cond;
                                         inst->is_dead = 1;
                                         changed = 1;
+                                        opt_stat_kb_change++;
                                         continue;
                                     }
                                 }
@@ -831,6 +843,7 @@ void opt_known_bits(Function *f) {
                     inst->dst->alias = src;
                     inst->is_dead = 1;
                     changed = 1;
+                    opt_stat_kb_change++;
                     continue;
                 }
 
@@ -840,6 +853,7 @@ void opt_known_bits(Function *f) {
                     if (v1->kind == VAL_CONST) inst->ops[0] = unwrapped;
                     else                       inst->ops[1] = unwrapped;
                     changed = 1;
+                    opt_stat_kb_change++;
                 }
             }
 
@@ -878,6 +892,7 @@ void opt_known_bits(Function *f) {
                             inst->dst->alias = src;
                             inst->is_dead = 1;
                             changed = 1;
+                            opt_stat_kb_change++;
                             continue;
                         }
                         // Compare-with-1 → compare-with-0 rotation for P6
@@ -887,6 +902,7 @@ void opt_known_bits(Function *f) {
                             zero->use_count++;
                             inst->kind = (inst->kind == IK_EQ) ? IK_NE : IK_EQ;
                             changed = 1;
+                            opt_stat_kb_change++;
                         }
                     }
                 }
@@ -969,6 +985,7 @@ void opt_bitwise_dist(Function *f) {
             inst->ops[0] = nv;
             inst->ops[1] = lc;
             changed = 1;
+            opt_stat_bd_change++;
         }
     }
 
@@ -1690,6 +1707,7 @@ void opt_remove_dead_blocks(Function *f) {
                     }
                 }
                 changed = 1;
+                opt_stat_dead_blk++;
             }
         }
         f->nblocks = new_n;

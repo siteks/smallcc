@@ -37,6 +37,18 @@
 extern unsigned opt_flags;
 
 // ============================================================
+// Phase 1 measurement counters (temporary)
+// ============================================================
+// Incremented at each fire site.  Callers reset to 0 before a pass,
+// read after; OPT_STATS env var gates per-call logging in smallcc.c.
+extern int opt_stat_fold_br;      // IK_BR→IK_JMP rewrites in opt_fold_branches
+extern int opt_stat_dead_blk;     // blocks removed in opt_remove_dead_blocks
+extern int opt_stat_copy_alias;   // alias sets in opt_copy_prop
+extern int opt_stat_cse_alias;    // alias sets in gvn_walk (opt_cse/opt_pre_oos_cse)
+extern int opt_stat_kb_change;    // rewrites in opt_known_bits
+extern int opt_stat_bd_change;    // rewrites in opt_bitwise_dist
+
+// ============================================================
 // Pass declarations
 // ============================================================
 
