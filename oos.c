@@ -283,10 +283,16 @@ void out_of_ssa(Function *f) {
         Block *b = f->blocks[bi];
 
         // Collect all phis in this block
-        // Count phis first
+        // Count phis first.  Skip phis whose dst has been aliased by a pre-OOS
+        // pass (dst->alias != NULL, i.e. val_resolve redirects): those phis
+        // are logically dead, and emitting phi-dst ← phi-op[k] copies would
+        // overwrite the alias target's register with unrelated phi operand
+        // values.  See project memory `P5/P5+/P6/P17 fusion` for the
+        // motivating case (R2K phi-select fold aliasing phi → cond).
         int nphi = 0;
         for (Inst *inst = b->head; inst; inst = inst->next)
-            if (inst->kind == IK_PHI) nphi++;
+            if (inst->kind == IK_PHI && val_resolve(inst->dst) == inst->dst)
+                nphi++;
         if (nphi == 0) continue;
 
         // For each predecessor, build a parallel copy set
@@ -294,6 +300,7 @@ void out_of_ssa(Function *f) {
 
         for (Inst *inst = b->head; inst; inst = inst->next) {
             if (inst->kind != IK_PHI) continue;
+            if (val_resolve(inst->dst) != inst->dst) continue;  // aliased → dead
             // phi->dst gets value from each predecessor
             // phi->ops[k] corresponds to b->preds[k]
             for (int k = 0; k < b->npreds && k < inst->nops; k++) {

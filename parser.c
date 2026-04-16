@@ -911,8 +911,9 @@ static Node *param_declaration()
     //                           | {<declaration-specifier>}+ <abstract-declarator>
     //                           | {<declaration-specifier>}+
     DeclParseState ds = {0};
-    // At least one decl_spec
-    // TODO storage class defaults A.8.1
+    // At least one decl_spec. Default storage class (K&R A.8.1: extern at top
+    // level, auto in blocks) is not tracked — storage class only matters at the
+    // declaration level, where it is set explicitly when present.
     parse_decl_specifiers(&ds);
     Node *spec = NULL;
     if (ds.typespec & (DS_STRUCT | DS_UNION))
@@ -1023,7 +1024,8 @@ static Node *declarator()
         node->u.declarator.pointer_level++;
         if (is_typequal(token_ctx.current->kind))
         {
-            // TODO record this somehow
+            // const/volatile on pointer level — parsed but not stored; the
+            // compiler does not enforce qualifier semantics.
             expect(token_ctx.current->kind);
         }
     }
@@ -1495,7 +1497,7 @@ const char *nodestr(Node_kind k)
         case ND_VA_START:    return "VA_START    ";
         case ND_VA_ARG:      return "VA_ARG      ";
         case ND_VA_END:      return "VA_END      ";
-        case ND_UNDEFINED:   return "##FIXME##   ";
+        case ND_UNDEFINED:   return "UNDEFINED   ";
         default:             return "unknown     ";
     }
 }

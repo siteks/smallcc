@@ -85,6 +85,11 @@ static uint8_t     g_blk_live_out_regs = 0xff; // conservative default: all busy
 // Find a caller-saved scratch register (r0-r3) that is genuinely dead at `inst`.
 // `exclude` is a bitmask of registers that must not be chosen (operands of inst).
 // Returns register number 0-3, or -1 if none is provably free.
+//
+// Use this when the IR at `inst` doesn't give you a free register but the block
+// does — it forward-scans the remaining instructions to prove no live register
+// is clobbered.  Prefer pick_scratch() when the caller already knows which
+// registers are in use (faster; no forward scan).
 static int find_free_scratch(Inst *inst, int exclude) {
     // Build bitmask of busy registers: live-out + forward-referenced + excluded
     unsigned busy = g_blk_live_out_regs | (unsigned)exclude;
@@ -106,8 +111,12 @@ static int find_free_scratch(Inst *inst, int exclude) {
     return -1;
 }
 
-// Pick a scratch register that is not in forbidden (combined already_used|blocked).
-// Falls back to r0 if nothing is clean.
+// Pick a scratch register not in (already_used | forbidden).  Falls back to r0
+// if nothing is clean — callers must tolerate the fallback (typically by
+// pushr/popr around the use).  Use this when the caller has already built a
+// precise busy mask for the surrounding context (e.g. call-arg emission with
+// known arg registers).  Prefer find_free_scratch() when the busy set depends
+// on forward uses within the block.
 static int pick_scratch(unsigned already_used, unsigned forbidden) {
     for (int r = 0; r < 8; r++) {
         if (!((already_used | forbidden) & (1u << r)))
@@ -188,18 +197,54 @@ static const char *store_f2(int size) {
     return "sl";
 }
 
-// CPU4 load mnemonic for size (register-relative F3b)
-static const char *load_f3b(int size, int is_signed) {
+// CPU4 load mnemonic for size (register-relative F3c)
+static const char *load_f3c(int size, int is_signed) {
     if (size == 1) return is_signed ? "llbx" : "llb";
     if (size == 2) return is_signed ? "llwx" : "llw";
     return "lll";
 }
 
-// CPU4 store mnemonic for size (register-relative F3b)
-static const char *store_f3b(int size) {
+// CPU4 store mnemonic for size (register-relative F3c)
+static const char *store_f3c(int size) {
     if (size == 1) return "slb";
     if (size == 2) return "slw";
     return "sll";
+}
+
+// Emit a bp-relative load into `rd`.  Uses F2 (2 bytes) when the offset fits;
+// otherwise emits lea + optional addi (to correct non-4-aligned offsets,
+// since CPU4 lea encodes only imm14*4) followed by an F3c load through `rd`.
+// `rd` must be free at this point — the fallback reuses it as both address
+// temp and destination.
+static void emit_bp_load(FILE *out, int rd, int off, int size, int is_signed) {
+    if (f2_range(off, size)) {
+        int scaled = (size >= 4) ? off / 4 : (size == 2) ? off / 2 : off;
+        fprintf(out, "    %s %s, %d\n",
+                load_f2(size, is_signed), regname(rd), scaled);
+        return;
+    }
+    int adj  = off % 4;
+    int base = off - adj;
+    fprintf(out, "    lea %s, %d\n", regname(rd), base);
+    if (adj) fprintf(out, "    addi %s, %d\n", regname(rd), adj);
+    fprintf(out, "    %s %s, %s, 0\n",
+            load_f3c(size, is_signed), regname(rd), regname(rd));
+}
+
+// Emit a bp-relative store of `rv`.  Uses F2 when the offset fits; otherwise
+// emits lea + optional addi into `tmp`, then an F3c store through `tmp`.
+// `tmp` is used only in the fallback and must differ from `rv`.
+static void emit_bp_store(FILE *out, int rv, int tmp, int off, int size) {
+    if (f2_range(off, size)) {
+        int scaled = (size >= 4) ? off / 4 : (size == 2) ? off / 2 : off;
+        fprintf(out, "    %s %s, %d\n", store_f2(size), regname(rv), scaled);
+        return;
+    }
+    int adj  = off % 4;
+    int base = off - adj;
+    fprintf(out, "    lea %s, %d\n", regname(tmp), base);
+    if (adj) fprintf(out, "    addi %s, %d\n", regname(tmp), adj);
+    fprintf(out, "    %s %s, %s, 0\n", store_f3c(size), regname(rv), regname(tmp));
 }
 
 // Is a ValType signed?
@@ -243,6 +288,39 @@ static const char *alu_mnemonic(InstKind k, int is_signed) {
     }
 }
 
+// Emit a 3-operand ALU instruction where one source is a register (`r_reg`)
+// and the other source is the compile-time constant `kv`.  `const_on_left`
+// selects the operand position for the constant (1 = first alu source,
+// 0 = second).  Materializes the constant into `rd` when `r_reg != rd`;
+// otherwise into a scratch register (using pushr/popr if none is free).
+static void emit_alu_const(FILE *out, Inst *inst, int is_signed, int rd,
+                           int r_reg, int kv, int const_on_left) {
+    const char *m = alu_mnemonic(inst->kind, is_signed);
+    if (r_reg != rd) {
+        // rd is free: materialize constant into rd.
+        emit_imm(out, rd, kv);
+        if (const_on_left)
+            fprintf(out, "    %s %s, %s, %s\n", m, regname(rd), regname(rd), regname(r_reg));
+        else
+            fprintf(out, "    %s %s, %s, %s\n", m, regname(rd), regname(r_reg), regname(rd));
+        return;
+    }
+    // r_reg occupies rd — materialize constant into a scratch, spilling if
+    // no free register is available.
+    int sc = find_free_scratch(inst, 1u << rd);
+    int spilled = (sc < 0);
+    if (spilled) {
+        sc = (rd == 0) ? 1 : 0;
+        fprintf(out, "    pushr %s\n", regname(sc));
+    }
+    emit_imm(out, sc, kv);
+    if (const_on_left)
+        fprintf(out, "    %s %s, %s, %s\n", m, regname(rd), regname(sc), regname(rd));
+    else
+        fprintf(out, "    %s %s, %s, %s\n", m, regname(rd), regname(rd), regname(sc));
+    if (spilled) fprintf(out, "    popr %s\n", regname(sc));
+}
+
 // Map fuseable comparison kind to F3b branch mnemonic (P5 compare+branch fusion)
 static const char *fused_branch_mnemonic(InstKind kind) {
     switch (kind) {
@@ -254,6 +332,14 @@ static const char *fused_branch_mnemonic(InstKind kind) {
     case IK_ULE: return "ble";
     default:     return NULL;
     }
+}
+
+// True if v is defined by an IK_CONST instruction (not VAL_CONST, not a
+// symbolic GADDR).  Callers use this to decide whether a constant's def
+// can be safely marked is_dead after peephole folding.
+static int is_ik_const(Value *v) {
+    return v && v->kind == VAL_INST && v->def &&
+           v->def->kind == IK_CONST && !v->def->fname;
 }
 
 // resolve_const: try to resolve a Value to a compile-time integer constant.
@@ -616,56 +702,10 @@ static void emit_inst(Inst *inst, FILE *out) {
                 emit_imm(out, rd, op0->iconst);
                 p0 = rd;
             }
-            if (p0 == rd) {
-                // ops[0] occupies rd — can't use rd for the constant.
-                int sc = find_free_scratch(inst, 1u << rd);
-                if (sc >= 0) {
-                    emit_imm(out, sc, op1->iconst);
-                    fprintf(out, "    %s %s, %s, %s\n",
-                            alu_mnemonic(inst->kind, is_signed),
-                            regname(rd), regname(rd), regname(sc));
-                } else {
-                    sc = (rd == 0) ? 1 : 0;
-                    fprintf(out, "    pushr %s\n", regname(sc));
-                    emit_imm(out, sc, op1->iconst);
-                    fprintf(out, "    %s %s, %s, %s\n",
-                            alu_mnemonic(inst->kind, is_signed),
-                            regname(rd), regname(rd), regname(sc));
-                    fprintf(out, "    popr %s\n", regname(sc));
-                }
-            } else {
-                // ops[0] is in p0 != rd: load const into rd, emit op(p0, rd).
-                emit_imm(out, rd, op1->iconst);
-                fprintf(out, "    %s %s, %s, %s\n",
-                        alu_mnemonic(inst->kind, is_signed),
-                        regname(rd), regname(p0), regname(rd));
-            }
+            emit_alu_const(out, inst, is_signed, rd, p0, op1->iconst, /*const_on_left=*/0);
         } else {
             // ops[0] is const, ops[1] is VAL_INST.
-            if (p1 == rd) {
-                // ops[1] occupies rd — can't use rd for the constant.
-                int sc = find_free_scratch(inst, 1u << rd);
-                if (sc >= 0) {
-                    emit_imm(out, sc, op0->iconst);
-                    fprintf(out, "    %s %s, %s, %s\n",
-                            alu_mnemonic(inst->kind, is_signed),
-                            regname(rd), regname(sc), regname(rd));
-                } else {
-                    sc = (rd == 0) ? 1 : 0;
-                    fprintf(out, "    pushr %s\n", regname(sc));
-                    emit_imm(out, sc, op0->iconst);
-                    fprintf(out, "    %s %s, %s, %s\n",
-                            alu_mnemonic(inst->kind, is_signed),
-                            regname(rd), regname(sc), regname(rd));
-                    fprintf(out, "    popr %s\n", regname(sc));
-                }
-            } else {
-                // ops[1] in p1 != rd: load const into rd, emit op(rd, p1).
-                emit_imm(out, rd, op0->iconst);
-                fprintf(out, "    %s %s, %s, %s\n",
-                        alu_mnemonic(inst->kind, is_signed),
-                        regname(rd), regname(rd), regname(p1));
-            }
+            emit_alu_const(out, inst, is_signed, rd, p1, op0->iconst, /*const_on_left=*/1);
         }
         break;
         }
@@ -758,42 +798,23 @@ static void emit_inst(Inst *inst, FILE *out) {
         int is_s    = vtype_signed(dst->vtype);
         int off     = inst->imm;
 
-        // F3b imm10 and F2 imm7 are both scaled by access size
-        int scaled = (size >= 4) ? off / 4 : (size == 2) ? off / 2 : off;
         if (!base || base->kind == VAL_UNDEF) {
-            // spill load (base is implicit bp frame slot)
-            // imm is the bp-relative byte offset
-            if (f2_range(off, size)) {
-                // F2: mnem rx, scaled_imm7
-                fprintf(out, "    %s %s, %d\n",
-                        is_s ? (size==1 ? "lbx" : (size==2 ? "lwx" : "ll")) :
-                               load_f2(size, 0),
-                        regname(rd), scaled);
-            } else {
-                // Out of F2 range: lea rd, off; load rd, [rd+0]
-                // Using rd as both the address temp and the destination avoids
-                // clobbering any other live register (e.g. a phi-copy just
-                // computed above this instruction in the same block).
-                // The new CPU4 'lea' only represents multiples of 4; correct
-                // non-aligned offsets with addi.
-                int adj_l  = off % 4;
-                int base_l = off - adj_l;
-                fprintf(out, "    lea %s, %d\n", regname(rd), base_l);
-                if (adj_l) fprintf(out, "    addi %s, %d\n", regname(rd), adj_l);
-                fprintf(out, "    %s %s, %s, 0\n",
-                        load_f3b(size, is_s), regname(rd), regname(rd));
-            }
+            // Spill load: base is implicit bp.  Using rd as both address
+            // temp and destination in the out-of-F2-range fallback avoids
+            // clobbering any other live register.
+            emit_bp_load(out, rd, off, size, is_s);
         } else {
             int rb = preg(base);
             if (base->kind == VAL_CONST && base->iconst == 0) {
                 // null base, use imm as absolute (unusual)
                 int tmp = (rd == 0) ? 1 : 0;
                 emit_imm(out, tmp, off);
-                fprintf(out, "    %s %s, %s, 0\n", load_f3b(size, is_s), regname(rd), regname(tmp));
+                fprintf(out, "    %s %s, %s, 0\n", load_f3c(size, is_s), regname(rd), regname(tmp));
             } else {
-                // F3b: mnem rx, ry, scaled_imm10
+                // F3c: mnem rx, ry, scaled_imm10
+                int scaled = (size >= 4) ? off / 4 : (size == 2) ? off / 2 : off;
                 fprintf(out, "    %s %s, %s, %d\n",
-                        load_f3b(size, is_s), regname(rd), regname(rb), scaled);
+                        load_f3c(size, is_s), regname(rd), regname(rb), scaled);
             }
         }
         break;
@@ -820,28 +841,17 @@ static void emit_inst(Inst *inst, FILE *out) {
             rb = rb_scratch;
         }
 
-        int scaled = (size >= 4) ? off / 4 : (size == 2) ? off / 2 : off;
         if (!base || (inst->nops < 2)) {
-            // spill store: base is implicit bp
-            if (f2_range(off, size)) {
-                // F2: mnem rv, scaled_imm7
-                fprintf(out, "    %s %s, %d\n", store_f2(size), regname(rv), scaled);
-            } else {
-                // Out of F2 range: lea + F3b store
-                // The new CPU4 'lea' only represents multiples of 4; correct
-                // non-aligned offsets with addi.
-                int tmp = (rv == 0) ? 1 : 0;
-                if (tmp == rv) tmp = 2;
-                int adj_s  = off % 4;
-                int base_s = off - adj_s;
-                fprintf(out, "    lea %s, %d\n", regname(tmp), base_s);
-                if (adj_s) fprintf(out, "    addi %s, %d\n", regname(tmp), adj_s);
-                fprintf(out, "    %s %s, %s, 0\n", store_f3b(size), regname(rv), regname(tmp));
-            }
+            // Spill store: base is implicit bp.  Need a scratch distinct
+            // from rv for the out-of-F2-range lea base.
+            int tmp = (rv == 0) ? 1 : 0;
+            if (tmp == rv) tmp = 2;
+            emit_bp_store(out, rv, tmp, off, size);
         } else {
-            // F3b: mnem rv, ry, scaled_imm10
+            // F3c: mnem rv, ry, scaled_imm10
+            int scaled = (size >= 4) ? off / 4 : (size == 2) ? off / 2 : off;
             fprintf(out, "    %s %s, %s, %d\n",
-                    store_f3b(size), regname(rv), regname(rb), scaled);
+                    store_f3c(size), regname(rv), regname(rb), scaled);
         }
         break;
     }
@@ -1051,6 +1061,7 @@ typedef struct {
 //
 // Processed in reverse order so copy chains resolve naturally.
 static void remap_single_use_values(Function *f) {
+    int debug_remap = getenv("DEBUG_REMAP") != NULL;
     for (int bi = 0; bi < f->nblocks; bi++) {
         Block *b = f->blocks[bi];
 
@@ -1076,7 +1087,7 @@ static void remap_single_use_values(Function *f) {
             if (inst->is_dead || !inst->dst) continue;
             Value *v = inst->dst;
             if (v->use_count != 1 || v->phys_reg < 0) {
-                if (inst->kind == IK_CONST && v->phys_reg >= 0 && getenv("DEBUG_REMAP"))
+                if (debug_remap && inst->kind == IK_CONST && v->phys_reg >= 0)
                     fprintf(stderr, "remap skip: %s v%d r%d use_count=%d\n",
                             f->name, v->id, v->phys_reg, v->use_count);
                 continue;
@@ -1294,8 +1305,7 @@ static void mark_dead_consts(Function *f) {
             // P9: SEXT8/SEXT16 of constant → immw; source IK_CONST not needed
             if ((inst->kind == IK_SEXT8 || inst->kind == IK_SEXT16) && inst->nops >= 1) {
                 Value *sv = inst->ops[0] ? val_resolve(inst->ops[0]) : NULL;
-                if (sv && sv->kind == VAL_INST && sv->def && sv->def->kind == IK_CONST
-                    && !sv->def->fname && sv->use_count <= 1)
+                if (is_ik_const(sv) && sv->use_count <= 1)
                     sv->def->is_dead = 1;
                 continue;
             }
@@ -1303,8 +1313,8 @@ static void mark_dead_consts(Function *f) {
             if (inst->nops < 2) continue;
             Value *o0 = inst->ops[0] ? val_resolve(inst->ops[0]) : NULL;
             Value *o1 = inst->ops[1] ? val_resolve(inst->ops[1]) : NULL;
-            int ik0 = o0 && o0->kind == VAL_INST && o0->def && o0->def->kind == IK_CONST && !o0->def->fname;
-            int ik1 = o1 && o1->kind == VAL_INST && o1->def && o1->def->kind == IK_CONST && !o1->def->fname;
+            int ik0 = is_ik_const(o0);
+            int ik1 = is_ik_const(o1);
             int is_k0 = (o0 && o0->kind == VAL_CONST) || ik0;
             int is_k1 = (o1 && o1->kind == VAL_CONST) || ik1;
 
@@ -1360,9 +1370,7 @@ static void mark_dead_consts(Function *f) {
                             d->is_dead = 1;
                             for (int j2 = 0; j2 < d->nops; j2++) {
                                 Value *a = d->ops[j2] ? val_resolve(d->ops[j2]) : NULL;
-                                if (a && a->kind == VAL_INST && a->def &&
-                                    a->def->kind == IK_CONST && !a->def->fname &&
-                                    a->use_count <= 1)
+                                if (is_ik_const(a) && a->use_count <= 1)
                                     a->def->is_dead = 1;
                             }
                         }
@@ -1589,6 +1597,31 @@ static void detect_branch_fusions(Function *f, BranchFuse *fuse) {
         }
         const char *mnem = fused_branch_mnemonic(def->kind);
         if (!mnem) continue;
+
+        // Fusion correctness invariant: every value that will be marked
+        // is_dead by the paths below (P6 / P5 / P17 / P5+) must have no
+        // live user other than the next link in the compare-branch chain.
+        //
+        // - P5 / P6 / P17 drop the comparison instruction; its dst register
+        //   is never written, so any downstream user reads garbage.
+        // - P5+ additionally overwrites cond->phys_reg with the materialised
+        //   constant (it uses cond's register as a scratch), so even if the
+        //   register would have been written by an earlier compare, P5+
+        //   trashes it before the branch.
+        //
+        // use_count here is the post-DCE recount from alloc.c's dce_pass,
+        // which walks operands via val_resolve — so it correctly includes
+        // uses reached through alias chains (e.g. phis aliased to cond by
+        // R2K's phi-select fold, or CSE'd boolean materialisations).
+        {
+            int safe = (cond->use_count <= 1);
+            if (chain_shift && chain_shift->dst &&
+                chain_shift->dst->use_count > 1) safe = 0;
+            if (def->dst && def->dst != cond &&
+                def->dst->use_count > 1) safe = 0;
+            if (!safe) continue;
+        }
+
         Value *dop0 = def->ops[0] ? val_resolve(def->ops[0]) : NULL;
         Value *dop1 = def->ops[1] ? val_resolve(def->ops[1]) : NULL;
         // Estimate byte distance to true target; skip if out of F3b range.

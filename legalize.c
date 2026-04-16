@@ -169,7 +169,6 @@ void legalize_function(Function *f) {
     }
 
     // ── Pass E: AND-chain constant folding ──────────────────────────────
-    if (opt_flags & OPT_LEG_E)
     // Fold AND(AND(x, c1), c2) → AND(x, c1 & c2) when both c1, c2 are constants.
     // Also looks through type-coercing IK_COPY instructions (e.g. u8→i16 zero-
     // extension after TRUNC lowering), since copy_prop leaves those intact.
@@ -178,49 +177,50 @@ void legalize_function(Function *f) {
     // Fold: AND(copy(AND(expr, 255)), 1) → AND(expr, 1).  Correct because the
     // copy zero-extends (high bits 0) so AND with any mask c2 ≤ 0xff is safe.
     // Dead inner AND + IK_CONST(255) + copy are removed by irc_allocate DCE.
-    for (int bi = 0; bi < f->nblocks; bi++) {
-        Block *b = f->blocks[bi];
-        for (Inst *inst = b->head; inst; inst = inst->next) {
-            if (inst->is_dead || inst->kind != IK_AND || inst->nops < 2) continue;
-            int c2;
-            if (!get_iconst(val_resolve(inst->ops[1]), &c2)) continue;
+    if (opt_flags & OPT_LEG_E) {
+        for (int bi = 0; bi < f->nblocks; bi++) {
+            Block *b = f->blocks[bi];
+            for (Inst *inst = b->head; inst; inst = inst->next) {
+                if (inst->is_dead || inst->kind != IK_AND || inst->nops < 2) continue;
+                int c2;
+                if (!get_iconst(val_resolve(inst->ops[1]), &c2)) continue;
 
-            // Look through copy_prop-surviving IK_COPY chains (e.g. u8→i16 coercion)
-            Value *inner = val_resolve(inst->ops[0]);
-            while (inner && inner->kind == VAL_INST && inner->def &&
-                   inner->def->kind == IK_COPY && inner->def->nops >= 1)
-                inner = val_resolve(inner->def->ops[0]);
+                // Look through copy_prop-surviving IK_COPY chains (e.g. u8→i16 coercion)
+                Value *inner = val_resolve(inst->ops[0]);
+                while (inner && inner->kind == VAL_INST && inner->def &&
+                       inner->def->kind == IK_COPY && inner->def->nops >= 1)
+                    inner = val_resolve(inner->def->ops[0]);
 
-            if (!inner || inner->kind != VAL_INST || !inner->def) continue;
-            if (inner->def->kind != IK_AND || inner->def->nops < 2) continue;
+                if (!inner || inner->kind != VAL_INST || !inner->def) continue;
+                if (inner->def->kind != IK_AND || inner->def->nops < 2) continue;
 
-            // Check both operand positions for the inner AND's constant
-            // (braun.c may emit AND(const, x) or AND(x, const))
-            int c1;
-            int inner_const_pos = -1;
-            if (get_iconst(val_resolve(inner->def->ops[1]), &c1))      inner_const_pos = 1;
-            else if (get_iconst(val_resolve(inner->def->ops[0]), &c1)) inner_const_pos = 0;
-            if (inner_const_pos < 0) continue;
+                // Check both operand positions for the inner AND's constant
+                // (braun.c may emit AND(const, x) or AND(x, const))
+                int c1;
+                int inner_const_pos = -1;
+                if (get_iconst(val_resolve(inner->def->ops[1]), &c1))      inner_const_pos = 1;
+                else if (get_iconst(val_resolve(inner->def->ops[0]), &c1)) inner_const_pos = 0;
+                if (inner_const_pos < 0) continue;
 
-            int combined = c1 & c2;
-            // Repoint outer AND's first operand past the inner AND (and any copies)
-            inst->ops[0] = val_resolve(inner->def->ops[1 - inner_const_pos]);
+                int combined = c1 & c2;
+                // Repoint outer AND's first operand past the inner AND (and any copies)
+                inst->ops[0] = val_resolve(inner->def->ops[1 - inner_const_pos]);
 
-            if (combined != c2) {
-                // Need a new constant; replace ops[1] with IK_CONST(combined)
-                Value *new_mask_v = new_value(f, VAL_INST, VT_I16);
-                Inst  *new_mask_i = new_inst(f, b, IK_CONST, new_mask_v);
-                new_mask_i->imm  = combined;
-                new_mask_i->line = inst->line;
-                inst_insert_before(inst, new_mask_i);
-                inst->ops[1] = new_mask_v;
+                if (combined != c2) {
+                    // Need a new constant; replace ops[1] with IK_CONST(combined)
+                    Value *new_mask_v = new_value(f, VAL_INST, VT_I16);
+                    Inst  *new_mask_i = new_inst(f, b, IK_CONST, new_mask_v);
+                    new_mask_i->imm  = combined;
+                    new_mask_i->line = inst->line;
+                    inst_insert_before(inst, new_mask_i);
+                    inst->ops[1] = new_mask_v;
+                }
+                // If combined == c2, ops[1] is already the right constant; leave it alone.
             }
-            // If combined == c2, ops[1] is already the right constant; leave it alone.
         }
     }
 
     // ── Pass F: Materialize large VAL_CONST binary ALU operands ────────────
-    if (opt_flags & OPT_LEG_F)
     // When a binary ALU or comparison instruction has a VAL_CONST operand
     // whose value cannot be handled by any compact emit-time encoding,
     // insert an explicit IK_CONST before it.  This lets IRC allocate a
@@ -232,71 +232,72 @@ void legalize_function(Function *f) {
     //   AND:     P14 (andi 0..127), P8 (zxb 0xFF, zxw 0xFFFF)
     //   CMP=0:   P6 (jz/jnz) — only EQ/NE against zero
     // Everything else must be materialized into a register.
-    for (int bi = 0; bi < f->nblocks; bi++) {
-        Block *b = f->blocks[bi];
-        for (Inst *inst = b->head; inst; inst = inst->next) {
-            if (inst->is_dead || inst->nops < 2 || !inst->dst) continue;
-            // Only binary ALU and bitwise (not comparisons — P5+ handles those)
-            switch (inst->kind) {
-            case IK_OR: case IK_XOR:
-            case IK_MUL: case IK_DIV: case IK_UDIV:
-            case IK_MOD: case IK_UMOD:
-            case IK_SHL: case IK_SHR: case IK_USHR:
-            case IK_FADD: case IK_FSUB: case IK_FMUL: case IK_FDIV:
-                // F0b immediate handles |k| ≤ 255 (P18 mulli, P19 general);
-                // P11/P13 handle SHL/SHR/USHR shifts via resolve_const.
-                // Only materialize constants outside those ranges.
-                for (int j = 0; j < inst->nops; j++) {
-                    Value *v = inst->ops[j] ? val_resolve(inst->ops[j]) : NULL;
-                    if (!v || v->kind != VAL_CONST) continue;
-                    int k = v->iconst;
-                    if (k >= -256 && k <= 255) continue;  // F0b immediate range
-                    Value *cv = new_value(f, VAL_INST, inst->dst->vtype);
-                    Inst  *ci = new_inst(f, b, IK_CONST, cv);
-                    ci->imm  = v->iconst;
-                    ci->line = inst->line;
-                    inst_insert_before(inst, ci);
-                    inst->ops[j] = cv;
+    if (opt_flags & OPT_LEG_F) {
+        for (int bi = 0; bi < f->nblocks; bi++) {
+            Block *b = f->blocks[bi];
+            for (Inst *inst = b->head; inst; inst = inst->next) {
+                if (inst->is_dead || inst->nops < 2 || !inst->dst) continue;
+                // Only binary ALU and bitwise (not comparisons — P5+ handles those)
+                switch (inst->kind) {
+                case IK_OR: case IK_XOR:
+                case IK_MUL: case IK_DIV: case IK_UDIV:
+                case IK_MOD: case IK_UMOD:
+                case IK_SHL: case IK_SHR: case IK_USHR:
+                case IK_FADD: case IK_FSUB: case IK_FMUL: case IK_FDIV:
+                    // F0b immediate handles |k| ≤ 255 (P18 mulli, P19 general);
+                    // P11/P13 handle SHL/SHR/USHR shifts via resolve_const.
+                    // Only materialize constants outside those ranges.
+                    for (int j = 0; j < inst->nops; j++) {
+                        Value *v = inst->ops[j] ? val_resolve(inst->ops[j]) : NULL;
+                        if (!v || v->kind != VAL_CONST) continue;
+                        int k = v->iconst;
+                        if (k >= -256 && k <= 255) continue;  // F0b immediate range
+                        Value *cv = new_value(f, VAL_INST, inst->dst->vtype);
+                        Inst  *ci = new_inst(f, b, IK_CONST, cv);
+                        ci->imm  = v->iconst;
+                        ci->line = inst->line;
+                        inst_insert_before(inst, ci);
+                        inst->ops[j] = cv;
+                    }
+                    break;
+                case IK_ADD: case IK_SUB:
+                    // P2/P3/P4 handle |k| ≤ 511; materialize only larger constants
+                    for (int j = 0; j < inst->nops; j++) {
+                        Value *v = inst->ops[j] ? val_resolve(inst->ops[j]) : NULL;
+                        if (!v || v->kind != VAL_CONST) continue;
+                        int k = v->iconst;
+                        if (inst->kind == IK_SUB && j == 1) k = -k;
+                        if (k >= -512 && k <= 511) continue;
+                        Value *cv = new_value(f, VAL_INST, inst->dst->vtype);
+                        Inst  *ci = new_inst(f, b, IK_CONST, cv);
+                        ci->imm  = v->iconst;
+                        ci->line = inst->line;
+                        inst_insert_before(inst, ci);
+                        inst->ops[j] = cv;
+                    }
+                    break;
+                case IK_AND:
+                    // P14 handles 0..255 (andi 0..127, andli 128..255); P8 handles 0xFFFF
+                    for (int j = 0; j < inst->nops; j++) {
+                        Value *v = inst->ops[j] ? val_resolve(inst->ops[j]) : NULL;
+                        if (!v || v->kind != VAL_CONST) continue;
+                        int k = v->iconst;
+                        if (k >= 0 && k <= 255) continue;  // P14 andi/andli
+                        if (k == 0xffff) continue;  // P8 zxw
+                        Value *cv = new_value(f, VAL_INST, inst->dst->vtype);
+                        Inst  *ci = new_inst(f, b, IK_CONST, cv);
+                        ci->imm  = v->iconst;
+                        ci->line = inst->line;
+                        inst_insert_before(inst, ci);
+                        inst->ops[j] = cv;
+                    }
+                    break;
+                default:
+                    break;
                 }
-                break;
-            case IK_ADD: case IK_SUB:
-                // P2/P3/P4 handle |k| ≤ 511; materialize only larger constants
-                for (int j = 0; j < inst->nops; j++) {
-                    Value *v = inst->ops[j] ? val_resolve(inst->ops[j]) : NULL;
-                    if (!v || v->kind != VAL_CONST) continue;
-                    int k = v->iconst;
-                    if (inst->kind == IK_SUB && j == 1) k = -k;
-                    if (k >= -512 && k <= 511) continue;
-                    Value *cv = new_value(f, VAL_INST, inst->dst->vtype);
-                    Inst  *ci = new_inst(f, b, IK_CONST, cv);
-                    ci->imm  = v->iconst;
-                    ci->line = inst->line;
-                    inst_insert_before(inst, ci);
-                    inst->ops[j] = cv;
-                }
-                break;
-            case IK_AND:
-                // P14 handles 0..255 (andi 0..127, andli 128..255); P8 handles 0xFFFF
-                for (int j = 0; j < inst->nops; j++) {
-                    Value *v = inst->ops[j] ? val_resolve(inst->ops[j]) : NULL;
-                    if (!v || v->kind != VAL_CONST) continue;
-                    int k = v->iconst;
-                    if (k >= 0 && k <= 255) continue;  // P14 andi/andli
-                    if (k == 0xffff) continue;  // P8 zxw
-                    Value *cv = new_value(f, VAL_INST, inst->dst->vtype);
-                    Inst  *ci = new_inst(f, b, IK_CONST, cv);
-                    ci->imm  = v->iconst;
-                    ci->line = inst->line;
-                    inst_insert_before(inst, ci);
-                    inst->ops[j] = cv;
-                }
-                break;
-            default:
-                break;
             }
         }
     }
-
 }
 
 // ── Post-legalize LICM: hoist IK_CONST out of loop bodies ──────────────
@@ -309,15 +310,21 @@ void legalize_function(Function *f) {
 //
 // Uses the same back-edge + dominator detection as opt_licm_const, but
 // operates on IK_CONST (VAL_INST) rather than VAL_CONST operands.
+//
+// All three caps below are optimization-quality caps, not correctness bounds —
+// exceeding any of them silently skips further hoisting for that function.
+// Real code bases do not come close to these limits in practice.
 
-#define HOIST_MAX_CANDS 32
-#define HOIST_MAX 4
+#define HOIST_MAX_HEADERS 16  // loops considered per function
+#define HOIST_MAX_CANDS   32  // distinct IK_CONST values tracked per loop
+#define HOIST_LIVE_CAP    32  // live-across-loop value set size
+#define HOIST_MAX          4  // max hoists per loop
 
 void legalize_hoist_const(Function *f) {
     if (!f || f->nblocks < 2) return;
 
     // Step 1: Find loop headers via back edges.
-    Block *headers[16];
+    Block *headers[HOIST_MAX_HEADERS];
     int nheaders = 0;
     for (int bi = 0; bi < f->nblocks; bi++) {
         Block *b = f->blocks[bi];
@@ -327,7 +334,7 @@ void legalize_hoist_const(Function *f) {
                 int dup = 0;
                 for (int k = 0; k < nheaders; k++)
                     if (headers[k] == h) { dup = 1; break; }
-                if (!dup && nheaders < 16)
+                if (!dup && nheaders < HOIST_MAX_HEADERS)
                     headers[nheaders++] = h;
             }
         }
@@ -356,7 +363,6 @@ void legalize_hoist_const(Function *f) {
         if (outside_count != 1 || !preheader || !preheader->tail) continue;
 
         // Register pressure guard: count values live across the loop.
-        #define HOIST_LIVE_CAP 32
         int live_ids[HOIST_LIVE_CAP];
         int nlive = 0;
         for (int bi = 0; bi < f->nblocks; bi++) {

@@ -57,11 +57,14 @@ typedef struct {
     int licm_gen_dense_hi;         // nloop_defs threshold for budget=1
     int licm_gen_dense_lo;         // nloop_defs threshold for budget=min(budget,2)
 
-    // opt_cse — post-OOS cross-block policy
+    // opt_cse — post-OOS cross-block policy.
+    // Both currently 0 in every profile: wider CSE extends canonical live
+    // ranges across loop exits, which defeats the P12 emit-time loop rotation
+    // peephole.  Kept as experiment hooks; flip to 1 to measure trade-offs.
     int cse_xblock_dom;            // 1 = allow any dominator (not just direct pred)
     int cse_xblock_samedelta;      // 1 = allow same loop depth (not just depth 0)
 
-    // opt_copy_prop
+    // opt_copy_prop — currently 0 in every profile for the same P12 reason.
     int copyprop_typecoerce;       // 1 = propagate type-coercing copies (vtype mismatch)
 } OptProfile;
 

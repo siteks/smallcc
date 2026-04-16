@@ -41,10 +41,9 @@ const OptProfile opt_profile_aggressive = {
     .licm_gen_max             = 6,
     .licm_gen_dense_hi        = 14,
     .licm_gen_dense_lo        = 10,
-    // cse post-OOS — same as conservative (wider CSE can break P12)
+    // cse post-OOS / copy_prop — same as conservative (see OptProfile struct notes)
     .cse_xblock_dom           = 0,
     .cse_xblock_samedelta     = 0,
-    // copy_prop — same as conservative (type-coercing prop can break P12)
     .copyprop_typecoerce      = 0,
 };
 
@@ -639,8 +638,10 @@ static void compute_known_bits(Function *f) {
             KnownBits r = { 0, 0 };
             switch (inst->kind) {
             case IK_CONST:
-                r.zero = ~(uint32_t)inst->dst->iconst;
-                r.one  =  (uint32_t)inst->dst->iconst;
+                // IK_CONST stores its value in inst->imm (dst->iconst is only
+                // populated for VAL_CONST values, not VAL_INST dsts).
+                r.zero = ~(uint32_t)inst->imm;
+                r.one  =  (uint32_t)inst->imm;
                 break;
             case IK_COPY:
                 if (inst->nops >= 1) r = kb_get(inst->ops[0]);
@@ -804,6 +805,80 @@ void opt_known_bits(Function *f) {
         for (Inst *inst = b->head; inst; inst = inst->next) {
             if (inst->is_dead || !inst->dst) continue;
 
+            // Phi-select fold: phi(1, 0) or phi(0, 1) selected by a
+            // known-boolean branch condition → alias to cond directly.
+            // Eliminates the `immw 1` / `immw 0` materialisations for
+            // patterns like `carry = (x == 1) ? 1 : 0`.
+            //
+            // SAFETY: this introduces new uses of `cond` via the phi's alias
+            // chain.  Emission's P5/P5+/P6/P17 fusion peepholes guard against
+            // that by bailing out when cond->use_count > 1 (see emit.c
+            // detect_branch_fusions) and OOS skips aliased phis so their
+            // parallel copies never overwrite cond's register.
+            if (inst->kind == IK_PHI && inst->nops == 2 &&
+                b->npreds == 2) {
+                KnownBits k0 = kb_get(inst->ops[0]);
+                KnownBits k1 = kb_get(inst->ops[1]);
+                uint32_t unk0 = ~k0.zero & ~k0.one;
+                uint32_t unk1 = ~k1.zero & ~k1.one;
+                // Both operands must be exact constants in {0, 1}.
+                if (unk0 == 0 && unk1 == 0 &&
+                    (k0.one | k1.one) <= 1u &&
+                    k0.one != k1.one) {
+                    // Trace each predecessor back through any 1-pred/1-succ
+                    // intermediate blocks (introduced by critical-edge
+                    // splitting) to find the common branching ancestor `h`.
+                    Block *side[2];
+                    Block *anc[2];
+                    for (int s = 0; s < 2; s++) {
+                        Block *p = b->preds[s];
+                        side[s] = p;
+                        while (p->npreds == 1 && p->preds[0]->nsuccs == 1) {
+                            side[s] = p;
+                            p = p->preds[0];
+                        }
+                        anc[s] = (p->npreds == 1) ? p->preds[0] : NULL;
+                        if (anc[s] == NULL) side[s] = NULL;
+                    }
+                    if (anc[0] && anc[0] == anc[1] && side[0] != side[1]) {
+                        Block *h = anc[0];
+                        Inst *term = h->tail;
+                        if (term && term->kind == IK_BR && term->nops >= 1 &&
+                            term->target && term->target2) {
+                            Value *cond = val_resolve(term->ops[0]);
+                            KnownBits kc = kb_get(cond);
+                            // cond must be known-boolean (bits 1-31 known zero).
+                            // vtype mismatch is safe for booleans: {0, 1} has
+                            // the same bit representation under sign- and zero-
+                            // extension alike, so aliasing a wider cond to a
+                            // narrower phi (or vice versa) preserves semantics.
+                            if ((kc.zero & ~1u) == ~1u) {
+                                // Determine which side of h each predecessor
+                                // chain came from.  side[s] is an immediate
+                                // successor of h (first block after the chain
+                                // originating from h).
+                                int t0 = (side[0] == term->target);
+                                int f0 = (side[0] == term->target2);
+                                int t1 = (side[1] == term->target);
+                                int f1 = (side[1] == term->target2);
+                                if ((t0 && f1) || (f0 && t1)) {
+                                    // side[0] is true-path if t0; then op0 is
+                                    // value-when-cond=1.  Alias to cond iff
+                                    // that value is 1.
+                                    int v_when_true = t0 ? (int)k0.one : (int)k1.one;
+                                    if (v_when_true == 1) {
+                                        inst->dst->alias = cond;
+                                        inst->is_dead = 1;
+                                        changed = 1;
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             if (inst->kind == IK_AND && inst->nops == 2) {
                 Value *v0 = val_resolve(inst->ops[0]);
                 Value *v1 = val_resolve(inst->ops[1]);
@@ -835,25 +910,51 @@ void opt_known_bits(Function *f) {
                 }
             }
 
-            // Boolean branch fusion: EQ(x, 1) → NE(x, 0) and NE(x, 1) → EQ(x, 0)
-            // when x is known-boolean (bits 1-31 zero).  This enables P6 (jnz/jz)
-            // in emit.c, eliminating the immw r, 1 needed for the beq/bne.
+            // Boolean comparison simplification for known-boolean sources
+            // (bits 1-31 known zero, bit 0 possibly set — i.e. value ∈ {0, 1}):
+            //   EQ(x, 1) → x         (alias)
+            //   NE(x, 0) → x         (alias) — catches cases R2G misses because
+            //                                  x isn't directly a comparison result
+            //                                  (e.g. x = xor(and a 1, and b 1))
+            //   EQ(x, 1) → NE(x, 0)  (rotation — enables P6 jnz when alias vtype
+            //                         guard would fail; currently unused since
+            //                         alias is always safe for booleans, but kept
+            //                         as a no-op fallback for clarity)
+            //   NE(x, 1) → EQ(x, 0)  (rotation — enables P6 jz)
+            //
+            // Aliasing across vtypes is safe for booleans: {0, 1} has the same
+            // bit representation under sign- and zero-extension alike, so no
+            // downstream widening is affected.  R2G uses the same approach.
             if ((inst->kind == IK_EQ || inst->kind == IK_NE) && inst->nops == 2) {
                 Value *v0 = val_resolve(inst->ops[0]);
                 Value *v1 = val_resolve(inst->ops[1]);
-                // Find which operand is const 1, which is the boolean source
                 Value *src = NULL;
                 int const_idx = -1;
-                if (v1->kind == VAL_CONST && v1->iconst == 1) { src = v0; const_idx = 1; }
-                else if (v0->kind == VAL_CONST && v0->iconst == 1) { src = v1; const_idx = 0; }
+                int const_val = -1;
+                if (v1->kind == VAL_CONST && (v1->iconst == 0 || v1->iconst == 1)) {
+                    src = v0; const_idx = 1; const_val = v1->iconst;
+                } else if (v0->kind == VAL_CONST && (v0->iconst == 0 || v0->iconst == 1)) {
+                    src = v1; const_idx = 0; const_val = v0->iconst;
+                }
                 if (src) {
                     KnownBits kb = kb_get(src);
                     if ((kb.zero & ~1u) == ~1u) {   // bits 1-31 known zero
-                        Value *zero = new_const(f, 0, src->vtype);
-                        inst->ops[const_idx] = zero;
-                        zero->use_count++;
-                        inst->kind = (inst->kind == IK_EQ) ? IK_NE : IK_EQ;
-                        changed = 1;
+                        int is_alias = (inst->kind == IK_EQ && const_val == 1) ||
+                                       (inst->kind == IK_NE && const_val == 0);
+                        if (is_alias) {
+                            inst->dst->alias = src;
+                            inst->is_dead = 1;
+                            changed = 1;
+                            continue;
+                        }
+                        // Compare-with-1 → compare-with-0 rotation for P6
+                        if (const_val == 1) {
+                            Value *zero = new_const(f, 0, src->vtype);
+                            inst->ops[const_idx] = zero;
+                            zero->use_count++;
+                            inst->kind = (inst->kind == IK_EQ) ? IK_NE : IK_EQ;
+                            changed = 1;
+                        }
                     }
                 }
             }
