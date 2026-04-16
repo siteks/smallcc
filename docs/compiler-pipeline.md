@@ -108,8 +108,7 @@ Loop transforms (scalar promotion, address IVs, strength reduction) exploit the 
 phi structure.
 
 **Post-OOS passes** (R2A–R2J) run after `out_of_ssa`, before legalize. These are
-encapsulated in `run_post_oos_pipeline()` and parameterised by the active `OptProfile`
-(see Speculative Optimisation). The pass ordering is fixed:
+encapsulated in `run_post_oos_pipeline()`. The pass ordering is fixed:
 fold branches → dead blocks → copy prop → CSE → LICM const → LICM general →
 jump threading → unroll → copy prop (cleanup) → dominators → legalize → IRC.
 
@@ -122,9 +121,7 @@ jump threading → unroll → copy prop (cleanup) → dominators → legalize �
 | `-ssa file` | Braun SSA IR for each function, written to `file` after `braun_function` |
 | `-oos file` | Post-OOS IR for each function, written to `file` after `out_of_ssa` |
 | `-irc file` | Post-IRC IR for each function, written to `file` after `irc_allocate` |
-| `-speculative` | Try both optimisation profiles per function, pick the cheaper result (see Speculative Optimisation) |
-| `DUMP_IR=1` env var | Post-OOS IR and post-IRC IR for each function, printed to stderr. With `-speculative`, also prints which profile was chosen per function |
-| `DEBUG_SCORE=1` env var | Per-block scoring breakdown during speculative compilation |
+| `DUMP_IR=1` env var | Post-OOS IR and post-IRC IR for each function, printed to stderr |
 
 ---
 
@@ -344,7 +341,7 @@ After insertion: all `IK_PHI` instructions are removed.
 ## Optimisation Passes (`opt.c`)
 
 See **@docs/optimization-passes.md** for the complete pass catalog, dependency graph,
-bitmask system, CLI interface, and speculative optimisation framework.
+bitmask system, CLI interface, and LICM/CSE tuning constants.
 
 Brief summary of the post-OOS pass order (encapsulated in `run_post_oos_pipeline`):
 
@@ -829,7 +826,6 @@ See **@docs/optimization-passes.md** for the full catalog with dependencies and 
 | legalize Pass F | `legalize.c` | Materialize large VAL_CONST operands |
 | IRC | `alloc.c` | Appel & George 1996; K=8; phantom-node ABI; George coalescing; spill support |
 | emission P1–P18 | `emit.c` | CPU4 assembly; branch-to-next; compact encodings; compare+branch fusion; loop rotation; bitex fusion; cbeq/cbne fusion; mulli |
-| speculative pipeline | `smallcc.c` | Try conservative + aggressive profiles, pick cheaper (`-speculative`) |
 
 ---
 
@@ -864,7 +860,7 @@ Jump table optimisation is future work.
 | `braun.h` / `braun.c` | Braun SSA construction directly from Node* AST |
 | `dom.h` / `dom.c` | Dominator tree + loop depth |
 | `oos.h` / `oos.c` | Out-of-SSA (Boissinot) |
-| `opt.h` / `opt.c` | Post-OOS + pre-OOS optimisation passes; `OptProfile`; speculative profiles |
+| `opt.h` / `opt.c` | Post-OOS + pre-OOS optimisation passes |
 | `legalize.h` / `legalize.c` | ISA/ABI legalization: Passes A–F |
 | `alloc.h` / `alloc.c` | Liveness + IRC |
 | `emit.h` / `emit.c` | CPU4 emission (globals + functions); peepholes P1–P18 |

@@ -37,42 +37,6 @@
 extern unsigned opt_flags;
 
 // ============================================================
-// Speculative optimization profiles
-// ============================================================
-// Heuristic parameters that control register-pressure-sensitive
-// decisions.  The speculative pipeline tries both profiles and
-// picks the one that produces cheaper code after IRC.
-
-typedef struct {
-    // opt_licm_const — VAL_CONST hoisting
-    int licm_const_budget_small;   // budget when body_insts <= 16
-    int licm_const_budget_large;   // budget when body_insts > 16
-    int licm_const_hard_cap;       // max nlive for loop-bound const hoist
-    int licm_const_max_hoist;      // max constants hoisted per loop
-    int licm_const_use_threshold;  // min uses - 1 (best_uses init; >= threshold+1 to hoist)
-
-    // opt_licm — general invariant hoisting
-    int licm_gen_reserve;          // registers reserved for in-body temps (K - reserve - nlive = budget)
-    int licm_gen_max;              // cap on hoists per loop
-    int licm_gen_dense_hi;         // nloop_defs threshold for budget=1
-    int licm_gen_dense_lo;         // nloop_defs threshold for budget=min(budget,2)
-
-    // opt_cse — post-OOS cross-block policy.
-    // Both currently 0 in every profile: wider CSE extends canonical live
-    // ranges across loop exits, which defeats the P12 emit-time loop rotation
-    // peephole.  Kept as experiment hooks; flip to 1 to measure trade-offs.
-    int cse_xblock_dom;            // 1 = allow any dominator (not just direct pred)
-    int cse_xblock_samedelta;      // 1 = allow same loop depth (not just depth 0)
-
-    // opt_copy_prop — currently 0 in every profile for the same P12 reason.
-    int copyprop_typecoerce;       // 1 = propagate type-coercing copies (vtype mismatch)
-} OptProfile;
-
-extern const OptProfile opt_profile_conservative;
-extern const OptProfile opt_profile_aggressive;
-extern const OptProfile *opt_profile;   // points to active profile
-
-// ============================================================
 // Pass declarations
 // ============================================================
 

@@ -257,30 +257,6 @@ static void run_post_oos_pipeline(Function *f) {
     irc_allocate(f);
 }
 
-// Score a post-IRC Function: count live instructions weighted by 4^loop_depth.
-// Lower is better.  Spill loads/stores are included (they have loop_depth from
-// their block), so spill-heavy code is penalised automatically.
-static int score_function(Function *f) {
-    int score = 0;
-    int debug = (getenv("DEBUG_SCORE") != NULL);
-    for (int i = 0; i < f->nblocks; i++) {
-        Block *b = f->blocks[i];
-        int depth = b->loop_depth < 8 ? b->loop_depth : 8;
-        int weight = 1;
-        for (int d = 0; d < depth; d++) weight *= 4;
-        int cnt = 0;
-        for (Inst *inst = b->head; inst; inst = inst->next) {
-            if (inst->is_dead) continue;
-            cnt++;
-        }
-        if (debug && cnt > 0)
-            fprintf(stderr, "  B%d: depth=%d cnt=%d weight=%d sub=%d\n",
-                    b->id, depth, cnt, weight, cnt * weight);
-        score += cnt * weight;
-    }
-    return score;
-}
-
 int main(int argc, char **argv)
 {
     // Parse flags: -o outfile, -stats, -DNAME[=VALUE]
@@ -288,7 +264,6 @@ int main(int argc, char **argv)
     int file_start = 1;
     bool show_stats = false;
     bool preprocess_only = false;
-    int flag_speculative = 0;  // -speculative: try both opt profiles, pick best
     FILE *ssa_out = NULL;  // -ssa file: write Braun SSA IR to this file after braun_function
     FILE *oos_out = NULL;  // -oos file: write post-OOS IR to this file
     FILE *irc_out = NULL;  // -irc file: write post-IRC IR to this file
@@ -413,11 +388,6 @@ int main(int argc, char **argv)
         else if (strcmp(argv[file_start], "-ann") == 0)
         {
             flag_annotate = 1;
-            file_start++;
-        }
-        else if (strcmp(argv[file_start], "-speculative") == 0)
-        {
-            flag_speculative = 1;
             file_start++;
         }
         else if (strncmp(argv[file_start], "-O", 2) == 0)
@@ -650,46 +620,7 @@ int main(int argc, char **argv)
                     out_of_ssa(f);
                     if (oos_out) { fprintf(oos_out, "=== OOS: %s ===\n", f->name); print_function(f, oos_out); }
                     if (run_oos && irsim) { irsim_add_function(irsim, f); continue; }
-                    if (flag_speculative) {
-                        // Speculative: try both profiles, pick the cheaper result.
-                        // Skip speculative for large functions (nvalues > 200)
-                        // to avoid arena exhaustion from spill rewriting.
-                        if (f->nvalues > 200) {
-                            opt_profile = &opt_profile_conservative;
-                            run_post_oos_pipeline(f);
-                        } else {
-                            // Run conservative on a clone
-                            Function *fc_con = clone_function(f);
-                            opt_profile = &opt_profile_conservative;
-                            run_post_oos_pipeline(fc_con);
-                            int score_con = score_function(fc_con);
-
-                            // Run aggressive on a second clone
-                            Function *fc_agg = clone_function(f);
-                            opt_profile = &opt_profile_aggressive;
-                            run_post_oos_pipeline(fc_agg);
-                            int score_agg = score_function(fc_agg);
-
-                            // Pick winner and run it for real on the original
-                            if (score_agg < score_con)
-                                opt_profile = &opt_profile_aggressive;
-                            else
-                                opt_profile = &opt_profile_conservative;
-                            run_post_oos_pipeline(f);
-
-                            if (getenv("DUMP_IR")) {
-                                if (score_agg < score_con)
-                                    fprintf(stderr, "speculative: %s aggressive (%d < %d)\n",
-                                            f->name, score_agg, score_con);
-                                else
-                                    fprintf(stderr, "speculative: %s conservative (%d <= %d)\n",
-                                            f->name, score_con, score_agg);
-                            }
-                        }
-                    } else {
-                        // Non-speculative: single pass with active profile
-                        run_post_oos_pipeline(f);
-                    }
+                    run_post_oos_pipeline(f);
                     if (irc_out) { fprintf(irc_out, "=== IRC: %s ===\n", f->name); print_function(f, irc_out); }
                     if (getenv("DUMP_IR")) { fprintf(stderr, "=== after irc ===\n"); print_function(f, stderr); }
                     if (run_irc && irsim) { irsim_add_function(irsim, f); continue; }

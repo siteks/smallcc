@@ -154,7 +154,6 @@ Value    *new_value(Function *f, ValKind kind, ValType vt);
 Value    *new_const(Function *f, int ival, ValType vt);
 Inst     *new_inst(Function *f, Block *b, InstKind kind, Value *dst);
 void      inst_append(Block *b, Inst *inst);
-Function *clone_function(Function *src);
 void      inst_add_op(Inst *inst, Value *v);
 void      block_add_succ(Block *from, Block *to);
 void      block_add_pred(Block *to, Block *from);

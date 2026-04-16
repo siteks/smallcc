@@ -6,49 +6,6 @@
 
 unsigned opt_flags = OPT_ALL;
 
-// ============================================================
-// Speculative profiles — conservative matches current hardcoded values
-// ============================================================
-
-const OptProfile opt_profile_conservative = {
-    // licm_const
-    .licm_const_budget_small  = 6,
-    .licm_const_budget_large  = 3,
-    .licm_const_hard_cap      = 6,
-    .licm_const_max_hoist     = 4,
-    .licm_const_use_threshold = 2,   // hoist when uses > 2 (i.e. >= 3)
-    // licm_gen
-    .licm_gen_reserve         = 4,
-    .licm_gen_max             = 4,
-    .licm_gen_dense_hi        = 10,
-    .licm_gen_dense_lo        = 6,
-    // cse post-OOS
-    .cse_xblock_dom           = 0,
-    .cse_xblock_samedelta     = 0,
-    // copy_prop
-    .copyprop_typecoerce      = 0,
-};
-
-const OptProfile opt_profile_aggressive = {
-    // licm_const — more generous budgets
-    .licm_const_budget_small  = 7,
-    .licm_const_budget_large  = 5,
-    .licm_const_hard_cap      = 7,
-    .licm_const_max_hoist     = 6,
-    .licm_const_use_threshold = 1,   // hoist when uses > 1 (i.e. >= 2)
-    // licm_gen — less reserved, higher cap
-    .licm_gen_reserve         = 3,
-    .licm_gen_max             = 6,
-    .licm_gen_dense_hi        = 14,
-    .licm_gen_dense_lo        = 10,
-    // cse post-OOS / copy_prop — same as conservative (see OptProfile struct notes)
-    .cse_xblock_dom           = 0,
-    .cse_xblock_samedelta     = 0,
-    .copyprop_typecoerce      = 0,
-};
-
-const OptProfile *opt_profile = &opt_profile_conservative;
-
 /*
  * opt.c — Post-OOS SSA-level optimisation passes
  *
@@ -179,7 +136,7 @@ void opt_copy_prop(Function *f) {
             Value *dst = inst->dst;
             if (copy_count[dst->id] > 1) continue;  // phi-variable: multiple defs
             Value *src = val_resolve(inst->ops[0]);
-            if (!opt_profile->copyprop_typecoerce && src->vtype != dst->vtype)
+            if (src->vtype != dst->vtype)
                 continue;  // type-coercion copy (e.g. i32↔u32)
             if (!src->def) continue;                 // VAL_CONST or VAL_UNDEF source
             if (src->def->kind == IK_CALL   ||
@@ -355,19 +312,13 @@ static void gvn_walk(Block *b, Function *f) {
                 } else {
                     if (gvn_ops_safe(inst)) {
                         Block *cb = e->inst->block;
-                        if (opt_profile->cse_xblock_dom) {
-                            // Aggressive: any dominator at same or shallower depth
-                            if (dominates(cb, b) &&
-                                (opt_profile->cse_xblock_samedelta
-                                    ? cb->loop_depth <= b->loop_depth
-                                    : (b->loop_depth == 0 && cb->loop_depth == 0)))
-                                xblock_ok = 1;
-                        } else {
-                            // Conservative: direct predecessor, both at depth 0
-                            if (b->loop_depth == 0 && cb->loop_depth == 0) {
-                                for (int p = 0; p < b->npreds; p++)
-                                    if (b->preds[p] == cb) { xblock_ok = 1; break; }
-                            }
+                        // Conservative: direct predecessor, both at depth 0.
+                        // Wider CSE (any dominator, same loop depth) extends
+                        // canonical live ranges across loop exits, which
+                        // defeats the P12 emit-time loop rotation peephole.
+                        if (b->loop_depth == 0 && cb->loop_depth == 0) {
+                            for (int p = 0; p < b->npreds; p++)
+                                if (b->preds[p] == cb) { xblock_ok = 1; break; }
                         }
                     }
                 }
@@ -1163,16 +1114,14 @@ void opt_licm_const(Function *f) {
                 if (!inst->is_dead) body_insts++;
         }
 
-        int budget = (body_insts > 16)
-            ? opt_profile->licm_const_budget_large
-            : opt_profile->licm_const_budget_small;
+        int budget = (body_insts > 16) ? 3 : 6;
         if (nlive + 1 > budget) {
             // Budget exceeded for general hoisting.  Still try to hoist the
             // loop-bound constant (VAL_CONST operand of the header's
             // terminator comparison).  P12 (emit_rotated_branch) duplicates
             // the comparison in the latch, so the constant is materialized
             // twice per iteration.  Allow one hoist with a relaxed cap.
-            if (nlive + 1 > opt_profile->licm_const_hard_cap) continue;
+            if (nlive + 1 > 6) continue;
             Inst *hdr_term = h->tail;
             if (!hdr_term || hdr_term->kind != IK_BR || hdr_term->nops < 1)
                 continue;
@@ -1209,7 +1158,7 @@ void opt_licm_const(Function *f) {
             continue;
         }
 
-        int max_hoist = opt_profile->licm_const_max_hoist;
+        int max_hoist = 4;
 
         // Step 4: Count VAL_CONST operand uses inside the loop body.
         LicmCand cands[LICM_MAX_CANDS];
@@ -1250,7 +1199,7 @@ void opt_licm_const(Function *f) {
         // register cost across the loop body).
         int nhoisted = 0;
         for (int pass = 0; pass < max_hoist; pass++) {
-            int best = -1, best_uses = opt_profile->licm_const_use_threshold;
+            int best = -1, best_uses = 2;   // hoist when uses > 2 (i.e. >= 3)
             for (int k = 0; k < ncands; k++) {
                 if (!cands[k].hoisted && cands[k].uses > best_uses) {
                     best = k;
@@ -1408,13 +1357,13 @@ void opt_licm(Function *f) {
         // temporaries (address computations, intermediate values), and each
         // hoist adds 1 to the cross-loop pressure.  Cap budget when loop-
         // internal definitions are high (tight loops with many values).
-        int budget = 8 - opt_profile->licm_gen_reserve - nlive;
+        int budget = 8 - 4 - nlive;   // reserve 4 regs for in-body temps
         if (budget <= 0) continue;
-        if (nloop_defs > opt_profile->licm_gen_dense_hi)
+        if (nloop_defs > 10)
             budget = budget < 1 ? 0 : 1;
-        else if (nloop_defs > opt_profile->licm_gen_dense_lo)
+        else if (nloop_defs > 6)
             budget = budget < 2 ? budget : 2;
-        if (budget > opt_profile->licm_gen_max) budget = opt_profile->licm_gen_max;
+        if (budget > 4) budget = 4;
 
         // Build def-count per value inside the loop.
         int nv = f->nvalues;

@@ -1,7 +1,7 @@
 # Optimization Passes
 
 Complete inventory of optimization passes, their dependencies, the bitmask
-system for selective enabling/disabling, and the speculative profile framework.
+system for selective enabling/disabling, and the LICM/CSE tuning constants.
 
 ---
 
@@ -112,8 +112,7 @@ introduce new constant-condition branches.
 ### Post-OOS Passes (opt.c)
 
 These run after phi elimination via `out_of_ssa()`. The post-OOS pass sequence is
-encapsulated in `run_post_oos_pipeline()` and parameterised by the active
-`OptProfile` (see Speculative Optimisation).
+encapsulated in `run_post_oos_pipeline()`.
 
 | ID | Bit | Function | What | Depends on |
 |----|-----|----------|------|------------|
@@ -197,73 +196,29 @@ with EQ/NE only; const 0 is handled by P6 with `jz`/`jnz` at unlimited range).
 
 ---
 
-## Speculative Optimisation (`-speculative`)
+## LICM / CSE Heuristics
 
-Several post-OOS passes (LICM, CSE, copy propagation) have register-pressure-sensitive
-heuristics where a more aggressive setting can produce better code for some functions
-but cause spills (and worse code) for others. The speculative pipeline tries two
-profiles and picks the winner.
+The register-pressure-sensitive LICM and CSE passes use hardcoded tuning constants
+(inlined at each site in `opt.c`):
 
-### OptProfile
+| Pass | Parameter | Value | Meaning |
+|------|-----------|-------|---------|
+| `opt_licm_const` | body budget (small/large) | 6 / 3 | Hoist budget when body_insts ≤ 16 / > 16 |
+| `opt_licm_const` | hard cap | 6 | Max `nlive+1` for loop-bound const hoist |
+| `opt_licm_const` | max hoists | 4 | Cap on constants hoisted per loop |
+| `opt_licm_const` | use threshold | 2 | Hoist only when `uses > 2` (i.e. ≥ 3) |
+| `opt_licm` | reserve | 4 | Registers reserved for in-body temps (`8 − 4 − nlive = budget`) |
+| `opt_licm` | max hoists | 4 | Cap on invariant hoists per loop |
+| `opt_licm` | dense-hi | 10 | `nloop_defs` threshold that forces budget ≤ 1 |
+| `opt_licm` | dense-lo | 6 | `nloop_defs` threshold that caps budget at 2 |
+| `opt_cse` post-OOS | cross-block | direct pred only | Wider policies defeat P12 loop rotation |
+| `opt_copy_prop` | type-coercing copies | not propagated | Same P12 interaction |
 
-The `OptProfile` struct (`opt.h`) centralises 13 heuristic parameters:
-
-| Parameter | Conservative | Aggressive | Controls |
-|-----------|-------------|------------|----------|
-| `licm_const_budget_small` | 6 | 7 | Const hoist budget (body ≤ 16 insts) |
-| `licm_const_budget_large` | 3 | 5 | Const hoist budget (body > 16 insts) |
-| `licm_const_hard_cap` | 6 | 7 | Max nlive for loop-bound const hoist |
-| `licm_const_max_hoist` | 4 | 6 | Max constants hoisted per loop |
-| `licm_const_use_threshold` | 2 | 1 | Min uses-1 (con: ≥3 uses, agg: ≥2) |
-| `licm_gen_reserve` | 4 | 3 | Registers reserved for in-body temps |
-| `licm_gen_max` | 4 | 6 | Cap on general hoists per loop |
-| `licm_gen_dense_hi` | 10 | 14 | nloop_defs threshold for budget=1 |
-| `licm_gen_dense_lo` | 6 | 10 | nloop_defs threshold for budget≤2 |
-| `cse_xblock_dom` | 0 | 0 | Cross-block CSE via dominator |
-| `cse_xblock_samedelta` | 0 | 0 | Cross-block CSE at same loop depth |
-| `copyprop_typecoerce` | 0 | 0 | Propagate type-coercing copies |
-
-The last three are intentionally identical — wider CSE and type-coercing copy
-propagation were found to interfere with P12 (emit-time loop rotation). The
-current profiles differ only in LICM parameters.
-
-The conservative profile matches the hand-tuned defaults. The aggressive profile
-allows more hoisting with less reserved register headroom — beneficial for
-loops with many invariant sub-expressions but risky for loops already at K=8
-register pressure.
-
-### Pipeline
-
-When `-speculative` is passed:
-
-1. Clone the post-OOS `Function` (via `clone_function` in `ssa.c`)
-2. Run `run_post_oos_pipeline` on the clone with the conservative profile
-3. Score the result via `score_function` (live instructions weighted by `4^loop_depth`)
-4. Clone again, run with the aggressive profile, score
-5. Pick the lower-scoring profile and run it on the original `Function`
-
-Both clones remain in the arena (no rollback). Functions with `nvalues > 200` skip
-speculative mode to avoid arena exhaustion from IRC spill rewriting on large functions.
-
-### Scoring
-
-`score_function` counts live (non-dead) instructions per block, weighted by
-`4^loop_depth`. This heavily penalises spill code inside loops. The score is
-an IR-level estimate — it does not account for emission peepholes (P1–P18), so
-it may mis-predict when peephole effects differ between profiles.
-
-### clone_function
-
-Deep clone of a `Function` with full pointer remapping (`ssa.c`). Value remapping
-uses an id-indexed array; block remapping uses linear scan (block arrays are small).
-Shared read-only data (`fname`, `label`, `calldesc`) is not cloned.
-
-### Status
-
-The infrastructure works (300/300 tests, CoreMark correct) but the current profile
-pair produces no meaningful improvement on CoreMark — conservative is already
-optimal for all hot inner loops. Future work: more principled per-parameter
-exploration, and profile dimensions beyond LICM (e.g. unroll factors, CSE scope).
+An earlier version of the compiler carried an `OptProfile` struct and a
+`-speculative` mode that tried a conservative + aggressive variant per function
+and picked the cheaper result. It produced no CoreMark improvement over the
+hand-tuned conservative profile, so the infrastructure was removed in favour of
+the inlined constants above.
 
 ---
 
@@ -302,7 +257,6 @@ exploration, and profile dimensions beyond LICM (e.g. unroll factors, CSE scope)
 -Opass=NAME           enable single pass by name (additive)
 -Ono-pass=NAME        disable single pass by name (subtractive from default)
 -Omask=0x7FF          set exact bitmask (hex)
--speculative          try both opt profiles per function, pick best
 ```
 
 Examples:
@@ -311,7 +265,6 @@ Examples:
 ./smallcc -Ono-pass=unroll -o out.s t.c        # all except unroll
 ./smallcc -O0 -Opass=copy_prop -o out.s t.c    # only copy prop
 ./smallcc -Omask=0x007 -o out.s t.c            # R2A+R2B+R2D only
-./smallcc -speculative -o out.s t.c            # speculative profile selection
 ```
 
 ### Pass Names for CLI
