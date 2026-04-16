@@ -86,6 +86,36 @@ const OptProfile *opt_profile = &opt_profile_conservative;
  *      used as a guard here.
  */
 
+// ── Shared helpers ────────────────────────────────────────────────────────
+
+/*
+ * Rewrite every operand to its canonical value (chasing Value.alias chains
+ * via val_resolve) and rebuild use_count from the surviving instruction
+ * stream.  Aliased instruction dsts naturally end up with use_count == 0
+ * and are removed later by IRC DCE.
+ *
+ * This is the standard post-transform cleanup after any pass that aliases
+ * Value dsts or marks instructions dead.  Passes that physically unlink
+ * dead instructions should do so BEFORE calling this helper, so the walk
+ * sees the final list; the is_dead guard here then handles any residual
+ * is_dead instructions that were not unlinked.
+ */
+static void recount_uses(Function *f) {
+    for (int i = 0; i < f->nvalues; i++) f->values[i]->use_count = 0;
+    for (int bi = 0; bi < f->nblocks; bi++) {
+        Block *b = f->blocks[bi];
+        for (Inst *inst = b->head; inst; inst = inst->next) {
+            if (inst->is_dead) continue;
+            for (int j = 0; j < inst->nops; j++) {
+                if (inst->ops[j]) {
+                    inst->ops[j] = val_resolve(inst->ops[j]);
+                    inst->ops[j]->use_count++;
+                }
+            }
+        }
+    }
+}
+
 // ── R2A: Constant-condition branch folding ────────────────────────────────
 
 void opt_fold_branches(Function *f) {
@@ -163,19 +193,7 @@ void opt_copy_prop(Function *f) {
 
     // Pass 2: rewrite every operand to its canonical value and recount use_count.
     // Aliased copy dsts will end up with use_count == 0 and be removed by IRC DCE.
-    for (int i = 0; i < f->nvalues; i++) f->values[i]->use_count = 0;
-    for (int bi = 0; bi < f->nblocks; bi++) {
-        Block *b = f->blocks[bi];
-        for (Inst *inst = b->head; inst; inst = inst->next) {
-            if (inst->is_dead) continue;
-            for (int j = 0; j < inst->nops; j++) {
-                if (inst->ops[j]) {
-                    inst->ops[j] = val_resolve(inst->ops[j]);
-                    inst->ops[j]->use_count++;
-                }
-            }
-        }
-    }
+    recount_uses(f);
 }
 
 // ── R2E: Global value numbering (dominator-tree CSE) ──────────────────────
@@ -406,19 +424,7 @@ void opt_cse(Function *f) {
     if (!gvn_changed) return;
 
     // Recount use_count after aliasing (same pattern as opt_copy_prop).
-    for (int i = 0; i < f->nvalues; i++) f->values[i]->use_count = 0;
-    for (int bi = 0; bi < f->nblocks; bi++) {
-        Block *b = f->blocks[bi];
-        for (Inst *inst = b->head; inst; inst = inst->next) {
-            if (inst->is_dead) continue;
-            for (int j = 0; j < inst->nops; j++) {
-                if (inst->ops[j]) {
-                    inst->ops[j] = val_resolve(inst->ops[j]);
-                    inst->ops[j]->use_count++;
-                }
-            }
-        }
-    }
+    recount_uses(f);
 }
 
 void opt_pre_oos_cse(Function *f) {
@@ -494,19 +500,7 @@ void opt_redundant_bool(Function *f) {
     if (!changed) return;
 
     // Recount use_count after aliasing
-    for (int i = 0; i < f->nvalues; i++) f->values[i]->use_count = 0;
-    for (int bi = 0; bi < f->nblocks; bi++) {
-        Block *b = f->blocks[bi];
-        for (Inst *inst = b->head; inst; inst = inst->next) {
-            if (inst->is_dead) continue;
-            for (int j = 0; j < inst->nops; j++) {
-                if (inst->ops[j]) {
-                    inst->ops[j] = val_resolve(inst->ops[j]);
-                    inst->ops[j]->use_count++;
-                }
-            }
-        }
-    }
+    recount_uses(f);
 }
 
 // ── R2H: Load narrowing ──────────────────────────────────────────────────
@@ -581,19 +575,7 @@ void opt_narrow_loads(Function *f) {
     if (!changed) return;
 
     // Recount use_count
-    for (int i = 0; i < f->nvalues; i++) f->values[i]->use_count = 0;
-    for (int bi = 0; bi < f->nblocks; bi++) {
-        Block *b = f->blocks[bi];
-        for (Inst *inst = b->head; inst; inst = inst->next) {
-            if (inst->is_dead) continue;
-            for (int j = 0; j < inst->nops; j++) {
-                if (inst->ops[j]) {
-                    inst->ops[j] = val_resolve(inst->ops[j]);
-                    inst->ops[j]->use_count++;
-                }
-            }
-        }
-    }
+    recount_uses(f);
 }
 
 // ── Known-bits analysis ──────────────────────────────────────────────────
@@ -967,19 +949,7 @@ void opt_known_bits(Function *f) {
     }
 
     if (!changed) return;
-    for (int i = 0; i < f->nvalues; i++) f->values[i]->use_count = 0;
-    for (int bi = 0; bi < f->nblocks; bi++) {
-        Block *b = f->blocks[bi];
-        for (Inst *inst = b->head; inst; inst = inst->next) {
-            if (inst->is_dead) continue;
-            for (int j = 0; j < inst->nops; j++) {
-                if (inst->ops[j]) {
-                    inst->ops[j] = val_resolve(inst->ops[j]);
-                    inst->ops[j]->use_count++;
-                }
-            }
-        }
-    }
+    recount_uses(f);
 }
 
 // ── R2L: Bitwise distribution ────────────────────────────────────────────
@@ -1052,19 +1022,7 @@ void opt_bitwise_dist(Function *f) {
     }
 
     if (!changed) return;
-    for (int i = 0; i < f->nvalues; i++) f->values[i]->use_count = 0;
-    for (int bi = 0; bi < f->nblocks; bi++) {
-        Block *b = f->blocks[bi];
-        for (Inst *inst = b->head; inst; inst = inst->next) {
-            if (inst->is_dead) continue;
-            for (int j = 0; j < inst->nops; j++) {
-                if (inst->ops[j]) {
-                    inst->ops[j] = val_resolve(inst->ops[j]);
-                    inst->ops[j]->use_count++;
-                }
-            }
-        }
-    }
+    recount_uses(f);
 }
 
 // ── R2F: LICM for IK_CONST (loop-invariant constant hoisting) ────────────
@@ -1342,19 +1300,7 @@ void opt_licm_const(Function *f) {
     if (!changed) return;
 
     // Recount use_count
-    for (int i = 0; i < f->nvalues; i++) f->values[i]->use_count = 0;
-    for (int bi = 0; bi < f->nblocks; bi++) {
-        Block *b = f->blocks[bi];
-        for (Inst *inst = b->head; inst; inst = inst->next) {
-            if (inst->is_dead) continue;
-            for (int j = 0; j < inst->nops; j++) {
-                if (inst->ops[j]) {
-                    inst->ops[j] = val_resolve(inst->ops[j]);
-                    inst->ops[j]->use_count++;
-                }
-            }
-        }
-    }
+    recount_uses(f);
 }
 
 // ── R2K: General LICM (loop-invariant code motion) ──────────────────────
@@ -2352,19 +2298,9 @@ void opt_lsr(Function *f) {
         }
     }
 
-    // Recount use_count after aliasing and unlinking
-    for (int i = 0; i < f->nvalues; i++) f->values[i]->use_count = 0;
-    for (int bi = 0; bi < f->nblocks; bi++) {
-        Block *b = f->blocks[bi];
-        for (Inst *inst = b->head; inst; inst = inst->next) {
-            for (int j = 0; j < inst->nops; j++) {
-                if (inst->ops[j]) {
-                    inst->ops[j] = val_resolve(inst->ops[j]);
-                    inst->ops[j]->use_count++;
-                }
-            }
-        }
-    }
+    // Recount use_count after aliasing and unlinking.  The physical unlink
+    // loop above has already removed all is_dead instructions from the list.
+    recount_uses(f);
 }
 
 // ── Scalar Promotion (pre-OOS) ───────────────────────────────────────────
@@ -2584,19 +2520,9 @@ void opt_scalar_promote(Function *f) {
         }
     }
 
-    // Recount use_count after aliasing and unlinking
-    for (int i = 0; i < f->nvalues; i++) f->values[i]->use_count = 0;
-    for (int bi = 0; bi < f->nblocks; bi++) {
-        Block *b = f->blocks[bi];
-        for (Inst *inst = b->head; inst; inst = inst->next) {
-            for (int j = 0; j < inst->nops; j++) {
-                if (inst->ops[j]) {
-                    inst->ops[j] = val_resolve(inst->ops[j]);
-                    inst->ops[j]->use_count++;
-                }
-            }
-        }
-    }
+    // Recount use_count after aliasing and unlinking.  The physical unlink
+    // loop above has already removed all is_dead instructions from the list.
+    recount_uses(f);
 }
 
 // ── Address Induction Variables (pre-OOS) ────────────────────────────────
@@ -2958,18 +2884,9 @@ void opt_addr_iv(Function *f) {
 
     if (!changed) return;
 
-    // Recount use_count (dead chain instructions naturally get use_count 0,
-    // removed later by IRC DCE)
-    for (int i = 0; i < f->nvalues; i++) f->values[i]->use_count = 0;
-    for (int bi = 0; bi < f->nblocks; bi++) {
-        Block *b = f->blocks[bi];
-        for (Inst *inst = b->head; inst; inst = inst->next) {
-            for (int j = 0; j < inst->nops; j++) {
-                if (inst->ops[j]) {
-                    inst->ops[j] = val_resolve(inst->ops[j]);
-                    inst->ops[j]->use_count++;
-                }
-            }
-        }
-    }
+    // Recount use_count.  The replaced address-chain instructions are not
+    // marked is_dead here; they simply lose all their users via the direct
+    // operand swap above, so their use_count drops to 0 and IRC DCE removes
+    // them later.
+    recount_uses(f);
 }
