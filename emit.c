@@ -1295,6 +1295,84 @@ static void sink_consts(Function *f) {
     }
 }
 
+// Greedy trace-based block reordering to minimize explicit jumps.
+//
+// For each block, the "hot successor" becomes the next block:
+//   - IK_JMP: follow target (if unplaced) — eliminates the j via P1.
+//   - IK_BR: prefer the successor with higher loop_depth (loop body over
+//            exit); on ties, prefer target2 (the fall-through path) so the
+//            trailing `j target2` after a taken branch is omitted.
+// When no successor is followable, start a new trace from the highest
+// loop_depth unplaced block to keep hot bodies contiguous.
+//
+// This does not reorder instructions within a block, add branches, or
+// touch live_in/live_out — it only permutes the f->blocks[] array. All
+// downstream passes (detect_bitex_fusions, detect_branch_fusions, emit)
+// read blocks from this array, so they automatically see the new layout.
+static void reorder_blocks(Function *f) {
+    if (f->nblocks <= 2) return;
+    int n = f->nblocks;
+    Block **new_order = arena_alloc(n * sizeof(Block *));
+    uint8_t *placed = arena_alloc(n);
+    for (int i = 0; i < n; i++) placed[i] = 0;
+
+    int n_placed = 0;
+    int cur_idx = 0;  // block 0 is the function entry; must come first
+
+    while (n_placed < n) {
+        Block *cur = f->blocks[cur_idx];
+        new_order[n_placed++] = cur;
+        placed[cur_idx] = 1;
+
+        // Find effective terminator (skip dead tail instructions)
+        Inst *term = cur->tail;
+        while (term && term->is_dead) term = term->prev;
+
+        Block *pref1 = NULL, *pref2 = NULL;
+        if (term) {
+            if (term->kind == IK_JMP && term->target) {
+                pref1 = term->target;
+            } else if (term->kind == IK_BR) {
+                Block *t1 = term->target;
+                Block *t2 = term->target2;
+                int d1 = t1 ? t1->loop_depth : -1;
+                int d2 = t2 ? t2->loop_depth : -1;
+                if (d1 > d2)      { pref1 = t1; pref2 = t2; }
+                else if (d2 > d1) { pref1 = t2; pref2 = t1; }
+                else              { pref1 = t2; pref2 = t1; }  // tie: fall-through first
+            }
+        }
+
+        int next_idx = -1;
+        Block *cands[2] = { pref1, pref2 };
+        for (int c = 0; c < 2 && next_idx < 0; c++) {
+            if (!cands[c]) continue;
+            for (int i = 0; i < n; i++) {
+                if (f->blocks[i] == cands[c] && !placed[i]) {
+                    next_idx = i;
+                    break;
+                }
+            }
+        }
+
+        if (next_idx < 0) {
+            int best = -1, best_d = -1;
+            for (int i = 0; i < n; i++) {
+                if (!placed[i] && f->blocks[i]->loop_depth > best_d) {
+                    best_d = f->blocks[i]->loop_depth;
+                    best = i;
+                }
+            }
+            next_idx = best;
+        }
+
+        if (next_idx < 0) break;
+        cur_idx = next_idx;
+    }
+
+    memcpy(f->blocks, new_order, n * sizeof(Block *));
+}
+
 // Pre-pass: mark IK_CONST instructions dead when their only consumer
 // is an ALU op that a peephole will fold.
 static void mark_dead_consts(Function *f) {
@@ -1525,10 +1603,133 @@ static int is_known_zero(Value *v) {
     return 0;
 }
 
+// Byte count for a CPU4 mnemonic. Returns 0 for unknown / non-instructions
+// (labels, directives, blank lines). See docs/isa/cpu4.md.
+static int cpu4_mnem_bytes(const char *m) {
+    if (!m || !*m) return 0;
+    // F0a (1 byte)
+    if (!strcmp(m, "halt") || !strcmp(m, "ret")) return 1;
+    // F1a (2 bytes): three-reg ALU + pseudo-ops
+    static const char *const two[] = {
+        "add","sub","mul","div","mod","shl","shr","lt","le","eq","ne",
+        "and","or","xor","lts","les","divs","mods","shrs",
+        "fadd","fsub","fmul","fdiv","flt","fle",
+        "gt","ge","gts","ges","fgt","fge","mov",
+        // F1b (2 bytes): single-reg
+        "sxb","sxw","inc","dec","pushr","popr","zxb","zxw",
+        "itof","ftoi","jlr","jr","ssp","putchar",
+        // F2 (2 bytes): bp-relative load/store/addi
+        "lb","lw","ll","sb","sw","sl","lbx","lwx",
+        "addi","shli","andi","shrsi",
+    };
+    for (size_t i = 0; i < sizeof(two)/sizeof(two[0]); i++)
+        if (!strcmp(m, two[i])) return 2;
+    // Everything else (F0b, F0c, F3a-F3e): 3 bytes
+    return 3;
+}
+
+// Parse an assembly buffer emitted for this function's body and compute
+// per-block byte offsets. On entry block_start[] is a scratch array of
+// length f->nblocks indexed by block id (must be ≥ max id + 1).
+// Sets block_start[b->id] = cumulative byte offset at which that block
+// begins. Block 0 has no label emitted (bi>0 guard), so block_start[
+// f->blocks[0]->id ] = 0. Block labels look like "_<funcname>_B<id>:".
+static void parse_block_offsets(Function *f, const char *buf, size_t len,
+                                int *block_start /* indexed by block id */,
+                                int *total_bytes /* optional */) {
+    // Init all block starts to -1 (unreached). Block 0 starts at 0.
+    int max_id = 0;
+    for (int i = 0; i < f->nblocks; i++)
+        if (f->blocks[i]->id > max_id) max_id = f->blocks[i]->id;
+    for (int i = 0; i <= max_id; i++) block_start[i] = -1;
+    block_start[f->blocks[0]->id] = 0;
+
+    char prefix[64];
+    int plen = snprintf(prefix, sizeof(prefix), "_%s_B", f->name);
+
+    int cum = 0;
+    const char *p = buf, *end = buf + len;
+    while (p < end) {
+        const char *eol = memchr(p, '\n', end - p);
+        const char *lend = eol ? eol : end;
+        // Skip leading whitespace
+        const char *q = p;
+        while (q < lend && (*q == ' ' || *q == '\t')) q++;
+        if (q < lend && *q != ';') {
+            // Detect block label: "_<funcname>_B<id>:"
+            if ((lend - q) > plen && !memcmp(q, prefix, plen)) {
+                const char *r = q + plen;
+                int id = 0, any = 0;
+                while (r < lend && *r >= '0' && *r <= '9') {
+                    id = id * 10 + (*r - '0');
+                    r++;
+                    any = 1;
+                }
+                if (any && r < lend && *r == ':') {
+                    if (id >= 0 && id <= max_id)
+                        block_start[id] = cum;
+                    goto next_line;
+                }
+            }
+            // Generic label?  "<name>:" — skip (no byte cost, not our block)
+            {
+                const char *r = q;
+                while (r < lend && (isalnum((unsigned char)*r) || *r == '_')) r++;
+                if (r > q && r < lend && *r == ':') goto next_line;
+            }
+            // Instruction: count bytes by mnemonic (first word).
+            {
+                const char *mstart = q;
+                const char *mend = q;
+                while (mend < lend && (isalnum((unsigned char)*mend) || *mend == '_'))
+                    mend++;
+                size_t mlen = mend - mstart;
+                if (mlen > 0 && mlen < 16) {
+                    char mnem[16];
+                    memcpy(mnem, mstart, mlen);
+                    mnem[mlen] = 0;
+                    cum += cpu4_mnem_bytes(mnem);
+                }
+            }
+        }
+    next_line:
+        p = eol ? eol + 1 : end;
+    }
+    if (total_bytes) *total_bytes = cum;
+}
+
+// Return the byte count of block bi, given per-id block_start[] and the
+// total byte count of the function body. Uses block layout order
+// (f->blocks[]) to find the "next" block. For the last block, uses
+// total_bytes as its end.
+static int block_size_from_offsets(Function *f, int bi,
+                                   const int *block_start, int total_bytes) {
+    int start = block_start[f->blocks[bi]->id];
+    if (start < 0) return 0;
+    int end;
+    if (bi + 1 < f->nblocks) {
+        end = block_start[f->blocks[bi + 1]->id];
+        if (end < 0) end = total_bytes;
+    } else {
+        end = total_bytes;
+    }
+    return end > start ? end - start : 0;
+}
+
 // Detect comparison+branch pairs that can be fused into F3b branches.
-static void detect_branch_fusions(Function *f, BranchFuse *fuse) {
-    memset(fuse, 0, f->nblocks * sizeof(BranchFuse));
+// block_size[] (may be NULL) gives exact byte sizes indexed by layout
+// position (f->blocks[bi]). When non-NULL it replaces the coarse
+// "3 bytes × instruction count" heuristic with measured bytes.
+// fuse[] must be zeroed by the caller on the first call. On subsequent
+// calls (fixpoint iteration), already-committed entries are preserved:
+// a block with fuse[bi].fused != 0 is skipped. Any committed fusion
+// only shrinks blocks (marks cmp as is_dead, compact terminator), so
+// re-measuring after each call is monotonic.
+static int detect_branch_fusions(Function *f, BranchFuse *fuse,
+                                 const int *block_size) {
+    int committed = 0;
     for (int fbi = 0; fbi < f->nblocks; fbi++) {
+        if (fuse[fbi].fused != 0) continue;
         Block *fb  = f->blocks[fbi];
         Inst  *term = fb->tail;
         if (!term || term->kind != IK_BR || term->nops < 1) continue;
@@ -1633,11 +1834,18 @@ static void detect_branch_fusions(Function *f, BranchFuse *fuse) {
         int lo = (fbi < target_bi) ? fbi + 1 : target_bi;
         int hi = (fbi < target_bi) ? target_bi : fbi;
         int est_bytes = 0;
-        for (int k = lo; k < hi; k++) {
-            for (Inst *ii = f->blocks[k]->head; ii; ii = ii->next)
-                if (!ii->is_dead) est_bytes += 3;
+        if (block_size) {
+            for (int k = lo; k < hi; k++) est_bytes += block_size[k];
+        } else {
+            for (int k = lo; k < hi; k++)
+                for (Inst *ii = f->blocks[k]->head; ii; ii = ii->next)
+                    if (!ii->is_dead) est_bytes += 3;
         }
-        int in_range = (est_bytes <= 450);
+        // F3c displacement is ±511 bytes (10-bit signed, PC-relative from
+        // end of branch instruction). Use 500 when measured, 450 for the
+        // conservative heuristic fallback.
+        int p5_cap = block_size ? 500 : 450;
+        int in_range = (est_bytes <= p5_cap);
 
         // P6: NE(x, 0) or EQ(x, 0) → jnz/jz directly (checked before P5
         // because P6 needs no scratch register and saves the immw entirely).
@@ -1662,7 +1870,59 @@ static void detect_branch_fusions(Function *f, BranchFuse *fuse) {
                 fuse[fbi].fused  = 3;
                 fuse[fbi].p0     = test_val->phys_reg;
                 fuse[fbi].is_eq  = (def->kind == IK_EQ);
+                committed++;
                 continue;
+            }
+        }
+
+        // P17: cbeq/cbne — EQ/NE with 8-bit unsigned const, short-range.
+        // Checked before P5 because when a constant has been materialised to
+        // an IK_CONST (by CSE or LICM const-hoisting), both operands are
+        // VAL_INST with phys_reg and P5 would otherwise fire first, giving
+        // `immw rX, K; beq rY, rX, T` (6 bytes) instead of `cbeq rY, K, T`
+        // (3 bytes). resolve_const peeks through IK_CONST to catch those.
+        if ((def->kind == IK_EQ || def->kind == IK_NE) && def->nops >= 2) {
+            Value *cb_reg = NULL;
+            int cb_k = 0, tmp = 0;
+            if (dop0 && dop0->kind == VAL_INST && dop0->phys_reg >= 0 &&
+                resolve_const(dop1, &tmp) && tmp >= 0 && tmp <= 255)
+                { cb_reg = dop0; cb_k = tmp; }
+            else if (dop1 && dop1->kind == VAL_INST && dop1->phys_reg >= 0 &&
+                     resolve_const(dop0, &tmp) && tmp >= 0 && tmp <= 255)
+                { cb_reg = dop1; cb_k = tmp; }
+            if (cb_reg) {
+                // Determine which target we'll actually branch to
+                Block *next_det = (fbi + 1 < f->nblocks) ? f->blocks[fbi + 1] : NULL;
+                int will_inv = (term->target == next_det && term->target2 != NULL);
+                Block *cb_tgt = will_inv ? term->target2 : term->target;
+                int cb_tbi = -1;
+                for (int k = 0; k < f->nblocks; k++)
+                    if (f->blocks[k] == cb_tgt) { cb_tbi = k; break; }
+                if (cb_tbi >= 0) {
+                    int cb_lo = (fbi < cb_tbi) ? fbi + 1 : cb_tbi;
+                    int cb_hi = (fbi < cb_tbi) ? cb_tbi : fbi;
+                    int cb_est = 0;
+                    if (block_size) {
+                        for (int k = cb_lo; k < cb_hi; k++) cb_est += block_size[k];
+                    } else {
+                        for (int k = cb_lo; k < cb_hi; k++)
+                            for (Inst *ii = f->blocks[k]->head; ii; ii = ii->next)
+                                if (!ii->is_dead) cb_est += 3;
+                    }
+                    // F0c displacement is ±255 bytes (9-bit signed,
+                    // PC-relative). 250 when measured, 250 for the
+                    // conservative heuristic fallback.
+                    int p17_cap = block_size ? 250 : 250;
+                    if (cb_est <= p17_cap) {
+                        def->is_dead        = 1;
+                        fuse[fbi].fused     = 4;
+                        fuse[fbi].p0        = cb_reg->phys_reg;
+                        fuse[fbi].const_val = cb_k;
+                        fuse[fbi].is_eq     = (def->kind == IK_EQ);
+                        committed++;
+                        continue;
+                    }
+                }
             }
         }
 
@@ -1677,43 +1937,8 @@ static void detect_branch_fusions(Function *f, BranchFuse *fuse) {
             fuse[fbi].mnem   = mnem;
             fuse[fbi].p0     = dop0->phys_reg;
             fuse[fbi].p1     = dop1->phys_reg;
+            committed++;
             continue;
-        }
-
-        // P17: cbeq/cbne — EQ/NE with 8-bit unsigned const, short-range
-        if ((def->kind == IK_EQ || def->kind == IK_NE) && def->nops >= 2) {
-            Value *cb_reg = NULL, *cb_const = NULL;
-            if (dop1 && dop1->kind == VAL_CONST && dop1->iconst >= 0 && dop1->iconst <= 255 &&
-                dop0 && dop0->kind == VAL_INST && dop0->phys_reg >= 0)
-                { cb_reg = dop0; cb_const = dop1; }
-            else if (dop0 && dop0->kind == VAL_CONST && dop0->iconst >= 0 && dop0->iconst <= 255 &&
-                     dop1 && dop1->kind == VAL_INST && dop1->phys_reg >= 0)
-                { cb_reg = dop1; cb_const = dop0; }
-            if (cb_reg && cb_const) {
-                // Determine which target we'll actually branch to
-                Block *next_det = (fbi + 1 < f->nblocks) ? f->blocks[fbi + 1] : NULL;
-                int will_inv = (term->target == next_det && term->target2 != NULL);
-                Block *cb_tgt = will_inv ? term->target2 : term->target;
-                int cb_tbi = -1;
-                for (int k = 0; k < f->nblocks; k++)
-                    if (f->blocks[k] == cb_tgt) { cb_tbi = k; break; }
-                if (cb_tbi >= 0) {
-                    int cb_lo = (fbi < cb_tbi) ? fbi + 1 : cb_tbi;
-                    int cb_hi = (fbi < cb_tbi) ? cb_tbi : fbi;
-                    int cb_est = 0;
-                    for (int k = cb_lo; k < cb_hi; k++)
-                        for (Inst *ii = f->blocks[k]->head; ii; ii = ii->next)
-                            if (!ii->is_dead) cb_est += 5;
-                    if (cb_est <= 200) {
-                        def->is_dead        = 1;
-                        fuse[fbi].fused     = 4;
-                        fuse[fbi].p0        = cb_reg->phys_reg;
-                        fuse[fbi].const_val = cb_const->iconst;
-                        fuse[fbi].is_eq     = (def->kind == IK_EQ);
-                        continue;
-                    }
-                }
-            }
         }
 
         // P5+: one operand is VAL_CONST, use cond's register as scratch
@@ -1752,11 +1977,13 @@ static void detect_branch_fusions(Function *f, BranchFuse *fuse) {
                     fuse[fbi].p1        = sc;
                     fuse[fbi].const_val = const_op->iconst;
                     fuse[fbi].swap      = const_is_lhs;
+                    committed++;
                     continue;
                 }
             }
         }
     }
+    return committed;
 }
 
 // Emit a rotated branch (P12): duplicate header's IK_BR at the end of a latch block.
@@ -1830,63 +2057,19 @@ static int emit_rotated_branch(Function *f, FILE *out, Inst *inst,
 // emit_function — main entry point
 // ============================================================
 
-void emit_function(Function *f, FILE *out) {
-    if (!f || f->nblocks == 0) return;
+#define MAX_JT 16
 
-    #define MAX_JT 16
+// Emit the function body (per-block instructions + jump tables) to `out`.
+// Invoked twice: once to a memstream for exact byte-size measurement, once
+// to the real output after branch fusions are committed.
+static void emit_function_body(Function *f, FILE *out, BranchFuse *fuse,
+                               uint8_t *blk_live_regs,
+                               int callee_frame, int callee_save[4],
+                               int frame, int ann_live) {
     struct { Inst *inst; int mn, mx; } jt_info[MAX_JT];
     int jt_count = 0;
-
-    if (getenv("SMALLCC_DEBUG_IR")) {
-        fprintf(stderr, "=== IR dump for %s ===\n", f->name);
-        extern void print_function(Function *, FILE *);
-        print_function(f, stderr);
-    }
-
-    g_cur_func_name = f->name;
-    fprintf(out, "    align\n");
-    fprintf(out, "%s:\n", f->name);
-
-    int frame = f->frame_size;
-    if (frame % 4) frame += (4 - frame % 4);
-
-    int callee_save[4] = {0, 0, 0, 0};
-    int callee_frame = emit_prologue(f, out, frame, callee_save);
-
-    mark_dead_consts(f);
-    remap_single_use_values(f);
-    sink_consts(f);
-    detect_bitex_fusions(f);
-
-    BranchFuse *fuse = arena_alloc(f->nblocks * sizeof(BranchFuse));
-    detect_branch_fusions(f, fuse);
-
-    // Precompute per-block physical-register live_out masks for scratch selection
-    uint8_t *blk_live_regs = arena_alloc(f->nblocks * sizeof(uint8_t));
-    for (int bi = 0; bi < f->nblocks; bi++) {
-        Block *b = f->blocks[bi];
-        uint8_t mask = 0;
-        if (b->live_out) {
-            for (int w = 0; w < b->nwords; w++) {
-                uint32_t bits = b->live_out[w];
-                while (bits) {
-                    int bit = __builtin_ctz(bits);
-                    int vid = w * 32 + bit;
-                    if (vid < f->nvalues) {
-                        int pr = f->values[vid]->phys_reg;
-                        if (pr >= 0 && pr < 8)
-                            mask |= (1u << pr);
-                    }
-                    bits &= bits - 1;
-                }
-            }
-        }
-        blk_live_regs[bi] = mask;
-    }
-
-    // Emit blocks
     int ann_prev_line = 0;
-    int ann_live = (getenv("LIVE_REGS") != NULL);
+
     for (int bi = 0; bi < f->nblocks; bi++) {
         Block *b = f->blocks[bi];
         g_blk_live_out_regs = blk_live_regs[bi];
@@ -2117,6 +2300,94 @@ void emit_function(Function *f, FILE *out) {
                 fprintf(out, "    word _%s_B%d\n", f->name, def_id);
         }
     }
+}
+
+void emit_function(Function *f, FILE *out) {
+    if (!f || f->nblocks == 0) return;
+
+    if (getenv("SMALLCC_DEBUG_IR")) {
+        fprintf(stderr, "=== IR dump for %s ===\n", f->name);
+        extern void print_function(Function *, FILE *);
+        print_function(f, stderr);
+    }
+
+    g_cur_func_name = f->name;
+    fprintf(out, "    align\n");
+    fprintf(out, "%s:\n", f->name);
+
+    int frame = f->frame_size;
+    if (frame % 4) frame += (4 - frame % 4);
+
+    int callee_save[4] = {0, 0, 0, 0};
+    int callee_frame = emit_prologue(f, out, frame, callee_save);
+
+    mark_dead_consts(f);
+    remap_single_use_values(f);
+    sink_consts(f);
+    reorder_blocks(f);
+    detect_bitex_fusions(f);
+
+    // Precompute per-block physical-register live_out masks
+    uint8_t *blk_live_regs = arena_alloc(f->nblocks * sizeof(uint8_t));
+    for (int bi = 0; bi < f->nblocks; bi++) {
+        Block *b = f->blocks[bi];
+        uint8_t mask = 0;
+        if (b->live_out) {
+            for (int w = 0; w < b->nwords; w++) {
+                uint32_t bits = b->live_out[w];
+                while (bits) {
+                    int bit = __builtin_ctz(bits);
+                    int vid = w * 32 + bit;
+                    if (vid < f->nvalues) {
+                        int pr = f->values[vid]->phys_reg;
+                        if (pr >= 0 && pr < 8)
+                            mask |= (1u << pr);
+                    }
+                    bits &= bits - 1;
+                }
+            }
+        }
+        blk_live_regs[bi] = mask;
+    }
+
+    BranchFuse *fuse = arena_alloc(f->nblocks * sizeof(BranchFuse));
+    memset(fuse, 0, f->nblocks * sizeof(BranchFuse));
+
+    // Two-pass branch-fusion range check with fixpoint iteration:
+    //   1. Dry-run body emission using current fuse[] state. This gives an
+    //      upper bound on real block sizes (uncommitted range-sensitive
+    //      fusions emit the unfused 8-byte cmp+jnz+j sequence).
+    //   2. Parse block-start offsets and derive per-block byte sizes.
+    //   3. Call detect_branch_fusions with exact sizes. It skips blocks
+    //      already committed (fuse[bi].fused != 0) and only adds new fusions.
+    //   4. Repeat until no new commits: each commit shrinks its block, which
+    //      may bring previously-out-of-range candidates into range.
+    int max_id = 0;
+    for (int i = 0; i < f->nblocks; i++)
+        if (f->blocks[i]->id > max_id) max_id = f->blocks[i]->id;
+    int *block_start = arena_alloc((max_id + 1) * sizeof(int));
+    int *block_size  = arena_alloc(f->nblocks * sizeof(int));
+
+    int committed;
+    do {
+        char *mbuf = NULL; size_t mlen = 0;
+        FILE *mf = open_memstream(&mbuf, &mlen);
+        emit_function_body(f, mf, fuse, blk_live_regs, callee_frame,
+                           callee_save, frame, /*ann_live=*/0);
+        fflush(mf);
+        fclose(mf);
+        int total_bytes = 0;
+        parse_block_offsets(f, mbuf, mlen, block_start, &total_bytes);
+        free(mbuf);
+        for (int bi = 0; bi < f->nblocks; bi++)
+            block_size[bi] = block_size_from_offsets(f, bi, block_start, total_bytes);
+        committed = detect_branch_fusions(f, fuse, block_size);
+    } while (committed > 0);
+
+    // Real emission pass.
+    int ann_live = (getenv("LIVE_REGS") != NULL);
+    emit_function_body(f, out, fuse, blk_live_regs, callee_frame,
+                       callee_save, frame, ann_live);
 }
 
 // ============================================================
