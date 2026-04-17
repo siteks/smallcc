@@ -18,19 +18,29 @@
 // ---------------------------------------------------------------
 // Arena allocators
 // ---------------------------------------------------------------
-#define ARENA_SIZE (16 * 1024 * 1024)
-static char arena_storage[ARENA_SIZE];
-Arena arena = { arena_storage, 0, sizeof(arena_storage) };
+#define ARENA_CHUNK_DEFAULT (4 * 1024 * 1024)
+Arena arena = { NULL, 0, 0, ARENA_CHUNK_DEFAULT };
 
 void *arena_alloc(size_t size)
 {
     // Round up to 8-byte alignment
     size = (size + 7) & ~(size_t)7;
-    if (arena.used + size > arena.cap)
-        error("arena exhausted (used %zu, requested %zu)", arena.used, size);
-    void *p = arena.base + arena.used;
+    if (!arena.head || arena.head->used + size > arena.head->size)
+    {
+        size_t cs = arena.chunk_size ? arena.chunk_size : ARENA_CHUNK_DEFAULT;
+        if (size > cs) cs = size;
+        ArenaChunk *c = calloc(1, sizeof(ArenaChunk) + cs);
+        if (!c) error("out of memory (arena chunk %zu bytes)", cs);
+        c->size = cs;
+        c->used = 0;
+        c->next = arena.head;
+        arena.head = c;
+        arena.cap += cs;
+    }
+    void *p = arena.head->data + arena.head->used;
+    arena.head->used += size;
     arena.used += size;
-    return p;   // pre-zeroed: arena_storage is static (BSS)
+    return p;   // pre-zeroed: calloc'd chunks
 }
 
 char *arena_strdup(const char *s)

@@ -14,15 +14,22 @@ void src_error(int line, int col, const char *fmt, ...) __attribute__((noreturn)
 // ===============================================================
 // Arena Allocator
 // ===============================================================
-// One bump-pointer arena:
-//
-//   arena   — permanent allocations (Types, Symbols, Nodes).
-//             Pre-zeroed BSS; never reset.
+// Chunked bump-pointer arena.  Grows on demand by prepending a new
+// chunk of at least `chunk_size` bytes.  All memory is pre-zeroed
+// (calloc'd chunks) so callers can rely on zero-initialised structs.
+typedef struct ArenaChunk {
+    struct ArenaChunk *next;
+    size_t             size;  // capacity of this chunk's data[]
+    size_t             used;  // bytes consumed in this chunk
+    char               data[];
+} ArenaChunk;
+
 typedef struct
 {
-    char   *base;
-    size_t  used;
-    size_t  cap;
+    ArenaChunk *head;        // current chunk (allocations bump here)
+    size_t      used;        // cumulative bytes allocated across all chunks
+    size_t      cap;         // cumulative capacity across all chunks
+    size_t      chunk_size;  // default size for a fresh chunk
 } Arena;
 extern Arena arena;
 void  *arena_alloc(size_t size);
