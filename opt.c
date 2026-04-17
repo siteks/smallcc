@@ -1272,12 +1272,11 @@ void opt_licm_const(Function *f) {
         }
 
         // Step 5: Sort candidates by use count (descending) and pick top N.
-        // Step 5: Sort candidates by use count (descending) and pick top N.
-        // Only hoist constants with uses >= 3 (enough savings to justify the
-        // register cost across the loop body).
+        // Only hoist constants with uses >= 2 (register cost for one loop
+        // balanced against two saved immw per iteration).
         int nhoisted = 0;
         for (int pass = 0; pass < max_hoist; pass++) {
-            int best = -1, best_uses = 2;   // hoist when uses > 2 (i.e. >= 3)
+            int best = -1, best_uses = 1;   // hoist when uses > 1 (i.e. >= 2)
             for (int k = 0; k < ncands; k++) {
                 if (!cands[k].hoisted && cands[k].uses > best_uses) {
                     best = k;
