@@ -403,8 +403,7 @@ static void gvn_walk(Block *b, Function *f) {
                     // live range from the preheader through the loop body,
                     // wasting a register for a value that costs only an immw
                     // to recreate locally.
-                    if (dominates(cb, b) &&
-                        b->loop_depth > cb->loop_depth) {
+                    if (dominates(cb, b) && b->loop_depth >= cb->loop_depth) {
                         int all_const = 1;
                         for (int oi = 0; oi < inst->nops; oi++) {
                             Value *ov = inst->ops[oi];
