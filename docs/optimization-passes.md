@@ -184,7 +184,7 @@ Pass F after E        (F should see folded AND chains from E)
 | P14 | `AND(x, 0-255)` → `andi`/`andli` | F2/F0b | 3/2 (5→2/3) |
 | P15 | Redundant AND via known-bits | — | 2-5 per elim |
 | P16 | `SHR(x,k)+AND(r,mask)` → `bitex` | F0b | 1-3 (4-6→3) |
-| P17 | `EQ/NE(x,const8)+BR` → `cbeq`/`cbne` | F0c | 2-3 (5-6→3) |
+| P17 | `EQ/NE(x,const7)+BR` → `cbeq`/`cbne` | F0c | 2-3 (5-6→3) |
 | P18 | `MUL(x, const)` → `mulli` | F0b | 2 (5→3) |
 | P19 | General F0b imm ALU (cmp/div/mod/or/xor) | F0b | 2 (5→3) |
 
@@ -192,7 +192,7 @@ Peepholes are purely local and have no ordering dependencies on each other.
 They fire during the single emission walk based on pattern matching.
 P2/P3/P4 are checked in priority order (smallest encoding first).
 P16 is detected in a pre-pass and takes priority over P13+P14 on matched pairs.
-P17 is detected in `detect_branch_fusions` and checked before P5+ (const 1–255
+P17 is detected in `detect_branch_fusions` and checked before P5+ (const 1–127
 with EQ/NE only; const 0 is handled by P6 with `jz`/`jnz` at unlimited range).
 
 ---

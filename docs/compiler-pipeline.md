@@ -96,7 +96,7 @@ Node* parse tree  (output of resolve_symbols / derive_types / insert_coercions)
                                          P2–P4: inc/dec, addi, addli compact encodings
                                          P5: compare+branch fusion (F3c)
                                          P16: SHR+AND → bitex fusion (F0b)
-                                         P17: EQ/NE(x, const8) → cbeq/cbne (F0c)
+                                         P17: EQ/NE(x, const7) → cbeq/cbne (F0c)
                                          P18: MUL(x, const) → mulli (F0b)
                                          P19: general F0b immediate ALU (cmp/div/mod/or/xor)
 ```
@@ -756,11 +756,11 @@ After:  bitex rd, src, 98                            (3 bytes, 1 instruction)
 For `IK_SHR` (arithmetic), an additional safety check ensures `shift + width <= 32` so
 that sign-extended bits do not leak into the extracted field.
 
-**P17 — cbeq/cbne fusion (EQ/NE with 8-bit constant)**
+**P17 — cbeq/cbne fusion (EQ/NE with 7-bit constant)**
 
 Replaces `IK_EQ(x, const)` or `IK_NE(x, const)` followed by `IK_BR` — where `const` is
-an unsigned 8-bit value (0–255) and the branch target is within the F0c 9-bit signed
-displacement range (±255 bytes) — with a single `cbeq`/`cbne` instruction (F0c, 3 bytes).
+an unsigned 7-bit value (0–127) and the branch target is within the F0c 10-bit signed
+displacement range (±511 bytes) — with a single `cbeq`/`cbne` instruction (F0c, 3 bytes).
 
 This replaces the P5+ pattern (`immw scratch, const; beq/bne rx, scratch, target`,
 5 bytes) with a single 3-byte instruction. Checked after P6 (which handles the `const == 0`

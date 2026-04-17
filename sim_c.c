@@ -631,18 +631,18 @@ static void assemble_cpu4(const char *src)
                 }
                 cur += 3;
             } else if (instr->extra == 2 && instr->subfmt == 7) {
-                /* F0b: cbeq/cbne — rx, imm8, label; encoding: 001odddiiiiiiiiiiiiiiiiii
-                   imm17 = (imm8 << 9) | (disp9 & 0x1ff) */
+                /* F0c: cbeq/cbne — rx, imm7, label; encoding: 001odddiiiiiiiiiiiiiiiiii
+                   imm17 = (imm7 << 10) | (disp10 & 0x3ff) */
                 int rx2 = (nops > 0) ? parse_reg4(ops[0]) : 0;
-                int32_t imm8 = (nops > 1) ? (int32_t)strtol(ops[1], NULL, 0) : 0;
+                int32_t imm7 = (nops > 1) ? (int32_t)strtol(ops[1], NULL, 0) : 0;
                 uint16_t tgt = (pass == 2 && nops > 2) ? (uint16_t)parse_tok(ops[2], pass) : 0;
-                int32_t disp9 = (int32_t)tgt - (instr_addr + instr_len);
-                if (pass == 2 && (disp9 < -256 || disp9 > 255)) {
+                int32_t disp10 = (int32_t)tgt - (instr_addr + instr_len);
+                if (pass == 2 && (disp10 < -512 || disp10 > 511)) {
                     fprintf(stderr, "error: %s displacement %d out of range at 0x%04x\n",
-                            instr->name, (int)disp9, (unsigned)instr_addr);
+                            instr->name, (int)disp10, (unsigned)instr_addr);
                     exit(1);
                 }
-                int32_t imm17 = ((imm8 & 0xff) << 9) | (disp9 & 0x1ff);
+                int32_t imm17 = ((imm7 & 0x7f) << 10) | (disp10 & 0x3ff);
                 /* Encoding: 001o ddd i iiiiiiiiiiiiiiii into 24 bits.
                    byte0[7:5] = 001, byte0[4] = opcode bit (0=cbeq, 1=cbne),
                    byte0[3:1] = rx[2:0], byte0[0] = imm17[16]
@@ -751,6 +751,7 @@ static int sym_cmp(const void *a, const void *b)
 }
 
 static int32_t sx9(int32_t v);  /* forward decl — defined with other sign-ext helpers below */
+static int32_t sx10(int32_t v); /* forward decl — defined with other sign-ext helpers below */
 
 static void print_dump(uint16_t code_end, uint16_t data_end)
 {
@@ -886,13 +887,13 @@ static void print_dump(uint16_t code_end, uint16_t data_end)
             int32_t simm9 = sx9(imm);
             snprintf(operands, sizeof(operands), "r%d, r%d, %d", rd, ry, (int)simm9);
         } else if (fmt2 == 0 && (b0 & 0xe0) == 0x20) {
-            /* F0c: cbeq/cbne — rx, imm8, target */
-            int32_t imm8_val = (imm >> 9) & 0xff;
-            int32_t disp9 = sx9(imm & 0x1ff);
-            uint16_t target = (uint16_t)((int)(pc + len) + disp9);
+            /* F0c: cbeq/cbne — rx, imm7, target */
+            int32_t imm7_val = (imm >> 10) & 0x7f;
+            int32_t disp10 = sx10(imm & 0x3ff);
+            uint16_t target = (uint16_t)((int)(pc + len) + disp10);
             const char *tgt = sym_for_target(target);
-            if (*tgt) snprintf(operands, sizeof(operands), "r%d, %d, %s", rx, (int)imm8_val, tgt);
-            else snprintf(operands, sizeof(operands), "r%d, %d, 0x%04x", rx, (int)imm8_val, (unsigned)target);
+            if (*tgt) snprintf(operands, sizeof(operands), "r%d, %d, %s", rx, (int)imm7_val, tgt);
+            else snprintf(operands, sizeof(operands), "r%d, %d, 0x%04x", rx, (int)imm7_val, (unsigned)target);
         } else if (fmt2 == 0) {
             /* F0a: no operands */
         } else if (fmt2 == 1 && (b0 & 0xfe) == 0x7e) {
@@ -1204,9 +1205,9 @@ static void run_cpu4(int verbose)
         /* F3b: adjw=0xc4, lea=0xc6 */
         case 0xc4: sp=(uint16_t)(sp+(uint16_t)(sx14(imm)<<2)); break; /* adjw */
         case 0xc6: r[rd]=(uint32_t)((int32_t)bp+(sx14(imm)<<2)); break; /* lea */
-        /* F0c: cbeq=0x20, cbne=0x30 — compare rx with imm8 and branch */
-        case 0x20: if(r[rx]==(uint32_t)(imm>>9))  pc=(uint16_t)(pc+sx9(imm&0x1ff)); break; /* cbeq */
-        case 0x30: if(r[rx]!=(uint32_t)(imm>>9))  pc=(uint16_t)(pc+sx9(imm&0x1ff)); break; /* cbne */
+        /* F0c: cbeq=0x20, cbne=0x30 — compare rx with imm7 and branch */
+        case 0x20: if(r[rx]==(uint32_t)(imm>>10)) pc=(uint16_t)(pc+sx10(imm&0x3ff)); break; /* cbeq */
+        case 0x30: if(r[rx]!=(uint32_t)(imm>>10)) pc=(uint16_t)(pc+sx10(imm&0x3ff)); break; /* cbne */
         /* F3c — register-relative */
         case 0xd0: r[rx]=read8 ((uint16_t)((int32_t)r[ry]+sx10(imm)));     break; /* llb  */
         case 0xd1: { uint16_t a = (uint16_t)((int32_t)r[ry]+sx10(imm)*2); check_align16(a, oldpc); r[rx]=read16(a); } break; /* llw  */

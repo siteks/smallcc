@@ -40,7 +40,7 @@ bits of the first byte:
 |---|---|---|---|
 | F0a | 1 byte | `0000 oooo` | No-operand (16 slots) |
 | F0b | 3 bytes | `0001 oooo odddxxxiiiiiiiii` | Two reg + imm9 ALU (32 slots via 16 first-bytes × 2 subops) |
-| F0c | 3 bytes | `001 o ddd iiiiiiiiiiiiiiiii` | Compare-and-branch: one reg + imm8 + disp9 (2 slots) |
+| F0c | 3 bytes | `001 o ddd iiiiiiiiiiiiiiiii` | Compare-and-branch: one reg + imm7 + disp10 (2 slots) |
 | F1a | 2 bytes | `01ooooo ddd xxx yyy` | Three-register ALU (31 usable slots; `11111` is F1b escape) |
 | F1b | 2 bytes | `0111111 ddd oooooo` | One-register ops (64 slots; triggered when F1a opcode = `11111`) |
 | F2 | 2 bytes | `10 oooo xxx iiiiiii` | One reg + imm7; bp-relative load/store/addi (16 slots) |
@@ -120,26 +120,26 @@ Useful for expressions like `N - x` or `N / x` where N is a small constant.
 ## Format F0c — Compare-and-Branch (3 bytes)
 
 `001 o ddd i iiiiiiiiiiiiiiii` — 1-bit opcode, 3-bit register (`rx`), 17-bit immediate.
-The 17-bit immediate encodes two fields: bits [16:9] = 8-bit unsigned comparison value
-(0–255), bits [8:0] = 9-bit signed PC-relative branch displacement (−256 to +255).
+The 17-bit immediate encodes two fields: bits [16:10] = 7-bit unsigned comparison value
+(0–127), bits [9:0] = 10-bit signed PC-relative branch displacement (−512 to +511).
 
 First bytes: 0x20–0x2f (cbeq), 0x30–0x3f (cbne).
 
 | Opcode | Mnemonic | Semantics |
 |---|---|---|
-| 0x20 | `cbeq rx, imm8, disp9` | if rx == imm8: pc += sext9(disp9) |
-| 0x30 | `cbne rx, imm8, disp9` | if rx != imm8: pc += sext9(disp9) |
+| 0x20 | `cbeq rx, imm7, disp10` | if rx == imm7: pc += sext10(disp10) |
+| 0x30 | `cbne rx, imm7, disp10` | if rx != imm7: pc += sext10(disp10) |
 
 Combines an immediate comparison and conditional branch into a single 3-byte instruction,
-replacing the common 5–6 byte `immw rT, const; beq/bne rx, rT, target` sequences. The 8-bit
-comparison value covers the most common small constants in switch/case dispatch and loop bound
-checks.
+replacing the common 5–6 byte `immw rT, const; beq/bne rx, rT, target` sequences. The 7-bit
+comparison value covers normal ASCII characters and the small constants used in switch/case
+dispatch and loop bound checks.
 
-The 9-bit signed displacement gives a range of −256 to +255 bytes from the end of the
+The 10-bit signed displacement gives a range of −512 to +511 bytes from the end of the
 instruction, covering most short-range branches in switch/case code and loop conditions.
 Branches to more distant targets must fall back to the `immw + beq/bne` sequence.
 
-**Assembly syntax:** `cbeq rx, imm8, label` / `cbne rx, imm8, label` — the assembler
+**Assembly syntax:** `cbeq rx, imm7, label` / `cbne rx, imm7, label` — the assembler
 computes the PC-relative displacement from the label address.
 
 ---

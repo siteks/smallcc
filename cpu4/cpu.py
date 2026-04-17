@@ -65,8 +65,8 @@ import sys
 #   rdivsli
 #
 #   Format 0c - one op + imm17 (2 slots)
-#   cbeq    pc = rx==imm17>>9 ? (pc + sxt(imm17&0x1ff)): pc
-#   cbne    pc = rx!=imm17>>9 ? (pc + sxt(imm17&0x1ff)): pc
+#   cbeq    pc = rx==imm17>>10 ? (pc + sxt(imm17&0x3ff)): pc
+#   cbne    pc = rx!=imm17>>10 ? (pc + sxt(imm17&0x3ff)): pc
 #
 #   Format 1a - three op (31 slots + 1 escape)
 #   add     rd = rx op ry
@@ -565,8 +565,8 @@ class CPU:
         elif    i == 'rmodli':  s.r[dst] = sext(imm, 9) % s.r[src1] if s.r[src1] != 0 else 0
         elif    i == 'rdivsli': s.r[dst] = int(sext(imm, 9) / sext(s.r[src1], 32)) if s.r[src1] != 0 else 0
         # f0c
-        elif    i == 'cbeq':    s.pc = s.pc + sext(imm & 0x1ff, 9) if s.r[src0] == imm >> 9 else s.pc
-        elif    i == 'cbne':    s.pc = s.pc + sext(imm & 0x1ff, 9) if s.r[src0] != imm >> 9 else s.pc
+        elif    i == 'cbeq':    s.pc = s.pc + sext(imm & 0x3ff, 10) if s.r[src0] == imm >> 10 else s.pc
+        elif    i == 'cbne':    s.pc = s.pc + sext(imm & 0x3ff, 10) if s.r[src0] != imm >> 10 else s.pc
         # f1a
         elif    i == 'add':     s.r[dst] = s.r[src0] + s.r[src1]
         elif    i == 'sub':     s.r[dst] = s.r[src0] - s.r[src1]

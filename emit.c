@@ -1875,7 +1875,7 @@ static int detect_branch_fusions(Function *f, BranchFuse *fuse,
             }
         }
 
-        // P17: cbeq/cbne — EQ/NE with 8-bit unsigned const, short-range.
+        // P17: cbeq/cbne — EQ/NE with 7-bit unsigned const, short-range.
         // Checked before P5 because when a constant has been materialised to
         // an IK_CONST (by CSE or LICM const-hoisting), both operands are
         // VAL_INST with phys_reg and P5 would otherwise fire first, giving
@@ -1885,10 +1885,10 @@ static int detect_branch_fusions(Function *f, BranchFuse *fuse,
             Value *cb_reg = NULL;
             int cb_k = 0, tmp = 0;
             if (dop0 && dop0->kind == VAL_INST && dop0->phys_reg >= 0 &&
-                resolve_const(dop1, &tmp) && tmp >= 0 && tmp <= 255)
+                resolve_const(dop1, &tmp) && tmp >= 0 && tmp <= 127)
                 { cb_reg = dop0; cb_k = tmp; }
             else if (dop1 && dop1->kind == VAL_INST && dop1->phys_reg >= 0 &&
-                     resolve_const(dop0, &tmp) && tmp >= 0 && tmp <= 255)
+                     resolve_const(dop0, &tmp) && tmp >= 0 && tmp <= 127)
                 { cb_reg = dop1; cb_k = tmp; }
             if (cb_reg) {
                 // Determine which target we'll actually branch to
@@ -1909,10 +1909,10 @@ static int detect_branch_fusions(Function *f, BranchFuse *fuse,
                             for (Inst *ii = f->blocks[k]->head; ii; ii = ii->next)
                                 if (!ii->is_dead) cb_est += 3;
                     }
-                    // F0c displacement is ±255 bytes (9-bit signed,
-                    // PC-relative). 250 when measured, 250 for the
+                    // F0c displacement is ±511 bytes (10-bit signed,
+                    // PC-relative). 500 when measured, 500 for the
                     // conservative heuristic fallback.
-                    int p17_cap = block_size ? 250 : 250;
+                    int p17_cap = block_size ? 500 : 500;
                     if (cb_est <= p17_cap) {
                         def->is_dead        = 1;
                         fuse[fbi].fused     = 4;
