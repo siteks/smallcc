@@ -498,17 +498,11 @@ Replaces zero-extension and truncation with an explicit mask-and:
 skipped — no masking is needed. The explicit `IK_CONST(mask)` lets IRC allocate a physical
 register for the mask rather than emitting pushr/popr scratch sequences in emit.c.
 
-**Fast path (8-bit truncation):** When the source of `IK_TRUNC` is a `VAL_CONST` and the
-destination is 8-bit, the instruction is folded directly to `IK_CONST(k & 0xff)` without
-creating a mask value. This avoids adding a register to the interference graph for a
-constant that is known at compile time.
-
-Note: The 16-bit constant-source fast-path is intentionally deferred. Applying it changes
-the IRC interference graph in a way that exposes a latent coalescing bug where an OOS
-phi-copy for a loop variable is dropped even though source and destination have different
-physical registers (manifests in `crcu8`: the shifted partial-CRC ends up in the loop
-phi slot instead of the full post-update CRC). Fix requires hardening IRC phi-copy
-handling under changed graph topology.
+**Fast path (constant source):** When the source of `IK_ZEXT`/`IK_TRUNC` is a constant
+(either `VAL_CONST` or a `VAL_INST` defined by `IK_CONST`), the instruction is folded
+directly to `IK_CONST(k & mask)` without creating a mask value. Covers both 8-bit
+(`mask = 0xff`) and 16-bit (`mask = 0xffff`) cases. This avoids adding a register to the
+interference graph for a constant known at compile time.
 
 ### Pass E — AND-chain constant folding
 

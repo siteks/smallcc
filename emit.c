@@ -532,34 +532,41 @@ static void emit_inst(Inst *inst, FILE *out) {
         }
 
         // P8: AND(x, 0xFF) → zxb; AND(x, 0xFFFF) → zxw
-        // In-place (rd == preg(x)): just zxb/zxw rd (2 bytes).
-        // Cross-register: or rd, ps, ps; zxb/zxw rd (4 bytes vs 5 for immw+and).
+        // In-place (rd == preg(x)): zxb/zxw rd (2 bytes).
+        // Cross-register 0xFF: andli rd, ps, 255 (F0b, 3 bytes).
+        // Cross-register 0xFFFF: zxwor rd, ps, ps (F1a, 2 bytes) — degenerate form of zxwor.
         if (inst->kind == IK_AND && (k0 ^ k1)) {
             int kv = k1 ? (c1 ? op1->iconst : op1->def->imm)
                         : (c0 ? op0->iconst : op0->def->imm);
             int ps = k1 ? p0 : p1;
-            if (kv == 0xff || kv == 0xffff) {
-                const char *zx = kv == 0xff ? "zxb" : "zxw";
-                if (ps != rd)
-                    fprintf(out, "    or %s, %s, %s\n", regname(rd), regname(ps), regname(ps));
-                fprintf(out, "    %s %s\n", zx, regname(rd));
+            if (kv == 0xff) {
+                if (ps == rd)
+                    fprintf(out, "    zxb %s\n", regname(rd));
+                else
+                    fprintf(out, "    andli %s, %s, 255\n", regname(rd), regname(ps));
+                break;
+            }
+            if (kv == 0xffff) {
+                if (ps == rd)
+                    fprintf(out, "    zxw %s\n", regname(rd));
+                else
+                    fprintf(out, "    zxwor %s, %s, %s\n", regname(rd), regname(ps), regname(ps));
                 break;
             }
         }
 
-        // P14: AND(x, k) where k in 0..127 → andi (F2, in-place, 2 bytes)
-        //       AND(x, k) where k in 128..255 → andli (F0b, 3 bytes vs 5 for immw+and)
+        // P14: AND(x, k) where k in 0..255
+        // In-place (rd == preg(x), k in 0..127): andi (F2, 2 bytes)
+        // Cross-register or k in 128..255: andli (F0b, 3 bytes vs 5 for immw+and)
         if (inst->kind == IK_AND && (k0 ^ k1)) {
             int kv = k1 ? (c1 ? op1->iconst : op1->def->imm)
                         : (c0 ? op0->iconst : op0->def->imm);
             int ps = k1 ? p0 : p1;
-            if (kv >= 0 && kv <= 127) {
-                if (ps != rd)
-                    fprintf(out, "    or %s, %s, %s\n", regname(rd), regname(ps), regname(ps));
+            if (kv >= 0 && kv <= 127 && ps == rd) {
                 fprintf(out, "    andi %s, %d\n", regname(rd), kv);
                 break;
             }
-            if (kv >= 128 && kv <= 255) {
+            if (kv >= 0 && kv <= 255) {
                 fprintf(out, "    andli %s, %s, %d\n", regname(rd), regname(ps), kv);
                 break;
             }
@@ -720,8 +727,12 @@ static void emit_inst(Inst *inst, FILE *out) {
     case IK_NEG: {
         if (!dst || inst->nops < 1) break;
         int r1 = get_val_reg(out, inst->ops[0], rd);
-        if (r1 != rd) fprintf(out, "    or %s, %s, %s\n", regname(rd), regname(r1), regname(r1));
-        fprintf(out, "    neg %s\n", regname(rd));
+        // In-place: `neg rd` (F1b, 2 bytes).
+        // Cross-register: `rsubli rd, rs, 0` (F0b, 3 bytes) beats `or+neg` (4 bytes).
+        if (r1 == rd)
+            fprintf(out, "    neg %s\n", regname(rd));
+        else
+            fprintf(out, "    rsubli %s, %s, 0\n", regname(rd), regname(r1));
         break;
     }
 
@@ -785,8 +796,10 @@ static void emit_inst(Inst *inst, FILE *out) {
             if (r1 != rd) fprintf(out, "    or %s, %s, %s\n", regname(rd), regname(r1), regname(r1));
         } else {
             int r1 = get_val_reg(out, inst->ops[0], rd);
-            if (r1 != rd) fprintf(out, "    or %s, %s, %s\n", regname(rd), regname(r1), regname(r1));
-            fprintf(out, "    sxw %s\n", regname(rd));
+            if (r1 == rd)
+                fprintf(out, "    sxw %s\n", regname(rd));
+            else
+                fprintf(out, "    sxwor %s, %s, %s\n", regname(rd), regname(r1), regname(r1));
         }
         break;
     }

@@ -128,16 +128,8 @@ void legalize_function(Function *f) {
             int mask_val = (mask_size == 1) ? 0xff : 0xffff;
 
             // Fast path: constant source — fold to IK_CONST(src & mask).
-            // Restricted to mask_size == 1 (u8 truncation) only.  The u16 fold
-            // (mask_size == 2) changes the IRC interference graph in a way that
-            // causes IRC to drop the OOS phi-copy for the CRC loop variable in
-            // crcu8 (the shifted partial value r3 = crc>>1 ends up in the phi
-            // slot that B2 reads, instead of the full post-update crc in r5).
-            // The u16 fold is mathematically correct but exposes a latent IRC
-            // coalescing bug; defer until IRC phi-copy handling is hardened.
-            //
-            // Also handles VAL_INST values defined by IK_CONST (e.g. LICM-hoisted
-            // constants that were demoted from VAL_CONST to VAL_INST).
+            // Handles both VAL_CONST and VAL_INST defined by IK_CONST
+            // (e.g. LICM-hoisted constants demoted from VAL_CONST).
             {
                 int is_src_const = 0;
                 int src_k = 0;
@@ -147,7 +139,7 @@ void legalize_function(Function *f) {
                            src_val->def && src_val->def->kind == IK_CONST) {
                     is_src_const = 1; src_k = src_val->def->imm;
                 }
-                if (is_src_const && mask_size == 1) {
+                if (is_src_const) {
                     int folded = src_k & mask_val;
                     inst->kind = IK_CONST;
                     inst->imm  = folded;

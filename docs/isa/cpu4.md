@@ -186,8 +186,14 @@ Result written to `rd`; `rx` and `ry` are read-only. Opcode `11111` (0x7e) is th
 | 0x6c | `fdiv rd, rx, ry` | rd = float_bits(float(rx) / float(ry)) |
 | 0x6e | `flt rd, rx, ry` | rd = (float(rx) < float(ry)) ? 1 : 0 |
 | 0x70 | `fle rd, rx, ry` | rd = (float(rx) <= float(ry)) ? 1 : 0 |
+| 0x72 | `zxwor rd, rx, ry` | rd = (rx \| ry) & 0xffff |
+| 0x74 | `sxwor rd, rx, ry` | rd = sign_extend_16((rx \| ry) & 0xffff) |
 
-*(6 slots available: 0x72, 0x74, 0x76, 0x78, 0x7a, 0x7c.)*
+*(4 slots available: 0x76, 0x78, 0x7a, 0x7c.)*
+
+`zxwor`/`sxwor` fuse a bitwise OR with 16-bit zero/sign extension. When `rx == ry` they
+degenerate to a pure cross-register 16-bit zero/sign extend (`rd = zx/sx(rx)`), used by the
+compiler for the `mov rd, rs; zxw/sxw rd` collapse.
 
 Float operands are 32-bit IEEE 754 single-precision values stored as raw bit patterns.
 `float(x)` means interpret the bit pattern `x` as IEEE 754; `float_bits(f)` means the

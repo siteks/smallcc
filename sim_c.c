@@ -256,6 +256,7 @@ static const Instr4 itab4[] = {
     {"fsub",   0x68,1,0,0}, {"fmul",   0x6a,1,0,0},
     {"fdiv",   0x6c,1,0,0}, {"flt",    0x6e,1,0,0},
     {"fle",    0x70,1,0,0},
+    {"zxwor",  0x72,1,0,0}, {"sxwor",  0x74,1,0,0},
     /* F1b — 2 bytes, rd only; subop distinguishes the operation */
     {"sxb",    0x7e,1,1,0x00}, {"sxw",    0x7e,1,1,0x01},
     {"inc",    0x7e,1,1,0x02}, {"dec",    0x7e,1,1,0x03},
@@ -1179,6 +1180,8 @@ static void run_cpu4(int verbose)
         case 0x6c: r[rd]=float2bits(bits2float(r[rx])/bits2float(r[ry])); break; /* fdiv */
         case 0x6e: r[rd]=(bits2float(r[rx])<bits2float(r[ry]))?1:0; break; /* flt */
         case 0x70: r[rd]=(bits2float(r[rx])<=bits2float(r[ry]))?1:0; break; /* fle */
+        case 0x72: r[rd]=(r[rx]|r[ry])&0xffff; break; /* zxwor */
+        case 0x74: r[rd]=(uint32_t)(int32_t)(int16_t)((r[rx]|r[ry])&0xffff); break; /* sxwor */
         /* F1b */
         case 0x7e:
             if      (subop==0x00) r[rd]=(uint32_t)(int32_t)(int8_t) (r[rd]&0xff);   /* sxb    */

@@ -634,6 +634,34 @@ void opt_narrow_loads(Function *f) {
         }
     }
 
+    // Also: IK_ZEXT(load_signed) at the load's own width is equivalent to
+    // reloading as unsigned — the sign extension is masked off.  Retype the
+    // load and collapse the ZEXT to a copy so emission uses the zero-extending
+    // load variant (llb/llw) and skips the zxb/zxw entirely.
+    for (int bi = 0; bi < f->nblocks; bi++) {
+        Block *b = f->blocks[bi];
+        for (Inst *inst = b->head; inst; inst = inst->next) {
+            if (inst->is_dead || !inst->dst || inst->nops < 1) continue;
+            if (inst->kind != IK_ZEXT) continue;
+            Value *src = val_resolve(inst->ops[0]);
+            if (!src || src->kind != VAL_INST || !src->def) continue;
+            if (src->def->kind != IK_LOAD) continue;
+            if (src->use_count != 1) continue;
+            int lsz = src->def->size;
+            int src_signed = (src->vtype == VT_I8 || src->vtype == VT_I16 || src->vtype == VT_I32);
+            if (!src_signed) continue;
+            if (lsz == 1) {
+                src->vtype = VT_U8;
+                inst->kind = IK_COPY;
+                changed = 1;
+            } else if (lsz == 2) {
+                src->vtype = VT_U16;
+                inst->kind = IK_COPY;
+                changed = 1;
+            }
+        }
+    }
+
     if (!changed) return;
 
     // Recount use_count
