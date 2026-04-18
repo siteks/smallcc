@@ -1,7 +1,71 @@
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include "alloc.h"
 #include "dom.h"
+
+// ============================================================
+// Per-function clobber-set record
+// ============================================================
+//
+// After allocating function F, we record which physical registers F may
+// clobber (transitively, including functions F calls).  At call sites in
+// other functions, we then add phantom-register interference edges only
+// for the registers the callee actually clobbers, instead of unconditionally
+// reserving all of r0-r3.  This lets live-through values keep caller-saved
+// registers across calls whose callees happen not to use them.
+//
+// Fallback for unknown callees (not yet seen, ICALL, cross-TU before the
+// callee has been compiled): 0x0F = full caller-saved (r0-r3).
+
+typedef struct ClobberEntry {
+    char *name;
+    uint8_t mask;
+    struct ClobberEntry *next;
+} ClobberEntry;
+
+static ClobberEntry *clobber_head = NULL;
+
+static ClobberEntry *find_clobber_entry(const char *name) {
+    if (!name) return NULL;
+    for (ClobberEntry *e = clobber_head; e; e = e->next)
+        if (strcmp(e->name, name) == 0) return e;
+    return NULL;
+}
+
+static uint8_t lookup_clobbers(const char *name) {
+    ClobberEntry *e = find_clobber_entry(name);
+    if (e) return e->mask;
+    return 0x0F;  // unknown: conservatively assume all caller-saved
+}
+
+static void record_clobbers(const char *name, uint8_t mask) {
+    if (!name) return;
+    ClobberEntry *e = find_clobber_entry(name);
+    if (e) { e->mask = mask; return; }
+    e = (ClobberEntry *)malloc(sizeof(ClobberEntry));
+    e->name = strdup(name);
+    e->mask = mask;
+    e->next = clobber_head;
+    clobber_head = e;
+}
+
+static void record_function_clobbers(Function *f) {
+    if (!f->name) return;
+    uint8_t mask = 0;
+    for (int bi = 0; bi < f->nblocks; bi++) {
+        for (Inst *inst = f->blocks[bi]->head; inst; inst = inst->next) {
+            if (inst->is_dead) continue;
+            if (inst->dst && inst->dst->phys_reg >= 0 && inst->dst->phys_reg < IRC_K)
+                mask |= (1u << inst->dst->phys_reg);
+            if (inst->kind == IK_CALL && inst->fname)
+                mask |= lookup_clobbers(inst->fname);
+            else if (inst->kind == IK_ICALL)
+                mask |= 0x0F;  // unknown target: assume all caller-saved
+        }
+    }
+    record_clobbers(f->name, mask);
+}
 
 // ============================================================
 // Bitvector helpers (indexed by Value.id)
@@ -351,20 +415,28 @@ static IGraph *build_interference_graph(Function *f) {
             }
 
             // Call-site interference: values that survive a call must not
-            // occupy r0-r3 (caller-saved).  Add edges to phantom r0-r3 nodes
-            // for every value live after (and therefore through) the call.
+            // occupy any register the callee clobbers.  Use the per-callee
+            // clobber mask recorded by record_function_clobbers at the end
+            // of its irc_allocate; unknown/ICALL fall back to all of r0-r3.
             if (inst->kind == IK_CALL || inst->kind == IK_ICALL || inst->kind == IK_SWITCH) {
-                // IK_SWITCH dispatch uses one scratch from {r0,r1}; phantom-interfere
-                // with those two so live-through values avoid them.
-                int max_r = (inst->kind == IK_SWITCH) ? 2 : IRC_CALLER_REGS;
+                uint8_t cmask;
+                if (inst->kind == IK_SWITCH)
+                    cmask = 0x03;  // dispatch uses a scratch from {r0,r1}
+                else if (inst->kind == IK_ICALL)
+                    cmask = 0x0F;  // unknown target: all caller-saved
+                else
+                    cmask = lookup_clobbers(inst->fname);
                 for (int w = 0; w < nw; w++) {
                     uint32_t word = live[w];
                     while (word) {
                         int bit = __builtin_ctz(word); word &= word - 1;
                         int vid = w * 32 + bit;
                         if (vid < nv) {
-                            for (int r = 0; r < max_r; r++)
+                            uint8_t m = cmask;
+                            while (m) {
+                                int r = __builtin_ctz(m); m &= m - 1;
                                 ig_add_edge(g, vid, phantom + r);
+                            }
                         }
                     }
                 }
@@ -1083,6 +1155,7 @@ void irc_allocate(Function *f) {
                     f->values[i]->phys_reg = g->color[i];
             }
             ig_free(g);
+            record_function_clobbers(f);
             break;
         }
 
