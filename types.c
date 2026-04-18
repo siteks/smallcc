@@ -26,6 +26,45 @@ static int     do_align(int val, int size)
     return (val + (size - 1)) & ~(size - 1);
 }
 
+// ---- Symbol_table hash (open addressing, (name, ns) key) ---------
+#define ST_HASH_INIT_CAP 8   // power of 2
+
+static uint32_t st_str_hash(const char *s)
+{
+    uint32_t h = 2166136261u;  // FNV-1a
+    while (*s) { h ^= (uint8_t)*s++; h *= 16777619u; }
+    return h;
+}
+
+static inline uint32_t st_key_hash(const char *name, Namespace ns)
+{
+    return st_str_hash(name) + (uint32_t)ns * 0x9e3779b1u;
+}
+
+static void st_hash_put(Symbol_table *st, Symbol *sym);
+
+static void st_hash_grow(Symbol_table *st)
+{
+    int       old_cap = st->hash_cap;
+    Symbol  **old_h   = st->hash;
+    st->hash_cap   = old_cap ? old_cap * 2 : ST_HASH_INIT_CAP;
+    st->hash       = arena_alloc(st->hash_cap * sizeof(Symbol *));
+    st->hash_nents = 0;
+    for (int i = 0; i < old_cap; i++)
+        if (old_h[i]) st_hash_put(st, old_h[i]);
+}
+
+static void st_hash_put(Symbol_table *st, Symbol *sym)
+{
+    if ((st->hash_nents + 1) * 2 >= st->hash_cap) st_hash_grow(st);
+    uint32_t mask = (uint32_t)st->hash_cap - 1;
+    uint32_t i    = st_key_hash(sym->name, sym->ns) & mask;
+    for (;;) {
+        if (!st->hash[i]) { st->hash[i] = sym; st->hash_nents++; return; }
+        i = (i + 1) & mask;
+    }
+}
+
 static void append_symbol(Symbol_table *st, Symbol *sym)
 {
     if (!st->symbols_tail)
@@ -33,6 +72,7 @@ static void append_symbol(Symbol_table *st, Symbol *sym)
     else
         st->symbols_tail->next = sym;
     st->symbols_tail = sym;
+    st_hash_put(st, sym);
 }
 
 static void append_type(Type *t)
@@ -44,15 +84,42 @@ static void append_type(Type *t)
     type_ctx.type_list_tail = t;
 }
 
+// ---- Derived-type hash (chained, keyed on base + discriminators) ------
+static inline uint32_t ptr_mix(uintptr_t p) { return (uint32_t)(p * 2654435761u); }
+
+static uint32_t derived_type_hash(Type_base base, const Type *t)
+{
+    uint32_t h = (uint32_t)base * 0x9e3779b1u;
+    switch (base) {
+    case TB_POINTER:  h ^= ptr_mix((uintptr_t)t->u.ptr.pointee); break;
+    case TB_ARRAY:    h ^= ptr_mix((uintptr_t)t->u.arr.elem) + (uint32_t)t->u.arr.count; break;
+    case TB_FUNCTION: {
+        h ^= ptr_mix((uintptr_t)t->u.fn.ret) + (t->u.fn.is_variadic ? 1u : 0u);
+        for (Param *p = t->u.fn.params; p; p = p->next)
+            h = h * 16777619u ^ ptr_mix((uintptr_t)p->type);
+        break;
+    }
+    case TB_STRUCT:   h ^= ptr_mix((uintptr_t)t->u.composite.tag); break;
+    case TB_ENUM:     h ^= ptr_mix((uintptr_t)t->u.enu.tag); break;
+    default: break;
+    }
+    return h;
+}
+
+static void derived_insert(Type *t)
+{
+    uint32_t idx = derived_type_hash(t->base, t) & (TYPE_DERIVED_HASH_CAP - 1);
+    t->hash_next = type_ctx.derived_hash[idx];
+    type_ctx.derived_hash[idx] = t;
+}
+
 // ---------------------------------------------------------------
 // Factory functions — intern types in global list
 // ---------------------------------------------------------------
 Type *get_basic_type(Type_base base)
 {
-    // Basic scalar types have no derived fields; check base alone.
-    for (Type *p = type_ctx.type_list; p; p = p->next)
-        if (p->base == base && base <= TB_DOUBLE)
-            return p;
+    if (base < TYPE_BASIC_COUNT && type_ctx.basic_types[base])
+        return type_ctx.basic_types[base];
 
     Type *t = arena_alloc(sizeof(Type));
     t->base = base;
@@ -96,12 +163,15 @@ Type *get_basic_type(Type_base base)
         break;
     }
     append_type(t);
+    if (base < TYPE_BASIC_COUNT) type_ctx.basic_types[base] = t;
     return t;
 }
 
 Type *get_pointer_type(Type *pointee)
 {
-    for (Type *p = type_ctx.type_list; p; p = p->next)
+    uint32_t idx = (ptr_mix((uintptr_t)pointee) ^ ((uint32_t)TB_POINTER * 0x9e3779b1u))
+                   & (TYPE_DERIVED_HASH_CAP - 1);
+    for (Type *p = type_ctx.derived_hash[idx]; p; p = p->hash_next)
         if (p->base == TB_POINTER && p->u.ptr.pointee == pointee)
             return p;
 
@@ -111,12 +181,15 @@ Type *get_pointer_type(Type *pointee)
     t->size          = 2;
     t->align         = 2;
     append_type(t);
+    derived_insert(t);
     return t;
 }
 
 Type *get_array_type(Type *elem, int count)
 {
-    for (Type *p = type_ctx.type_list; p; p = p->next)
+    uint32_t h   = ((uint32_t)TB_ARRAY * 0x9e3779b1u) ^ ptr_mix((uintptr_t)elem) ^ (uint32_t)count;
+    uint32_t idx = h & (TYPE_DERIVED_HASH_CAP - 1);
+    for (Type *p = type_ctx.derived_hash[idx]; p; p = p->hash_next)
         if (p->base == TB_ARRAY && p->u.arr.elem == elem && p->u.arr.count == count)
             return p;
 
@@ -127,6 +200,7 @@ Type *get_array_type(Type *elem, int count)
     t->size        = elem->size * count;
     t->align       = elem->align;
     append_type(t);
+    derived_insert(t);
     return t;
 }
 
@@ -144,7 +218,13 @@ static bool params_match(Param *a, Param *b)
 
 Type *get_function_type(Type *ret, Param *params, bool is_variadic)
 {
-    for (Type *p = type_ctx.type_list; p; p = p->next)
+    Type key;
+    key.base           = TB_FUNCTION;
+    key.u.fn.ret       = ret;
+    key.u.fn.params    = params;
+    key.u.fn.is_variadic = is_variadic;
+    uint32_t idx = derived_type_hash(TB_FUNCTION, &key) & (TYPE_DERIVED_HASH_CAP - 1);
+    for (Type *p = type_ctx.derived_hash[idx]; p; p = p->hash_next)
         if (p->base == TB_FUNCTION && p->u.fn.ret == ret && p->u.fn.is_variadic == is_variadic &&
             params_match(p->u.fn.params, params))
             return p;
@@ -157,12 +237,15 @@ Type *get_function_type(Type *ret, Param *params, bool is_variadic)
     t->size              = 2;
     t->align             = 2;
     append_type(t);
+    derived_insert(t);
     return t;
 }
 
 Type *get_struct_type(Symbol *tag, Field *members, bool is_union)
 {
-    for (Type *p = type_ctx.type_list; p; p = p->next)
+    uint32_t idx = (ptr_mix((uintptr_t)tag) ^ ((uint32_t)TB_STRUCT * 0x9e3779b1u))
+                   & (TYPE_DERIVED_HASH_CAP - 1);
+    for (Type *p = type_ctx.derived_hash[idx]; p; p = p->hash_next)
         if (p->base == TB_STRUCT && p->u.composite.tag == tag)
             return p;
 
@@ -172,20 +255,25 @@ Type *get_struct_type(Symbol *tag, Field *members, bool is_union)
     t->u.composite.members  = members;
     t->u.composite.is_union = is_union;
     append_type(t);
+    derived_insert(t);
     return t;
 }
 
 Type *get_enum_type(Symbol *tag)
 {
-    for (Type *p = type_ctx.type_list; p; p = p->next)
+    uint32_t idx = (ptr_mix((uintptr_t)tag) ^ ((uint32_t)TB_ENUM * 0x9e3779b1u))
+                   & (TYPE_DERIVED_HASH_CAP - 1);
+    for (Type *p = type_ctx.derived_hash[idx]; p; p = p->hash_next)
         if (p->base == TB_ENUM && p->u.enu.tag == tag)
             return p;
+
     Type *t      = arena_alloc(sizeof(Type));
     t->base      = TB_ENUM;
     t->u.enu.tag = tag;
     t->size      = 2;
     t->align     = 2;
     append_type(t);
+    derived_insert(t);
     return t;
 }
 
@@ -446,6 +534,9 @@ void reset_types_state(void)
     type_ctx.symbol_table               = arena_alloc(sizeof(Symbol_table));
     type_ctx.symbol_table->symbols      = carry;
     type_ctx.symbol_table->symbols_tail = carry_tail;
+    // Populate the new scope's lookup hash with carried symbols.
+    for (Symbol *s = carry; s; s = s->next)
+        st_hash_put(type_ctx.symbol_table, s);
     type_ctx.curr_scope_st         = type_ctx.symbol_table;
     type_ctx.last_symbol_table     = type_ctx.symbol_table;
     type_ctx.scope_depth           = 0;
@@ -456,14 +547,8 @@ void reset_types_state(void)
 void insert_extern_sym(const char *name, Type *type)
 {
     // If already present, mark it as an extern reference for subsequent TUs.
-    for (Symbol *s = type_ctx.symbol_table->symbols; s; s = s->next)
-    {
-        if (s->ns == NS_IDENT && !strcmp(s->name, name))
-        {
-            s->kind = SYM_EXTERN;
-            return;
-        }
-    }
+    Symbol *s = find_symbol_st(type_ctx.symbol_table, name, NS_IDENT);
+    if (s) { s->kind = SYM_EXTERN; return; }
     // Not present — add a new extern entry (e.g. injected from outside).
     Symbol *sym = arena_alloc(sizeof(Symbol));
     sym->name   = name;
@@ -478,9 +563,7 @@ void insert_extern_sym(const char *name, Type *type)
 // ---------------------------------------------------------------
 static void insert_builtin(char *name, Type *type)
 {
-    for (Symbol *s = type_ctx.symbol_table->symbols; s; s = s->next)
-        if (s->ns == NS_IDENT && !strcmp(s->name, name))
-            return;
+    if (find_symbol_st(type_ctx.symbol_table, name, NS_IDENT)) return;
     Symbol *sym = arena_alloc(sizeof(Symbol));
     sym->name   = name;
     sym->type   = type;
@@ -860,16 +943,15 @@ Symbol *find_symbol_st(Symbol_table *st, const char *name, Namespace nspace)
 {
     for (; st; st = st->parent)
     {
-        DBG_PRINT("Searching in scope id:%d depth:%d\n", st->scope_id, st->depth);
-        for (Symbol *s = st->symbols; s; s = s->next)
-        {
-            if (s->ns != nspace)
-                continue;
-            DBG_PRINT("Name:%s\n", s->name);
-            if (!strcmp(name, s->name))
-                return s;
+        if (!st->hash_cap) continue;
+        uint32_t mask = (uint32_t)st->hash_cap - 1;
+        uint32_t i    = st_key_hash(name, nspace) & mask;
+        for (;;) {
+            Symbol *s = st->hash[i];
+            if (!s) break;
+            if (s->ns == nspace && !strcmp(name, s->name)) return s;
+            i = (i + 1) & mask;
         }
-        DBG_PRINT("Not found, going to enclosing scope\n");
     }
     return NULL;
 }
@@ -929,12 +1011,20 @@ void leave_scope()
 Symbol *insert_tag(Symbol_table *st, char *ident)
 {
     DBG_PRINT("%s %s\n", __func__, ident);
-    for (Symbol *s = st->symbols; s; s = s->next)
-        if (s->ns == NS_TAG && !strcmp(s->name, ident))
-        {
-            DBG_PRINT("%s tag already exists\n", __func__);
-            return s;
+    // Lookup this scope only (no walk up) — tags shadow across scopes.
+    if (st->hash_cap) {
+        uint32_t mask = (uint32_t)st->hash_cap - 1;
+        uint32_t i    = st_key_hash(ident, NS_TAG) & mask;
+        for (;;) {
+            Symbol *s = st->hash[i];
+            if (!s) break;
+            if (s->ns == NS_TAG && !strcmp(ident, s->name)) {
+                DBG_PRINT("%s tag already exists\n", __func__);
+                return s;
+            }
+            i = (i + 1) & mask;
         }
+    }
     Symbol *sym = new_symbol(t_void, ident, 0);
     sym->ns     = NS_TAG;
     append_symbol(st, sym);
@@ -955,9 +1045,17 @@ static Symbol *insert_typedef(Node *node, Type *type, const char *ident)
 {
     DBG_PRINT("%s %s\n", __func__, ident);
     Symbol_table *st = node->st;
-    for (Symbol *s = st->symbols; s; s = s->next)
-        if (s->ns == NS_TYPEDEF && !strcmp(s->name, ident))
-            return s;
+    // Lookup this scope only (no walk up) — typedefs shadow across scopes.
+    if (st->hash_cap) {
+        uint32_t mask = (uint32_t)st->hash_cap - 1;
+        uint32_t i    = st_key_hash(ident, NS_TYPEDEF) & mask;
+        for (;;) {
+            Symbol *s = st->hash[i];
+            if (!s) break;
+            if (s->ns == NS_TYPEDEF && !strcmp(ident, s->name)) return s;
+            i = (i + 1) & mask;
+        }
+    }
     Symbol *sym = new_symbol(type, ident, 0);
     sym->ns     = NS_TYPEDEF;
     append_symbol(st, sym);
@@ -991,10 +1089,9 @@ static Symbol *new_symbol(Type *type, const char *ident, int offset)
 static Symbol *insert_global_ident(Symbol_table *st, Type *type, const char *ident, StorageClass sclass)
 {
     // Check for existing entry — dedup for pre-populated externs, upgrade on real definition.
-    for (Symbol *s = st->symbols; s; s = s->next)
+    Symbol *s = find_symbol_st(st, ident, NS_IDENT);
+    if (s)
     {
-        if (s->ns != NS_IDENT || strcmp(s->name, ident))
-            continue;
         if (sclass != SC_EXTERN)
         {
             s->type = type;

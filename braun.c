@@ -424,16 +424,54 @@ static Block *get_label_block(BraunCtx *ctx, const char *name) {
 // ============================================================
 // Variable maps (Braun algorithm, Symbol* keys)
 // ============================================================
+// Open-addressing hash keyed by Symbol* pointer identity.  Load factor
+// capped at 0.5 (nents*2 >= cap → grow).  Lazily allocated on first insert.
+
+#define BRAUN_DEFS_INIT_CAP 8   // must be power of 2
+
+static inline uint32_t braun_hash(Symbol *s) {
+    // Fibonacci mixing of pointer bits
+    return (uint32_t)((uintptr_t)s * 2654435761u);
+}
+
+static void defs_insert(BraunDefs *m, Symbol *sym, Value *v);
+
+static void defs_grow(BraunDefs *m) {
+    int      old_cap  = m->cap;
+    Symbol **old_keys = m->keys;
+    Value  **old_vals = m->vals;
+    m->cap   = old_cap ? old_cap * 2 : BRAUN_DEFS_INIT_CAP;
+    m->keys  = arena_alloc(m->cap * sizeof(Symbol *));
+    m->vals  = arena_alloc(m->cap * sizeof(Value *));
+    m->nents = 0;
+    for (int i = 0; i < old_cap; i++)
+        if (old_keys[i]) defs_insert(m, old_keys[i], old_vals[i]);
+}
+
+static void defs_insert(BraunDefs *m, Symbol *sym, Value *v) {
+    if ((m->nents + 1) * 2 >= m->cap) defs_grow(m);
+    uint32_t mask = (uint32_t)m->cap - 1;
+    uint32_t i    = braun_hash(sym) & mask;
+    for (;;) {
+        if (!m->keys[i]) { m->keys[i] = sym; m->vals[i] = v; m->nents++; return; }
+        if (m->keys[i] == sym) { m->vals[i] = v; return; }
+        i = (i + 1) & mask;
+    }
+}
+
+static Value *defs_lookup(BraunDefs *m, Symbol *sym) {
+    if (!m->cap) return NULL;
+    uint32_t mask = (uint32_t)m->cap - 1;
+    uint32_t i    = braun_hash(sym) & mask;
+    for (;;) {
+        if (!m->keys[i])       return NULL;
+        if (m->keys[i] == sym) return m->vals[i];
+        i = (i + 1) & mask;
+    }
+}
 
 static void write_var(Block *b, Symbol *sym, Value *v) {
-    for (int i = 0; i < b->ndef; i++) {
-        if (b->def_syms[i] == sym) { b->def_vals[i] = v; return; }
-    }
-    if (b->ndef >= BRAUN_MAP_MAX)
-        error("braun: block B%d has too many variable definitions (max %d); increase BRAUN_MAP_MAX in ssa.h", b->id, BRAUN_MAP_MAX);
-    b->def_syms[b->ndef] = sym;
-    b->def_vals[b->ndef] = v;
-    b->ndef++;
+    defs_insert(&b->defs, sym, v);
 }
 
 static Value *read_var(BraunCtx *ctx, Block *b, Symbol *sym);
@@ -442,9 +480,25 @@ static Value *try_remove_trivial_phi(BraunCtx *ctx, Inst *phi);
 static Value *add_phi_operands(BraunCtx *ctx, Symbol *sym, Inst *phi);
 
 static Value *read_var(BraunCtx *ctx, Block *b, Symbol *sym) {
-    for (int i = 0; i < b->ndef; i++)
-        if (b->def_syms[i] == sym) return val_resolve(b->def_vals[i]);
+    Value *v = defs_lookup(&b->defs, sym);
+    if (v) return val_resolve(v);
     return read_var_recursive(ctx, b, sym);
+}
+
+static void iphi_push(Block *b, Inst *phi, Symbol *sym) {
+    if (b->niphi >= b->iphi_cap) {
+        int nc = b->iphi_cap ? b->iphi_cap * 2 : 4;
+        Inst   **ni = arena_alloc(nc * sizeof(Inst *));
+        Symbol **ns = arena_alloc(nc * sizeof(Symbol *));
+        memcpy(ni, b->iphi_insts, b->niphi * sizeof(Inst *));
+        memcpy(ns, b->iphi_syms,  b->niphi * sizeof(Symbol *));
+        b->iphi_insts = ni;
+        b->iphi_syms  = ns;
+        b->iphi_cap   = nc;
+    }
+    b->iphi_insts[b->niphi] = phi;
+    b->iphi_syms [b->niphi] = sym;
+    b->niphi++;
 }
 
 static Value *read_var_recursive(BraunCtx *ctx, Block *b, Symbol *sym) {
@@ -463,11 +517,7 @@ static Value *read_var_recursive(BraunCtx *ctx, Block *b, Symbol *sym) {
         b->head = phi;
         phi->block = b;
         write_var(b, sym, dst);
-        if (b->niphi >= BRAUN_MAP_MAX)
-            error("braun: block B%d has too many incomplete phis (max %d); increase BRAUN_MAP_MAX in ssa.h", b->id, BRAUN_MAP_MAX);
-        b->iphi_insts[b->niphi] = phi;
-        b->iphi_syms [b->niphi] = sym;
-        b->niphi++;
+        iphi_push(b, phi, sym);
         return dst;
     }
     if (b->npreds == 0) {

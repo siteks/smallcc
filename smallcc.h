@@ -264,7 +264,8 @@ struct Type
         }       enu;
 
     }           u;
-    Type        *next;
+    Type        *next;       // enumeration list (type_list)
+    Type        *hash_next;  // chain in derived-type hash bucket
 };
 
 typedef enum
@@ -319,6 +320,11 @@ struct Symbol_table
     int             local_offset; // running byte offset for the next SYM_LOCAL
     int             param_offset; // running byte offset for the next SYM_PARAM (init: FRAME_OVERHEAD)
     Symbol_table    *parent;
+    // Open-addressing hash keyed by (name, ns) for O(1) lookup.
+    // Lazy: hash_cap=0 until the first insert.
+    int             hash_cap;
+    int             hash_nents;
+    Symbol          **hash;
 };
 
 
@@ -492,9 +498,15 @@ const char *sym_label(Symbol *sym);
 // Context Struct Definitions (must come after type definitions)
 // ===============================================================
 
+#define TYPE_BASIC_COUNT 11       // TB_VOID..TB_DOUBLE
+#define TYPE_DERIVED_HASH_CAP 256 // power of 2; chained hash for derived types
+
 typedef struct TypeContext {
     Type *type_list;            // linked list of all interned types
     Type *type_list_tail;       // tail of type_list (O(1) append)
+    // Type interning indices (persist across TUs, like type_list)
+    Type *basic_types[TYPE_BASIC_COUNT];               // indexed by Type_base
+    Type *derived_hash[TYPE_DERIVED_HASH_CAP];         // chained via Type.hash_next
     // Basic type singletons
     Type *t_void;
     Type *t_char;

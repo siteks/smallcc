@@ -101,7 +101,13 @@ struct Inst {
 };
 
 // Braun variable maps (valid only during SSA construction)
-#define BRAUN_MAP_MAX 256
+// Open-addressing hash: Symbol* → Value*, lazily allocated on first insert.
+typedef struct {
+    int      cap;     // power of 2; 0 = unallocated
+    int      nents;
+    Symbol **keys;    // NULL slot = empty
+    Value  **vals;
+} BraunDefs;
 
 struct Block {
     int     id;
@@ -112,13 +118,10 @@ struct Block {
     int     sealed;         // all predecessors known
     int     filled;         // terminator emitted
 
-    // Braun maps (Symbol* keys for O(1) pointer-equality lookup)
-    Symbol *def_syms [BRAUN_MAP_MAX];
-    Value  *def_vals [BRAUN_MAP_MAX];
-    int     ndef;
-    Inst   *iphi_insts[BRAUN_MAP_MAX];
-    Symbol *iphi_syms[BRAUN_MAP_MAX];
-    int     niphi;
+    // Braun maps (valid during SSA construction)
+    BraunDefs defs;                      // current def per Symbol
+    Inst   **iphi_insts; int niphi; int iphi_cap;   // grow-by-2 dynamic array
+    Symbol **iphi_syms;
 
     // Dominator analysis
     int     loop_depth;

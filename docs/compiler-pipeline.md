@@ -432,9 +432,9 @@ struct Block {
     Block **preds;  int npreds;
     Block **succs;  int nsuccs;
     int     sealed, filled;
-    // Braun maps (fixed-size arrays; valid only during construction):
-    Symbol *def_syms[BRAUN_MAP_MAX];  Value *def_vals[BRAUN_MAP_MAX];  int ndef;
-    Inst   *iphi_insts[BRAUN_MAP_MAX]; Symbol *iphi_syms[BRAUN_MAP_MAX]; int niphi;
+    // Braun maps (valid only during construction):
+    BraunDefs defs;                                          // Symbol*→Value* open-addressing hash
+    Inst   **iphi_insts; Symbol **iphi_syms; int niphi; int iphi_cap;
     // Dominator analysis:
     int     loop_depth, rpo_index;
     Block  *idom;
