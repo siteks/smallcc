@@ -124,15 +124,50 @@ typedef struct {
     Node       *func_decl;  // ND_DECLARATION with is_func_defn
     Symbol    **param_syms; // callee's parameter Symbol* array
     int         nparams;
-    Node       *ret_expr;   // the single return expression node
+    Node       *body;       // ND_COMPSTMT body (for straight-line prefix walk)
+    Node       *ret_expr;   // the return expression node (ch[0] of final ND_RETURNSTMT)
 } InlineCandidate;
 
-#define MAX_INLINE 256
+#define MAX_INLINE        256
+#define INLINE_MAX_NODES   80   // total body node count cap
+#define INLINE_MAX_STMTS   10   // prefix-statement count cap (excludes final return)
 static InlineCandidate g_inline[MAX_INLINE];
 static int g_ninline;
 
+// Recursive body check: bound node count, reject &local/&param, reject self-recursion.
+// Control-flow statement kinds are pre-filtered by inline_qualify's stmt walk, so they
+// cannot appear at statement level here; sub-expressions may contain ND_TERNARY which
+// is fine (lowered by cg_expr into blocks in the caller).
+static int walk_inline_check(Node *n, Symbol *self_fsym, int *count) {
+    if (!n) return 1;
+    if (++(*count) > INLINE_MAX_NODES) return 0;
+
+    if (n->kind == ND_UNARYOP && n->op_kind == TK_AMPERSAND) {
+        Node *operand = n->ch[0];
+        if (operand && operand->kind == ND_IDENT && operand->symbol) {
+            Symbol *sym = operand->symbol;
+            if (sym->kind == SYM_LOCAL || sym->kind == SYM_PARAM)
+                return 0;
+        }
+    }
+    if (n->kind == ND_IDENT && n->u.ident.is_function && n->symbol == self_fsym)
+        return 0;
+
+    for (int i = 0; i < 4; i++)
+        if (n->ch[i] && !walk_inline_check(n->ch[i], self_fsym, count))
+            return 0;
+    if (n->next && !walk_inline_check(n->next, self_fsym, count))
+        return 0;
+    return 1;
+}
+
 // Check whether a function qualifies for inlining.
 // Returns the return expression Node* if yes, NULL if no.
+//
+// Accepted body shape:
+//     { (ND_DECLARATION | ND_EXPRSTMT)* ; ND_RETURNSTMT expr ; }
+// Declarations must be scalar (no array, struct, static-local). No control flow
+// statements in the body. No &local/&param. No recursive self-call.
 static Node *inline_qualify(Node *func_decl) {
     if (!func_decl || func_decl->kind != ND_DECLARATION) return NULL;
     if (!func_decl->u.declaration.is_func_defn) return NULL;
@@ -166,49 +201,55 @@ static Node *inline_qualify(Node *func_decl) {
     // Struct return — skip (hidden sret pointer)
     if (ret_type && ret_type->base == TB_STRUCT) return NULL;
 
-    // Body must be ND_COMPSTMT with exactly one statement: ND_RETURNSTMT
     if (body->kind != ND_COMPSTMT) return NULL;
     Node *stmt = body->ch[0];
     if (!stmt) return NULL;
-    if (stmt->next) return NULL;  // more than one statement
-    if (stmt->kind != ND_RETURNSTMT) return NULL;
-    Node *ret_expr = stmt->ch[0];
-    if (!ret_expr) return NULL;
 
-    // No locals (only params in scope)
-    if (body->symtable) {
-        for (Symbol *s = body->symtable->symbols; s; s = s->next) {
-            if (s->ns != NS_IDENT) continue;
-            if (s->kind == SYM_LOCAL) return NULL;
-            if (s->kind == SYM_STATIC_LOCAL) return NULL;
+    // Walk statements: all non-final must be scalar ND_DECLARATION or ND_EXPRSTMT;
+    // the final statement must be ND_RETURNSTMT with a non-null expression.
+    Node *ret_stmt = NULL;
+    int   nstmts   = 0;
+    for (Node *s = stmt; s; s = s->next) {
+        Node *u = s;
+        while (u && u->kind == ND_STMT) u = u->ch[0];
+
+        if (!s->next) {
+            // Last statement must be the return
+            if (!u || u->kind != ND_RETURNSTMT) return NULL;
+            if (!u->ch[0]) return NULL;
+            ret_stmt = u;
+            break;
         }
-    }
+        if (!u || u->kind == ND_EMPTY) continue;
 
-    // No address-taken params (scan return expression for &param)
-    // Simple check: walk ret_expr for ND_UNARYOP '&' on a param ident
-    // We use a non-recursive stack to avoid complexity
-    // (the expression tree is small for qualifying functions)
-    {
-        Node *stack[64]; int sp = 0;
-        stack[sp++] = ret_expr;
-        while (sp > 0) {
-            Node *nd = stack[--sp];
-            if (!nd) continue;
-            if (nd->kind == ND_UNARYOP && nd->op_kind == TK_AMPERSAND) {
-                Node *operand = nd->ch[0];
-                if (operand && operand->kind == ND_IDENT && operand->symbol &&
-                    operand->symbol->kind == SYM_PARAM)
-                    return NULL;
+        if (++nstmts > INLINE_MAX_STMTS) return NULL;
+
+        if (u->kind == ND_DECLARATION) {
+            // Scalars only; no static_local, no array/struct/function types.
+            for (Node *d = u->ch[1]; d; d = d->next) {
+                if (d->kind != ND_DECLARATOR) continue;
+                Symbol *sy = d->symbol;
+                if (!sy) return NULL;
+                if (sy->ns == NS_TYPEDEF) continue;
+                if (sy->kind == SYM_ENUM_CONST) continue;
+                if (sy->kind == SYM_STATIC_LOCAL) return NULL;
+                if (!sy->type) return NULL;
+                if (istype_array(sy->type)) return NULL;
+                if (sy->type->base == TB_STRUCT) return NULL;
+                if (istype_function(sy->type)) return NULL;
             }
-            // Check for recursive call (callee calls itself)
-            if (nd->kind == ND_IDENT && nd->u.ident.is_function && nd->symbol == fsym)
-                return NULL;
-            for (int i = 0; i < 4; i++)
-                if (nd->ch[i] && sp < 64) stack[sp++] = nd->ch[i];
+            continue;
         }
+        if (u->kind == ND_EXPRSTMT) continue;
+        return NULL;
     }
+    if (!ret_stmt) return NULL;
 
-    return ret_expr;
+    // Whole-body walk for size cap, address-taken rejection, self-recursion rejection.
+    int count = 0;
+    if (!walk_inline_check(body, fsym, &count)) return NULL;
+
+    return ret_stmt->ch[0];
 }
 
 void braun_register_inline_candidate(Node *func_decl, int tu_index) {
@@ -240,6 +281,7 @@ void braun_register_inline_candidate(Node *func_decl, int tu_index) {
     ic->name = label;
     ic->func_decl = func_decl;
     ic->nparams = np;
+    ic->body = body;
     ic->ret_expr = ret_expr;
     if (np > 0) {
         ic->param_syms = arena_alloc(np * sizeof(Symbol *));
@@ -1093,7 +1135,20 @@ static Value *braun_try_inline(BraunCtx *ctx, Block **cur, Symbol *fsym,
         arg = arg->next;
     }
 
-    // Generate code for the callee's return expression in the caller's context
+    // Walk the straight-line prefix. Each declaration or expression statement is
+    // emitted into the caller's current block; the callee's local Symbols get bound
+    // in the caller's Braun variable map via write_var (locals are pure SSA since
+    // we rejected &local/&param in qualify).
+    Node *body_stmts = ic->body ? ic->body->ch[0] : NULL;
+    for (Node *s = body_stmts; s && s->next; s = s->next) {
+        Node *u = s;
+        while (u && u->kind == ND_STMT) u = u->ch[0];
+        if (!u || u->kind == ND_EMPTY) continue;
+        b = cg_stmt(ctx, b, u);
+        *cur = b;
+    }
+
+    // Final statement is the return — evaluate its expression as the inline result.
     return cg_expr(ctx, cur, ic->ret_expr);
 }
 
