@@ -69,17 +69,18 @@ void legalize_function(Function *f) {
         }
     }
 
-    // ── Pass C: Lower IK_NEG / IK_NOT ──────────────────────────────────
-    // IK_NEG: sub rd, 0, r1  — needs a zero register.
-    // IK_NOT: eq  rd, r1, 0  — needs a zero register.
-    // emit.c previously used pushr/popr to borrow a scratch register.
-    // Lower to a two-operand form with an explicit IK_CONST(0) so IRC
-    // allocates the zero register properly.
+    // ── Pass C: Lower IK_NEG (float) / IK_NOT ──────────────────────────
+    // Integer IK_NEG is kept as-is: emit.c emits the native `neg rd` F1b
+    // instruction (2 bytes) which does not need a zero register.
+    // Float IK_NEG → IK_FSUB(0, src): no native float-neg, still needs a zero.
+    // IK_NOT src → IK_EQ(src, 0): needs a zero register.
     for (int bi = 0; bi < f->nblocks; bi++) {
         Block *b = f->blocks[bi];
         for (Inst *inst = b->head; inst; inst = inst->next) {
             if (inst->kind != IK_NEG && inst->kind != IK_NOT) continue;
             if (!inst->dst || inst->nops < 1) continue;
+            // Integer NEG: emit.c handles natively with F1b `neg rd`.
+            if (inst->kind == IK_NEG && inst->dst->vtype != VT_F32) continue;
 
             Value *zero_v = new_value(f, VAL_INST, inst->dst->vtype);
             Inst  *zero_i = new_inst(f, b, IK_CONST, zero_v);
@@ -91,10 +92,10 @@ void legalize_function(Function *f) {
             Value **new_ops  = arena_alloc(2 * sizeof(Value *));
 
             if (inst->kind == IK_NEG) {
-                // IK_NEG src → IK_FSUB(0, src)  or  IK_SUB(0, src)
+                // IK_NEG (float) src → IK_FSUB(0, src)
                 new_ops[0] = zero_v;  zero_v->use_count++;
                 new_ops[1] = src;     // use_count unchanged (was already counted)
-                inst->kind = (inst->dst->vtype == VT_F32) ? IK_FSUB : IK_SUB;
+                inst->kind = IK_FSUB;
             } else {
                 // IK_NOT src → IK_EQ(src, 0)
                 new_ops[0] = src;

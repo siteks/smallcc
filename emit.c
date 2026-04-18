@@ -136,7 +136,11 @@ static int preg(Value *v) {
 // Emit an immediate into a register (uses immw + immwh for large values)
 static void emit_imm(FILE *out, int rd, int val) {
     unsigned uval = (unsigned)val;
-    if (uval <= 0xffff) {
+    if (val == 0 && rd >= 0 && rd <= 7) {
+        fprintf(out, "    zero%d\n", rd);
+    } else if (val >= -64 && val <= 63) {
+        fprintf(out, "    imms %s, %d\n", regname(rd), val);
+    } else if (uval <= 0xffff) {
         fprintf(out, "    immw %s, %u\n", regname(rd), uval);
     } else {
         fprintf(out, "    immw %s, %u\n",  regname(rd), uval & 0xffff);
@@ -711,9 +715,15 @@ static void emit_inst(Inst *inst, FILE *out) {
         }
     }
 
-    // IK_NEG and IK_NOT are lowered by legalize_function() to two-operand
-    // IK_SUB/IK_FSUB and IK_EQ respectively, with an explicit IK_CONST(0)
-    // operand so IRC allocates the zero register.  These cases are dead.
+    // Integer IK_NEG: native F1b `neg rd` (2 bytes). Float IK_NEG and IK_NOT
+    // are lowered to IK_FSUB/IK_EQ by legalize Pass C.
+    case IK_NEG: {
+        if (!dst || inst->nops < 1) break;
+        int r1 = get_val_reg(out, inst->ops[0], rd);
+        if (r1 != rd) fprintf(out, "    or %s, %s, %s\n", regname(rd), regname(r1), regname(r1));
+        fprintf(out, "    neg %s\n", regname(rd));
+        break;
+    }
 
     case IK_ITOF: {
         if (!dst || inst->nops < 1) break;

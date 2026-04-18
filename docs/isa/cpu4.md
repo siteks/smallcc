@@ -67,10 +67,20 @@ field is `1111`.
 |---|---|---|
 | 0x00 | `halt` | H = 1 |
 | 0x01 | `ret` | sp = bp; tmp = mem32[sp]; bp = tmp & 0xffff; pc = tmp >> 16; sp += 4 |
+| 0x02 | `zero0` | r0 = 0 |
+| 0x03 | `zero1` | r1 = 0 |
+| 0x04 | `zero2` | r2 = 0 |
+| 0x05 | `zero3` | r3 = 0 |
+| 0x06 | `zero4` | r4 = 0 |
+| 0x07 | `zero5` | r5 = 0 |
+| 0x08 | `zero6` | r6 = 0 |
+| 0x09 | `zero7` | r7 = 0 |
 
 `ret` unpacks the saved `(lr << 16) | bp` word written by `enter`.
 
-*(14 slots reserved for future hotspot encodings.)*
+`zero0`–`zero7` replace the 3-byte `immw rd, 0` zero-initialization with a single byte.
+
+*(6 slots reserved for future hotspot encodings.)*
 
 ---
 
@@ -225,9 +235,15 @@ giving 64 single-register slots.
 | 0x0a | `jlr rd` | lr = pc; pc = rd & 0xffff (indirect call via rd) |
 | 0x0b | `jr rd` | pc = rd & 0xffff (indirect jump via rd) |
 | 0x0c | `ssp rd` | sp = rd & 0xffff (set stack pointer from register) |
+| 0x0d | `neg rd` | rd = −signed(rd) (in-place 2's-complement negate) |
 | 0x3f | `putchar rd` | write chr(rd & 0xff) to stderr; rd unchanged |
 
-*(50 slots reserved for future hotspot encodings.)*
+*(49 slots reserved for future hotspot encodings.)*
+
+`neg rd` replaces the 3-instruction `immw tmp, 0; sub rd, tmp, rd` sequence (5 bytes) or
+the 2-instruction `zero rd; sub rd, rd, src` sequence with a single in-place 2-byte
+instruction. Integer `IK_NEG` is kept in the IR past legalize (Pass C only lowers the
+float variant to `IK_FSUB(0, src)`).
 
 `inc`/`dec` cover the K=±1 in-place case in 2 bytes, compared to 5 bytes for the general
 `immw r_tmp, 1; add rd, rd, r_tmp` sequence. They are particularly effective for loop counters
@@ -259,8 +275,14 @@ All memory accesses are relative to `bp`. The immediate is scaled by access widt
 | 0xa4 | `shli rx, imm7` | rx = rx << (imm7 & 0x1f) (in-place shift left) |
 | 0xa8 | `andi rx, imm7` | rx = rx & imm7 (in-place bitwise AND; no sign-extension) |
 | 0xac | `shrsi rx, imm7` | rx = signed(rx) >> (imm7 & 0x1f) (in-place arithmetic right shift) |
+| 0xb0 | `imms rx, imm7` | rx = sext7(imm7) (load small signed constant, −64..63) |
 
-*(4 slots available.)*
+*(3 slots available.)*
+
+`imms rx, K` loads a signed 7-bit constant (−64..63) in 2 bytes instead of 3-byte
+`immw rx, K`. Used by the backend for any `IK_CONST` that isn't folded by a peephole
+(`addi`/`shli`/`inc`/`dec`/`addli`/`cbeq`/`mulli`/`orli`/etc.). `K = 0` is handled by
+the 1-byte `zeroN` F0a instructions instead.
 
 `lbx`/`lwx` (sign-extending loads) replace the `lb`/`lbx; sxb` pair that would otherwise be
 needed for every signed `char` or `short` local read.

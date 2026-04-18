@@ -223,6 +223,10 @@ typedef struct {
 static const Instr4 itab4[] = {
     /* F0a — 1 byte, no operands */
     {"halt",   0x00,0,0,0}, {"ret",    0x01,0,0,0},
+    {"zero0",  0x02,0,0,0}, {"zero1",  0x03,0,0,0},
+    {"zero2",  0x04,0,0,0}, {"zero3",  0x05,0,0,0},
+    {"zero4",  0x06,0,0,0}, {"zero5",  0x07,0,0,0},
+    {"zero6",  0x08,0,0,0}, {"zero7",  0x09,0,0,0},
     /* F0b — 3 bytes, rd rx imm9 (two-op+imm9); subfmt=8; subop=0/1 per first_byte */
     {"addli",  0x10,2,8,0}, {"subli",  0x10,2,8,1},
     {"mulli",  0x11,2,8,0}, {"divli",  0x11,2,8,1},
@@ -259,7 +263,8 @@ static const Instr4 itab4[] = {
     {"zxb",    0x7e,1,1,0x06}, {"zxw",    0x7e,1,1,0x07},
     {"itof",   0x7e,1,1,0x08}, {"ftoi",   0x7e,1,1,0x09},
     {"jlr",    0x7e,1,1,0x0a}, {"jr",     0x7e,1,1,0x0b},
-    {"ssp",    0x7e,1,1,0x0c}, {"putchar",0x7e,1,1,0x3f},
+    {"ssp",    0x7e,1,1,0x0c}, {"neg",    0x7e,1,1,0x0d},
+    {"putchar",0x7e,1,1,0x3f},
     /* F2 — 2 bytes, rx imm7 (bp-relative; imm scaled by access width) */
     {"lb",     0x80,1,0,0}, {"lw",     0x84,1,0,0},
     {"ll",     0x88,1,0,0}, {"sb",     0x8c,1,0,0},
@@ -269,6 +274,7 @@ static const Instr4 itab4[] = {
     {"shli",   0xa4,1,0,0},
     {"andi",   0xa8,1,0,0},
     {"shrsi",  0xac,1,0,0},
+    {"imms",   0xb0,1,0,0},
     /* F3a — 3 bytes, imm16 only */
     {"j",      0xc0,2,0,0}, {"jl",     0xc1,2,0,0},
     {"enter",  0xc2,2,0,0},
@@ -1139,6 +1145,14 @@ static void run_cpu4(int verbose)
             pc = (uint16_t)(read32(sp) >> 16);
             sp = (uint16_t)(sp + 4);
             break;
+        case 0x02: r[0]=0; break;  /* zero0 */
+        case 0x03: r[1]=0; break;  /* zero1 */
+        case 0x04: r[2]=0; break;  /* zero2 */
+        case 0x05: r[3]=0; break;  /* zero3 */
+        case 0x06: r[4]=0; break;  /* zero4 */
+        case 0x07: r[5]=0; break;  /* zero5 */
+        case 0x08: r[6]=0; break;  /* zero6 */
+        case 0x09: r[7]=0; break;  /* zero7 */
         /* F1a */
         case 0x40: r[rd]=r[rx]+r[ry]; break;  /* add */
         case 0x42: r[rd]=r[rx]-r[ry]; break;  /* sub */
@@ -1180,6 +1194,7 @@ static void run_cpu4(int verbose)
             else if (subop==0x0a) { uint16_t t=pc; pc=(uint16_t)(r[rd]&0xffff); lr=t; }       /* jlr  */
             else if (subop==0x0b) { pc=(uint16_t)(r[rd]&0xffff); }                             /* jr   */
             else if (subop==0x0c) { sp=(uint16_t)(r[rd]&0xffff); }                             /* ssp  */
+            else if (subop==0x0d) { r[rd] = (uint32_t)(-(int32_t)r[rd]); }                     /* neg  */
             else if (subop==0x3f) { fputc((int)(r[rd]&0xff),stderr); fflush(stderr); }         /* putchar */
             break;
         /* F2 — bp-relative (imm is raw 7-bit; scaled by access size) */
@@ -1195,6 +1210,7 @@ static void run_cpu4(int verbose)
         case 0xa4: r[rd]=r[rx]<<(imm&0x1f); break;                /* shli */
         case 0xa8: r[rd]=r[rx]&(uint32_t)imm; break;              /* andi (no sext) */
         case 0xac: r[rd]=(uint32_t)((int32_t)r[rx]>>(imm&0x1f)); break; /* shrsi */
+        case 0xb0: r[rd]=(uint32_t)sx7(imm); break;                     /* imms */
         /* F3a */
         case 0xc0: pc=(uint16_t)imm; break;  /* j   */
         case 0xc1: lr=pc; pc=(uint16_t)imm; break; /* jl  */

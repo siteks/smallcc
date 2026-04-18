@@ -189,6 +189,14 @@ class G:
         # This space will be used for hot code ops after analysis
         'halt'  :   (0x00, 0, 0, 0),
         'ret'   :   (0x01, 0, 0, 0),
+        'zero0' :   (0x02, 0, 0, 0),
+        'zero1' :   (0x03, 0, 0, 0),
+        'zero2' :   (0x04, 0, 0, 0),
+        'zero3' :   (0x05, 0, 0, 0),
+        'zero4' :   (0x06, 0, 0, 0),
+        'zero5' :   (0x07, 0, 0, 0),
+        'zero6' :   (0x08, 0, 0, 0),
+        'zero7' :   (0x09, 0, 0, 0),
         # format 0b - two op + imm9     0001ooooodddxxxiiiiiiiii
         'addli' :   (0x10, 2, 1, 0),
         'subli' :   (0x10, 2, 1, 1),
@@ -258,6 +266,7 @@ class G:
         'jlr'   :   (0x7e, 1, 1, 0x0a),
         'jr'    :   (0x7e, 1, 1, 0x0b),
         'ssp'   :   (0x7e, 1, 1, 0x0c),
+        'neg'   :   (0x7e, 1, 1, 0x0d),
         'putchar':  (0x7e, 1, 1, 0x3f),
         # format 2 - one op + imm7      10ooooxxxiiiiiii
         'lb'    :   (0x80, 1, 0, 0),
@@ -272,6 +281,7 @@ class G:
         'shli'  :   (0xa4, 1, 0, 0),
         'andi'  :   (0xa8, 1, 0, 0),
         'shrsi' :   (0xac, 1, 0, 0),
+        'imms'  :   (0xb0, 1, 0, 0),
         # format 3a - zero op + imm16   110000ooiiiiiiiiiiiiiiii
         'j'     :   (0xc0, 2, 0, 0),
         'jl'    :   (0xc1, 2, 0, 0),
@@ -539,6 +549,14 @@ class CPU:
         # f0a
         if      i == 'halt':    s.H = 1
         elif    i == 'ret':     s.sp = s.bp; s.bp = m.read32(s.sp) & 0xffff; s.pc = m.read32(s.sp) >> 16; s.sp += 4
+        elif    i == 'zero0':   s.r[0] = 0
+        elif    i == 'zero1':   s.r[1] = 0
+        elif    i == 'zero2':   s.r[2] = 0
+        elif    i == 'zero3':   s.r[3] = 0
+        elif    i == 'zero4':   s.r[4] = 0
+        elif    i == 'zero5':   s.r[5] = 0
+        elif    i == 'zero6':   s.r[6] = 0
+        elif    i == 'zero7':   s.r[7] = 0
         # f0b
         elif    i == 'addli':   s.r[dst] = s.r[src1] + sext(imm, 9)
         elif    i == 'subli':   s.r[dst] = s.r[src1] - sext(imm, 9)
@@ -607,6 +625,7 @@ class CPU:
         elif    i == 'jlr':     s.pc, s.lr = s.r[src0], s.pc
         elif    i == 'jr':      s.pc = s.r[src0]
         elif    i == 'ssp':     s.sp = s.r[src0]
+        elif    i == 'neg':     s.r[dst] = -sext(s.r[src0], 32)
         elif    i == 'putchar': sys.stderr.write(chr(s.r[src0] & 0xff)); sys.stderr.flush()
         # f2
         elif    i == 'lb':      s.r[dst] = m.read8(s.bp + sext(imm, 7))
@@ -621,6 +640,7 @@ class CPU:
         elif    i == 'shli':    s.r[dst] = s.r[src0] << (imm & 0x1f)
         elif    i == 'andi':    s.r[dst] = s.r[src0] & imm
         elif    i == 'shrsi':   s.r[dst] = sext(s.r[src0], 32) >> (imm & 0x1f)
+        elif    i == 'imms':    s.r[dst] = sext(imm, 7)
         # f3a
         elif    i == 'j':       s.pc = imm
         elif    i == 'jl':      s.pc, s.lr = imm, s.pc
