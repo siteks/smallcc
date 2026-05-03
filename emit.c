@@ -2602,14 +2602,15 @@ static void emit_sx_data(Sx *sx, FILE *out) {
         if (size >= 2) fprintf(out, "    align\n");
         fprintf(out, "%s:\n", name);
 
-        // Check for strref init: (strref "label") → emit word label
+        // Check for strref init: (strref "label") → emit pointer-sized address.
+        // ILP32: pointers are 4 bytes (long), not 2 (word).
         int handled = 0;
         if (init_sx && init_sx->kind == SX_PAIR) {
             Sx *tag2 = init_sx->car;
             if (tag2 && tag2->kind == SX_SYM && strcmp(tag2->s, "strref") == 0) {
                 Sx *lbl = init_sx->cdr ? init_sx->cdr->car : NULL;
                 if (lbl && (lbl->kind == SX_STR || lbl->kind == SX_SYM))
-                    fprintf(out, "    word %s\n", lbl->s);
+                    fprintf(out, "    long %s\n", lbl->s);
                 else
                     fprintf(out, "    allocb %d\n", size);
                 handled = 1;
@@ -2676,13 +2677,20 @@ static void emit_sx_data(Sx *sx, FILE *out) {
                         else if (esize == 4) fprintf(out, "    long %d\n", v->i);
                         emitted += esize;
                     } else if (v && v->kind == SX_PAIR) {
-                        // strref element: (strref "label") → word label
+                        // strref element: (strref "label") — pointer-typed slot.
+                        // ILP32: pointers are 4 bytes, so emit `long`. Under
+                        // the old LP32 model this was 2 bytes (`word`); the
+                        // mismatch caused arrays of pointers like
+                        //   static char *intpat[4] = { "5012", "1234", ... }
+                        // to lay out at 2-byte stride while the indexer used
+                        // sizeof(char*)==4, reading a different element than
+                        // the source named.
                         Sx *t2 = v->car;
                         if (t2 && t2->kind == SX_SYM && strcmp(t2->s, "strref") == 0) {
                             Sx *lbl = v->cdr ? v->cdr->car : NULL;
                             if (lbl && (lbl->kind == SX_STR || lbl->kind == SX_SYM))
-                                fprintf(out, "    word %s\n", lbl->s);
-                            emitted += 2;
+                                fprintf(out, "    long %s\n", lbl->s);
+                            emitted += PTR_SIZE;
                         }
                     }
                     vals = vals->cdr;

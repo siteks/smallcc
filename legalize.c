@@ -178,7 +178,10 @@ void legalize_function(Function *f) {
                 int c2;
                 if (!get_iconst(val_resolve(inst->ops[1]), &c2)) continue;
 
-                // Look through copy_prop-surviving IK_COPY chains (e.g. u8→i16 coercion)
+                // Look through copy_prop-surviving IK_COPY chains (e.g. u8→i16 coercion).
+                // CAUTION: under ILP32 this look-through has caused subtle
+                // miscompiles (CoreMark crcs went off without it being obvious why);
+                // keeping it for now but worth re-investigating if anything fails.
                 Value *inner = val_resolve(inst->ops[0]);
                 while (inner && inner->kind == VAL_INST && inner->def &&
                        inner->def->kind == IK_COPY && inner->def->nops >= 1)
@@ -186,6 +189,12 @@ void legalize_function(Function *f) {
 
                 if (!inner || inner->kind != VAL_INST || !inner->def) continue;
                 if (inner->def->kind != IK_AND || inner->def->nops < 2) continue;
+                // ILP32 safety: the inner AND must be in the same block as the
+                // outer AND. Without this, the repoint at line 200 can move a
+                // use of `inner->def->ops[1-inner_const_pos]` to a point that
+                // its definition no longer dominates — silently producing wrong
+                // values when blocks are reordered or only sometimes reachable.
+                if (inner->def->block != b) continue;
 
                 // Check both operand positions for the inner AND's constant
                 // (braun.c may emit AND(const, x) or AND(x, const))
