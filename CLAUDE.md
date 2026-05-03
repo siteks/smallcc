@@ -2,6 +2,10 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Cross-Repo Coordination
+
+CPU4 spans three repos with their own Claude Code contexts: this one (`smallcc`, the compiler + reference simulator + ISA/ABI specs), `../cpu4_hardware` (the RTL implementation), and `../coremark_single_file` (the benchmark). Read **@coordination.md** before making changes that touch the ISA, the ABI, or anything visible across the repo boundary. Short version: read freely from any repo, write only to your own, route ISA/ABI changes through the human, file cross-repo bugs as test-corpus entries.
+
 ## Debugging Rule
 
 **Always debug test failures at the earliest point in the pipeline.** For CPU4 pipeline failures, check and fix the issue in the IR (OOS IR via `-oos` dump) before looking at final CPU4 assembly output. The pipeline is: Braun SSA → OOS → legalize → IRC → emission. Fix the problem at the first stage where it appears.
@@ -175,5 +179,6 @@ Per-TU loop [smallcc.c] (lib TUs first, then user TUs):
 - @docs/optimization-passes.md — pass catalog, bitmask system, LICM/CSE tuning constants, emission peepholes
 - @docs/isa/cpu3.md — CPU3 registers, instruction set, assembly syntax
 - @docs/isa/cpu4.md — CPU4 registers, instruction set, assembly syntax
+- @docs/abi.md — calling convention, frame layout, type sizes, symbol naming, MMIO map (the contract between compiler and hardware)
 - @docs/c89-status.md — compliance tables, deliberate deviations, what's implemented/missing
 - @docs/testing.md — test systems and debugging tips
