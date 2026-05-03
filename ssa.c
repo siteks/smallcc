@@ -89,8 +89,8 @@ int vtype_size(ValType vt) {
     case VT_I8:  case VT_U8:  return 1;
     case VT_I16: case VT_U16: return 2;
     case VT_I32: case VT_U32: case VT_F32: return 4;
-    case VT_PTR: return 2;
-    default: return 2;
+    case VT_PTR: return 4;     // ILP32: pointers are 4 bytes
+    default: return 4;
     }
 }
 

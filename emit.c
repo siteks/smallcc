@@ -2539,6 +2539,41 @@ static void emit_sx_data(Sx *sx, FILE *out) {
                 handled = 1;
             }
         }
+        // Struct initializer: (gfields (size value) (size value) ...)
+        // Heterogeneous element sizes per declared field; (0 N) emits N pad bytes.
+        if (!handled && init_sx && init_sx->kind == SX_PAIR) {
+            Sx *tag2 = init_sx->car;
+            if (tag2 && tag2->kind == SX_SYM && strcmp(tag2->s, "gfields") == 0) {
+                int emitted = 0;
+                Sx *cur2 = init_sx->cdr;
+                while (cur2 && cur2->kind == SX_PAIR) {
+                    Sx *pair = cur2->car;
+                    if (pair && pair->kind == SX_PAIR) {
+                        Sx *sz_sx  = pair->car;
+                        Sx *val_sx = pair->cdr ? pair->cdr->car : NULL;
+                        // strref (pointer-to-string) is encoded as (strref "label")
+                        if (sz_sx && sz_sx->kind == SX_SYM && strcmp(sz_sx->s, "strref") == 0) {
+                            if (val_sx && (val_sx->kind == SX_STR || val_sx->kind == SX_SYM))
+                                fprintf(out, "    long %s\n", val_sx->s);
+                            emitted += PTR_SIZE;
+                        } else if (sz_sx && sz_sx->kind == SX_INT && val_sx && val_sx->kind == SX_INT) {
+                            int sz = sz_sx->i;
+                            int val = val_sx->i;
+                            if (sz == 0)        fprintf(out, "    allocb %d\n", val); // pad
+                            else if (sz == 1)   fprintf(out, "    byte %d\n", val & 0xff);
+                            else if (sz == 2)   fprintf(out, "    word %d\n", val & 0xffff);
+                            else if (sz == 4)   fprintf(out, "    long %d\n", val);
+                            else                fprintf(out, "    allocb %d\n", sz);
+                            emitted += (sz == 0 ? val : sz);
+                        }
+                    }
+                    cur2 = cur2->cdr;
+                }
+                int remaining = size - emitted;
+                if (remaining > 0) fprintf(out, "    allocb %d\n", remaining);
+                handled = 1;
+            }
+        }
         // Array initializer list: (ginit elem_size v0 v1 ...)
         if (!handled && init_sx && init_sx->kind == SX_PAIR) {
             Sx *tag2 = init_sx->car;

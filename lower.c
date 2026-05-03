@@ -123,6 +123,87 @@ static Sx *lower_global(int tu_index, Node *decl, Symbol *sym) {
         return gv;
     }
 
+    // Struct initializer list — fields can have different sizes (e.g. `struct
+    // { char c; int i; }` is 1 + (3 pad) + 4), so we walk fields and emit each
+    // as a (size value) pair rather than the homogeneous ginit form below.
+    if (init->kind == ND_INITLIST && sym->type && sym->type->base == TB_STRUCT) {
+        Sx *gf = sx_list(1, sx_sym("gfields"));
+        Sx **gt = &gf->cdr;
+        Field *f = sym->type->u.composite.members;
+        Node *el = init->ch[0];
+        int cur_off = 0;
+        while (f && el) {
+            // Padding before this field
+            if (f->offset > cur_off) {
+                *gt = sx_cons(sx_list(2, sx_int(0), sx_int(f->offset - cur_off)), NULL);
+                gt = &(*gt)->cdr;
+            }
+            int fsz = f->type ? f->type->size : 2;
+            Node *r = el;
+            int neg = 1;
+            while (r && r->kind == ND_CAST) r = r->ch[1];
+            if (r && r->kind == ND_UNARYOP && r->op_kind == TK_MINUS) { neg = -1; r = r->ch[0]; }
+            while (r && r->kind == ND_CAST) r = r->ch[1];
+            // Nested struct init: { ... }
+            if (r && r->kind == ND_INITLIST && f->type && f->type->base == TB_STRUCT) {
+                // Recursively encode each subfield
+                Field *sf = f->type->u.composite.members;
+                Node *se = r->ch[0];
+                int sub_off = 0;
+                while (sf && se) {
+                    if (sf->offset > sub_off) {
+                        *gt = sx_cons(sx_list(2, sx_int(0), sx_int(sf->offset - sub_off)), NULL);
+                        gt = &(*gt)->cdr;
+                    }
+                    int ssz = sf->type ? sf->type->size : 2;
+                    Node *sr = se;
+                    while (sr && sr->kind == ND_CAST) sr = sr->ch[1];
+                    int sv = (sr && sr->kind == ND_LITERAL) ? (int)sr->u.literal.ival : 0;
+                    *gt = sx_cons(sx_list(2, sx_int(ssz), sx_int(sv)), NULL);
+                    gt = &(*gt)->cdr;
+                    sub_off = sf->offset + ssz;
+                    sf = sf->next;
+                    se = se->next;
+                }
+                // Tail padding inside the nested struct
+                if (sub_off < fsz) {
+                    *gt = sx_cons(sx_list(2, sx_int(0), sx_int(fsz - sub_off)), NULL);
+                    gt = &(*gt)->cdr;
+                }
+            } else if (r && r->kind == ND_UNARYOP && r->op_kind == TK_AMPERSAND) {
+                Node *operand = r->ch[0];
+                Symbol *osym = (operand && operand->kind == ND_IDENT) ? operand->symbol : NULL;
+                const char *olabel = osym ? sym_label(osym) : "_nil";
+                *gt = sx_cons(sx_list(2, sx_sym("strref"), sx_str(olabel)), NULL);
+                gt = &(*gt)->cdr;
+            } else if (r && r->kind == ND_LITERAL && r->u.literal.strval &&
+                       f->type && f->type->base == TB_POINTER) {
+                const char *lbl = assign_strlit(r->u.literal.strval, r->u.literal.strval_len);
+                *gt = sx_cons(sx_list(2, sx_sym("strref"), sx_str(lbl)), NULL);
+                gt = &(*gt)->cdr;
+            } else {
+                int v = (r && r->kind == ND_LITERAL) ? (int)r->u.literal.ival * neg : 0;
+                if (f->type && (f->type->base == TB_FLOAT || f->type->base == TB_DOUBLE)) {
+                    double fv = (r && r->kind == ND_LITERAL) ? r->u.literal.fval * neg : 0.0;
+                    float fv32 = (float)fv;
+                    uint32_t bits; memcpy(&bits, &fv32, 4); v = (int)bits;
+                }
+                *gt = sx_cons(sx_list(2, sx_int(fsz), sx_int(v)), NULL);
+                gt = &(*gt)->cdr;
+            }
+            cur_off = f->offset + fsz;
+            f = f->next;
+            el = el->next;
+        }
+        // Tail padding to bring up to declared struct size
+        if (cur_off < size) {
+            *gt = sx_cons(sx_list(2, sx_int(0), sx_int(size - cur_off)), NULL);
+            gt = &(*gt)->cdr;
+        }
+        *tail = sx_cons(gf, NULL);
+        return gv;
+    }
+
     // Array / struct initializer list
     if (init->kind == ND_INITLIST) {
         Type *etype = (sym->type && sym->type->base == TB_ARRAY)

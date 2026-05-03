@@ -273,40 +273,50 @@ static Node *primary_expr()
         node = new_node(ND_LITERAL, expect(token_ctx.current->kind), true);
         int slen = strlen(tk->val);
         Const_suffix cs = CS_NONE;
-        // Get the suffix
-        if (tk->val[slen - 1] == 'l' || tk->val[slen - 1] == 'L')
-            if (!isdigit(tk->val[slen - 2]))
-                cs = CS_UL;
-            else
-                cs = CS_L;
-        else if (tk->val[slen - 1] == 'u' || tk->val[slen - 1] == 'U')
-            cs = CS_U;
-        else if (tk->val[slen - 1] == 'f' || tk->val[slen - 1] == 'F')
-            cs = CS_F;
+        // Get the suffix.  IMPORTANT: 'f'/'F' is a hex digit, so for hex int
+        // literals like 0xbeef the trailing 'f' must NOT be treated as a float
+        // suffix.  Only consider the float suffix when the tokeniser already
+        // classified the token as a float (TK_CONSTFLT).  For TK_CONSTINT we
+        // only look for the integer suffixes (l/L/u/U/UL/LU).
+        if (tk->kind == TK_CONSTINT) {
+            if (tk->val[slen - 1] == 'l' || tk->val[slen - 1] == 'L')
+                if (slen >= 2 && !isdigit(tk->val[slen - 2]))
+                    cs = CS_UL;
+                else
+                    cs = CS_L;
+            else if (tk->val[slen - 1] == 'u' || tk->val[slen - 1] == 'U')
+                cs = CS_U;
+        } else {
+            if (tk->val[slen - 1] == 'f' || tk->val[slen - 1] == 'F')
+                cs = CS_F;
+        }
         if (tk->val[0] == '0') // leading zero is octal or hex
             cs |= CS_OX;
 
         if (tk->kind == TK_CONSTINT)
         {
-            //  dec     int,            l int,  ul int
-            //  hex     int,    u int,  l int,  ul int
-            //  u               u int,          ul int
-            //  l                       l int,  ul int
-            //  ul                              ul int
+            // ILP32: int and long are both 4 bytes, so literal-typing collapses.
+            // C89 §3.1.3.2 rules — the type is the first one that fits, given the
+            // base (decimal vs hex/octal) and the suffix. With int==long, the
+            // signed-int / signed-long rows merge, and unsigned-int / unsigned-long
+            // do too; we keep `long`/`ulong` as the second-tier choice so that
+            // explicit `L`/`UL` suffixes still produce those types for typing.
+            //   dec     int,             l int,  ul int
+            //   hex     int,    u int,   l int,  ul int   (u-row triggers when
+            //                                              value > INT_MAX)
+            //   u               u int,           ul int
+            //   l                        l int,  ul int
+            //   ul                               ul int
             long long i = node->u.literal.ival = tk->ival;
             if (cs == CS_NONE)
-                if (i >= -32768 && i <= 32767)                      node->type = t_int;
-                else if (i >= -2147483648ll && i <= 2147483647ll)   node->type = t_long;
+                if (i >= -2147483648ll && i <= 2147483647ll)        node->type = t_int;
                 else src_error(tk->line, tk->col, "Integer constant out of range");
             else if (cs == CS_OX)
-                if (i >= -32768 && i <= 32767)                      node->type = t_int;
-                else if (i >= 0 && i <= 65535)                      node->type = t_uint;
-                else if (i >= -2147483648ll && i <= 2147483647ll)   node->type = t_long;
-                else if (i >= 0 && i <= 4294967295ll)               node->type = t_ulong;
+                if (i >= -2147483648ll && i <= 2147483647ll)        node->type = t_int;
+                else if (i >= 0 && i <= 4294967295ll)               node->type = t_uint;
                 else src_error(tk->line, tk->col, "Integer constant out of range");
             else if ((cs & ~CS_OX) == CS_U)
-                if (i >= 0 && i <= 65535)                           node->type = t_uint;
-                else if (i >= 0 && i <= 4294967295ll)               node->type = t_ulong;
+                if (i >= 0 && i <= 4294967295ll)                    node->type = t_uint;
                 else src_error(tk->line, tk->col, "Integer constant out of range");
             else if ((cs & ~CS_OX) == CS_L)
                 if (i >= -2147483648ll && i <= 2147483647ll)        node->type = t_long;
@@ -1686,12 +1696,14 @@ void insert_cast(Node *n, int child, Type *t)
     n->ch[child] = c;
 }
 // C89 §3.2.1.1 integer promotions: narrow integer types widen to int (or uint).
-// NOTE: on a 32-bit target sizeof(int)==4, so ushort would promote to int instead of uint,
-// and short→int would emit sxw rather than being a no-op.
+// On this ILP32 target sizeof(int) == 4 and sizeof(unsigned short) == 2, so int can
+// represent every value of unsigned short — the promotion is to plain `int`, not
+// `unsigned int`. (On the old LP32 layout where int was 2 bytes, unsigned short
+// promoted to unsigned int because int couldn't hold values > 32767.)
 static Type *promote(Type *t)
 {
-    if (istype_char(t) || istype_uchar(t) || istype_short(t) || istype_enum(t)) return t_int;
-    if (istype_ushort(t)) return t_uint;
+    if (istype_char(t) || istype_uchar(t) || istype_short(t) || istype_ushort(t) || istype_enum(t))
+        return t_int;
     return t;
 }
 

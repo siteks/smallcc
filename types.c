@@ -141,8 +141,8 @@ Type *get_basic_type(Type_base base)
         break;
     case TB_INT:
     case TB_UINT:
-        t->size  = 2;
-        t->align = 2;
+        t->size  = 4;   // ILP32: int is 4 bytes
+        t->align = 4;
         break;
     case TB_LONG:
     case TB_ULONG:
@@ -178,8 +178,8 @@ Type *get_pointer_type(Type *pointee)
     Type *t          = arena_alloc(sizeof(Type));
     t->base          = TB_POINTER;
     t->u.ptr.pointee = pointee;
-    t->size          = 2;
-    t->align         = 2;
+    t->size          = 4;   // ILP32: pointer is 4 bytes (high half zero for compiler-emitted addrs)
+    t->align         = 4;
     append_type(t);
     derived_insert(t);
     return t;
@@ -234,8 +234,8 @@ Type *get_function_type(Type *ret, Param *params, bool is_variadic)
     t->u.fn.ret          = ret;
     t->u.fn.params       = params;
     t->u.fn.is_variadic  = is_variadic;
-    t->size              = 2;
-    t->align             = 2;
+    t->size              = 4;   // ILP32: function pointer stored as 4 bytes (semantically 16-bit; jlr masks)
+    t->align             = 4;
     append_type(t);
     derived_insert(t);
     return t;
@@ -1145,13 +1145,16 @@ static Symbol *insert_local_ident(Symbol_table *st, Type *type, const char *iden
     Symbol *n;
     if (is_param)
     {
-        // Slot size on the caller's stack: structs use WORD_SIZE (pointer), 4-byte types use 4,
-        // and everything smaller (char, short, int) uses WORD_SIZE because the caller always
-        // uses pushw (2 bytes) for any type smaller than 4 bytes.
+        // Slot size on the caller's stack. CPU4 ABI: every stack-passed argument
+        // occupies a 4-byte slot regardless of declared type — the caller pushr's
+        // 4 bytes per arg. Structs are passed via a hidden pointer (also 4 bytes).
+        // (The actual stack-arg layout in braun.c uses bp+4+idx*4; this symbol-
+        // table value mostly survives as a debug aid since cg_addr falls back to
+        // sym->offset only for unusual paths.)
         int slot_size;
-        if (type->base == TB_STRUCT)    slot_size = WORD_SIZE;
+        if (type->base == TB_STRUCT)    slot_size = PTR_SIZE;
         else if (type->size >= 4)       slot_size = type->size;
-        else                            slot_size = WORD_SIZE;
+        else                            slot_size = 4;  // smaller types still take a 4-byte slot
         n        = new_symbol(type, ident, st->param_offset);
         n->kind  = SYM_PARAM;
         st->param_offset += slot_size;
@@ -1207,13 +1210,13 @@ void finalize_local_offsets(void)
 // ---------------------------------------------------------------
 // When a function returns a struct, the hidden retbuf pointer occupies the
 // first parameter slot (bp+FRAME_OVERHEAD).  This function shifts all SYM_PARAM
-// symbols in the given scope up by WORD_SIZE to make room for that hidden slot.
+// symbols in the given scope up by PTR_SIZE to make room for that hidden slot.
 // Called from the parser immediately after a struct-returning function definition
 // is recognised.
 void shift_param_offsets_for_struct_ret(Symbol_table *param_scope)
 {
-    // Hidden retbuf pointer occupies one WORD_SIZE slot before the declared params.
-    int hidden_slot = WORD_SIZE;
+    // Hidden retbuf pointer occupies one pointer-sized slot before the declared params.
+    int hidden_slot = PTR_SIZE;
     for (Symbol *s = param_scope->symbols; s; s = s->next)
     {
         if (s->ns == NS_IDENT && s->kind == SYM_PARAM)

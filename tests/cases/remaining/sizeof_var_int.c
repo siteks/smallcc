@@ -1,2 +1,2 @@
-// EXPECT_R0: 2
+// EXPECT_R0: 4
 int main() { int x; return sizeof(x); }

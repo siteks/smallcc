@@ -271,14 +271,17 @@ ValType type_to_valtype(Type *t) {
     case TB_VOID:                       return VT_VOID;
     case TB_CHAR:                       return VT_I8;
     case TB_UCHAR:                      return VT_U8;
-    case TB_SHORT: case TB_INT:         return VT_I16;
-    case TB_USHORT: case TB_UINT:       return VT_U16;
+    case TB_SHORT:                      return VT_I16;
+    case TB_USHORT:                     return VT_U16;
+    case TB_INT:                        return VT_I32;   // ILP32: int is 4 bytes
+    case TB_UINT:                       return VT_U32;   // ILP32: unsigned int is 4 bytes
     case TB_LONG:                       return VT_I32;
     case TB_ULONG:                      return VT_U32;
     case TB_FLOAT: case TB_DOUBLE:      return VT_F32;
     case TB_POINTER: case TB_FUNCTION:  return VT_PTR;
     case TB_ARRAY:                      return VT_PTR;   // array decays to pointer
-    case TB_STRUCT: case TB_ENUM:       return VT_I16;   // struct size varies; enum is int
+    case TB_STRUCT:                     return VT_I32;   // struct size varies; pass-around is pointer-sized
+    case TB_ENUM:                       return VT_I32;   // enum follows int
     default:                            return VT_VOID;
     }
 }

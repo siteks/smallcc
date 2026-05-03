@@ -35,9 +35,24 @@ extern Arena arena;
 void  *arena_alloc(size_t size);
 char  *arena_strdup(const char *s);
 
-// Target architecture constants
-#define WORD_SIZE      2   // size of int and pointer (16-bit target)
-#define FRAME_OVERHEAD 8   // enter saves lr+bp (4 bytes each); params start at bp+8
+// Target architecture constants (ILP32 on a 16-bit-address CPU)
+//
+//   sizeof(char)  = 1
+//   sizeof(short) = 2
+//   sizeof(int)   = 4   ← was 2 in the old LP32 layout
+//   sizeof(long)  = 4
+//   sizeof(ptr)   = 4   ← was 2; high half is zero for compiler-emitted addresses
+//
+// Stack/code addresses still live in the low 64 KB (sp/bp/pc are 16-bit), but
+// pointers are stored as 4-byte values so user code can address the 32 MB SDRAM
+// behind the pbus through ordinary C pointers.
+//
+// WORD_SIZE is retained for code that still wants the "natural integer / pointer
+// slot" abstraction. PTR_SIZE / INT_SIZE are explicit aliases for clarity.
+#define INT_SIZE       4
+#define PTR_SIZE       4
+#define WORD_SIZE      4   // back-compat alias; equals INT_SIZE == PTR_SIZE
+#define FRAME_OVERHEAD 4   // CPU4 enter packs (lr<<16)|bp into one 4-byte word; params start at bp+4
 
 // ===============================================================
 // Debug Output Control
