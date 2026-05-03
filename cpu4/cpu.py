@@ -662,7 +662,7 @@ class CPU:
         elif    i == 'enter':   m.write32(s.sp - 4, (s.lr << 16) | s.bp); s.bp = s.sp - 4; s.sp -= imm + 4
         # f3b
         elif    i == 'adjw':    s.sp += sext((imm << 2), 16)
-        elif    i == 'lea':     s.r[dst] = s.bp + sext((imm << 2), 16)
+        elif    i == 'lea':     s.r[dst] = (s.bp + sext((imm << 2), 16)) & 0xffff  # ILP32: high half always zero
         # f3c
         elif    i == 'llb':     s.r[dst] = m.read8(s.r[src1] + sext(imm, 10))
         elif    i == 'llw':     s.r[dst] = m.read16(s.r[src1] + sext(imm<<1, 11))

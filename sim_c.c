@@ -1324,7 +1324,12 @@ static void run_cpu4(void)
             break;
         /* F3b: adjw=0xc4, lea=0xc6 */
         case 0xc4: sp=(uint16_t)(sp+(uint16_t)(sx14(imm)<<2)); break; /* adjw */
-        case 0xc6: r[rd]=(uint32_t)((int32_t)bp+(sx14(imm)<<2)); break; /* lea */
+        case 0xc6: /* lea: ILP32 — mask to 16 bits so the upper half is
+                   * always zero regardless of how negative offsets land in
+                   * int32 arithmetic. Mirrors the hardware (bp is 16-bit;
+                   * the address ALU computes bp+offset mod 2^16). */
+                   r[rd]=(uint32_t)(uint16_t)((int32_t)bp+(sx14(imm)<<2));
+                   break;
         /* F0c: cbeq=0x20, cbne=0x30 — compare rx with imm7 and branch */
         case 0x20: if(r[rx]==(uint32_t)(imm>>10)) pc=(uint16_t)(pc+sx10(imm&0x3ff)); break; /* cbeq */
         case 0x30: if(r[rx]!=(uint32_t)(imm>>10)) pc=(uint16_t)(pc+sx10(imm&0x3ff)); break; /* cbne */

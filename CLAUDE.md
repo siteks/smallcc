@@ -159,10 +159,10 @@ Per-TU loop [smallcc.c] (lib TUs first, then user TUs):
 
 ### Key Target Facts
 
-- 16-bit address space: `int` and pointers are **2 bytes**, `long`/`float`/`double` are **4 bytes**
+- **ILP32 type model.** `char` is 1 byte, `short` is 2 bytes, `int`/`long`/`float`/`double`/pointer are all **4 bytes**. Stack and code addresses still live in the low 64 KB (`sp`, `bp`, `pc` are 16-bit), but pointers are stored as 4-byte values so user code can address the 32 MB SDRAM behind the pbus through ordinary C pointers. The high half of compiler-emitted addresses is zero; `lea` masks its result to 16 bits to guarantee that.
 - `new_node()` initializes `node->type = t_void` (not NULL) — type-propagation guards use `== t_void`
 - Type singletons (`t_int`, `t_void`, etc.) are interned — use pointer equality for comparison
-- Stack starts at `sp = 0x1000`; grows downward; `enter N` saves lr+bp and allocates N bytes
+- Stack starts at `sp = 0x1000`; grows downward; `enter N` saves `(lr<<16)|bp` into one 4-byte slot and allocates N bytes; the first stack-passed param is at `bp+4` (not `bp+8`).
 - `adj imm8` (opcode 0x41) adjusts `sp` by a signed 8-bit value (−128..127); `adjw imm16` (opcode 0x89) adjusts by a signed 16-bit value — used by the backend for locals larger than 127 bytes
 
 ---

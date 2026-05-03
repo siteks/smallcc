@@ -1,8 +1,30 @@
-# 32-bit Data Pointers — Scoping (not implemented)
+# 32-bit Data Pointers — Scoping (superseded — landed as ILP32)
 
-**Status:** scoping only. No code change yet. This document captures the proposal,
-its ABI implications, and the concrete touch-list so that the work can be picked
-up later or reviewed without re-deriving the analysis.
+**Status:** **superseded by the ILP32 transition.** The proposal here was to
+widen pointers to 4 bytes while keeping `int` at 2 bytes. In the end the
+project went one step further and adopted the full **ILP32** model (`int` is
+also 4 bytes), giving `sizeof(int) == sizeof(void*)` and matching every
+mainstream 32-bit C target. See the commit `types: switch to ILP32 — int
+and pointer are now 4 bytes` for the final landing.
+
+The analysis below is preserved as-is for reference. Notes where the actual
+landing diverged from the original plan:
+
+* `int` was widened to 4 bytes (this doc proposed keeping it at 2). Removes
+  the int↔ptr coercion that this doc had to add.
+* `unsigned short` now promotes to `int` (not `unsigned int`).
+* `(int)ptr` round-trip is a no-op again (was going to need TRUNC/ZEXT).
+* Struct globals get a new `(gfields ...)` sexp form because field sizes
+  are heterogeneous (int=4, char=1, etc.).
+* A latent parser bug — `f`/`F` treated as a float suffix on hex int
+  literals like `0xbeef` — was masked under LP32 and shaken out by the
+  widening; fixed in the same commit.
+* `lea` in sim_c.c is now explicitly masked to 16 bits so the upper half
+  of stack-relative addresses is provably zero.
+
+----
+
+(Original scoping below.)
 
 ## Motivation
 

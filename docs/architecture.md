@@ -332,16 +332,16 @@ struct Field {
 | uchar | 1 | 1 | `t_uchar` |
 | short | 2 | 2 | `t_short` |
 | ushort | 2 | 2 | `t_ushort` |
-| int | 2 | 2 | `t_int` |
-| uint | 2 | 2 | `t_uint` |
+| int | 4 | 4 | `t_int` |
+| uint | 4 | 4 | `t_uint` |
 | long | 4 | 4 | `t_long` |
 | ulong | 4 | 4 | `t_ulong` |
 | float | 4 | 4 | `t_float` |
 | double | 4 | 4 | `t_double` |
-| pointer | 2 | 2 | — |
-| function | 2 | 2 | — |
+| pointer | 4 | 4 | — |
+| function | 4 | 4 | — |
 
-**Note:** The target has a 16-bit address space. `int` and pointers are 2 bytes. Function types have size 2 (same as pointer); function designators used as values (e.g. passed as arguments) decay to a function-pointer value (2 bytes).
+**Note:** **ILP32 model.** Stack/code addresses live in the low 64 KB (sp/bp/pc are 16-bit) but pointers are stored as 4-byte values, with the high half zero for compiler-emitted addresses. `int` and pointer are both 4 bytes (`sizeof(int) == sizeof(void*)` holds — the assumption silently made by most portable C). Function types have size 4 (same as pointer); the function designator used as a value decays to a 4-byte function-pointer value (the actual call target is the low 16 bits, since `pc` is 16-bit and `jlr` masks).
 
 ### Factory Functions
 

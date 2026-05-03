@@ -157,7 +157,7 @@ typedef enum {
     VT_VOID,
     VT_I8, VT_I16, VT_I32,   // signed integers
     VT_U8, VT_U16, VT_U32,   // unsigned integers
-    VT_PTR,                    // pointer (16-bit address space)
+    VT_PTR,                    // pointer — 4 bytes (ILP32; high half zero for compiler-emitted addresses)
     VT_F32,                    // single-precision float
 } ValType;
 ```

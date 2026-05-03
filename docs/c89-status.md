@@ -58,8 +58,8 @@ Preprocessor excluded. Features are assessed against ANSI C89/ISO C90.
 |---|---|---|
 | `char` / `unsigned char` | ✅ | 1 byte |
 | `short` / `unsigned short` | ✅ | 2 bytes |
-| `int` / `unsigned int` | ✅ | 2 bytes on target |
-| `long` / `unsigned long` | ✅ | 4 bytes |
+| `int` / `unsigned int` | ✅ | 4 bytes (ILP32) |
+| `long` / `unsigned long` | ✅ | 4 bytes — same width as `int`, distinct as a C type |
 | `float` | ✅ | 4-byte IEEE 754; arithmetic, comparisons, and int↔float casts work |
 | `double` | ✅ | Treated identically to `float` (no 64-bit FP distinction on target) |
 | `void` | ✅ | |
@@ -122,17 +122,20 @@ Preprocessor excluded. Features are assessed against ANSI C89/ISO C90.
 | Usual arithmetic conversions (mixed-type operands) | ✅ | Full C89 rank hierarchy: float > ulong > long > uint > int |
 | Pointer ↔ integer conversions | ✅ | Used in tests (e.g. `a = 0x2000`) |
 | Floating-point conversions | ✅ | `itof`/`ftoi` opcodes; int→float sign-extends first |
-| Function-to-pointer decay | ✅ | Function designators used as values or passed as arguments decay to pointer-sized (2 bytes) |
+| Function-to-pointer decay | ✅ | Function designators used as values or passed as arguments decay to pointer-sized (4 bytes) |
 
-### Target-Dependent Arithmetic Notes (revisit if porting to a wider target)
+### Target-Dependent Arithmetic Notes (ILP32)
 
-These behaviors are correct for the current 16-bit target (`sizeof(int) == sizeof(short) == 2`) but would need changes for a 32-bit target (`sizeof(int) == 4`, `sizeof(short) == 2`):
+The compiler now uses the **ILP32** type model: `char` 1, `short` 2, `int`/`long`/pointer 4. All notes below describe behavior under that model. Under the previous LP32 layout (`int` 2, pointer 2) the rules were different — see git history for that variant if needed.
 
-- **`unsigned short` promotes to `unsigned int`** — on this target `int` is 2 bytes and cannot represent unsigned short values above 32767, so C89 §3.2.1.1 requires promotion to `unsigned int`. On a 32-bit target `int` can represent all `unsigned short` values, so the promotion would be to `int` instead of `unsigned int`. Both are size-2 here, so no code is generated either way.
-- **`short → int` is a no-op** — both are 2 bytes on this target; no code is generated. On a 32-bit target this would emit `sxw` (sign-extend to 32 bits).
-- **`unsigned char → int` is a no-op** — zero-extension from 8 to 16 bits is assumed already done; on a 32-bit target it would zero-extend to 32 bits.
-- **Function argument slot widening is applied** — `push_args_list` compares each argument's natural slot size against the declared parameter's slot size. When widening is needed (e.g. `int` arg to `unsigned long` param), the caller sign-extends (signed types) or zero-extends before pushing. When narrowing is needed (e.g. `long` arg to `int` param), the caller truncates with a mask. This ensures the callee's load matches the pushed slot size.
-- **`int` vs `unsigned int` arithmetic** — both are 2 bytes; only sign-interpretation differs (comparisons, right-shift, division). Mixed `int`/`uint` arithmetic converts to `uint` per the conversions, but the bit patterns are identical for `+`, `-`, `*`.
+- **`unsigned short` promotes to `int`** — `int` is 4 bytes and can represent every `unsigned short` value, so C89 §3.2.1.1 promotes to plain `int`, not `unsigned int`.
+- **`short → int` emits `sxw`** — 16-bit sign-extension to 32 bits. (Was a no-op on the old LP32 layout.)
+- **`unsigned short → int` / `unsigned int` is `zxw`** — 16-bit zero-extension to 32 bits. (Was a no-op on the old LP32 layout.)
+- **`unsigned char → int` is `zxb`** — 8-bit zero-extension to 32 bits.
+- **`(int)ptr` and `(ptr)int` are no-ops** — both are 4 bytes (`sizeof(int) == sizeof(void*)`), so the cast is identity at the IR level.
+- **Function argument slot widening is applied** — `push_args_list` compares each argument's natural slot size against the declared parameter's slot size. When widening is needed (e.g. `short` arg to `long` param), the caller sign- or zero-extends before pushing. Stack slots are 4 bytes minimum (CPU4 ABI: pushr is 4-byte aligned).
+- **`int` vs `unsigned int` arithmetic** — both are 4 bytes; only sign-interpretation differs (comparisons, right-shift, division). Mixed `int`/`uint` arithmetic converts to `uint` per the conversions; bit patterns are identical for `+`, `-`, `*`.
+- **`long` is functionally a synonym for `int`** — both 4 bytes, same alignment, distinct as C types. `printf("%d")` and `printf("%ld")` read identical 4-byte slots. (On a future 64-bit target, `long` would widen and the distinction would matter again.)
 
 ## Summary
 

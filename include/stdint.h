@@ -46,10 +46,11 @@ typedef unsigned long      uintmax_t;
 #define INT32_MAX          2147483647L
 #define UINT32_MAX         4294967295UL
 
-/* Limits of other types */
-#define INTPTR_MIN         INT16_MIN
-#define INTPTR_MAX         INT16_MAX
-#define UINTPTR_MAX        UINT16_MAX
+/* Limits of other types — ILP32: pointers are 4 bytes, so intptr_t covers
+ * the full int32 range. */
+#define INTPTR_MIN         INT32_MIN
+#define INTPTR_MAX         INT32_MAX
+#define UINTPTR_MAX        UINT32_MAX
 
 #define INTMAX_MIN         INT32_MIN
 #define INTMAX_MAX         INT32_MAX
