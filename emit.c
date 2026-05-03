@@ -2014,8 +2014,27 @@ static int detect_branch_fusions(Function *f, BranchFuse *fuse,
 }
 
 // Emit a rotated branch (P12): duplicate header's IK_BR at the end of a latch block.
+//
+// `block_start` (may be NULL) carries the dry-run measured starting offset of
+// each block keyed by block id. When provided we also know `cur_offset` —
+// the byte offset at which the rotated branch would land — so we can check
+// the F3c (10-bit signed) and F0c (10-bit signed) reach for the fused forms.
+// The rotated branch is duplicated at a totally different point from the
+// header's original IK_BR, so the original detect_branch_fusions range check
+// (rooted at the header) does NOT cover it; without this extra check we can
+// emit a fused F3c branch with a -2k displacement that the assembler rejects.
+//
+// `no_rotate[bi]` is a sticky bit: once a rotation at block bi is rejected
+// (out of range), it stays rejected for all subsequent passes. This makes the
+// rotation decision monotonic across the dry-run / real-emit fixpoint loop —
+// without it we'd oscillate as enabling a rotation grows the block, which can
+// push another rotation out of range, which when removed shrinks the block,
+// which puts the first one back in range, …
 static int emit_rotated_branch(Function *f, FILE *out, Inst *inst,
-                               BranchFuse *fuse, Block *next_blk, int bi) {
+                               BranchFuse *fuse, Block *next_blk, int bi,
+                               const int *block_start, int cur_offset,
+                               uint8_t *no_rotate) {
+    if (no_rotate && no_rotate[bi]) return 0;
     Block *hdr = inst->target;
     Inst *hdr_br = NULL;
     int hdr_clean = 1;
@@ -2036,6 +2055,30 @@ static int emit_rotated_branch(Function *f, FILE *out, Inst *inst,
         if (f->blocks[hi] == hdr) { hbi = hi; break; }
     }
     if (hbi < 0) return 0;
+
+    // Range check for fused F3c / F0c forms (fused == 1, 2, 4). The fused == 0
+    // path emits an unfused jnz/jz (F3e, 16-bit absolute) which has no range
+    // limit; the fused == 3 path also emits jz/jnz (F3e). We only need to
+    // guard the F3c/F0c forms.
+    if ((fuse[hbi].fused == 1 || fuse[hbi].fused == 2 || fuse[hbi].fused == 4)
+        && block_start && hdr_br->target) {
+        int tgt_id = hdr_br->target->id;
+        int tgt_off = block_start[tgt_id];
+        if (tgt_off < 0) {
+            // Target unreached during dry-run; conservatively skip rotation
+            // but DON'T set no_rotate — once the next dry-run reaches it we
+            // may be able to commit the rotation.
+            return 0;
+        }
+        // Branch is encoded as (rel-to-end-of-instruction). The fused form
+        // is 3 bytes; its end is at cur_offset + 3.
+        int disp = tgt_off - (cur_offset + 3);
+        if (disp > 511 || disp < -512) {
+            // Out of F3c/F0c reach — sticky decision so we don't oscillate.
+            if (no_rotate) no_rotate[bi] = 1;
+            return 0;
+        }
+    }
 
     int rotated = 0;
     if (fuse[hbi].fused == 0) {
@@ -2092,7 +2135,9 @@ static int emit_rotated_branch(Function *f, FILE *out, Inst *inst,
 static void emit_function_body(Function *f, FILE *out, BranchFuse *fuse,
                                uint8_t *blk_live_regs,
                                int callee_frame, int callee_save[4],
-                               int frame, int ann_live) {
+                               int frame, int ann_live,
+                               const int *block_start, const int *block_size,
+                               uint8_t *no_rotate) {
     struct { Inst *inst; int mn, mx; } jt_info[MAX_JT];
     int jt_count = 0;
     int ann_prev_line = 0;
@@ -2232,7 +2277,19 @@ static void emit_function_body(Function *f, FILE *out, BranchFuse *fuse,
             } else if (inst->kind == IK_JMP && inst->target) {
                 // P12: loop rotation
                 Block *next_blk = (bi + 1 < f->nblocks) ? f->blocks[bi + 1] : NULL;
-                if (!emit_rotated_branch(f, out, inst, fuse, next_blk, bi))
+                // cur_offset: byte offset where the rotated branch instruction
+                // begins. The branch is emitted at the end of block bi, so its
+                // 3-byte position is approximately (start of next layout block) - 3.
+                // (When block_start is unavailable — first dry-run pass — pass
+                // 0; emit_rotated_branch then degrades to no range check, which
+                // is safe because the dry-run output is only used for sizing.)
+                int cur_off = 0;
+                if (block_start && next_blk) {
+                    int nb_start = block_start[next_blk->id];
+                    if (nb_start >= 0) cur_off = nb_start - 3;
+                }
+                if (!emit_rotated_branch(f, out, inst, fuse, next_blk, bi,
+                                         block_start, cur_off, no_rotate))
                     emit_inst(inst, out);
             } else if (inst->kind == IK_SWITCH && inst->nops >= 1) {
                 int sel_r = get_val_reg(out, inst->ops[0], 0);
@@ -2400,13 +2457,21 @@ void emit_function(Function *f, FILE *out) {
         if (f->blocks[i]->id > max_id) max_id = f->blocks[i]->id;
     int *block_start = arena_alloc((max_id + 1) * sizeof(int));
     int *block_size  = arena_alloc(f->nblocks * sizeof(int));
+    uint8_t *no_rotate = arena_alloc(f->nblocks * sizeof(uint8_t));
+    memset(no_rotate, 0, f->nblocks * sizeof(uint8_t));
+    // First pass: pass NULL block_start so emit_rotated_branch skips the
+    // range-sensitive fused forms entirely. Subsequent passes use measured
+    // block_start; emit_rotated_branch's range check sets no_rotate[bi]
+    // sticky on out-of-range, so the decision converges monotonically.
+    const int *cur_block_start = NULL;
 
     int committed;
     do {
         char *mbuf = NULL; size_t mlen = 0;
         FILE *mf = open_memstream(&mbuf, &mlen);
         emit_function_body(f, mf, fuse, blk_live_regs, callee_frame,
-                           callee_save, frame, /*ann_live=*/0);
+                           callee_save, frame, /*ann_live=*/0,
+                           cur_block_start, NULL, no_rotate);
         fflush(mf);
         fclose(mf);
         int total_bytes = 0;
@@ -2414,13 +2479,34 @@ void emit_function(Function *f, FILE *out) {
         free(mbuf);
         for (int bi = 0; bi < f->nblocks; bi++)
             block_size[bi] = block_size_from_offsets(f, bi, block_start, total_bytes);
+        cur_block_start = block_start;   // available from iter 2 onward
         committed = detect_branch_fusions(f, fuse, block_size);
     } while (committed > 0);
+
+    // One final dry-run with the now-stable block_start so emit_rotated_branch
+    // decisions match what the real emit will produce. (If the previous loop
+    // iteration's dry-run used an older block_start, a rotation may have
+    // gotten enabled or skipped that we want to lock in for the real pass.)
+    {
+        char *mbuf = NULL; size_t mlen = 0;
+        FILE *mf = open_memstream(&mbuf, &mlen);
+        emit_function_body(f, mf, fuse, blk_live_regs, callee_frame,
+                           callee_save, frame, /*ann_live=*/0,
+                           cur_block_start, NULL, no_rotate);
+        fflush(mf);
+        fclose(mf);
+        int total_bytes = 0;
+        parse_block_offsets(f, mbuf, mlen, block_start, &total_bytes);
+        free(mbuf);
+        for (int bi = 0; bi < f->nblocks; bi++)
+            block_size[bi] = block_size_from_offsets(f, bi, block_start, total_bytes);
+    }
 
     // Real emission pass.
     int ann_live = (getenv("LIVE_REGS") != NULL);
     emit_function_body(f, out, fuse, blk_live_regs, callee_frame,
-                       callee_save, frame, ann_live);
+                       callee_save, frame, ann_live,
+                       block_start, block_size, no_rotate);
 }
 
 // ============================================================

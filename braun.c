@@ -2355,7 +2355,13 @@ Function *braun_function(Node *func_decl, int tu_index, int *strlit_id) {
         for (int i = 0; i < n_at; i++) {
             Symbol *ps = at_params[i];
             int psz = ps->type ? ps->type->size : 2;
-            if (psz == 4 && (f->frame_size % 4) != 0) f->frame_size += 2;
+            // Round frame_size UP to a multiple of psz before reserving the
+            // slot, so home_off = -frame_size is naturally aligned for the
+            // psz-sized store/load. The old `+= 2` only happened to work when
+            // frame_size was already at residue 2 mod 4 — under ILP32 we hit
+            // all residues.
+            if (psz == 4)      f->frame_size = (f->frame_size + 3) & ~3;
+            else if (psz == 2) f->frame_size = (f->frame_size + 1) & ~1;
             f->frame_size += psz;
             int home_off = -f->frame_size;
             if (ctx.n_param_homes >= ctx.param_home_cap) {

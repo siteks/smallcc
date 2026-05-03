@@ -793,7 +793,7 @@ static Value *insert_spill_addr(Function *f, Block *b, Inst *anchor, int slot_of
 static Value *insert_spill_load(Function *f, Block *b, Inst *before,
                                  Value *spilled_val, int slot_offset) {
     int sz = (spilled_val->vtype == VT_F32 || spilled_val->vtype == VT_I32 ||
-              spilled_val->vtype == VT_U32) ? 4 : 2;
+              spilled_val->vtype == VT_U32 || spilled_val->vtype == VT_PTR) ? 4 : 2;
 
     Value *tmp  = new_value(f, VAL_INST, spilled_val->vtype);
     Inst  *load = new_inst(f, b, IK_LOAD, tmp);
@@ -829,7 +829,7 @@ static Value *insert_spill_load(Function *f, Block *b, Inst *before,
 static void insert_spill_store(Function *f, Block *b, Inst *after,
                                 Value *src, int slot_offset) {
     int sz = (src->vtype == VT_F32 || src->vtype == VT_I32 ||
-              src->vtype == VT_U32) ? 4 : 2;
+              src->vtype == VT_U32 || src->vtype == VT_PTR) ? 4 : 2;
 
     Inst *store  = new_inst(f, b, IK_STORE, NULL);
     store->size  = sz;
@@ -918,13 +918,23 @@ static void rewrite_spills(Function *f, IGraph *g) {
             continue;
         }
         newly_spilled[i] = 1;
-        int sz = (v->vtype == VT_F32 || v->vtype == VT_I32 || v->vtype == VT_U32) ? 4 : 2;
+        // ILP32: pointers are also 4 bytes — without VT_PTR in this set,
+        // a spilled pointer would get a 2-byte slot and rewrite_spills would
+        // emit `lw`/`sw` (16-bit) instead of `ll`/`sl` (32-bit), corrupting
+        // the high half of the address. The misaligned spill offset also
+        // triggers the "32-bit access to unaligned address" trap in sim_c.
+        int sz = (v->vtype == VT_F32 || v->vtype == VT_I32 || v->vtype == VT_U32 ||
+                  v->vtype == VT_PTR) ? 4 : 2;
+        // Align FIRST so the resulting offset is naturally aligned for `sz`.
+        // The previous `+= 2` / `+= 1` heuristics only worked when frame_size
+        // was already at a specific residue; under ILP32 the new mix of int
+        // (4-byte) and short (2-byte) and char (1-byte) spills hits all four
+        // residues mod 4. Round frame_size up to the next multiple of `sz`,
+        // then add `sz`. spill_offset = -frame_size lands at a -multiple-of-sz
+        // boundary as required by the F2 / F3c bp-relative ops.
+        if (sz == 4) f->frame_size = (f->frame_size + 3) & ~3;
+        else if (sz == 2) f->frame_size = (f->frame_size + 1) & ~1;
         f->frame_size += sz;
-        // Align: 4-byte spills need 4-byte alignment, 2-byte spills need 2-byte alignment
-        if (sz == 4 && (f->frame_size % 4) != 0)
-            f->frame_size += 2;
-        if (sz == 2 && (f->frame_size % 2) != 0)
-            f->frame_size += 1;
         spill_offset[i] = -(f->frame_size);  // negative = below bp
         v->spill_slot = spill_offset[i];
     }
