@@ -144,15 +144,29 @@ two-slot scheme used by older CPU3 toolchains.
   multiple of 4) and `callee_frame` (4 × number of saved r4–r7 registers),
   then emits `enter (frame_size + callee_frame)`.
 
-### Alignment requirement (hardware-enforced)
+### Alignment requirement (software contract)
 
 All multi-byte memory access must be naturally aligned:
 - 16-bit load/store at addresses divisible by 2.
 - 32-bit load/store at addresses divisible by 4.
 
-Misaligned access raises an alignment exception. Both `sim_c` and the RTL
-trap on this. The compiler is responsible for placing every local and spill
-slot at a properly-aligned bp-relative offset.
+The compiler is responsible for placing every local and spill slot at a
+properly-aligned bp-relative offset.
+
+**Enforcement is currently asymmetric.** `sim_c` checks every load/store
+and aborts with `CPU4 alignment error: 32-bit access to unaligned address
+0xXXXX at pc=0xYYYY` on a violation — that's how the spill-alignment bugs
+during the ILP32 transition were caught. The RTL does **not** raise an
+exception on misaligned access; it silently performs whatever the
+hardware datapath does (typically dropping the low bits of the address),
+which produces wrong values rather than a clean trap.
+
+Adding a hardware alignment exception (along with a general exception /
+trap mechanism for future use — divide-by-zero, illegal opcode, etc.) is
+parked future work, **low priority**. Until then, the compiler is the
+only line of defence: any misalignment is a compiler bug to be caught by
+`sim_c` and fixed at source. User code that hand-writes pointer arithmetic
+risks silent corruption on the RTL even though `sim_c` would have caught it.
 
 ---
 
