@@ -250,6 +250,38 @@ static int collect_needed_libs(char **user_files, int user_count,
     return lib_count;
 }
 
+// Force-include every .c file in the target runtime dir (e.g. lib/targets/hw/).
+// These are not header-driven — they are always compiled in for the selected
+// target. Returns the number of files appended into files[] starting at
+// already_have; files[] must have room for at least max_additional entries.
+static int collect_runtime_files(const char *runtime_dir,
+                                  char **files, int already_have, int max_additional)
+{
+    DIR *d = opendir(runtime_dir);
+    if (!d) return 0;
+    int added = 0;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL)
+    {
+        const char *name = de->d_name;
+        size_t n = strlen(name);
+        if (n < 3) continue;
+        if (strcmp(name + n - 2, ".c") != 0) continue;
+        if (added >= max_additional) break;
+        char path[4096];
+        snprintf(path, sizeof(path), "%s/%s", runtime_dir, name);
+        char *p = malloc(strlen(path) + 1);
+        if (!p) error("out of memory");
+        strcpy(p, path);
+        files[already_have + added] = p;
+        added++;
+    }
+    closedir(d);
+    // Alphabetise the newly-added entries for deterministic order
+    qsort(files + already_have, added, sizeof(char *), compare_str);
+    return added;
+}
+
 // Phase 1 measurement: log per-call fire counts when OPT_STATS is set.
 // STAT(tag, counter, call) resets the counter, runs the call, then emits
 // one line to stderr — only when OPT_STATS is set AND the count is > 0.
@@ -303,6 +335,7 @@ int main(int argc, char **argv)
     IrSim *irsim = NULL;
     const char *cmdline_defines[256];
     int num_defines = 0;
+    const char *target_name = "sim";  // -target {sim|hw}; selects runtime (lib/targets/<t>/) and crt0
 
     while (file_start < argc && argv[file_start][0] == '-')
     {
@@ -319,6 +352,12 @@ int main(int argc, char **argv)
                 "  -DNAME[=VALUE]     Define preprocessor macro\n"
                 "  -I<dir>            Add directory to #include <...> search path\n"
                 "\n"
+                "Target:\n"
+                "  -arch cpu4         Target architecture (only cpu4 is supported; default)\n"
+                "  -target sim|hw     Select runtime backend (default: sim).\n"
+                "                     sim  = putchar via __putchar opcode -> stderr\n"
+                "                     hw   = putchar writes to 0xF000 ASCII framebuffer\n"
+                "\n"
                 "IR dumps:\n"
                 "  -ssa <file>        Write Braun SSA IR to <file> after braun_function\n"
                 "  -oos <file>        Write post-OOS IR to <file> after out_of_ssa\n"
@@ -330,6 +369,8 @@ int main(int argc, char **argv)
                 "\n"
                 "Debug:\n"
                 "  -ann               Annotate assembly output with source comments\n"
+                "  -g                 Emit '; @src FILE LINE' directives for the assembler's\n"
+                "                     PC->source line map (consumed by sim_c -linemap)\n"
                 "  -O0                Disable all optional optimization passes\n"
                 "  -O1                Safe passes only (fold_br + dead_blocks + copy_prop)\n"
                 "  -O / -O2           All passes (default)\n"
@@ -388,6 +429,16 @@ int main(int argc, char **argv)
             else { fprintf(stderr, "smallcc: unknown arch: %s\n", arch); return 1; }
             file_start += 2;
         }
+        else if (strcmp(argv[file_start], "-target") == 0 && file_start + 1 < argc)
+        {
+            const char *t = argv[file_start + 1];
+            if (strcmp(t, "sim") != 0 && strcmp(t, "hw") != 0) {
+                fprintf(stderr, "smallcc: unknown target: %s (expected sim or hw)\n", t);
+                return 1;
+            }
+            target_name = t;
+            file_start += 2;
+        }
         else if (strcmp(argv[file_start], "-ssa") == 0 && file_start + 1 < argc)
         {
             ssa_out = fopen(argv[file_start + 1], "w");
@@ -419,6 +470,11 @@ int main(int argc, char **argv)
         else if (strcmp(argv[file_start], "-ann") == 0)
         {
             flag_annotate = 1;
+            file_start++;
+        }
+        else if (strcmp(argv[file_start], "-g") == 0)
+        {
+            flag_linemap = 1;
             file_start++;
         }
         else if (strncmp(argv[file_start], "-O", 2) == 0)
@@ -486,12 +542,25 @@ int main(int argc, char **argv)
     snprintf(include_dir, sizeof(include_dir), "%s/include", compiler_dir);
     set_include_dir(include_dir);
 
+    // Predefine target macro so source can #ifdef on the target.
+    if (num_defines < 256)
+    {
+        cmdline_defines[num_defines++] =
+            (strcmp(target_name, "hw") == 0) ? "__TARGET_HW__=1" : "__TARGET_SIM__=1";
+    }
+
     // Collect lib/*.c files for headers actually #include'd by user files
     char lib_dir[4096];
     snprintf(lib_dir, sizeof(lib_dir), "%s/lib", compiler_dir);
     char *lib_files[64];
     int lib_count = collect_needed_libs(argv + file_start, argc - file_start,
                                         lib_dir, lib_files, 64);
+
+    // Force-include every .c file in the target-specific runtime dir
+    // (e.g. lib/targets/sim/_putc.c). These are not header-driven.
+    char runtime_dir[4096];
+    snprintf(runtime_dir, sizeof(runtime_dir), "%s/lib/targets/%s", compiler_dir, target_name);
+    lib_count += collect_runtime_files(runtime_dir, lib_files, lib_count, 64 - lib_count);
 
     int user_count = argc - file_start;
     int tu_count = lib_count + user_count;
@@ -510,10 +579,15 @@ int main(int argc, char **argv)
     }
 
     if (!preprocess_only) {
-        // Preamble: emit crt0_cpu4.s if present, else built-in default
+        // Preamble: try target-specific crt0 first, fall back to generic,
+        // then to built-in default.
         char crt0_path[4096];
-        snprintf(crt0_path, sizeof(crt0_path), "%s/lib/crt0_cpu4.s", compiler_dir);
+        snprintf(crt0_path, sizeof(crt0_path), "%s/lib/targets/%s/crt0_cpu4.s", compiler_dir, target_name);
         FILE *crt0 = fopen(crt0_path, "r");
+        if (!crt0) {
+            snprintf(crt0_path, sizeof(crt0_path), "%s/lib/crt0_cpu4.s", compiler_dir);
+            crt0 = fopen(crt0_path, "r");
+        }
         if (crt0) {
             char buf[256];
             while (fgets(buf, sizeof(buf), crt0))
@@ -531,10 +605,14 @@ int main(int argc, char **argv)
             fprintf(stderr, "%-4s  %-10s  %8s  %8s\n", "TU", "file", "arena_before", "arena_used");
     }
 
-    // For CPU4: defer all globals/strlits to after all functions, so that
-    // _globals_start: marks the clean code/data boundary for clearmem + watchpoint.
-    FILE *globals_buf = tmpfile();
-    if (!globals_buf) { perror("tmpfile"); return 1; }
+    // For CPU4: defer all globals/strlits to after all functions.
+    // Two buffers so the emitted layout separates initialized data (RODATA:
+    // strlits, initialized globals, initialized static locals) from BSS
+    // (zero-init globals/static-locals). The crt0 only zero-fills BSS, so
+    // this keeps string literals and other initialized data intact on hw.
+    FILE *init_buf = tmpfile();
+    FILE *bss_buf  = tmpfile();
+    if (!init_buf || !bss_buf) { perror("tmpfile"); return 1; }
 
     int cpu4_strlit_id = 0;  // monotonically increasing string literal ID across TUs
     for (int tu = 0; tu < tu_count; tu++)
@@ -613,7 +691,7 @@ int main(int argc, char **argv)
             // Nanopass pipeline: Node* → SSA → IRC → CPU4
             // Phase 1: emit global variables and top-level string literals
             Sx *sx_prog = lower_globals(node, tu, &cpu4_strlit_id);
-            emit_globals(sx_prog, globals_buf);
+            emit_globals(sx_prog, init_buf, bss_buf);
             if (irsim) irsim_populate_globals(irsim, sx_prog);
             // Phase 2: compile each function directly from Node* to SSA
             Node *decls = (node && node->kind == ND_PROGRAM) ? node->ch[0] : node;
@@ -631,7 +709,7 @@ int main(int argc, char **argv)
                         irsim_add_strlit(irsim, _lbl, _dat, _len);
                     }
                 }
-                braun_emit_strlits(globals_buf);
+                braun_emit_strlits(init_buf, bss_buf);
                 if (f) {
                     if (ssa_out) { fprintf(ssa_out, "=== SSA: %s ===\n", f->name); print_function(f, ssa_out); }
                     split_critical_edges(f);
@@ -673,18 +751,30 @@ int main(int argc, char **argv)
         }
     }
 
-    // Flush deferred globals after all functions — _globals_start: marks
-    // the code/data boundary used by clearmem and the sim_c write watchpoint.
+    // Flush deferred globals after all functions.
+    //   _globals_start: first byte of all global data (code/data boundary)
+    //   _bss_start: first byte of zero-init data (clearmem range start)
+    //   _bss_end:   one-past-last byte of zero-init data (clearmem range end)
+    //   _globals_end: one-past-last byte of all global data
+    // On real hardware the crt0 zero-fills [_bss_start, _bss_end); on the
+    // simulator sim_c treats clearmem as a no-op (memory starts zero anyway).
     if (!run_oos && !run_irc) {
         fprintf(out, "    align\n");
         fprintf(out, "_globals_start:\n");
-        rewind(globals_buf);
         char xbuf[4096];
         size_t n;
-        while ((n = fread(xbuf, 1, sizeof(xbuf), globals_buf)) > 0)
+        rewind(init_buf);
+        while ((n = fread(xbuf, 1, sizeof(xbuf), init_buf)) > 0)
             fwrite(xbuf, 1, n, out);
+        fprintf(out, "_bss_start:\n");
+        rewind(bss_buf);
+        while ((n = fread(xbuf, 1, sizeof(xbuf), bss_buf)) > 0)
+            fwrite(xbuf, 1, n, out);
+        fprintf(out, "_bss_end:\n");
+        fprintf(out, "_globals_end:\n");
     }
-    fclose(globals_buf);
+    fclose(init_buf);
+    fclose(bss_buf);
 
     if (show_stats)
         fprintf(stderr, "arena total: %zu / %zu bytes (%.1f%%)\n",

@@ -138,6 +138,8 @@ struct Block {
 
 struct Function {
     char    *name;
+    const char *filename;   // source file the function was compiled from (for -g line map)
+    int      decl_line;     // source line of the function declaration (for -g line map)
     Block  **blocks;    int nblocks;   int blk_cap;
     Value  **values;    int nvalues;   int val_cap;
     Value  **params;    int nparams;   int param_cap;

@@ -1,26 +1,48 @@
+#include <stdarg.h>
+#include <_putc.h>
+
+/* Output sink state.
+ * _out_buf == NULL → write to _putc (printf, puts)
+ * _out_buf != NULL:
+ *   _out_size <  0  → write unbounded to _out_buf (sprintf)
+ *   _out_size >= 0  → write at most _out_size-1 bytes to _out_buf (snprintf)
+ * _out_pos counts bytes that *would* be written, used for the return value. */
+static char *_out_buf;
+static int   _out_size;
+static int   _out_pos;
+
 int putchar(int c)
 {
-    __putchar(c);
-    return c;
+    return _putc(c);
+}
+
+static void _emit(int c)
+{
+    if (_out_buf == 0) {
+        _putc(c);
+    } else if (_out_size < 0 || _out_pos + 1 < _out_size) {
+        _out_buf[_out_pos] = (char)c;
+    }
+    _out_pos++;
 }
 
 static void _print_str(const char *s)
 {
     while (*s)
-        putchar(*s++);
+        _emit(*s++);
 }
 
 static void _print_int(int n)
 {
-    if (n < 0) { putchar('-'); n = -n; }
+    if (n < 0) { _emit('-'); n = -n; }
     if (n > 9) _print_int(n / 10);
-    putchar('0' + n % 10);
+    _emit('0' + n % 10);
 }
 
 static void _print_ulong(unsigned long n)
 {
     if (n > 9) _print_ulong(n / 10);
-    putchar('0' + (int)(n % 10));
+    _emit('0' + (int)(n % 10));
 }
 
 static void _print_hex(unsigned long n, int width)
@@ -36,15 +58,14 @@ static void _print_hex(unsigned long n, int width)
         }
     }
     int i;
-    for (i = len; i < width; i++) putchar('0');
-    /* Print digits stored in reverse — avoid i>=0 with negative i */
-    while (len > 0) { len--; putchar(buf[len]); }
+    for (i = len; i < width; i++) _emit('0');
+    while (len > 0) { len--; _emit(buf[len]); }
 }
 
 static void _print_long_dec(long n)
 {
     if (n >= 10) _print_long_dec(n / 10);
-    putchar('0' + (int)(n % 10));
+    _emit('0' + (int)(n % 10));
 }
 
 static int _count_long_digits(long n)
@@ -60,44 +81,35 @@ static void _print_float_wp(double f, int width, int prec)
     if (f < 0.0) { neg = 1; f = -f; }
     long ipart = (long)f;
     double fpart = f - (double)ipart;
-    /* Compute total character count for padding */
     int total = (neg ? 1 : 0) + _count_long_digits(ipart) + 1 + prec;
     int i;
-    for (i = total; i < width; i++) putchar(' ');
-    if (neg) putchar('-');
+    for (i = total; i < width; i++) _emit(' ');
+    if (neg) _emit('-');
     _print_long_dec(ipart);
-    putchar('.');
+    _emit('.');
     for (i = 0; i < prec; i++) {
         fpart *= 10.0;
         int d = (int)fpart;
-        putchar('0' + d);
+        _emit('0' + d);
         fpart -= (double)d;
     }
 }
 
-static void _print_float(double f)
-{
-    _print_float_wp(f, 0, 6);
-}
-
 int puts(const char *s)
 {
+    _out_buf = 0;
     _print_str(s);
-    putchar('\n');
+    _emit('\n');
     return 0;
 }
 
-int printf(const char *fmt, ...)
+static void _vformat(const char *fmt, va_list ap)
 {
-    va_list ap;
-    va_start(ap, fmt);
-    int count = 0;
     while (*fmt)
     {
         if (*fmt != '%')
         {
-            putchar(*fmt);
-            count++;
+            _emit(*fmt);
             fmt++;
             continue;
         }
@@ -126,7 +138,7 @@ int printf(const char *fmt, ...)
             {
                 if (is_long) {
                     long n = va_arg(ap, long);
-                    if (n < 0) { putchar('-'); _print_long_dec(-n); }
+                    if (n < 0) { _emit('-'); _print_long_dec(-n); }
                     else _print_long_dec(n);
                 } else {
                     int n = va_arg(ap, int);
@@ -140,7 +152,6 @@ int printf(const char *fmt, ...)
                     unsigned long n = va_arg(ap, unsigned long);
                     _print_ulong(n);
                 } else {
-                    /* unsigned int is same slot size as int on this target */
                     unsigned int n = (unsigned int)va_arg(ap, int);
                     _print_ulong((unsigned long)n);
                 }
@@ -164,8 +175,7 @@ int printf(const char *fmt, ...)
             case 99:    /* 'c' */
             {
                 int c = va_arg(ap, int);
-                putchar(c);
-                count++;
+                _emit(c);
                 break;
             }
             case 102:   /* 'f' */
@@ -175,12 +185,50 @@ int printf(const char *fmt, ...)
                 break;
             }
             case 37:    /* '%' */
-                putchar('%');
-                count++;
+                _emit('%');
                 break;
         }
         fmt++;
     }
+}
+
+int printf(const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    _out_buf = 0;
+    _out_pos = 0;
+    _vformat(fmt, ap);
     va_end(ap);
-    return count;
+    return _out_pos;
+}
+
+int sprintf(char *buf, const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    _out_buf = buf;
+    _out_size = -1;
+    _out_pos = 0;
+    _vformat(fmt, ap);
+    va_end(ap);
+    buf[_out_pos] = '\0';
+    return _out_pos;
+}
+
+int snprintf(char *buf, int size, const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    _out_buf = buf;
+    _out_size = size;
+    _out_pos = 0;
+    _vformat(fmt, ap);
+    va_end(ap);
+    if (size > 0) {
+        int term = _out_pos;
+        if (term > size - 1) term = size - 1;
+        buf[term] = '\0';
+    }
+    return _out_pos;
 }

@@ -115,11 +115,16 @@ class CTestItem(pytest.Item):
 
             return
 
+        target = meta.get('TARGET', 'sim')
+        if target not in ('sim', 'hw'):
+            raise pytest.fail.Exception(f"invalid TARGET {target!r} (expected sim or hw)")
+
         with tempfile.TemporaryDirectory() as tmp:
             asm = os.path.join(tmp, 'out.s')
 
-            # Compile with -arch cpu4
-            compile_cmd = [str(root / 'smallcc'), '-arch', 'cpu4', '-o', asm] + files
+            # Compile with -arch cpu4 -target <target>
+            compile_cmd = [str(root / 'smallcc'), '-arch', 'cpu4',
+                           '-target', target, '-o', asm] + files
 
             proc = subprocess.run(compile_cmd, capture_output=True, text=True)
 
@@ -131,8 +136,11 @@ class CTestItem(pytest.Item):
             assert proc.returncode == 0, \
                 f"compile failed (exit {proc.returncode}):\n{proc.stderr}"
 
-            # Simulate with sim_c -arch cpu4
-            sim_cmd = [str(root / 'sim_c'), '-arch', 'cpu4', asm]
+            # Simulate with sim_c -arch cpu4; for hw target, request framebuffer dump.
+            sim_cmd = [str(root / 'sim_c'), '-arch', 'cpu4']
+            if target == 'hw':
+                sim_cmd.append('-dumpfb')
+            sim_cmd.append(asm)
 
             sim = subprocess.run(sim_cmd, capture_output=True, text=True)
 

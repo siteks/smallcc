@@ -37,6 +37,14 @@ import sys
 #   Format 0a implicit or special hotspot (16 slots)
 #   halt
 #   ret     sp = bp; bp = [sp]&0xffff; pc = [sp]>>16; sp += 4
+#   zero0   r0 = 0
+#   zero1   r1 = 0
+#   zero2   r2 = 0
+#   zero3   r3 = 0
+#   zero4   r4 = 0
+#   zero5   r5 = 0
+#   zero6   r6 = 0
+#   zero7   r7 = 0
 #
 #   Format 0b - two op + imm9 (32 slots)
 #   addli   rx = ry + sxt(imm9)
@@ -94,7 +102,9 @@ import sys
 #   fdiv
 #   flt
 #   fle
-#   (6 left)
+#   zxwor   rd = (rx | ry) & 0xffff
+#   sxwor   rd = sxt((rx | ry) & 0xffff, 16)
+#   (4 left)
 #
 #   Format 1b - single op, (64 slots)
 #   sxb     rd
@@ -125,6 +135,7 @@ import sys
 #   shli    rx = rx << imm7
 #   andi    rx = rx & imm7
 #   shrsi   rx = rx >> imm7
+#   imms    rx = sxt(imm7)
 #
 #   Format 3a - zero op + imm16 (4 slots)
 #   j       pc = imm16
@@ -251,6 +262,8 @@ class G:
         'fdiv'  :   (0x6c, 1, 0, 0),
         'flt'   :   (0x6e, 1, 0, 0),
         'fle'   :   (0x70, 1, 0, 0),
+        'zxwor' :   (0x72, 1, 0, 0),
+        'sxwor' :   (0x74, 1, 0, 0),
         # format 1b - one op, 16 bits   0111111dddoooooo
         # this format escapes to give large space for single op no imm
         'sxb'   :   (0x7e, 1, 1, 0x00),
@@ -611,6 +624,8 @@ class CPU:
         elif    i == 'fdiv':    s.r[dst] = f2b(b2f(s.r[src0]) / b2f(s.r[src1]))
         elif    i == 'flt':     s.r[dst] = b2f(s.r[src0]) < b2f(s.r[src1])
         elif    i == 'fle':     s.r[dst] = b2f(s.r[src0]) <= b2f(s.r[src1])
+        elif    i == 'zxwor':   s.r[dst] = (s.r[src0] | s.r[src1]) & 0xffff
+        elif    i == 'sxwor':   v = (s.r[src0] | s.r[src1]) & 0xffff; s.r[dst] = 0xffff0000 | v if v & 0x8000 else v
         # f1b
         elif    i == 'sxb':     s.r[dst] = 0xffffff00 | s.r[src0] if s.r[src0] & 0x80 else 0xff & s.r[src0]
         elif    i == 'sxw':     s.r[dst] = 0xffff0000 | s.r[src0] if s.r[src0] & 0x8000 else 0xffff & s.r[src0]

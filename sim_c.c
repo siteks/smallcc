@@ -1,7 +1,7 @@
 /*
  * sim_c.c — CPU4 assembler + simulator
  *
- * Usage:  ./sim_c [-v] [-arch cpu4] [-maxsteps N] file.s
+ * Usage:  ./sim_c [-trace FILE] [-arch cpu4] [-maxsteps N] file.s
  * Output: putchar to stderr; state line to stdout
  *   r0:..r7:XXXXXXXX sp:XXXX bp:XXXX lr:XXXX pc:XXXX H:X cycles:N
  */
@@ -29,12 +29,69 @@ static uint32_t g_cycles = 0;
 /* ------------------------------------------------------------------ */
 
 static int       g_profile   = 0;
-static int       g_dump      = 0;
+static const char *g_dump_out = NULL;
 static uint16_t  g_asm_end   = 0;   /* high-water mark of assembler cur */
 static uint32_t  prof_count[65536];   /* execution count per PC address */
 static int16_t   prof_lineno[65536];  /* addr -> source line index (-1 = none) */
 static char    **prof_lines  = NULL;  /* original source lines (strdup'd) */
 static int       prof_nlines = 0;
+
+/* ------------------------------------------------------------------ */
+/* Source-line map (-linemap): PC -> (file, line)                       */
+/* Populated from "; @src FILE LINE" directives emitted by smallcc -g.  */
+/* ------------------------------------------------------------------ */
+
+typedef struct { uint16_t addr; char file[128]; int line; } SrcLoc;
+static SrcLoc   *g_srclocs      = NULL;
+static int       g_nsrclocs     = 0;
+static int       g_cap_srclocs  = 0;
+static const char *g_linemap_out = NULL;
+static const char *g_hex_out     = NULL;
+
+static void add_srcloc(uint16_t addr, const char *file, int line)
+{
+    if (g_nsrclocs == g_cap_srclocs) {
+        int nc = g_cap_srclocs ? g_cap_srclocs * 2 : 256;
+        SrcLoc *nb = realloc(g_srclocs, nc * sizeof(SrcLoc));
+        if (!nb) { fprintf(stderr, "oom srcloc\n"); exit(1); }
+        g_srclocs = nb; g_cap_srclocs = nc;
+    }
+    SrcLoc *sl = &g_srclocs[g_nsrclocs++];
+    sl->addr = addr;
+    sl->line = line;
+    size_t n = strlen(file);
+    if (n >= sizeof(sl->file)) n = sizeof(sl->file) - 1;
+    memcpy(sl->file, file, n);
+    sl->file[n] = '\0';
+}
+
+/* Dump the assembled image as whitespace-delimited hex bytes. Covers
+ * [0 .. g_asm_end), i.e. all code + data the assembler produced. */
+static void dump_hex(const char *path)
+{
+    FILE *f = fopen(path, "w");
+    if (!f) { perror(path); return; }
+    for (uint16_t a = 0; a < g_asm_end; a++) {
+        fprintf(f, "%02x%c", mem[a],
+                ((a + 1) % 32 == 0 || a + 1 == g_asm_end) ? '\n' : ' ');
+    }
+    fclose(f);
+}
+
+/* Dump collected (pc -> file:line) entries as JSON. */
+static void dump_linemap(const char *path)
+{
+    FILE *f = fopen(path, "w");
+    if (!f) { perror(path); return; }
+    fprintf(f, "{\n");
+    for (int i = 0; i < g_nsrclocs; i++) {
+        fprintf(f, "  \"0x%04x\": {\"file\": \"%s\", \"line\": %d}%s\n",
+                g_srclocs[i].addr, g_srclocs[i].file, g_srclocs[i].line,
+                (i == g_nsrclocs - 1) ? "" : ",");
+    }
+    fprintf(f, "}\n");
+    fclose(f);
+}
 
 static void prof_split_lines(const char *src)
 {
@@ -413,6 +470,34 @@ static void assemble_cpu4(const char *src)
                 p += strlen(p);
             }
             int cur_lineno = lineno++;
+
+            /* Debug directive "; @src FILE LINE" — recorded against the
+             * NEXT emitted byte address (cur). Parsed before strip_comment
+             * swallows the semicolon. */
+            if (pass == 2) {
+                const char *sp = line;
+                while (*sp == ' ' || *sp == '\t') sp++;
+                if (sp[0] == ';') {
+                    sp++;
+                    while (*sp == ' ' || *sp == '\t') sp++;
+                    if (strncmp(sp, "@src", 4) == 0 &&
+                        (sp[4] == ' ' || sp[4] == '\t')) {
+                        sp += 5;
+                        while (*sp == ' ' || *sp == '\t') sp++;
+                        char file[128];
+                        size_t fi = 0;
+                        while (*sp && *sp != ' ' && *sp != '\t' &&
+                               fi + 1 < sizeof(file))
+                            file[fi++] = *sp++;
+                        file[fi] = '\0';
+                        while (*sp == ' ' || *sp == '\t') sp++;
+                        int ln = (int)strtol(sp, NULL, 0);
+                        if (fi > 0 && ln > 0)
+                            add_srcloc((uint16_t)cur, file, ln);
+                    }
+                }
+            }
+
             strip_comment(line);
             if (line[0] == '\0') continue;
 
@@ -760,9 +845,10 @@ static int sym_cmp(const void *a, const void *b)
 static int32_t sx9(int32_t v);  /* forward decl — defined with other sign-ext helpers below */
 static int32_t sx10(int32_t v); /* forward decl — defined with other sign-ext helpers below */
 
-static void print_dump(uint16_t code_end, uint16_t data_end)
+static void print_dump(uint16_t code_end, uint16_t data_end, const char *path)
 {
-    FILE *out = stderr;
+    FILE *out = fopen(path, "w");
+    if (!out) { perror(path); return; }
 
     /* --- Symbol table --- */
     Sym *sorted = malloc((size_t)nsyms * sizeof(Sym));
@@ -1006,6 +1092,7 @@ static void print_dump(uint16_t code_end, uint16_t data_end)
     }
 
     fprintf(out, "\n");
+    fclose(out);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1025,7 +1112,9 @@ static int32_t sx16(int32_t v) { return (int32_t)(int16_t)(v & 0xffff); }
 /* CPU4 executor                                                        */
 /* ------------------------------------------------------------------ */
 
-static void run_cpu4(int verbose)
+static FILE *g_trace_out = NULL;
+
+static void run_cpu4(void)
 {
     uint32_t r[8] = {0};
     uint16_t sp = 0, bp = 0, lr = 0, pc = 0;
@@ -1132,9 +1221,21 @@ static void run_cpu4(int verbose)
         trace[trace_idx].r0 = r[0]; trace[trace_idx].sp = sp; trace[trace_idx].bp = bp;
         trace_idx = (trace_idx + 1) % TRACE_N4;
 
-        if (verbose) {
-            fprintf(stderr, "[%04x] op=%02x r0=%08x r1=%08x r2=%08x r3=%08x sp=%04x bp=%04x\n",
-                    oldpc, b0, r[0], r[1], r[2], r[3], sp, bp);
+        if (g_trace_out) {
+            int ilen = (int)(uint16_t)(pc - oldpc);
+            if (ilen < 1) ilen = 1;
+            if (ilen > 3) ilen = 3;
+            char ins_buf[8];
+            int p = 0;
+            for (int i = 0; i < ilen; i++)
+                p += snprintf(ins_buf + p, sizeof(ins_buf) - p,
+                              "%02x", read8((uint16_t)(oldpc + i)));
+            fprintf(g_trace_out,
+                "pc=%04x ins=%-6s r0=%08x r1=%08x r2=%08x r3=%08x "
+                "r4=%08x r5=%08x r6=%08x r7=%08x sp=%04x bp=%04x lr=%04x\n",
+                oldpc, ins_buf,
+                r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7],
+                sp, bp, lr);
         }
 
         switch (lookupop) {
@@ -1360,16 +1461,60 @@ static char *read_file(const char *path)
     return buf;
 }
 
+/* Dump the 80x30 ASCII framebuffer at 0xF000 to stderr.
+ * Each row is printed as up to 80 chars, trimmed of trailing whitespace, + '\n'.
+ * Non-printable bytes (including \0) render as ' '. */
+static void dump_framebuffer(void)
+{
+    for (int row = 0; row < 30; row++) {
+        char line[81];
+        for (int col = 0; col < 80; col++) {
+            uint8_t b = mem[0xF000 + row * 80 + col];
+            line[col] = (b >= 32 && b < 127) ? (char)b : ' ';
+        }
+        int end = 80;
+        while (end > 0 && line[end - 1] == ' ') end--;
+        line[end] = '\0';
+        fprintf(stderr, "%s\n", line);
+    }
+}
+
+static const char *usage_text =
+"usage: sim_c [options] file.s\n"
+"\n"
+"Assemble and run a CPU4 program.\n"
+"\n"
+"Options:\n"
+"  -h, --help         Show this help and exit\n"
+"  -trace FILE        Write a per-instruction execution trace to FILE\n"
+"  -arch cpu4         Target architecture (only cpu4 is supported)\n"
+"  -maxsteps N        Override the default instruction-step cap\n"
+"  -dump FILE         Assemble and write a bytecode dump; do not execute\n"
+"  -dumpfb            After running, dump the 80x30 framebuffer at 0xF000\n"
+"  -profile           Collect and print a per-source-line execution profile\n"
+"  -linemap FILE      Assemble and write a PC->source JSON map; do not execute\n"
+"  -hex FILE          Assemble and write whitespace-delimited hex bytes; do not execute\n"
+"\n"
+"-dump, -linemap, and -hex stop after assembly and produce no runtime output.\n";
+
+static void print_usage(FILE *f) { fputs(usage_text, f); }
+
 int main(int argc, char **argv)
 {
-    int verbose = 0;
+    int dumpfb = 0;
+    const char *trace_path = NULL;
     const char *filename = NULL;
     int maxsteps_override = 0;
 
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "-v") == 0) verbose = 1;
+        if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+            print_usage(stdout);
+            return 0;
+        }
+        else if (strcmp(argv[i], "-trace") == 0 && i+1 < argc) trace_path = argv[++i];
         else if (strcmp(argv[i], "-profile") == 0) g_profile = 1;
-        else if (strcmp(argv[i], "-dump") == 0) g_dump = 1;
+        else if (strcmp(argv[i], "-dump") == 0 && i+1 < argc) g_dump_out = argv[++i];
+        else if (strcmp(argv[i], "-dumpfb") == 0) dumpfb = 1;
         else if (strcmp(argv[i], "-arch") == 0 && i+1 < argc) {
             i++;
             if (strcmp(argv[i], "cpu4") != 0) {
@@ -1380,10 +1525,16 @@ int main(int argc, char **argv)
         else if (strcmp(argv[i], "-maxsteps") == 0 && i+1 < argc) {
             maxsteps_override = atoi(argv[++i]);
         }
+        else if (strcmp(argv[i], "-linemap") == 0 && i+1 < argc) {
+            g_linemap_out = argv[++i];
+        }
+        else if (strcmp(argv[i], "-hex") == 0 && i+1 < argc) {
+            g_hex_out = argv[++i];
+        }
         else filename = argv[i];
     }
     if (!filename) {
-        fprintf(stderr, "usage: sim_c [-v] [-dump] [-profile] [-arch cpu4] [-maxsteps N] file.s\n");
+        print_usage(stderr);
         return 1;
     }
 
@@ -1394,15 +1545,24 @@ int main(int argc, char **argv)
     if (g_profile) prof_split_lines(src);
     assemble_cpu4(src);
     free(src);
+    if (g_linemap_out) dump_linemap(g_linemap_out);
+    if (g_hex_out)     dump_hex(g_hex_out);
     { int i = find_sym("_globals_start"); if (i >= 0) g_write_threshold = syms[i].addr; }
     g_assembler_done = 1;
-    if (g_dump) {
+    if (g_dump_out) {
         uint16_t code_end = g_asm_end;
         { int i = find_sym("_globals_start"); if (i >= 0) code_end = syms[i].addr; }
-        print_dump(code_end, g_asm_end);
-        return 0;
+        print_dump(code_end, g_asm_end, g_dump_out);
     }
-    run_cpu4(verbose);
+    /* -dump / -linemap / -hex are assembly-only passes — do not execute. */
+    if (g_dump_out || g_linemap_out || g_hex_out) return 0;
+    if (trace_path) {
+        g_trace_out = fopen(trace_path, "w");
+        if (!g_trace_out) { perror(trace_path); return 1; }
+    }
+    run_cpu4();
+    if (g_trace_out) fclose(g_trace_out);
+    if (dumpfb) dump_framebuffer();
     if (g_profile) print_profile();
     return 0;
 }

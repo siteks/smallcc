@@ -59,6 +59,20 @@ static void static_locals_push(int id, Symbol *sym, Node *init) {
     g_nsl++;
 }
 
+// Returns 1 if the static local has no initializer or a zero scalar literal.
+static int static_local_is_bss(BStaticLocal *sl) {
+    Node *init = sl->init_node;
+    Type *ty   = sl->sym ? sl->sym->type : NULL;
+    if (!init) return 1;
+    if (ty && istype_array(ty) && init->kind == ND_LITERAL && init->u.literal.strval)
+        return 0;
+    if (!istype_array(ty) && ty && ty->base != TB_STRUCT && init->kind == ND_LITERAL) {
+        if (init->u.literal.ival == 0) return 1;
+        return 0;
+    }
+    return 1;
+}
+
 // Emit data-section assembly for a static local variable
 static void emit_static_local_data(FILE *out, BStaticLocal *sl) {
     Symbol *sym  = sl->sym;
@@ -99,18 +113,22 @@ void braun_get_strlit(int i, char label_buf[32], const char **data, int *len) {
     *len  = g_strlits[i].len;
 }
 
-void braun_emit_strlits(FILE *out) {
+void braun_emit_strlits(FILE *init_out, FILE *bss_out) {
+    // String literals are always initialized RODATA.
     for (int i = 0; i < g_nstrlits; i++) {
-        fprintf(out, "_l%d:", g_strlits[i].id);
+        fprintf(init_out, "_l%d:", g_strlits[i].id);
         const char *data = g_strlits[i].data;
         int len = g_strlits[i].len;
         for (int j = 0; j < len; j++)
-            fprintf(out, "\n    byte %d", (unsigned char)data[j]);
-        fprintf(out, "\n    byte 0\n");
+            fprintf(init_out, "\n    byte %d", (unsigned char)data[j]);
+        fprintf(init_out, "\n    byte 0\n");
     }
     g_nstrlits = 0;
-    for (int i = 0; i < g_nsl; i++)
-        emit_static_local_data(out, &g_static_locals[i]);
+    // Static locals split by whether their initializer is zero.
+    for (int i = 0; i < g_nsl; i++) {
+        FILE *dst = static_local_is_bss(&g_static_locals[i]) ? bss_out : init_out;
+        emit_static_local_data(dst, &g_static_locals[i]);
+    }
     g_nsl = 0;
 }
 
@@ -2276,6 +2294,8 @@ Function *braun_function(Node *func_decl, int tu_index, int *strlit_id) {
     Function *f = new_function(fname);
     f->frame_size  = frame_size;
     f->is_variadic = is_variadic;
+    f->filename    = token_ctx.filename;
+    f->decl_line   = func_decl->line;
 
     BraunCtx ctx = {0};
     ctx.f         = f;

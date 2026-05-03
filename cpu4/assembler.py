@@ -67,13 +67,13 @@ def reg_num(s):
 
 class Assembler:
     def __init__(self):
-        self.clearmem_addr = None
+        self.clearmem_range = None  # (start_addr, end_addr) or None
 
     def assemble(self, code, showsymbols=False):
         self.code = code
         self.symbols = {}
         self.assembly = []
-        self.clearmem_addr = None
+        self.clearmem_range = None
 
         for passes in ['labels', 'assemble']:
             self.textaddr = 0
@@ -175,13 +175,22 @@ class Assembler:
                     operands = transform(operands)
                     mnemonic = real_ins
 
-                # clearmem pseudo-instruction
+                # clearmem pseudo-instruction: clearmem start_label, end_label
+                # Zero-fills the image from start_label up to (but not including)
+                # end_label at load time. Emits no machine code.
                 if mnemonic == 'clearmem':
                     i.length = 0
                     i.ins = []
                     if passes == 'assemble':
-                        if operands and operands[0] in self.symbols:
-                            self.clearmem_addr = self.symbols[operands[0]].addr
+                        if len(operands) != 2:
+                            print('clearmem requires 2 operands (start, end): %s' % i.line)
+                            sys.exit(1)
+                        if operands[0] not in self.symbols or operands[1] not in self.symbols:
+                            print('clearmem: undefined symbol in %s' % i.line)
+                            sys.exit(1)
+                        start = self.symbols[operands[0]].addr
+                        end   = self.symbols[operands[1]].addr
+                        self.clearmem_range = (start, end)
                         self.assembly.append(i)
                     continue
 
@@ -285,8 +294,22 @@ class Assembler:
                     i.ins = [first_byte, (imm16 >> 8) & 0xff, imm16 & 0xff]
                     i.length = 3
 
+                elif extra_bytes == 2 and subfmt == 1 and first_byte < 0x40:
+                    # F0b: two registers + 9-bit signed immediate
+                    # Encoding: byte0 = first_byte
+                    #           byte1 = (subop<<7)|(rd<<4)|(rx<<1)|(imm9>>8)
+                    #           byte2 = imm9 & 0xff
+                    rd = reg_num(operands[0])
+                    rx = reg_num(operands[1])
+                    imm9 = resolve(operands[2]) & 0x1ff
+                    byte0 = first_byte
+                    byte1 = (subop_val << 7) | (rd << 4) | (rx << 1) | ((imm9 >> 8) & 1)
+                    byte2 = imm9 & 0xff
+                    i.ins = [byte0, byte1, byte2]
+                    i.length = 3
+
                 elif extra_bytes == 2 and subfmt == 1:
-                    # Shared F3b/subfmt=1 handler for enter, adjw, lea
+                    # F3b: enter, adjw, lea
                     # enter N: rd=0, imm14=N (frame size in bytes, stored directly)
                     # adjw N: rd=0, imm14=N>>2 (byte offset / 4)
                     # lea rd, N: rd=register, imm14=N>>2 (bp-relative byte offset / 4)
@@ -302,6 +325,20 @@ class Assembler:
                     byte0 = first_byte | (rd >> 2)
                     byte1 = ((rd & 3) << 6) | ((imm14 >> 8) & 0x3f)
                     byte2 = imm14 & 0xff
+                    i.ins = [byte0, byte1, byte2]
+                    i.length = 3
+
+                elif extra_bytes == 2 and subfmt == 2 and first_byte < 0x40:
+                    # F0c: one register + imm7 + PC-relative disp10
+                    # Encoding: byte0 = 001odddi, byte1 = imm17[15:8], byte2 = imm17[7:0]
+                    # where imm17 = (imm7 << 10) | (disp10 & 0x3ff)
+                    rx = reg_num(operands[0])
+                    imm7 = resolve(operands[1]) & 0x7f
+                    disp10 = resolve(operands[2], instr_addr, instr_len, pc_rel=True) & 0x3ff
+                    imm17 = (imm7 << 10) | disp10
+                    byte0 = first_byte | (rx << 1) | (imm17 >> 16)
+                    byte1 = (imm17 >> 8) & 0xff
+                    byte2 = imm17 & 0xff
                     i.ins = [byte0, byte1, byte2]
                     i.length = 3
 
@@ -370,11 +407,9 @@ class Assembler:
                     print('%-15s%4s %04x' % (k, v.section, v.addr))
 
     def makeimage(self, m):
-        if self.clearmem_addr is not None:
-            max_addr = max(
-                (item.addr + item.length for item in self.assembly if item.length > 0),
-                default=self.clearmem_addr)
-            m.mem[self.clearmem_addr:max_addr] = 0
+        if self.clearmem_range is not None:
+            start, end = self.clearmem_range
+            m.mem[start:end] = 0
         for item in self.assembly:
             if item.ins:
                 m.write(item.addr, item.ins)

@@ -463,10 +463,11 @@ The top 256 bytes are MMIO.
 
 | Address | Size | Register | Access |
 |---|---|---|---|
-| `0xFF00` | 4 B | Cycle counter (32-bit, wraps at 2³²−1) | RO |
+| `0xFF00` | 4 B | Microsecond counter (32-bit, wraps at 2³²−1) | RO |
 | `0xFF04–0xFFFF` | — | Reserved | — |
 
-The cycle counter increments once per instruction executed.
+The microsecond counter increments once per microsecond of wall-clock time
+(wraps every ~71.6 minutes).
 
 ---
 

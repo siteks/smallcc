@@ -10,6 +10,7 @@
 // ============================================================
 
 int         flag_annotate = 0;
+int         flag_linemap  = 0;
 
 static char       *ann_src    = NULL;
 static const char **ann_lines = NULL;
@@ -1218,6 +1219,9 @@ static int emit_prologue(Function *f, FILE *out, int frame, int callee_save[4]) 
     for (int r = 4; r <= 7; r++)
         if (callee_save[r - 4]) callee_frame += 4;
 
+    if (flag_linemap && f->decl_line)
+        fprintf(out, "; @src %s %d\n",
+                f->filename ? f->filename : "?", f->decl_line);
     fprintf(out, "    enter %d\n", frame + callee_frame);
 
     int callee_tmp = 0;
@@ -2092,6 +2096,7 @@ static void emit_function_body(Function *f, FILE *out, BranchFuse *fuse,
     struct { Inst *inst; int mn, mx; } jt_info[MAX_JT];
     int jt_count = 0;
     int ann_prev_line = 0;
+    int lm_prev_line  = 0;   // separate tracker for -g line-map directives
 
     for (int bi = 0; bi < f->nblocks; bi++) {
         Block *b = f->blocks[bi];
@@ -2127,6 +2132,11 @@ static void emit_function_body(Function *f, FILE *out, BranchFuse *fuse,
             if (flag_annotate && inst->line && inst->line != ann_prev_line) {
                 emit_src_comment(inst->line, real_out);
                 ann_prev_line = inst->line;
+            }
+            if (flag_linemap && inst->line && inst->line != lm_prev_line) {
+                fprintf(real_out, "; @src %s %d\n",
+                        f->filename ? f->filename : "?", inst->line);
+                lm_prev_line = inst->line;
             }
             // Redirect output to buffer so we can append live annotation
             char *membuf = NULL; size_t memlen = 0;
@@ -2437,19 +2447,34 @@ static Sx *emit_sx_nth(Sx *sx, int n) {
     return cur->car;
 }
 
-void emit_globals(Sx *program, FILE *out) {
+// Returns 1 if the gvar is pure BSS (no init, or SX_INT 0).
+static int gvar_is_bss(Sx *sx) {
+    Sx *init_sx = emit_sx_nth(sx, 3);
+    if (!init_sx) return 1;
+    if (init_sx->kind == SX_INT && init_sx->i == 0) return 1;
+    return 0;
+}
+
+void emit_globals(Sx *program, FILE *init_out, FILE *bss_out) {
     if (!program) return;
     // program is (program item...)
     // Each item is either (func ...) or (gvar name type value) or (strlit id str)
+    // Two passes: initialized data first (strlit + non-BSS gvar) to init_out,
+    // then zero-init gvars to bss_out. Separating these lets the crt0 clearmem
+    // zero only the BSS region without destroying string literals.
     Sx *list = program->kind == SX_PAIR ? program->cdr : NULL;
-    while (list && list->kind == SX_PAIR) {
-        Sx *item = list->car;
+    for (Sx *cur = list; cur && cur->kind == SX_PAIR; cur = cur->cdr) {
+        Sx *item = cur->car;
         const char *tag = sx_tag(item);
-        if (tag) {
-            if (strcmp(tag, "gvar") == 0) emit_sx_data(item, out);
-            if (strcmp(tag, "strlit") == 0) emit_sx_data(item, out);
-        }
-        list = list->cdr;
+        if (!tag) continue;
+        if (strcmp(tag, "strlit") == 0) emit_sx_data(item, init_out);
+        else if (strcmp(tag, "gvar") == 0 && !gvar_is_bss(item)) emit_sx_data(item, init_out);
+    }
+    for (Sx *cur = list; cur && cur->kind == SX_PAIR; cur = cur->cdr) {
+        Sx *item = cur->car;
+        const char *tag = sx_tag(item);
+        if (!tag) continue;
+        if (strcmp(tag, "gvar") == 0 && gvar_is_bss(item)) emit_sx_data(item, bss_out);
     }
 }
 
