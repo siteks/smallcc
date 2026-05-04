@@ -1421,7 +1421,37 @@ static Value *cg_expr(BraunCtx *ctx, Block **cur, Node *n) {
         if (kind >= IK_LT && kind <= IK_NE) result_vt = VT_I16;
         if (kind >= IK_FLT && kind <= IK_FNE) result_vt = VT_I16;
         if (kind == IK_ULT || kind == IK_ULE) result_vt = VT_I16;
-        if (result_vt == VT_VOID) result_vt = VT_I16;
+
+        // Operand-driven widening for non-comparison ops.
+        //
+        // The parent expression's type can be t_void (which the top-level
+        // cg_expr maps to VT_I16) when one operand is a parser-inserted stride
+        // literal. The original fallback then produced an i16 result for
+        // pointer arithmetic, truncating bp-relative addresses to 16 bits.
+        // Under ILP32 a downstream SEXT16 sign-extends those addresses to
+        // 0xFFFF_xxxx — which the cpu4 hardware routes to SDRAM, returning
+        // garbage. (sim_c masks to 16 bits and silently hides the bug.)
+        //
+        // Fix: if either operand is a pointer, the result is a pointer; if
+        // either operand is wider than the inferred result type, widen.
+        bool is_compare = (kind >= IK_LT && kind <= IK_NE) ||
+                          (kind >= IK_FLT && kind <= IK_FNE) ||
+                          (kind == IK_ULT || kind == IK_ULE);
+        if (!is_compare) {
+            if (lv->vtype == VT_PTR || rv->vtype == VT_PTR) {
+                result_vt = VT_PTR;
+            } else if (result_vt == VT_VOID || result_vt == VT_I8 ||
+                       result_vt == VT_U8 || result_vt == VT_I16 ||
+                       result_vt == VT_U16) {
+                if (lv->vtype == VT_F32 || rv->vtype == VT_F32) {
+                    result_vt = VT_F32;
+                } else if (lv->vtype == VT_I32 || lv->vtype == VT_U32 ||
+                           rv->vtype == VT_I32 || rv->vtype == VT_U32) {
+                    result_vt = VT_I32;
+                }
+            }
+        }
+        if (result_vt == VT_VOID) result_vt = VT_I32;   // ILP32 default
 
         return emit_binop(ctx, b, kind, lv, rv, result_vt);
     }
