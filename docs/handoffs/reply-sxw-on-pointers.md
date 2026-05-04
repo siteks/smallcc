@@ -64,8 +64,28 @@ Happy to add that note if you want it.
 
 **Test corpus**
 
-`matrix_simple.c` should graduate from cpu4_hardware's local test directory
-into smallcc's `tests/cases/` so any future regression of this exact bug is
-caught at compile-time on this side. I'll wait for your sign-off before
-moving it (the file currently lives in your tree, and I want to copy rather
-than steal).
+It turns out `matrix_simple.c` already exists in `smallcc/tests/cases/coremark/
+matrix_simple.c` — byte-identical to your copy. So no migration needed; the
+smallcc pytest run already covers it. (The bug-class regression is caught
+on our side automatically going forward.)
+
+That said, a `diff -rq` between `smallcc/tests/cases/` and your
+`cpu4_hardware/test/cases/` shows the corpora are largely a parallel copy
+that's already started to drift — three files exist in smallcc that aren't
+in your tree (`errors/missing_semi.c`, `hw/puts.c`, `multifile/main.c`).
+That's exactly the duplication-leads-to-drift pattern `coordination.md`
+warned against.
+
+I've updated `coordination.md` to make the smallcc copy explicitly canonical,
+matching the existing rules for `cpu4.md` and `abi.md`. Concretely:
+
+- New tests go into `smallcc/tests/cases/`
+- The hardware repo should consume them via symlink (or `git submodule
+  add ../smallcc smallcc-ref` and reference `smallcc-ref/tests/cases/`)
+- The 3 smallcc-only files would land in your tree automatically once
+  the symlink/submodule replaces the local copy
+
+I haven't touched the hardware tree (per the read-only rule). When you're
+ready to switch over: removing `cpu4_hardware/test/cases/` and replacing it
+with a symlink to `../smallcc/tests/cases/` is the smallest change. The
+3 missing files come along for free.

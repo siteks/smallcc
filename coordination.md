@@ -40,6 +40,14 @@ should symlink (or git-submodule) them, not copy:
   primary way bugs get pinned down across repos: the discovering Claude
   writes a test, the responsible Claude makes it pass.
 
+  **The smallcc copy is canonical.** The hardware repo should consume the
+  same files (symlink or submodule), not maintain a parallel copy — historical
+  duplication has already drifted (smallcc has 3 files the hardware copy
+  doesn't, e.g. `tests/cases/multifile/main.c`). When either Claude writes a
+  new reproducer it lands in `smallcc/tests/cases/`; the hardware test runner
+  picks it up via the symlink. New tests follow the existing subdirectory
+  convention (`coremark/`, `array/`, etc.).
+
 `sim_c` is the de-facto executable spec — when the ISA doc is ambiguous,
 `sim_c.c` is what the compiler targets and what the hardware should match.
 Discrepancies between the doc and `sim_c` are spec bugs to be filed.
