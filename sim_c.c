@@ -17,10 +17,39 @@
 /* ------------------------------------------------------------------ */
 /* Memory                                                               */
 /* ------------------------------------------------------------------ */
+/*
+ * The hardware data port is a 32-bit byte address with three regions
+ * (per cpu4_hardware/docs/architecture.md §"Memory map and routing"):
+ *
+ *   0x0000_0000–0x0000_FEFF  64 KB − 256 B  BRAM (code + data + stack)
+ *   0x0000_FF00–0x0000_FFFF  256 B          MMIO sub-decode
+ *   0x0001_0000–0x01FF_FFFF  ~32 MB         SDRAM (chip byte address = CPU addr)
+ *   0x0200_0000–0xFFFF_FFFF  —              Aliases SDRAM (addr[24:0] reaches chip)
+ *
+ * The first 64 KB of SDRAM (chip byte 0x0..0xFFFF) is shadowed by BRAM
+ * and unreachable from the un-aliased range; the alias is the only way
+ * to reach it. Aligned-access checks are still enforced (see
+ * check_align16/check_align32).
+ */
 
-static uint8_t mem[65536];
+static uint8_t  mem[65536];                    /* 64 KB BRAM */
+static uint8_t *sdram = NULL;                  /* 32 MB, lazy allocated */
 
 #define MMIO_BASE 0xFF00u
+#define SDRAM_SIZE (32u * 1024u * 1024u)       /* 0x0200_0000 */
+
+static void ensure_sdram(void) {
+    if (!sdram) {
+        sdram = calloc(SDRAM_SIZE, 1);
+        if (!sdram) { fprintf(stderr, "sim_c: SDRAM allocation failed\n"); exit(1); }
+    }
+}
+
+/* SDRAM chip byte for any 32-bit CPU address that lives in the SDRAM
+ * range (callers must have already routed away from BRAM and MMIO).
+ * Both the un-aliased (0x10000..0x1FFFFFF) and aliased (>=0x2000000)
+ * ranges land here; addr[31:25] is don't-care. */
+static uint32_t sdram_chip_byte(uint32_t a) { return a & 0x1FFFFFFu; }
 
 static uint32_t g_cycles = 0;
 
@@ -190,11 +219,17 @@ static void print_profile(void)
     free(lineno2addr);
 }
 
-static uint8_t mmio_read8(uint16_t a) {
-    uint32_t off = (uint16_t)(a - MMIO_BASE);
-    if (off < 4) return (uint8_t)(g_cycles >> (off * 8));
-    return 0;
-}
+/* MMIO state. Most registers are simple word-aligned RW shadows; the
+ * SDRAM keyhole is modelled with a single-slot scoreboard that completes
+ * synchronously (a real-hardware request takes ~10–20 cycles, but for
+ * simulator behavioural fidelity instant completion is fine — software
+ * still polls the busy bit, it just always sees it clear). */
+static uint32_t g_disp_mode      = 0;          /* 0xFF1C */
+static uint32_t g_disp_lut[256]  = {0};        /* 0xFF20 latches via index byte */
+static uint32_t g_perfcnt[16]    = {0};        /* 0xFF40-0xFF7C  (cycle counter at idx 0 mirrors g_cycles) */
+static uint32_t g_sdram_addr_w   = 0;          /* 0xFFA0 — word address into SDRAM */
+static uint32_t g_sdram_wdata    = 0;          /* 0xFFA4 */
+static uint32_t g_sdram_rdata    = 0;          /* 0xFFAC — last completed READ result */
 
 static uint16_t g_watch_pc = 0; /* set to pc of instruction being executed */
 static uint32_t g_watch_r0 = 0;
@@ -203,26 +238,138 @@ static uint16_t g_watch_sp = 0, g_watch_bp = 0;
    Threshold defaults to 0x5000; updated to _globals_start after assembly. */
 static int      g_assembler_done  = 0;
 static uint16_t g_write_threshold = 0x5000;
-static void write8_inner (uint16_t a, uint8_t  v) { if (a >= MMIO_BASE) return; if (g_assembler_done && a < g_write_threshold) fprintf(stderr, "  WRITE8 to %04x = %02x  at pc=%04x sp=%04x bp=%04x r0=%08x\n", a, v, g_watch_pc, g_watch_sp, g_watch_bp, g_watch_r0); mem[a] = v; }
-static void write16_inner(uint16_t a, uint16_t v) { if (a >= MMIO_BASE) return; if (g_assembler_done && a < g_write_threshold) fprintf(stderr, "  WRITE16 to %04x = %04x  at pc=%04x sp=%04x bp=%04x r0=%08x\n", a, v, g_watch_pc, g_watch_sp, g_watch_bp, g_watch_r0); mem[a]=(uint8_t)v; mem[(uint16_t)(a+1)]=(uint8_t)(v>>8); }
-static void write32_inner(uint16_t a, uint32_t v) { if (a >= MMIO_BASE) return; if (g_assembler_done && a < g_write_threshold) fprintf(stderr, "  WRITE32 to %04x = %08x  at pc=%04x sp=%04x bp=%04x r0=%08x\n", a, v, g_watch_pc, g_watch_sp, g_watch_bp, g_watch_r0); write16_inner(a,(uint16_t)v); write16_inner((uint16_t)(a+2),(uint16_t)(v>>16)); }
+
+/* MMIO 32-bit read/write. Word-aligned addresses only (`a & 3 == 0`);
+ * sub-word access is rare and the hardware decode is word-keyed too,
+ * so the few callers that go through the byte/halfword paths just
+ * extract the relevant bytes from a word read. */
+static uint32_t mmio_read32(uint32_t a) {
+    if (a == 0xFF00)                              return g_cycles;
+    if (a == 0xFF1C)                              return g_disp_mode;
+    if (a >= 0xFF40 && a < 0xFF80 && (a & 3) == 0) return g_perfcnt[(a - 0xFF40) >> 2];
+    if (a == 0xFFA0)                              return g_sdram_addr_w;
+    if (a == 0xFFA4)                              return g_sdram_wdata;
+    if (a == 0xFFAC)                              return g_sdram_rdata;
+    if (a == 0xFFB0)                              return 0;   /* SDRAM_STATUS — never busy */
+    /* Reads from unmapped MMIO addresses return zero (matches hardware) */
+    return 0;
+}
+
+static void mmio_write32(uint32_t a, uint32_t v) {
+    if (a == 0xFF1C) { g_disp_mode = v;                                       return; }
+    if (a == 0xFF20) { g_disp_lut[(v >> 24) & 0xFF] = v & 0xFFFFFFu;          return; }
+    if (a == 0xFF80) { for (int i = 0; i < 16; i++) g_perfcnt[i] = 0;          return; }
+    if (a == 0xFFA0) { g_sdram_addr_w = v & 0x7FFFFFu;                         return; }
+    if (a == 0xFFA4) { g_sdram_wdata  = v;                                    return; }
+    if (a == 0xFFA8) {
+        /* Trigger READ (bit 0) or WRITE (bit 1). The hardware completes
+         * asynchronously via a pbus state machine; we complete inline. */
+        ensure_sdram();
+        uint32_t byte_addr = g_sdram_addr_w << 2;
+        if (byte_addr + 4 > SDRAM_SIZE) return;  /* out of range — silently no-op */
+        if (v & 1u) {
+            g_sdram_rdata = (uint32_t)sdram[byte_addr]
+                          | ((uint32_t)sdram[byte_addr + 1] << 8)
+                          | ((uint32_t)sdram[byte_addr + 2] << 16)
+                          | ((uint32_t)sdram[byte_addr + 3] << 24);
+        }
+        if (v & 2u) {
+            sdram[byte_addr]     = (uint8_t)g_sdram_wdata;
+            sdram[byte_addr + 1] = (uint8_t)(g_sdram_wdata >> 8);
+            sdram[byte_addr + 2] = (uint8_t)(g_sdram_wdata >> 16);
+            sdram[byte_addr + 3] = (uint8_t)(g_sdram_wdata >> 24);
+        }
+        return;
+    }
+    /* µs counter, perfcnt slots, build ID, etc. are read-only or RO-aliased. */
+}
+
+static uint8_t mmio_read8(uint32_t a) {
+    uint32_t aligned = a & ~3u;
+    uint32_t shift   = (a & 3u) * 8;
+    return (uint8_t)(mmio_read32(aligned) >> shift);
+}
+
+/* ──────────────────────────────────────────────────────────────────
+ * 32-bit read/write through the BRAM/MMIO/SDRAM router.
+ * ────────────────────────────────────────────────────────────────── */
+
+static int addr_is_mmio(uint32_t a) {
+    return a >= 0xFF00u && a <= 0xFFFFu;
+}
+static int addr_is_bram(uint32_t a) {
+    return a < 0xFF00u;
+}
+static int addr_is_sdram(uint32_t a) {
+    return a >= 0x10000u;
+}
+
+static void write8_inner (uint32_t a, uint8_t  v) {
+    if (addr_is_bram(a)) {
+        if (g_assembler_done && a < g_write_threshold)
+            fprintf(stderr, "  WRITE8 to %04x = %02x  at pc=%04x sp=%04x bp=%04x r0=%08x\n",
+                    (unsigned)a, v, g_watch_pc, g_watch_sp, g_watch_bp, g_watch_r0);
+        mem[a] = v;
+        return;
+    }
+    if (addr_is_mmio(a)) {
+        /* 8-bit MMIO write: read-modify-write the enclosing word. */
+        uint32_t aligned = a & ~3u;
+        uint32_t shift   = (a & 3u) * 8;
+        uint32_t cur     = mmio_read32(aligned);
+        cur = (cur & ~(0xFFu << shift)) | ((uint32_t)v << shift);
+        mmio_write32(aligned, cur);
+        return;
+    }
+    if (addr_is_sdram(a)) { ensure_sdram(); sdram[sdram_chip_byte(a)] = v; return; }
+}
+
+static void write16_inner(uint32_t a, uint16_t v) {
+    write8_inner(a,     (uint8_t)v);
+    write8_inner(a + 1, (uint8_t)(v >> 8));
+}
+
+static void write32_inner(uint32_t a, uint32_t v) {
+    if (addr_is_mmio(a) && (a & 3u) == 0) { mmio_write32(a, v); return; }
+    write16_inner(a,     (uint16_t)v);
+    write16_inner(a + 2, (uint16_t)(v >> 16));
+}
+
 #define write8  write8_inner
 #define write16 write16_inner
 #define write32 write32_inner
-static uint8_t  read8 (uint16_t a) { if (a >= MMIO_BASE) return mmio_read8(a); return mem[a]; }
-static uint16_t read16(uint16_t a) { if (a >= MMIO_BASE) return (uint16_t)mmio_read8(a) | ((uint16_t)mmio_read8((uint16_t)(a+1))<<8); return (uint16_t)mem[a] | ((uint16_t)mem[(uint16_t)(a+1)] << 8); }
-static uint32_t read32(uint16_t a) { if (a >= MMIO_BASE) return (uint32_t)mmio_read8(a)|((uint32_t)mmio_read8((uint16_t)(a+1))<<8)|((uint32_t)mmio_read8((uint16_t)(a+2))<<16)|((uint32_t)mmio_read8((uint16_t)(a+3))<<24); return (uint16_t)read16(a) | ((uint32_t)read16((uint16_t)(a+2)) << 16); }
 
-/* CPU4 alignment checking */
-static void check_align16(uint16_t addr, uint16_t pc) {
-    if (addr & 1) {
-        fprintf(stderr, "CPU4 alignment error: 16-bit access to unaligned address 0x%04x at pc=0x%04x\n", addr, pc);
+static uint8_t read8(uint32_t a) {
+    if (addr_is_bram(a))   return mem[a];
+    if (addr_is_mmio(a))   return mmio_read8(a);
+    if (addr_is_sdram(a))  { ensure_sdram(); return sdram[sdram_chip_byte(a)]; }
+    return 0;
+}
+
+static uint16_t read16(uint32_t a) {
+    return (uint16_t)read8(a) | ((uint16_t)read8(a + 1) << 8);
+}
+
+static uint32_t read32(uint32_t a) {
+    if (addr_is_mmio(a) && (a & 3u) == 0) return mmio_read32(a);
+    return (uint32_t)read16(a) | ((uint32_t)read16(a + 2) << 16);
+}
+
+/* CPU4 alignment checking. Hardware doesn't (yet) raise an exception
+ * on misaligned multi-byte access — see abi.md §3 — so this is the
+ * only line of defence on this side. The address is the full 32-bit
+ * data-port address; pc stays 16-bit (code lives in BRAM). */
+static void check_align16(uint32_t addr, uint16_t pc) {
+    if (addr & 1u) {
+        fprintf(stderr, "CPU4 alignment error: 16-bit access to unaligned address 0x%08x at pc=0x%04x\n",
+                (unsigned)addr, pc);
         exit(1);
     }
 }
-static void check_align32(uint16_t addr, uint16_t pc) {
-    if (addr & 3) {
-        fprintf(stderr, "CPU4 alignment error: 32-bit access to unaligned address 0x%04x at pc=0x%04x\n", addr, pc);
+static void check_align32(uint32_t addr, uint16_t pc) {
+    if (addr & 3u) {
+        fprintf(stderr, "CPU4 alignment error: 32-bit access to unaligned address 0x%08x at pc=0x%04x\n",
+                (unsigned)addr, pc);
         exit(1);
     }
 }
@@ -1333,15 +1480,19 @@ static void run_cpu4(void)
         /* F0c: cbeq=0x20, cbne=0x30 — compare rx with imm7 and branch */
         case 0x20: if(r[rx]==(uint32_t)(imm>>10)) pc=(uint16_t)(pc+sx10(imm&0x3ff)); break; /* cbeq */
         case 0x30: if(r[rx]!=(uint32_t)(imm>>10)) pc=(uint16_t)(pc+sx10(imm&0x3ff)); break; /* cbne */
-        /* F3c — register-relative */
-        case 0xd0: r[rx]=read8 ((uint16_t)((int32_t)r[ry]+sx10(imm)));     break; /* llb  */
-        case 0xd1: { uint16_t a = (uint16_t)((int32_t)r[ry]+sx10(imm)*2); check_align16(a, oldpc); r[rx]=read16(a); } break; /* llw  */
-        case 0xd2: { uint16_t a = (uint16_t)((int32_t)r[ry]+sx10(imm)*4); check_align32(a, oldpc); r[rx]=read32(a); } break; /* lll  */
-        case 0xd3: write8 ((uint16_t)((int32_t)r[ry]+sx10(imm)),    (uint8_t) r[rx]); break; /* slb  */
-        case 0xd4: { uint16_t a = (uint16_t)((int32_t)r[ry]+sx10(imm)*2); check_align16(a, oldpc); write16(a, (uint16_t)r[rx]); } break; /* slw  */
-        case 0xd5: { uint16_t a = (uint16_t)((int32_t)r[ry]+sx10(imm)*4); check_align32(a, oldpc); write32(a, r[rx]); } break; /* sll  */
-        case 0xd6: r[rx]=(uint32_t)(int32_t)(int8_t) read8 ((uint16_t)((int32_t)r[ry]+sx10(imm)));   break; /* llbx */
-        case 0xd7: { uint16_t a = (uint16_t)((int32_t)r[ry]+sx10(imm)*2); check_align16(a, oldpc); r[rx]=(uint32_t)(int32_t)(int16_t)read16(a); } break; /* llwx */
+        /* F3c — register-relative. Addresses are 32-bit so loads/stores
+         * can reach SDRAM (>= 0x10000) and its alias range. The previous
+         * (uint16_t) truncation that worked under LP32 is wrong now: any
+         * pointer with a non-zero upper half — i.e. anything aimed at
+         * SDRAM — would have been masked back into the low 64 KB. */
+        case 0xd0: r[rx]=read8 ((uint32_t)((int32_t)r[ry]+sx10(imm)));     break; /* llb  */
+        case 0xd1: { uint32_t a = (uint32_t)((int32_t)r[ry]+sx10(imm)*2); check_align16(a, oldpc); r[rx]=read16(a); } break; /* llw  */
+        case 0xd2: { uint32_t a = (uint32_t)((int32_t)r[ry]+sx10(imm)*4); check_align32(a, oldpc); r[rx]=read32(a); } break; /* lll  */
+        case 0xd3: write8 ((uint32_t)((int32_t)r[ry]+sx10(imm)),    (uint8_t) r[rx]); break; /* slb  */
+        case 0xd4: { uint32_t a = (uint32_t)((int32_t)r[ry]+sx10(imm)*2); check_align16(a, oldpc); write16(a, (uint16_t)r[rx]); } break; /* slw  */
+        case 0xd5: { uint32_t a = (uint32_t)((int32_t)r[ry]+sx10(imm)*4); check_align32(a, oldpc); write32(a, r[rx]); } break; /* sll  */
+        case 0xd6: r[rx]=(uint32_t)(int32_t)(int8_t) read8 ((uint32_t)((int32_t)r[ry]+sx10(imm)));   break; /* llbx */
+        case 0xd7: { uint32_t a = (uint32_t)((int32_t)r[ry]+sx10(imm)*2); check_align16(a, oldpc); r[rx]=(uint32_t)(int32_t)(int16_t)read16(a); } break; /* llwx */
         case 0xd8: if(r[rx]==r[ry]) pc=(uint16_t)(pc+sx10(imm)); break; /* beq  */
         case 0xd9: if(r[rx]!=r[ry]) pc=(uint16_t)(pc+sx10(imm)); break; /* bne  */
         case 0xda: if(r[rx]< r[ry]) pc=(uint16_t)(pc+sx10(imm)); break; /* blt  */
@@ -1484,6 +1635,60 @@ static void dump_framebuffer(void)
     }
 }
 
+/* Dump the bitmap framebuffer to a binary PPM (P6) file. The framebuffer
+ * lives in SDRAM at chip byte 0x10000 (= word 0x4000); resolution and
+ * pixel format come from g_disp_mode (the DISP_MODE MMIO register):
+ *
+ *   bit 0 (mode_320)   → 320x240 source resolution (vs 640x480)
+ *   bit 1 (mode_8bpp)  → 8-bit indexed (vs 32bpp XRGB), 4 indices per pbus
+ *                        word, indices look up an XRGB triple in g_disp_lut
+ *
+ * In all modes the source pixel format on disk is XRGB; bits[23:16]=R,
+ * [15:8]=G, [7:0]=B. The PPM is written at the *fb resolution* (no pixel
+ * doubling in the output) — viewers can scale. */
+static void dump_bitmap_fb(const char *path)
+{
+    if (!sdram) {
+        fprintf(stderr, "sim_c: -fb requested but SDRAM was never allocated; nothing to dump\n");
+        return;
+    }
+    int mode_320  = (g_disp_mode & 0x1u) != 0;
+    int mode_8bpp = (g_disp_mode & 0x2u) != 0;
+    int w = mode_320 ? 320 : 640;
+    int h = mode_320 ? 240 : 480;
+
+    FILE *f = fopen(path, "wb");
+    if (!f) { perror(path); return; }
+    fprintf(f, "P6\n%d %d\n255\n", w, h);
+
+    uint32_t fb_base = 0x10000;            /* SDRAM byte 0x10000 = word 0x4000 */
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) {
+            uint32_t xrgb;
+            if (mode_8bpp) {
+                /* Each fb byte indexes the LUT. Pixels pack 4 per word
+                 * with `i mod 4` selecting the byte. */
+                uint32_t idx = sdram[fb_base + y * w + x];
+                xrgb = g_disp_lut[idx];
+            } else {
+                /* 32bpp XRGB packed in one pbus word */
+                uint32_t off = fb_base + (uint32_t)(y * w + x) * 4u;
+                xrgb = (uint32_t)sdram[off]
+                     | ((uint32_t)sdram[off + 1] << 8)
+                     | ((uint32_t)sdram[off + 2] << 16)
+                     | ((uint32_t)sdram[off + 3] << 24);
+            }
+            uint8_t r = (uint8_t)(xrgb >> 16);
+            uint8_t g = (uint8_t)(xrgb >> 8);
+            uint8_t b = (uint8_t)(xrgb);
+            fputc(r, f); fputc(g, f); fputc(b, f);
+        }
+    }
+    fclose(f);
+    fprintf(stderr, "sim_c: wrote %dx%d %s framebuffer to %s\n",
+            w, h, mode_8bpp ? "8bpp" : "32bpp", path);
+}
+
 static const char *usage_text =
 "usage: sim_c [options] file.s\n"
 "\n"
@@ -1495,7 +1700,9 @@ static const char *usage_text =
 "  -arch cpu4         Target architecture (only cpu4 is supported)\n"
 "  -maxsteps N        Override the default instruction-step cap\n"
 "  -dump FILE         Assemble and write a bytecode dump; do not execute\n"
-"  -dumpfb            After running, dump the 80x30 framebuffer at 0xF000\n"
+"  -dumpfb            After running, dump the legacy 80x30 text framebuffer at 0xF000\n"
+"  -fb FILE           After running, dump the bitmap framebuffer to FILE.ppm\n"
+"                     (640x480 32bpp by default; honors DISP_MODE bits — 320x240 / 8bpp).\n"
 "  -profile           Collect and print a per-source-line execution profile\n"
 "  -linemap FILE      Assemble and write a PC->source JSON map; do not execute\n"
 "  -hex FILE          Assemble and write whitespace-delimited hex bytes; do not execute\n"
@@ -1509,6 +1716,7 @@ int main(int argc, char **argv)
     int dumpfb = 0;
     const char *trace_path = NULL;
     const char *filename = NULL;
+    const char *fb_out = NULL;
     int maxsteps_override = 0;
 
     for (int i = 1; i < argc; i++) {
@@ -1520,6 +1728,7 @@ int main(int argc, char **argv)
         else if (strcmp(argv[i], "-profile") == 0) g_profile = 1;
         else if (strcmp(argv[i], "-dump") == 0 && i+1 < argc) g_dump_out = argv[++i];
         else if (strcmp(argv[i], "-dumpfb") == 0) dumpfb = 1;
+        else if (strcmp(argv[i], "-fb") == 0 && i+1 < argc) fb_out = argv[++i];
         else if (strcmp(argv[i], "-arch") == 0 && i+1 < argc) {
             i++;
             if (strcmp(argv[i], "cpu4") != 0) {
@@ -1568,6 +1777,7 @@ int main(int argc, char **argv)
     run_cpu4();
     if (g_trace_out) fclose(g_trace_out);
     if (dumpfb) dump_framebuffer();
+    if (fb_out)  dump_bitmap_fb(fb_out);
     if (g_profile) print_profile();
     return 0;
 }
