@@ -2117,13 +2117,21 @@ static Block *cg_stmt(BraunCtx *ctx, Block *b, Node *n) {
         emit_jmp(b, cond_blk);
         Block *cur = cond_blk;
         if (!n->ch[1] || n->ch[1]->kind == ND_EMPTY) {
-            // Infinite loop: jump straight to body
-            seal_block(ctx, body_blk);
-            seal_block(ctx, cond_blk);
+            // Infinite loop: cond_blk unconditionally jumps to body_blk.
+            // Wire the cond_blk→body_blk edge BEFORE sealing body_blk so it
+            // sees its real 1-pred state. Sealing a 0-pred block sends
+            // read_var down the "npreds == 0" path which writes a const 0
+            // into the defs map (line 619-622); after that, every read of
+            // any loop-carried variable in the body returns cached 0,
+            // collapsing the SSA into trivial constants. cond_blk is the
+            // back-edge target and must stay unsealed until the body has
+            // wired its step_blk→cond_blk edge — natural seal at line 2147
+            // covers that.
             Inst *j = arena_alloc(sizeof(Inst));
             j->kind = IK_JMP; j->target = body_blk; j->block = cond_blk;
             inst_append(cond_blk, j); cond_blk->filled = 1;
             block_add_succ(cond_blk, body_blk); block_add_pred(body_blk, cond_blk);
+            seal_block(ctx, body_blk);
         } else {
             Value *cond = cg_expr(ctx, &cur, n->ch[1]);
             emit_br(ctx->f, cur, cond, body_blk, exit_blk);
