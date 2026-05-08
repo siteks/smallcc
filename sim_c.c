@@ -799,13 +799,26 @@ static void assemble_cpu4(const char *src)
                 /* F2: rx, imm7 */
                 int rx2 = (nops > 0) ? parse_reg4(ops[0]) : 0;
                 int32_t imm7 = (nops > 1) ? (int32_t)strtol(ops[1], NULL, 0) : 0;
+                if (pass == 2 && (imm7 < -64 || imm7 > 63)) {
+                    fprintf(stderr, "asm error (line %d): %s imm7 value %d out of signed 7-bit range [-64..63] at 0x%04x\n",
+                            cur_lineno+1, real_mnem, (int)imm7, (unsigned)instr_addr);
+                    exit(1);
+                }
                 uint8_t b0 = instr->first_byte | (uint8_t)(rx2 >> 1);
                 uint8_t b1 = (uint8_t)(((rx2 & 1) << 7) | (imm7 & 0x7f));
                 if (pass == 2) { write8((uint16_t)cur, b0); write8((uint16_t)(cur+1), b1); }
                 cur += 2;
             } else if (instr->extra == 2 && instr->subfmt == 0) {
-                /* F3a: imm16 only */
-                uint16_t imm16 = (nops > 0) ? (uint16_t)parse_tok(ops[0], pass) : 0;
+                /* F3a: imm16 only — jump-style absolute address (`j`/`jl`)
+                   or `enter`'s 14-bit-encoded frame size (handled below
+                   in subfmt==3). Here imm is a 16-bit absolute target. */
+                int32_t v = (nops > 0) ? parse_tok(ops[0], pass) : 0;
+                if (pass == 2 && (v < -32768 || v > 65535)) {
+                    fprintf(stderr, "asm error (line %d): %s imm16 value %d out of 16-bit range [-32768..65535] at 0x%04x\n",
+                            cur_lineno+1, real_mnem, (int)v, (unsigned)instr_addr);
+                    exit(1);
+                }
+                uint16_t imm16 = (uint16_t)v;
                 if (pass == 2) {
                     write8((uint16_t)cur,   instr->first_byte);
                     write8((uint16_t)(cur+1), (uint8_t)(imm16 >> 8));
@@ -821,12 +834,17 @@ static void assemble_cpu4(const char *src)
                     uint16_t tgt = (pass == 2 && nops > 2) ? (uint16_t)parse_tok(ops[2], pass) : 0;
                     imm10 = (int32_t)tgt - (instr_addr + instr_len);
                     if (pass == 2 && (imm10 < -512 || imm10 > 511)) {
-                        fprintf(stderr, "error: %s displacement %d out of range at 0x%04x\n",
-                                real_mnem, (int)imm10, (unsigned)instr_addr);
+                        fprintf(stderr, "asm error (line %d): %s displacement %d out of signed 10-bit range [-512..511] at 0x%04x\n",
+                                cur_lineno+1, real_mnem, (int)imm10, (unsigned)instr_addr);
                         exit(1);
                     }
                 } else {
                     imm10 = (nops > 2) ? (int32_t)strtol(ops[2], NULL, 0) : 0;
+                    if (pass == 2 && (imm10 < -512 || imm10 > 511)) {
+                        fprintf(stderr, "asm error (line %d): %s imm10 value %d out of signed 10-bit range [-512..511] at 0x%04x\n",
+                                cur_lineno+1, real_mnem, (int)imm10, (unsigned)instr_addr);
+                        exit(1);
+                    }
                 }
                 imm10 &= 0x3ff;
                 uint8_t b0 = instr->first_byte;
@@ -839,9 +857,17 @@ static void assemble_cpu4(const char *src)
                 }
                 cur += 3;
             } else if (instr->extra == 2 && instr->subfmt == 2) {
-                /* F3e: rd, imm16 */
+                /* F3e: rd, imm16 — `immw` (zero-extend), `immwh`, `jz`, `jnz`.
+                   Accept the union of signed and unsigned 16-bit ranges so
+                   `immw r0, -1` (= 0xFFFF) and `immw r0, 65535` both work. */
                 int rd2 = (nops > 0) ? parse_reg4(ops[0]) : 0;
-                uint16_t imm16 = (nops > 1) ? (uint16_t)parse_tok(ops[1], pass) : 0;
+                int32_t v = (nops > 1) ? parse_tok(ops[1], pass) : 0;
+                if (pass == 2 && (v < -32768 || v > 65535)) {
+                    fprintf(stderr, "asm error (line %d): %s imm16 value %d out of 16-bit range [-32768..65535] at 0x%04x\n",
+                            cur_lineno+1, real_mnem, (int)v, (unsigned)instr_addr);
+                    exit(1);
+                }
+                uint16_t imm16 = (uint16_t)v;
                 uint8_t b0 = (instr->first_byte & 0xf8u) | (uint8_t)(rd2 & 7);
                 if (pass == 2) {
                     write8((uint16_t)cur,   b0);
@@ -850,7 +876,9 @@ static void assemble_cpu4(const char *src)
                 }
                 cur += 3;
             } else if (instr->extra == 2 && instr->subfmt == 3) {
-                /* new F3b: rd + imm14 (byte offset / 4); adjw has no reg (rd=0) */
+                /* F3b: rd + imm14 (byte offset / 4); adjw has no reg (rd=0).
+                   Encoded field is signed 14-bit, scaled x4 → byte offset
+                   must be a multiple of 4 in [-32768..32764]. */
                 int rd2 = 0;
                 int32_t byte_off = 0;
                 if (strcmp(real_mnem, "adjw") == 0) {
@@ -859,7 +887,18 @@ static void assemble_cpu4(const char *src)
                     rd2 = (nops > 0) ? parse_reg4(ops[0]) : 0;
                     byte_off = (nops > 1) ? (int32_t)strtol(ops[1], NULL, 0) : 0;
                 }
-                int32_t imm14 = (byte_off >> 2) & 0x3fff;
+                if (pass == 2 && (byte_off & 3)) {
+                    fprintf(stderr, "asm error (line %d): %s byte offset %d not 4-byte aligned at 0x%04x\n",
+                            cur_lineno+1, real_mnem, (int)byte_off, (unsigned)instr_addr);
+                    exit(1);
+                }
+                int32_t scaled = byte_off >> 2;
+                if (pass == 2 && (scaled < -8192 || scaled > 8191)) {
+                    fprintf(stderr, "asm error (line %d): %s byte offset %d (scaled %d) out of signed 14-bit range [-32768..32764] at 0x%04x\n",
+                            cur_lineno+1, real_mnem, (int)byte_off, (int)scaled, (unsigned)instr_addr);
+                    exit(1);
+                }
+                int32_t imm14 = scaled & 0x3fff;
                 uint8_t b0 = (instr->first_byte & 0xfe) | (uint8_t)((rd2 >> 2) & 1);
                 uint8_t b1 = (uint8_t)(((rd2 & 3) << 6) | ((imm14 >> 8) & 0x3f));
                 uint8_t b2 = (uint8_t)(imm14 & 0xff);
@@ -874,11 +913,17 @@ static void assemble_cpu4(const char *src)
                    imm17 = (imm7 << 10) | (disp10 & 0x3ff) */
                 int rx2 = (nops > 0) ? parse_reg4(ops[0]) : 0;
                 int32_t imm7 = (nops > 1) ? (int32_t)strtol(ops[1], NULL, 0) : 0;
+                /* F0c imm7 is a 7-bit unsigned compare value (0..127). */
+                if (pass == 2 && (imm7 < 0 || imm7 > 127)) {
+                    fprintf(stderr, "asm error (line %d): %s imm7 value %d out of unsigned 7-bit range [0..127] at 0x%04x\n",
+                            cur_lineno+1, real_mnem, (int)imm7, (unsigned)instr_addr);
+                    exit(1);
+                }
                 uint16_t tgt = (pass == 2 && nops > 2) ? (uint16_t)parse_tok(ops[2], pass) : 0;
                 int32_t disp10 = (int32_t)tgt - (instr_addr + instr_len);
                 if (pass == 2 && (disp10 < -512 || disp10 > 511)) {
-                    fprintf(stderr, "error: %s displacement %d out of range at 0x%04x\n",
-                            instr->name, (int)disp10, (unsigned)instr_addr);
+                    fprintf(stderr, "asm error (line %d): %s displacement %d out of signed 10-bit range [-512..511] at 0x%04x\n",
+                            cur_lineno+1, real_mnem, (int)disp10, (unsigned)instr_addr);
                     exit(1);
                 }
                 int32_t imm17 = ((imm7 & 0x7f) << 10) | (disp10 & 0x3ff);
@@ -905,6 +950,14 @@ static void assemble_cpu4(const char *src)
                 int rd2 = (nops > 0) ? parse_reg4(ops[0]) : 0;
                 int rx2 = (nops > 1) ? parse_reg4(ops[1]) : 0;
                 int32_t imm9 = (nops > 2) ? (int32_t)strtol(ops[2], NULL, 0) : 0;
+                /* F0b imm9 is a 9-bit signed field (-256..255). Some F0b
+                   instructions (shift counts, bitex) treat the low bits
+                   as unsigned, but the encoding range is signed 9-bit. */
+                if (pass == 2 && (imm9 < -256 || imm9 > 511)) {
+                    fprintf(stderr, "asm error (line %d): %s imm9 value %d out of 9-bit range [-256..511] at 0x%04x\n",
+                            cur_lineno+1, real_mnem, (int)imm9, (unsigned)instr_addr);
+                    exit(1);
+                }
                 imm9 &= 0x1ff;
                 uint8_t b0 = instr->first_byte;
                 uint8_t b1 = (uint8_t)((instr->subop << 7) | (rd2 << 4) | (rx2 << 1) | ((imm9 >> 8) & 1));
@@ -921,8 +974,8 @@ static void assemble_cpu4(const char *src)
                 uint16_t tgt = (pass == 2 && nops > 1) ? (uint16_t)parse_tok(ops[1], pass) : 0;
                 int32_t imm10 = (int32_t)tgt - (instr_addr + instr_len);
                 if (pass == 2 && (imm10 < -512 || imm10 > 511)) {
-                    fprintf(stderr, "error: %s displacement %d out of range at 0x%04x\n",
-                            instr->name, (int)imm10, (unsigned)instr_addr);
+                    fprintf(stderr, "asm error (line %d): %s displacement %d out of signed 10-bit range [-512..511] at 0x%04x\n",
+                            cur_lineno+1, instr->name, (int)imm10, (unsigned)instr_addr);
                     exit(1);
                 }
                 imm10 &= 0x3ff;
