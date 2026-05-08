@@ -454,9 +454,23 @@ static IGraph *build_interference_graph(Function *f) {
     return g;
 }
 
+static int is_rematerializable(Value *v);   /* forward decl: defined below */
+
 // Assign colors using a simple greedy graph coloring
-// Returns 1 if all values colored, 0 if spills needed
-static int assign_colors(IGraph *g, Function *f, int K, int pessimistic) {
+// Returns 1 if all values colored, 0 if spills needed.
+//
+// `persist_spill` (may be NULL) is the persistent-spill set used by the IRC
+// outer loop's tier-3 spilling. When provided, the success check uses it
+// to distinguish "this value was spilled in a prior iteration and has
+// already been processed by rewrite_spills" (success-compatible) from
+// "this value was newly spilled in *this* assign_colors call and rewrite
+// hasn't run yet" (must return 0). Without that distinction,
+// rematerializable values — which never get a frame slot via
+// rewrite_spills — would either look like fresh spills forever (old
+// behaviour, EXHAUST 500) or like immediate successes before rewrite
+// inserted their per-use clones (the alternative also-broken).
+static int assign_colors(IGraph *g, Function *f, int K, int pessimistic,
+                          const uint8_t *persist_spill, int persist_cap) {
     // Simplification order: build a stack using degree < K heuristic
     int nv = g->nv;
     int *stack    = arena_alloc(nv * sizeof(int));
@@ -749,14 +763,29 @@ static int assign_colors(IGraph *g, Function *f, int K, int pessimistic) {
     }
 
     // Check if any NEW spills occurred (values that weren't pre-marked by
-    // the persistent set).  A pre-marked spill that stays spilled is expected;
+    // the persistent set). A pre-marked spill that stays spilled is expected;
     // only a newly-failed coloring means we need another rewrite round.
+    //
+    // The "is this a new spill" test uses two signals:
+    //   - persist_spill[i] is set — this value was spilled in a prior IRC
+    //                              iteration and rewrite_spills has already
+    //                              processed it (allocated a slot, or for
+    //                              rematerializable values inserted the
+    //                              per-use clones). Treat as success.
+    //   - v->spill_slot != -1     — for non-remat values, equivalent to
+    //                              the persistent check (rewrite gave it
+    //                              a slot). Used as a fallback when no
+    //                              persist set is supplied.
+    //
+    // Without this distinction, remat values — which never get a frame slot
+    // — either look like fresh spills forever (old behaviour, EXHAUST 500
+    // on njRowIDCT) or like immediate successes on iter 0 before rewrite
+    // had a chance to insert their per-use remat clones.
     for (int i = 0; i < nv; i++) {
         if (g->spilled[i] && g->color[i] < 0 && g->precolored[i] < 0) {
-            // Check if this is a genuinely new spill (not a persistent one
-            // that was force-marked before simplify).
             Value *v = f->values[i];
-            if (v->spill_slot == -1)
+            int already_persistent = (persist_spill && i < persist_cap && persist_spill[i]);
+            if (!already_persistent && v->spill_slot == -1)
                 return 0;  // new spill — need another round
         }
     }
@@ -1118,7 +1147,7 @@ void irc_allocate(Function *f) {
     // coalescing.
 
     int K = IRC_K;
-    int max_iter = 100;
+    int max_iter = 500;
     // Persistent spill set for Tier 3: once a value is spilled, it stays
     // spilled.  Dynamically grown as rewrite_spills adds new values.
     int persist_cap = f->nvalues + 64;  // initial capacity with headroom
@@ -1156,7 +1185,9 @@ void irc_allocate(Function *f) {
 
         // Tier 3 (iter >= 8): pessimistic spilling to break cascade
         int pessimistic = (iter >= 8);
-        int ok = assign_colors(g, f, K, pessimistic);
+        int ok = assign_colors(g, f, K, pessimistic,
+                               iter >= 8 ? persist_spill : NULL,
+                               iter >= 8 ? persist_cap : 0);
 
         if (ok) {
             // Apply colors to values
@@ -1183,6 +1214,20 @@ void irc_allocate(Function *f) {
                 if (g->spilled[i])
                     persist_spill[i] = 1;
             }
+        }
+
+        if (getenv("DBG_IRC")) {
+            int spilled_count = 0;
+            int new_spills    = 0;       /* spills not yet in persistent set */
+            int uncolored_no_slot = 0;   /* values that the success check rejects as "new" */
+            for (int i = 0; i < g->nv; i++) {
+                if (g->spilled[i]) spilled_count++;
+                if (g->spilled[i] && i < persist_cap && !persist_spill[i]) new_spills++;
+                if (g->spilled[i] && g->color[i] < 0 && g->precolored[i] < 0 &&
+                    i < f->nvalues && f->values[i]->spill_slot == -1) uncolored_no_slot++;
+            }
+            fprintf(stderr, "IRC %s iter=%d ok=%d nv=%d/%d spilled=%d new_persist=%d uncolored_no_slot=%d\n",
+                    f->name, iter, ok, g->nv, f->nvalues, spilled_count, new_spills, uncolored_no_slot);
         }
 
         // Rewrite spills and try again

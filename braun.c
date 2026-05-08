@@ -1360,6 +1360,15 @@ static Value *cg_expr(BraunCtx *ctx, Block **cur, Node *n) {
 
         // Dereference: load from pointer
         if (op == TK_STAR) {
+            // If pointee is an array, the dereference value IS the address
+            // (arrays decay to pointers in expression context — no load).
+            // This matters for chained subscripts on a pointer-to-array
+            // member, e.g. `(&)nj.vlctab[i][0]` where `vlctab` has type
+            // `T (*)[N]`. The parser only sets is_array_deref on subscripts
+            // of an ND_IDENT base; subscripts on ND_MEMBER (or other
+            // non-IDENT bases) take the generic ND_UNARYOP "*" path here.
+            if (n->type && n->type->base == TB_ARRAY)
+                return cg_expr(ctx, cur, n->ch[0]);
             Value *ptr = cg_expr(ctx, cur, n->ch[0]); b = *cur;
             int sz = n->type ? n->type->size : 2;
             return emit_load(ctx, b, ptr, sz, 0, vt);
