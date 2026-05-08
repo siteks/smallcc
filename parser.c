@@ -370,6 +370,35 @@ bool is_postfix(Token_kind tk)
             ||  tk == TK_INC
             ||  tk == TK_DEC;
 }
+// sizeof_expr_type: best-effort compile-time type resolution of an
+// expression for use inside `sizeof(expr)`. derive_types hasn't run
+// yet at parse time so most expression types are still t_void;
+// this walker handles the patterns we can resolve from symbol-table
+// lookup alone -- ident, struct/union member access (`s.f`, `p->f`),
+// and explicit casts. Returns NULL for patterns we can't resolve;
+// caller falls back to size 0 (matching previous behaviour).
+static Type *sizeof_expr_type(Node *n)
+{
+    if (!n) return NULL;
+    if (n->type && n->type != t_void) return n->type;
+    if (n->kind == ND_IDENT && n->symbol) return n->symbol->type;
+    if (n->kind == ND_MEMBER && n->ch[0])
+    {
+        Type *base = sizeof_expr_type(n->ch[0]);
+        if (!base) return NULL;
+        if (n->op_kind == TK_ARROW && base->base == TB_POINTER)
+            base = base->u.ptr.pointee;
+        if (!base || (base->base != TB_STRUCT && base->base != TB_ENUM))
+            return NULL;
+        Type *ft = NULL;
+        find_offset(base, n->u.member.field_name, &ft);
+        return ft;
+    }
+    if (n->kind == ND_CAST && n->ch[0] && n->ch[0]->type)
+        return n->ch[0]->type;
+    return NULL;
+}
+
 static Node *unary_expr()
 {
     DBG_FUNC_TOKEN(token_ctx.current);
@@ -399,7 +428,9 @@ static Node *unary_expr()
             }
             else
                 inner = unary_expr();
-            Type *t = (inner->kind == ND_IDENT && inner->symbol)
+            Type *t = sizeof_expr_type(inner);
+            if (!t)
+                t = (inner->kind == ND_IDENT && inner->symbol)
                        ? inner->symbol->type : inner->type;
             int sz = t ? t->size : 0;
             node->u.literal.ival = sz;

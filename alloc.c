@@ -1169,11 +1169,19 @@ void irc_allocate(Function *f) {
         // Tier 3 (iter >= 8): force-spill persistent set before coloring.
         // Mark these values as already spilled in the graph so assign_colors
         // skips them and rewrite_spills inserts load/store for them.
+        //
+        // Skip values that already have a slot: rewrite_spills has shortened
+        // their live range to [def, spill-store] in a prior iteration, and
+        // they need a register for that brief window so emit.c can read the
+        // def's output and write it to the slot. Marking them spilled here
+        // would leave them uncolored, and emit.c's preg() fallback to r0
+        // would collide with the IK_ADDR that the spill-store uses.
         if (iter >= 8) {
             int lim = persist_cap < g->nv ? persist_cap : g->nv;
             for (int i = 0; i < lim; i++) {
-                if (persist_spill[i])
-                    g->spilled[i] = 1;
+                if (!persist_spill[i]) continue;
+                if (i < f->nvalues && f->values[i]->spill_slot != -1) continue;
+                g->spilled[i] = 1;
             }
         }
 
