@@ -1172,11 +1172,25 @@ static void remap_single_use_values(Function *f) {
             }
             if (prior) continue;
 
-            // Safety 4: target not read/written between inst and user
+            // Safety 4: target not read/written between inst and user.
+            // This includes implicit clobbers from intervening IK_CALL /
+            // IK_ICALL: if `target` is caller-saved (r0..r3) and a call
+            // happens between inst and user, the call corrupts target
+            // even though the IR-level dst (the return value, r0) and
+            // operand list don't mention it. Without this guard the
+            // remap silently lands a live value in a clobbered register
+            // (typical case: an IK_GADDR computed before a call, with
+            // its single user being a pre-colored IK_COPY for a *later*
+            // call's argument list).
             int between = 0;
+            int target_caller_saved = (target >= 0 && target <= 3);
             for (Inst *p = inst->next; p != user; p = p->next) {
                 if (p->is_dead) continue;
                 if (p->dst && p->dst->phys_reg == target)
+                    { between = 1; break; }
+                if (target_caller_saved &&
+                    (p->kind == IK_CALL || p->kind == IK_ICALL ||
+                     p->kind == IK_PUTCHAR || p->kind == IK_SWITCH))
                     { between = 1; break; }
                 for (int i = 0; i < p->nops; i++) {
                     Value *op = val_resolve(p->ops[i]);

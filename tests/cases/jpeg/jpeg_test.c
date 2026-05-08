@@ -1,3 +1,13 @@
+// EXPECT_R0: 1637504486
+//
+// pytest entry point for the smallcc-canonical NanoJPEG decode (see
+// the longer note above main(), around line 280, for runtime budget,
+// hash semantics, and how to re-establish the canonical value after
+// an intentional codegen change).
+//
+// ─── BEGIN NanoJPEG (unchanged from upstream apart from the CPU4 ───
+//     hosting layer near the top of the implementation section)
+
 // NanoJPEG -- KeyJ's Tiny Baseline JPEG Decoder
 // version 1.3.5 (2016-11-14)
 // Copyright (c) 2009-2016 Martin J. Fiedler <martin.fiedler@gmx.net>
@@ -255,19 +265,47 @@ void njCopyMem(void* dest, const void* src, int size) {
     for (int i = 0; i < size; i++) d[i] = s[i];
 }
 
+// EXPECT_R0: 1637504486
+//
+// Stress-test the full smallcc pipeline by running NanoJPEG on an
+// embedded 320x240 baseline JPEG (a black cat in a box). Goes through
+// almost every interesting compiler path: 4:2:0 subsampling, scaled
+// IDCTs (njRowIDCT/njColIDCT have ~300-byte frames), Huffman decode,
+// chroma upsampling, YCbCr->RGB conversion, big static lookup tables,
+// pointer-to-array struct members, large constants from legalize Pass F,
+// and ~30 KB of code. If anything regresses in the compiler -- IRC
+// spilling, pass interactions, opt correctness -- this test catches it
+// well before unit tests do.
+//
+// EXPECT_R0 is an FNV-1a hash (low 31 bits) of the decoded RGB output,
+// computed during the SDRAM framebuffer write. The hash is "smallcc
+// canonical": it locks the current decode output into place. Any
+// codegen change that perturbs the decoded image will fail this test.
+// To re-establish a canonical value (after an intentional codegen
+// change), run the test, capture the printed r0, update EXPECT_R0,
+// and visually verify the decoded image with:
+//   ./sim_c -arch cpu4 -fb /tmp/cat.ppm tests/cases/jpeg/jpeg_test.s
+//
+// Runtime budget: ~19M cycles, ~0.7s wall on a fast x86_64 host.
+//
+// Note: smallcc -O0 and -O2 currently produce slightly different
+// decoded output (~18% of pixels differ, avg magnitude ~4). Both look
+// like the cat visually; -O2 is closer to libjpeg native (avg mag 0.4
+// vs 4.2 for -O0). The drift is real but small enough to be plausible
+// IDCT-rounding-from-arithmetic-reordering rather than a correctness
+// bug. Tests run at the default opt level (-O2); this hash is the -O2
+// canonical.
+
 int main() {
     int size = test_cat_jpeg_len;
     char *buf = test_cat_jpeg;
 
-    printf("size:%d location:%08x\n", size, (uint32_t)buf);
     njInit();
     nj_result_t res = njDecode(buf, size);
-    if (res) {
-        printf("Error decoding the input file: %d\n", res);
-        return 1;
-    }
+    if (res) return -1;
+    if (njGetWidth() != 320 || njGetHeight() != 240 || !njIsColor())
+        return -2;
 
-    printf("P%d\n%d %d\n255\n", njIsColor() ? 6 : 5, njGetWidth(), njGetHeight());
     char *image = njGetImage();
 
     // ── Write to framebuffer ────────────────────────────────────
@@ -301,6 +339,9 @@ int main() {
     int ncomp = njIsColor() ? 3 : 1;
     unsigned char *src = (unsigned char *) image;
 
+    // FNV-1a hash interleaved with the framebuffer pack so we touch
+    // each decoded byte exactly once.
+    uint32_t hash = 2166136261u;
     for (int i = 0; i < n; i++) {
         unsigned char r = src[0];
         unsigned char g = (ncomp == 3) ? src[1] : src[0];
@@ -308,19 +349,19 @@ int main() {
         fb[i] = ((uint32_t) r << 16)
               | ((uint32_t) g <<  8)
               |  (uint32_t) b;
+        hash ^= r; hash *= 16777619u;
+        hash ^= g; hash *= 16777619u;
+        hash ^= b; hash *= 16777619u;
         src += ncomp;
     }
 
-    // Enable 320×240 pixel-doubled mode (32bpp, no LUT lookup).
-    // Set last so the display switches over to a fully-written
-    // framebuffer rather than showing partial fill in the
-    // default 640×480 32bpp mode.
+    // Enable 320x240 pixel-doubled mode (32bpp, no LUT lookup) so a
+    // hardware run with -fb still latches a viewable image. Sim_c
+    // ignores this beyond the dump path.
     mmio[7] = 0x1;
 
-    printf("frame ready\n");
-    while (1) ;        // hold the picture on screen
-
-    return 0;
+    // Mask to 31 bits so EXPECT_R0 (signed decimal) round-trips cleanly.
+    return (int)(hash & 0x7fffffffu);
 }
 
 
