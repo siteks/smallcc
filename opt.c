@@ -838,6 +838,18 @@ static Value *unwrap_for_mask(Value *v, uint32_t mask) {
         if (v->kind != VAL_INST || !v->def || v->def->nops < 1) break;
         Inst *d = v->def;
         if (d->kind == IK_COPY) {
+            // Don't unwrap through IK_COPY whose source is a constrained
+            // value (param landing or call return) — those landings are
+            // pre-colored to caller-saved r0–r3 and the IK_COPY exists
+            // specifically to keep the landing's live range short. Folding
+            // a use back to the landing extends its live range across
+            // intervening calls; same hazard opt_copy_prop guards against.
+            Value *cs = val_resolve(d->ops[0]);
+            if (cs && cs->def &&
+                (cs->def->kind == IK_PARAM ||
+                 cs->def->kind == IK_CALL  ||
+                 cs->def->kind == IK_ICALL))
+                break;
             v = d->ops[0]; continue;
         }
         if (d->kind == IK_TRUNC || d->kind == IK_ZEXT) {
