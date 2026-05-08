@@ -1744,15 +1744,35 @@ void opt_remove_dead_blocks(Function *f) {
             if (bi == 0 || b->npreds > 0) {
                 f->blocks[new_n++] = b;
             } else {
-                // Dead block: strip outgoing edges from successors' pred lists
+                // Dead block: strip outgoing edges from successors' pred lists.
+                // CRITICAL: phi operands are paired positionally with the
+                // pred list, so dropping a pred without dropping its phi op
+                // leaves the remaining ops mis-aligned. OOS would then emit
+                // the wrong value at the surviving predecessor — observed in
+                // NanoJPEG's njDecodeSOF where a dead `goto throw` left a
+                // phi(0, v_c) attached to preds[B_dead, B_live] become
+                // [B_live]; OOS picked the first phi op (0) for B_live and
+                // emitted `v = copy 0` on what should have been v_c, NULLing
+                // the pointer used by the next c->ssx access.
                 for (int k = 0; k < b->nsuccs; k++) {
                     Block *succ = b->succs[k];
+                    int dead_pred_idx = -1;
                     for (int j = 0; j < succ->npreds; j++) {
-                        if (succ->preds[j] == b) {
-                            succ->preds[j] = succ->preds[--succ->npreds];
-                            break;
+                        if (succ->preds[j] == b) { dead_pred_idx = j; break; }
+                    }
+                    if (dead_pred_idx < 0) continue;
+                    /* Remove the matching phi op from every phi in succ.
+                     * Mirror the swap-with-last we do for the pred entry so
+                     * the index correspondence is preserved. */
+                    for (Inst *inst = succ->head; inst; inst = inst->next) {
+                        if (inst->kind != IK_PHI) continue;
+                        if (dead_pred_idx < inst->nops) {
+                            inst->ops[dead_pred_idx] = inst->ops[inst->nops - 1];
+                            inst->nops--;
                         }
                     }
+                    /* Now drop the pred itself with the same swap-with-last. */
+                    succ->preds[dead_pred_idx] = succ->preds[--succ->npreds];
                 }
                 changed = 1;
                 opt_stat_dead_blk++;

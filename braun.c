@@ -66,6 +66,13 @@ static int static_local_is_bss(BStaticLocal *sl) {
     if (!init) return 1;
     if (ty && istype_array(ty) && init->kind == ND_LITERAL && init->u.literal.strval)
         return 0;
+    /* Array with brace-initializer-list: { v0, v1, ... }. Treat as
+     * initialized data so emit_static_local_data emits per-element bytes
+     * rather than a bare allocb. (The previous fall-through silently
+     * dropped the initializer, leaving the array all-zero — found while
+     * bringing up NanoJPEG's static lookup tables under -target sim.) */
+    if (ty && istype_array(ty) && init->kind == ND_INITLIST)
+        return 0;
     if (!istype_array(ty) && ty && ty->base != TB_STRUCT && init->kind == ND_LITERAL) {
         if (init->u.literal.ival == 0) return 1;
         return 0;
@@ -98,6 +105,32 @@ static void emit_static_local_data(FILE *out, BStaticLocal *sl) {
             fprintf(out, "\n    word %d\n", (int)init->u.literal.ival & 0xffff);
         else
             fprintf(out, "\n    long %d\n", (int)init->u.literal.ival);
+        return;
+    }
+
+    // Array with brace-initialized element list: emit one directive per
+    // element using the element type's size, then pad any remainder up
+    // to the declared array size. Element-type discovery walks through
+    // any ND_CAST a coercion pass may have wrapped the literal in.
+    if (ty && istype_array(ty) && init && init->kind == ND_INITLIST) {
+        Type *etype = array_elem_type(ty);
+        int   esize = etype ? etype->size : 1;
+        int   emitted = 0;
+        fprintf(out, "\n");
+        for (Node *el = init->ch[0]; el; el = el->next) {
+            Node *r = el;
+            int   neg = 1;
+            while (r && r->kind == ND_CAST) r = r->ch[1];
+            if (r && r->kind == ND_UNARYOP && r->op_kind == TK_MINUS) { neg = -1; r = r->ch[0]; }
+            while (r && r->kind == ND_CAST) r = r->ch[1];
+            int v = (r && r->kind == ND_LITERAL) ? (int)r->u.literal.ival * neg : 0;
+            if      (esize == 1) fprintf(out, "    byte %d\n", v & 0xff);
+            else if (esize == 2) fprintf(out, "    word %d\n", v & 0xffff);
+            else if (esize == 4) fprintf(out, "    long %d\n", v);
+            else                 fprintf(out, "    byte %d\n", v & 0xff);  /* shouldn't happen */
+            emitted += esize;
+        }
+        if (emitted < size) fprintf(out, "    allocb %d\n", size - emitted);
         return;
     }
 

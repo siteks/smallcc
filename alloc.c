@@ -1118,7 +1118,7 @@ void irc_allocate(Function *f) {
     // coalescing.
 
     int K = IRC_K;
-    int max_iter = 20;
+    int max_iter = 100;
     // Persistent spill set for Tier 3: once a value is spilled, it stays
     // spilled.  Dynamically grown as rewrite_spills adds new values.
     int persist_cap = f->nvalues + 64;  // initial capacity with headroom
