@@ -1228,7 +1228,18 @@ static int emit_prologue(Function *f, FILE *out, int frame, int callee_save[4]) 
     for (int r = 4; r <= 7; r++) {
         if (callee_save[r - 4]) {
             callee_tmp += 4;
-            fprintf(out, "    sl r%d, %d\n", r, -(frame + callee_tmp) / 4);
+            int off = -(frame + callee_tmp);
+            if (f2_range_long(off)) {
+                // F2 sl rd, imm7 (imm7 * 4 = byte offset, range -256..252)
+                fprintf(out, "    sl r%d, %d\n", r, off / 4);
+            } else {
+                // Beyond F2 range: compute address via lea (F3b imm14*4 = 4-byte
+                // aligned, ±32K range) and store via F3c sll [base+0] (3-reg).
+                // r0 is caller-saved and free immediately after enter (params
+                // live in r1/r2/r3 only), so it's safe to clobber as scratch.
+                fprintf(out, "    lea r0, %d\n", off);
+                fprintf(out, "    sll r%d, r0, 0\n", r);
+            }
         }
     }
     return callee_frame;
@@ -2205,7 +2216,21 @@ static void emit_function_body(Function *f, FILE *out, BranchFuse *fuse,
                 for (int r = 4; r <= 7; r++) {
                     if (callee_save[r - 4]) {
                         tmp_frame += 4;
-                        fprintf(out, "    ll r%d, %d\n", r, -(frame + tmp_frame) / 4);
+                        int off = -(frame + tmp_frame);
+                        if (f2_range_long(off)) {
+                            fprintf(out, "    ll r%d, %d\n", r, off / 4);
+                        } else {
+                            // Beyond F2: lea + lll (mirrors emit_prologue).
+                            // r0 is the return value: clobber-safe only if
+                            // it has been moved (above) — but here we're
+                            // restoring r4-r7 which are saved values, and
+                            // r0's value at this point IS the return value
+                            // already loaded. We must use a scratch that
+                            // doesn't collide. r3 is caller-saved and not
+                            // used for return; we don't need it after ret.
+                            fprintf(out, "    lea r3, %d\n", off);
+                            fprintf(out, "    lll r%d, r3, 0\n", r);
+                        }
                     }
                 }
                 fprintf(out, "    ret\n");
