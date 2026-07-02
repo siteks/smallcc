@@ -3,6 +3,22 @@
 Complete inventory of optimization passes, their dependencies, the bitmask
 system for selective enabling/disabling, and the LICM/CSE tuning constants.
 
+## The cost model: dynamic instruction count is the metric
+
+The CPU4 hardware is an 8-context barrel processor — one instruction per
+context per rotation, so no context ever sees a branch penalty, and (for
+BRAM-resident code) `sim_c`'s instruction count equals the aggregate
+hardware cycle count exactly. Consequences for every pass and peephole:
+
+- A transform pays off iff it reduces the **dynamic instruction count**
+  (or, secondarily, code size at equal count). There is no speculative or
+  pipeline dimension to reason about.
+- Branch-reduction tricks that add instructions (if-conversion, branchless
+  selects, shared epilogues) are **losses** here. Branchy-but-shorter
+  always wins; taken branches cost 1 cycle like everything else.
+- Fused operations (`dbnz`, `bitex`, `cbeq`, compare+branch) are worth
+  exactly the instructions they remove — no more, no less.
+
 ---
 
 ## Pipeline Order
