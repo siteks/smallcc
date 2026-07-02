@@ -1147,8 +1147,16 @@ static void remap_single_use_values(Function *f) {
             for (Inst *p = inst->next; p && steps < 4; p = p->next) {
                 if (p->is_dead) {
                     if (p->kind == IK_COPY && p->dst && p->nops >= 1 &&
-                        val_resolve(p->ops[0]) == search_val)
+                        val_resolve(p->ops[0]) == search_val) {
+                        // Chaining through a dead (coalesced) copy transfers
+                        // the single-use requirement to the copy's dst: if
+                        // THAT value has other users, remapping its register
+                        // clobbers them at the later use (fuzz seed 5031 —
+                        // v = xor..; c = copy v [dead]; cmp uses c; ret-chain
+                        // ALSO uses c: remap moved v/c onto the cmp's dst).
+                        if (p->dst->use_count != 1) break;
                         search_val = p->dst;
+                    }
                     continue;
                 }
                 steps++;
