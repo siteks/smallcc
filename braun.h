@@ -30,4 +30,10 @@ void      braun_get_strlit(int i, char label_buf[32], const char **data, int *le
 int            braun_nstatic_locals(void);
 unsigned char *braun_render_static_local(int i, char label_buf[32], int *len_out);
 
+/* Cross-TU string literal dedup table (shared with lower.c):
+ * strlit_lookup returns the _lN id already assigned to (data,len), or -1;
+ * strlit_register records a newly assigned mapping. */
+int       strlit_lookup(const char *data, int len);
+void      strlit_register(const char *data, int len, int id);
+
 #endif // BRAUN_H

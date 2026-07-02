@@ -15,6 +15,41 @@
 #include "smallcc.h"
 
 // ============================================================
+// Cross-TU string literal dedup table: (data,len) → assigned _lN id.
+// Shared by braun.c (function-body literals) and lower.c (global-
+// initializer strref literals) so identical strings get one label and
+// one copy of the data bytes. Data pointers live in the arena (never
+// freed), so they remain valid across TUs.
+// ============================================================
+
+typedef struct { const char *data; int len; int id; } StrLitKey;
+static StrLitKey *g_slmap;
+static int        g_nslmap, g_slmap_cap;
+
+// Return the id already assigned to (data,len), or -1 if unseen.
+int strlit_lookup(const char *data, int len) {
+    for (int i = 0; i < g_nslmap; i++)
+        if (g_slmap[i].len == len && memcmp(g_slmap[i].data, data, len) == 0)
+            return g_slmap[i].id;
+    return -1;
+}
+
+// Record a newly assigned (data,len) → id mapping.
+void strlit_register(const char *data, int len, int id) {
+    if (g_nslmap >= g_slmap_cap) {
+        int nc = g_slmap_cap ? g_slmap_cap * 2 : 16;
+        StrLitKey *nb = arena_alloc(nc * sizeof(StrLitKey));
+        memcpy(nb, g_slmap, g_nslmap * sizeof(StrLitKey));
+        g_slmap     = nb;
+        g_slmap_cap = nc;
+    }
+    g_slmap[g_nslmap].data = data;
+    g_slmap[g_nslmap].len  = len;
+    g_slmap[g_nslmap].id   = id;
+    g_nslmap++;
+}
+
+// ============================================================
 // String literal accumulator (flushed by braun_emit_strlits)
 // ============================================================
 
@@ -466,6 +501,13 @@ static Inst *bi(BraunCtx *ctx, Block *b, InstKind k, Value *dst)
 // Helper: is sym address-taken in this function?
 // ============================================================
 
+// ValType for an IR value derived from a (possibly NULL) Type*.
+// VT_VOID never labels a value; default to VT_I16.
+static ValType vt_of(Type *t) {
+    ValType vt = t ? type_to_valtype(t) : VT_I16;
+    return vt == VT_VOID ? VT_I16 : vt;
+}
+
 static bool is_addr_taken(BraunCtx *ctx, Symbol *sym) {
     for (int i = 0; i < ctx->n_addr_taken; i++)
         if (ctx->addr_taken[i] == sym) return true;
@@ -644,28 +686,31 @@ static void iphi_push(Block *b, Inst *phi, Symbol *sym) {
     b->niphi++;
 }
 
+// Splice a phi instruction at the head of a block so it stays before all
+// non-phi instructions.
+static void prepend_phi(Block *b, Inst *phi) {
+    phi->next = b->head;
+    phi->prev = NULL;
+    if (b->head) b->head->prev = phi;
+    else         b->tail = phi;
+    b->head = phi;
+    phi->block = b;
+}
+
 static Value *read_var_recursive(BraunCtx *ctx, Block *b, Symbol *sym) {
     Value *v;
     if (!b->sealed) {
         // Incomplete phi
-        ValType vt = sym->type ? type_to_valtype(sym->type) : VT_I16;
-        if (vt == VT_VOID) vt = VT_I16;
+        ValType vt = vt_of(sym->type);
         Value *dst = new_value(ctx->f, VAL_INST, vt);
         Inst  *phi = bi(ctx, b, IK_PHI, dst);
-        // Prepend to front of block so phi stays before all non-phi instructions
-        phi->next = b->head;
-        phi->prev = NULL;
-        if (b->head) b->head->prev = phi;
-        else         b->tail = phi;
-        b->head = phi;
-        phi->block = b;
+        prepend_phi(b, phi);
         write_var(b, sym, dst);
         iphi_push(b, phi, sym);
         return dst;
     }
     if (b->npreds == 0) {
-        ValType vt = sym->type ? type_to_valtype(sym->type) : VT_I16;
-        if (vt == VT_VOID) vt = VT_I16;
+        ValType vt = vt_of(sym->type);
         Value *u = new_value(ctx->f, VAL_CONST, vt);
         u->iconst = 0;
         write_var(b, sym, u);
@@ -676,16 +721,10 @@ static Value *read_var_recursive(BraunCtx *ctx, Block *b, Symbol *sym) {
         write_var(b, sym, v);
         return v;
     }
-    ValType vt = sym->type ? type_to_valtype(sym->type) : VT_I16;
-    if (vt == VT_VOID) vt = VT_I16;
+    ValType vt = vt_of(sym->type);
     Value *dst = new_value(ctx->f, VAL_INST, vt);
     Inst  *phi = bi(ctx, b, IK_PHI, dst);
-    phi->next   = b->head;
-    phi->prev   = NULL;
-    if (b->head) b->head->prev = phi;
-    else         b->tail = phi;
-    b->head = phi;
-    phi->block = b;
+    prepend_phi(b, phi);
     write_var(b, sym, dst);
     v = add_phi_operands(ctx, sym, phi);
     write_var(b, sym, v);
@@ -899,6 +938,30 @@ static Value *emit_unop(BraunCtx *ctx, Block *b, InstKind kind, Value *v, ValTyp
     return dst;
 }
 
+// Emit IK_ADDR: bp-relative frame address (positive = param, negative = local)
+static Value *emit_frame_addr(BraunCtx *ctx, Block *b, int bp_off) {
+    Value *dst  = new_value(ctx->f, VAL_INST, VT_PTR);
+    Inst  *inst = bi(ctx, b, IK_ADDR, dst);
+    inst->imm = bp_off;
+    inst_append(b, inst);
+    return dst;
+}
+
+// Emit IK_GADDR: address of a global/static symbol or string literal label
+static Value *emit_gaddr(BraunCtx *ctx, Block *b, const char *label) {
+    Value *dst  = new_value(ctx->f, VAL_INST, VT_PTR);
+    Inst  *inst = bi(ctx, b, IK_GADDR, dst);
+    inst->fname = (char *)label;
+    inst_append(b, inst);
+    return dst;
+}
+
+// Base + constant byte offset (no-op when offset is 0)
+static Value *addr_at(BraunCtx *ctx, Block *b, Value *base, int off) {
+    if (off == 0) return base;
+    return emit_binop(ctx, b, IK_ADD, base, new_const(ctx->f, off, VT_I16), VT_PTR);
+}
+
 static Value *emit_load(BraunCtx *ctx, Block *b, Value *ptr, int size, int offset, ValType vt) {
     // Absorb constant ADD offset into load: LOAD(ADD(base, k), 0) → LOAD(base, k)
     if (offset == 0 && ptr && ptr->kind == VAL_INST && ptr->def &&
@@ -1100,8 +1163,7 @@ static void cg_call_args(BraunCtx *ctx, Block **cur, Inst *call, Node *args_head
 
 static Value *emit_call_result(BraunCtx *ctx, Block *b, Inst *call, Type *ret_type) {
     inst_append(b, call);
-    ValType call_vt = ret_type ? type_to_valtype(ret_type) : VT_I16;
-    if (call_vt == VT_VOID) call_vt = VT_I16;
+    ValType call_vt = vt_of(ret_type);
     call->dst->vtype = call_vt;
     // Working copy — freely allocated by IRC
     Value *working = new_value(ctx->f, VAL_INST, call_vt);
@@ -1133,10 +1195,7 @@ static Value *cg_addr(BraunCtx *ctx, Block **cur, Node *n) {
             int sk = (int)(sp ^ (sp >> 16));
             Value *hit = lvn_lookup(ctx, b, IK_GADDR, sk, -1);
             if (hit) return hit;
-            Value *dst = new_value(ctx->f, VAL_INST, VT_PTR);
-            Inst  *inst = bi(ctx, b, IK_GADDR, dst);
-            inst->fname = (char *)sym_label(sym);
-            inst_append(b, inst);
+            Value *dst = emit_gaddr(ctx, b, sym_label(sym));
             lvn_insert(ctx, b, IK_GADDR, sk, -1, dst);
             return dst;
         }
@@ -1150,34 +1209,18 @@ static Value *cg_addr(BraunCtx *ctx, Block **cur, Node *n) {
         // Addr-taken param: use home slot
         if (sym->kind == SYM_PARAM && is_addr_taken(ctx, sym)) {
             int voff = vparam_off(ctx, sym);
-            int bpoff = (voff >= 0) ? voff : param_home_off(ctx, sym);
-            Value *dst = new_value(ctx->f, VAL_INST, VT_PTR);
-            Inst  *inst = bi(ctx, b, IK_ADDR, dst);
-            inst->imm = bpoff;
-            inst_append(b, inst);
-            return dst;
+            return emit_frame_addr(ctx, b, (voff >= 0) ? voff : param_home_off(ctx, sym));
         }
 
         // Non-addr-taken param (non-variadic): IK_ADDR with sym->offset
         // (but typically cg_addr on a non-addr-taken param should not happen)
         if (sym->kind == SYM_PARAM) {
             int voff = vparam_off(ctx, sym);
-            int bpoff = (voff >= 0) ? voff : sym->offset;
-            Value *dst = new_value(ctx->f, VAL_INST, VT_PTR);
-            Inst  *inst = bi(ctx, b, IK_ADDR, dst);
-            inst->imm = bpoff;
-            inst_append(b, inst);
-            return dst;
+            return emit_frame_addr(ctx, b, (voff >= 0) ? voff : sym->offset);
         }
 
         // Local: IK_ADDR at negative bp offset
-        {
-            Value *dst = new_value(ctx->f, VAL_INST, VT_PTR);
-            Inst  *inst = bi(ctx, b, IK_ADDR, dst);
-            inst->imm = -(sym->offset);
-            inst_append(b, inst);
-            return dst;
-        }
+        return emit_frame_addr(ctx, b, -(sym->offset));
     }
 
     if (n->kind == ND_UNARYOP) {
@@ -1195,9 +1238,7 @@ static Value *cg_addr(BraunCtx *ctx, Block **cur, Node *n) {
         else
             base = cg_addr(ctx, cur, n->ch[0]);
         b = *cur;
-        if (offset == 0) return base;
-        Value *off_v = new_const(ctx->f, offset, VT_I16);
-        return emit_binop(ctx, b, IK_ADD, base, off_v, VT_PTR);
+        return addr_at(ctx, b, base, offset);
     }
 
     // Fallback: evaluate as expression (pointer result)
@@ -1263,23 +1304,22 @@ static Value *cg_expr(BraunCtx *ctx, Block **cur, Node *n) {
     if (n->line) ctx->cur_line = n->line;
 
     Block *b = *cur;
-    ValType vt = n->type ? type_to_valtype(n->type) : VT_I16;
-    if (vt == VT_VOID) vt = VT_I16;
+    ValType vt = vt_of(n->type);
 
     switch (n->kind) {
 
     // ----------------------------------------------------------
     case ND_LITERAL: {
         if (n->u.literal.strval) {
-            // String literal → gaddr "_lN"
-            int lid = (*ctx->strlit_id)++;
-            strlits_push(lid, n->u.literal.strval, n->u.literal.strval_len);
+            // String literal → gaddr "_lN" (identical literals share one label)
+            int lid = strlit_lookup(n->u.literal.strval, n->u.literal.strval_len);
+            if (lid < 0) {
+                lid = (*ctx->strlit_id)++;
+                strlit_register(n->u.literal.strval, n->u.literal.strval_len, lid);
+                strlits_push(lid, n->u.literal.strval, n->u.literal.strval_len);
+            }
             char buf[32]; snprintf(buf, sizeof(buf), "_l%d", lid);
-            Value *dst = new_value(ctx->f, VAL_INST, VT_PTR);
-            Inst  *inst = bi(ctx, b, IK_GADDR, dst);
-            inst->fname = arena_strdup(buf);
-            inst_append(b, inst);
-            return dst;
+            return emit_gaddr(ctx, b, arena_strdup(buf));
         }
         if (n->type && (n->type->base == TB_FLOAT || n->type->base == TB_DOUBLE)) {
             float fv = (float)n->u.literal.fval;
@@ -1301,8 +1341,7 @@ static Value *cg_expr(BraunCtx *ctx, Block **cur, Node *n) {
         // Direct function call: foo(args)
         if (n->u.ident.is_function) {
             Node *args_head = n->ch[0];
-            ValType call_vt = n->type ? type_to_valtype(n->type) : VT_I16;
-            if (call_vt == VT_VOID) call_vt = VT_I16;
+            ValType call_vt = vt_of(n->type);
 
             // Builtin putchar
             if (sym->kind == SYM_BUILTIN &&
@@ -1350,10 +1389,7 @@ static Value *cg_expr(BraunCtx *ctx, Block **cur, Node *n) {
         // Global scalar
         if (sym->kind == SYM_GLOBAL || sym->kind == SYM_EXTERN ||
             sym->kind == SYM_STATIC_GLOBAL || sym->kind == SYM_STATIC_LOCAL) {
-            Value *addr = new_value(ctx->f, VAL_INST, VT_PTR);
-            Inst  *ga = bi(ctx, b, IK_GADDR, addr);
-            ga->fname = (char *)sym_label(sym);
-            inst_append(b, ga);
+            Value *addr = emit_gaddr(ctx, b, sym_label(sym));
             int sz = sym->type ? sym->type->size : 2;
             return emit_load(ctx, b, addr, sz, 0, vt);
         }
@@ -1367,10 +1403,7 @@ static Value *cg_expr(BraunCtx *ctx, Block **cur, Node *n) {
             } else {
                 bpoff = -(sym->offset);
             }
-            Value *addr = new_value(ctx->f, VAL_INST, VT_PTR);
-            Inst  *ai = bi(ctx, b, IK_ADDR, addr);
-            ai->imm = bpoff;
-            inst_append(b, ai);
+            Value *addr = emit_frame_addr(ctx, b, bpoff);
             int sz = sym->type ? sym->type->size : 2;
             return emit_load(ctx, b, addr, sz, 0, vt);
         }
@@ -1386,8 +1419,7 @@ static Value *cg_expr(BraunCtx *ctx, Block **cur, Node *n) {
         // Indirect call: (*fp)(args) — is_function=true, ch[0]=fp, ch[1]=args
         if (op == TK_STAR && n->u.unaryop.is_function) {
             Node *args_head = n->ch[1];
-            ValType call_vt = n->type ? type_to_valtype(n->type) : VT_I16;
-            if (call_vt == VT_VOID) call_vt = VT_I16;
+            ValType call_vt = vt_of(n->type);
 
             Value *fp = cg_expr(ctx, cur, n->ch[0]); b = *cur;
             // If fp is from a binop (array subscript of fn ptrs), it might need a load
@@ -1577,8 +1609,7 @@ static Value *cg_expr(BraunCtx *ctx, Block **cur, Node *n) {
 
     // ----------------------------------------------------------
     case ND_COMPOUND_ASSIGN: {
-        ValType lhs_vt = n->ch[0]->type ? type_to_valtype(n->ch[0]->type) : VT_I16;
-        if (lhs_vt == VT_VOID) lhs_vt = VT_I16;
+        ValType lhs_vt = vt_of(n->ch[0]->type);
         Value   *rhs  = cg_expr(ctx, cur, n->ch[1]); b = *cur;
         InstKind kind = tok_binop_kind(n->op_kind, lhs_vt);
         return cg_rmw(ctx, cur, n->ch[0], kind, rhs, lhs_vt, false);
@@ -1680,9 +1711,7 @@ static Value *cg_expr(BraunCtx *ctx, Block **cur, Node *n) {
             Inst  *phi     = bi(ctx, merge, IK_PHI, phi_dst);
             inst_add_op(phi, then_v);
             inst_add_op(phi, else_v);
-            phi->next = merge->head; phi->prev = NULL;
-            if (merge->head) merge->head->prev = phi; else merge->tail = phi;
-            merge->head = phi; phi->block = merge;
+            prepend_phi(merge, phi);
             return phi_dst;
         }
         return then_v ? then_v : new_const(ctx->f, 0, VT_I16);
@@ -1693,8 +1722,7 @@ static Value *cg_expr(BraunCtx *ctx, Block **cur, Node *n) {
         // Function pointer member call: s.fp(args) or s->fp(args)
         if (n->u.member.is_function) {
             Node *args_head = n->ch[1];
-            ValType call_vt = n->type ? type_to_valtype(n->type) : VT_I16;
-            if (call_vt == VT_VOID) call_vt = VT_I16;
+            ValType call_vt = vt_of(n->type);
             Value *fp_addr = cg_addr(ctx, cur, n); b = *cur;
             Value *fp = emit_load(ctx, b, fp_addr, PTR_SIZE, 0, VT_PTR);
             Value *landing = new_value(ctx->f, VAL_INST, call_vt);
@@ -1820,9 +1848,7 @@ static Value *cg_logand(BraunCtx *ctx, Block **cur, Node *lhs, Node *rhs, bool i
     Value *lhs_contrib = is_or ? new_const(ctx->f, 1, VT_I16) : new_const(ctx->f, 0, VT_I16);
     inst_add_op(phi, lhs_contrib);
     inst_add_op(phi, rhs_bool);
-    phi->next = end_blk->head; phi->prev = NULL;
-    if (end_blk->head) end_blk->head->prev = phi; else end_blk->tail = phi;
-    end_blk->head = phi; phi->block = end_blk;
+    prepend_phi(end_blk, phi);
     return phi_dst;
 }
 
@@ -1869,14 +1895,7 @@ static void cg_fill_array(BraunCtx *ctx, Block **cur, Value *base_addr,
             // Zero: already zero-filled, skip
             *byte_off += lsz;
         } else {
-            int off = *byte_off;
-            Value *ptr;
-            if (off == 0) {
-                ptr = base_addr;
-            } else {
-                Value *ov = new_const(ctx->f, off, VT_I16);
-                ptr = emit_binop(ctx, *cur, IK_ADD, base_addr, ov, VT_PTR);
-            }
+            Value *ptr = addr_at(ctx, *cur, base_addr, *byte_off);
             Value *v = cg_expr(ctx, cur, item);
             emit_store(ctx, *cur, ptr, v, lsz, 0);
             *byte_off += lsz;
@@ -1903,13 +1922,7 @@ static void cg_fill_struct(BraunCtx *ctx, Block **cur, Value *base_addr, int bas
             cg_fill_array(ctx, cur, base_addr, f->type, raw, &off);
         } else {
             Value *v = cg_expr(ctx, cur, item);
-            Value *ptr;
-            if (foff == 0) {
-                ptr = base_addr;
-            } else {
-                Value *ov = new_const(ctx->f, foff, VT_I16);
-                ptr = emit_binop(ctx, *cur, IK_ADD, base_addr, ov, VT_PTR);
-            }
+            Value *ptr = addr_at(ctx, *cur, base_addr, foff);
             int fsz = f->type ? f->type->size : 2;
             emit_store(ctx, *cur, ptr, v, fsz, 0);
         }
@@ -1931,10 +1944,7 @@ static void cg_decl_init(BraunCtx *ctx, Block **cur, Symbol *sym, Node *init) {
         if (is_addr_taken(ctx, sym)) {
             int bpoff = -(sym->offset);
             if (sym->kind == SYM_PARAM) bpoff = param_home_off(ctx, sym);
-            Value *addr = new_value(ctx->f, VAL_INST, VT_PTR);
-            Inst  *ai = bi(ctx, b, IK_ADDR, addr);
-            ai->imm = bpoff;
-            inst_append(b, ai);
+            Value *addr = emit_frame_addr(ctx, b, bpoff);
             emit_store(ctx, b, addr, v, ty->size, 0);
         } else {
             write_var(b, sym, v);
@@ -1944,21 +1954,11 @@ static void cg_decl_init(BraunCtx *ctx, Block **cur, Symbol *sym, Node *init) {
 
     // char array from string literal: byte-by-byte stores
     if (istype_array(ty) && init->kind == ND_LITERAL && init->u.literal.strval) {
-        int bpoff = -(sym->offset);
-        Value *base_addr = new_value(ctx->f, VAL_INST, VT_PTR);
-        Inst  *ai = bi(ctx, b, IK_ADDR, base_addr);
-        ai->imm = bpoff;
-        inst_append(b, ai);
+        Value *base_addr = emit_frame_addr(ctx, b, -(sym->offset));
         const char *str = init->u.literal.strval;
         int slen = init->u.literal.strval_len;
         for (int i = 0; i <= slen; i++) {
-            Value *ptr;
-            if (i == 0) {
-                ptr = base_addr;
-            } else {
-                Value *off = new_const(ctx->f, i, VT_I16);
-                ptr = emit_binop(ctx, b, IK_ADD, base_addr, off, VT_PTR);
-            }
+            Value *ptr = addr_at(ctx, b, base_addr, i);
             Value *bval = new_const(ctx->f, i < slen ? (unsigned char)str[i] : 0, VT_I8);
             emit_store(ctx, b, ptr, bval, 1, 0);
         }
@@ -1967,23 +1967,13 @@ static void cg_decl_init(BraunCtx *ctx, Block **cur, Symbol *sym, Node *init) {
 
     // Array with initializer list: zero-fill then write non-zero elements
     if (istype_array(ty) && init->kind == ND_INITLIST) {
-        int bpoff = -(sym->offset);
-        Value *base_addr = new_value(ctx->f, VAL_INST, VT_PTR);
-        Inst  *ai = bi(ctx, b, IK_ADDR, base_addr);
-        ai->imm = bpoff;
-        inst_append(b, ai);
+        Value *base_addr = emit_frame_addr(ctx, b, -(sym->offset));
         // Zero-fill entire array
         Type *leaf = array_elem_type(ty);
         int lsz = (leaf && leaf->size > 0) ? leaf->size : 2;
         int total = ty->size;
         for (int off = 0; off < total; off += lsz) {
-            Value *ptr;
-            if (off == 0) {
-                ptr = base_addr;
-            } else {
-                Value *off_v = new_const(ctx->f, off, VT_I16);
-                ptr = emit_binop(ctx, b, IK_ADD, base_addr, off_v, VT_PTR);
-            }
+            Value *ptr = addr_at(ctx, b, base_addr, off);
             emit_store(ctx, b, ptr, new_const(ctx->f, 0, VT_I16), lsz, 0);
         }
         // Write non-zero initializers (recursive for multi-dim arrays)
@@ -1995,23 +1985,13 @@ static void cg_decl_init(BraunCtx *ctx, Block **cur, Symbol *sym, Node *init) {
     // Struct with initializer list: handled as memcpy from a temp
     // (for simplicity: zero addr then store each field is complex; use memcpy approach)
     if (ty && ty->base == TB_STRUCT) {
-        int bpoff = -(sym->offset);
-        Value *dst_addr = new_value(ctx->f, VAL_INST, VT_PTR);
-        Inst  *ai = bi(ctx, b, IK_ADDR, dst_addr);
-        ai->imm = bpoff;
-        inst_append(b, ai);
+        Value *dst_addr = emit_frame_addr(ctx, b, -(sym->offset));
 
         if (init->kind == ND_INITLIST) {
             // Zero-fill struct
             int total = ty->size;
             for (int off = 0; off < total; off += 2) {
-                Value *ptr;
-                if (off == 0) {
-                    ptr = dst_addr;
-                } else {
-                    Value *ov = new_const(ctx->f, off, VT_I16);
-                    ptr = emit_binop(ctx, b, IK_ADD, dst_addr, ov, VT_PTR);
-                }
+                Value *ptr = addr_at(ctx, b, dst_addr, off);
                 emit_store(ctx, b, ptr, new_const(ctx->f, 0, VT_I16), 2, 0);
             }
             // Store each field (recursive for nested struct/array fields)
@@ -2518,8 +2498,7 @@ Function *braun_function(Node *func_decl, int tu_index, int *strlit_id) {
     int stack_slot = 0;  // count of stack params (beyond NREG_PARAMS)
     for (int idx = 0; idx < nparams; idx++) {
         Symbol *ps = param_syms[idx];
-        ValType pvt = ps->type ? type_to_valtype(ps->type) : VT_I16;
-        if (pvt == VT_VOID) pvt = VT_I16;
+        ValType pvt = vt_of(ps->type);
 
         if (is_variadic) {
             // All params from stack (4-byte slots)
@@ -2551,11 +2530,7 @@ Function *braun_function(Node *func_decl, int tu_index, int *strlit_id) {
                 // Home the param: store to frame slot
                 int home_off = param_home_off(&ctx, ps);
                 int sz = ps->type ? ps->type->size : 2;
-                // Emit addr + store
-                Value *addr = new_value(f, VAL_INST, VT_PTR);
-                Inst  *ai = new_inst(f, entry, IK_ADDR, addr);
-                ai->imm = home_off;
-                inst_append(entry, ai);
+                Value *addr = emit_frame_addr(&ctx, entry, home_off);
                 emit_store(&ctx, entry, addr, landing, sz, 0);
                 // For subsequent reads: the variable maps to memory, not an SSA value.
                 // We do NOT write_var here — cg_expr will emit a load from the home slot.

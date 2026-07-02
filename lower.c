@@ -12,6 +12,7 @@
 #include "lower.h"
 #include "sx.h"
 #include "smallcc.h"
+#include "braun.h"   // strlit_lookup / strlit_register (cross-TU dedup)
 
 // ============================================================
 // String literal accumulator
@@ -37,11 +38,16 @@ static void push_strlit(int id, const char *data, int len) {
     g_nstrlits++;
 }
 
-// Assign the next strlit ID and return its label string "_lN".
-// Also records the data so it can be emitted later.
+// Return the label "_lN" for a string literal, reusing an existing label
+// when an identical literal was already assigned (cross-TU dedup); otherwise
+// assign the next strlit ID and record the data so it can be emitted later.
 static const char *assign_strlit(const char *data, int len) {
-    int id = g_strlit_id++;
-    push_strlit(id, data, len);
+    int id = strlit_lookup(data, len);
+    if (id < 0) {
+        id = g_strlit_id++;
+        strlit_register(data, len, id);
+        push_strlit(id, data, len);
+    }
     char buf[32]; snprintf(buf, sizeof(buf), "_l%d", id);
     return arena_strdup(buf);
 }
