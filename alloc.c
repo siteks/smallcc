@@ -621,23 +621,33 @@ static int assign_colors(IGraph *g, Function *f, int K, int pessimistic,
             // The max ensures outer-loop defs with inner-loop uses get
             // high cost (use_cost dominates) while values with many uses
             // in their def block also stay protected (def_cost dominates).
+            // Spill temps (reloads/remats inserted by a previous
+            // rewrite_spills) are excluded in the first pass: their tiny
+            // use_count makes them the cheapest candidate every time, and
+            // re-spilling a reload livelocks the whole allocation (each
+            // iteration spills the previous iteration's temp — fuzz seed
+            // 40156 span 500 iterations this way). Fall back to allowing
+            // them only if no real value is left to spill.
             int worst = -1;
             long long cost_worst = 0;
-            for (int i = 0; i < nv; i++) {
-                if (removed[i]) continue;
-                Value *vi = f->values[i];
-                int depth = (vi->def && vi->def->block)
-                            ? vi->def->block->loop_depth : 0;
-                if (depth > 20) depth = 20;
-                long long cost_i = (long long)vi->use_count << depth;
-                // Prefer minimum cost_i/degree[i]; compare via cross-multiply
-                // to avoid division: cost_i/deg_i < cost_w/deg_w
-                //   ⟺  cost_i * deg_w < cost_w * deg_i
-                if (worst < 0 ||
-                    cost_i * (long long)degree[worst] <
-                    cost_worst * (long long)degree[i]) {
-                    worst = i;
-                    cost_worst = cost_i;
+            for (int allow_tmp = 0; allow_tmp < 2 && worst < 0; allow_tmp++) {
+                for (int i = 0; i < nv; i++) {
+                    if (removed[i]) continue;
+                    Value *vi = f->values[i];
+                    if (vi->is_spill_tmp && !allow_tmp) continue;
+                    int depth = (vi->def && vi->def->block)
+                                ? vi->def->block->loop_depth : 0;
+                    if (depth > 20) depth = 20;
+                    long long cost_i = (long long)vi->use_count << depth;
+                    // Prefer minimum cost_i/degree[i]; compare via cross-multiply
+                    // to avoid division: cost_i/deg_i < cost_w/deg_w
+                    //   ⟺  cost_i * deg_w < cost_w * deg_i
+                    if (worst < 0 ||
+                        cost_i * (long long)degree[worst] <
+                        cost_worst * (long long)degree[i]) {
+                        worst = i;
+                        cost_worst = cost_i;
+                    }
                 }
             }
             if (worst < 0) break;
@@ -814,6 +824,7 @@ static Value *insert_spill_load(Function *f, Block *b, Inst *before,
     int sz = spill_size(spilled_val->vtype);
 
     Value *tmp  = new_value(f, VAL_INST, spilled_val->vtype);
+    tmp->is_spill_tmp = 1;
     Inst  *load = new_inst(f, b, IK_LOAD, tmp);
     load->size  = sz;
     if (before) load->line = before->line;
@@ -875,6 +886,7 @@ static int is_rematerializable(Value *v) {
 static Value *insert_remat(Function *f, Block *b, Inst *before, Value *orig) {
     Inst *def = orig->def;
     Value *tmp = new_value(f, VAL_INST, orig->vtype);
+    tmp->is_spill_tmp = 1;
     Inst *clone = new_inst(f, b, def->kind, tmp);
     clone->imm   = def->imm;
     clone->fname = def->fname;
@@ -1218,7 +1230,8 @@ void irc_allocate(Function *f) {
         ig_free(g);
 
         if (iter == max_iter - 1)
-            fprintf(stderr, "IRC: %s EXHAUSTED %d iterations (nvalues=%d)\n",
-                    f->name, max_iter, f->nvalues);
+            error("IRC: %s failed to converge after %d iterations "
+                  "(nvalues=%d) — refusing to emit code with uncolored "
+                  "values", f->name, max_iter, f->nvalues);
     }
 }

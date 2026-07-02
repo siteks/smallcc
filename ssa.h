@@ -98,6 +98,8 @@ struct Value {
     int      phys_reg;      // -1 until IRC assigns
     int      spill_slot;    // -1 unless spilled
     int      use_count;
+    int      is_spill_tmp;  // reload/remat temp created by rewrite_spills;
+                            // never a spill candidate itself (livelock guard)
 };
 
 struct Inst {
