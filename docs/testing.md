@@ -95,6 +95,21 @@ make test_irsim_p   # same, parallel
 
 ---
 
+## Differential fuzzing (`tools/fuzz.py`)
+
+`make fuzz` (or `python3 tools/fuzz.py -n N -seed S`) generates random C89
+programs inside the supported subset and runs each through four oracles —
+`-O2`→sim_c, `-O0`→sim_c, `-runoos`, `-runirc` — plus an `IR_VERIFY=1`
+compile. Any r0 disagreement, crash, compile timeout, or verifier failure
+saves the program to `fuzz_failures/` for reduction into a `tests/cases/`
+reproducer. The generator stays inside target-defined behavior (unsigned
+arithmetic, `|1`-guarded divisors, masked shift amounts) so the oracles must
+agree. Its first session found a sim_c ISA-semantics bug (`rdivli`/`rmodli`
+executed signed) and a compiler hang (unbounded copy-chain walk in legalize
+Pass E).
+
+---
+
 ## Compiler debug flags
 
 | Mechanism | What it shows |

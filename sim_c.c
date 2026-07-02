@@ -1604,10 +1604,13 @@ static void run_cpu4(void)
             break;
         case 0x1a: /* rsubli (sub=0) / rdivli (sub=1) */
             if (subop == 0) r[rd] = (uint32_t)sx9(imm) - r[ry];
-            else            r[rd] = r[ry] ? (uint32_t)(sx9(imm) / (int32_t)r[ry]) : 0;
+            /* rdivli is UNSIGNED: the sign-extended imm9 bit pattern is the
+               unsigned dividend (spec: rd = sext9 / rx). */
+            else            r[rd] = r[ry] ? (uint32_t)sx9(imm) / r[ry] : 0;
             break;
         case 0x1b: /* rmodli (sub=0) / rdivsli (sub=1) */
-            if (subop == 0) r[rd] = r[ry] ? (uint32_t)(sx9(imm) % (int32_t)r[ry]) : 0;
+            /* rmodli is UNSIGNED (spec: rd = sext9 % rx). */
+            if (subop == 0) r[rd] = r[ry] ? (uint32_t)sx9(imm) % r[ry] : 0;
             else            r[rd] = r[ry] ? (uint32_t)(sx9(imm) / (int32_t)r[ry]) : 0;
             break;
         /* F3d: beqz/bnez */

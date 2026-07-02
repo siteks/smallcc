@@ -27,6 +27,9 @@ test_irsim_v: smallcc
 test_irsim_p: smallcc
 	python3 -m pytest tests/cases/ -n auto -q --irsim
 
+fuzz: smallcc sim_c
+	python3 tools/fuzz.py -n 200
+
 clean:
 	rm -f smallcc sim_c mycc_* *.o *~ tmp* _tmp*.c test.s *.lst error.log
 	rm -rf .pytest_cache __pycache__ cpu4/__pycache__

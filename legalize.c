@@ -186,9 +186,15 @@ void legalize_function(Function *f) {
                 // CAUTION: under ILP32 this look-through has caused subtle
                 // miscompiles (CoreMark crcs went off without it being obvious why);
                 // keeping it for now but worth re-investigating if anything fails.
+                // Bounded walk: post-OOS copy chains that implement
+                // loop-carried phis can be CYCLIC (a = copy b in one pred,
+                // b = copy a on the back edge) — an unbounded walk here
+                // hangs the compiler (found by tools/fuzz.py, seed 77).
                 Value *inner = val_resolve(inst->ops[0]);
-                while (inner && inner->kind == VAL_INST && inner->def &&
-                       inner->def->kind == IK_COPY && inner->def->nops >= 1)
+                for (int hops = 0;
+                     inner && inner->kind == VAL_INST && inner->def &&
+                     inner->def->kind == IK_COPY && inner->def->nops >= 1 &&
+                     hops < 16; hops++)
                     inner = val_resolve(inner->def->ops[0]);
 
                 if (!inner || inner->kind != VAL_INST || !inner->def) continue;
