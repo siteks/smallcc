@@ -65,7 +65,10 @@ and performance-run seeds, suitable for quick validation and profiling:
 cd ../coremark_single_file
 ../smallcc/smallcc -arch cpu4 -o coremark.s coremark_single.c
 ../smallcc/sim_c -arch cpu4 -maxsteps 4000000 coremark.s
-# Expect: crcfinal printed to stderr, "Correct operation validated"
+# Expect: "Errors detected" — this is ONLY the 10-second minimum-runtime
+# check failing on a 1-iteration run and is immaterial for compiler work.
+# The real correctness signal is the CRC set: seedcrc 0xe9f5,
+# crclist/crcfinal 0xe714, crcmatrix 0x1fd7, crcstate 0x8e3a.
 ```
 
 To generate an execution profile:
