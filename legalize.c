@@ -48,9 +48,11 @@ void legalize_function(Function *f) {
                 v_ri->phys_reg = i + 1;  // r1, r2, r3
                 Inst  *cp = new_inst(f, b, IK_COPY, v_ri);
                 cp->line = inst->line;
-                inst_add_op(cp, arg);
+                inst_add_op(cp, arg);       // +1 on arg (copy's use)
+                arg->use_count--;           // call no longer uses arg directly
                 inst_insert_before(inst, cp);
                 inst->ops[arg_base + i] = v_ri;
+                v_ri->use_count++;          // call's new reference
             }
 
             if (is_icall) {
@@ -61,9 +63,11 @@ void legalize_function(Function *f) {
                     v_r0->phys_reg = 0;  // r0 for jlr
                     Inst  *fp_cp = new_inst(f, b, IK_COPY, v_r0);
                     fp_cp->line = inst->line;
-                    inst_add_op(fp_cp, fp);
+                    inst_add_op(fp_cp, fp);   // +1 on fp (copy's use)
+                    fp->use_count--;          // call no longer uses fp directly
                     inst_insert_before(inst, fp_cp);
                     inst->ops[0] = v_r0;
+                    v_r0->use_count++;        // call's new reference
                 }
             }
         }
@@ -206,7 +210,9 @@ void legalize_function(Function *f) {
 
                 int combined = c1 & c2;
                 // Repoint outer AND's first operand past the inner AND (and any copies)
+                inner->use_count--;   // outer AND no longer uses the inner AND's dst
                 inst->ops[0] = val_resolve(inner->def->ops[1 - inner_const_pos]);
+                inst->ops[0]->use_count++;
 
                 if (combined != c2) {
                     // Need a new constant; replace ops[1] with IK_CONST(combined)
@@ -215,7 +221,10 @@ void legalize_function(Function *f) {
                     new_mask_i->imm  = combined;
                     new_mask_i->line = inst->line;
                     inst_insert_before(inst, new_mask_i);
+                    Value *old1 = val_resolve(inst->ops[1]);
+                    if (old1 && old1->kind == VAL_INST) old1->use_count--;
                     inst->ops[1] = new_mask_v;
+                    new_mask_v->use_count++;
                 }
                 // If combined == c2, ops[1] is already the right constant; leave it alone.
             }
@@ -260,6 +269,7 @@ void legalize_function(Function *f) {
                         ci->line = inst->line;
                         inst_insert_before(inst, ci);
                         inst->ops[j] = cv;
+                        cv->use_count++;
                     }
                     break;
                 case IK_ADD: case IK_SUB:
@@ -276,6 +286,7 @@ void legalize_function(Function *f) {
                         ci->line = inst->line;
                         inst_insert_before(inst, ci);
                         inst->ops[j] = cv;
+                        cv->use_count++;
                     }
                     break;
                 case IK_AND:
@@ -292,6 +303,7 @@ void legalize_function(Function *f) {
                         ci->line = inst->line;
                         inst_insert_before(inst, ci);
                         inst->ops[j] = cv;
+                        cv->use_count++;
                     }
                     break;
                 default:

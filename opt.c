@@ -1735,6 +1735,9 @@ void opt_jump_thread(Function *f) {
     if (changed) {
         // Remove blocks that became predecessor-less
         opt_remove_dead_blocks(f);
+        // Standard post-transform cleanup: CFG rewiring above changes which
+        // copies/conditions are referenced without maintaining counts.
+        recount_uses(f);
     }
 }
 
@@ -2061,6 +2064,9 @@ void opt_unroll_loops(Function *f) {
         }
 
         free(vmap);
+        // Standard post-transform cleanup: cloning and exit fixups above
+        // add references without maintaining counts.
+        recount_uses(f);
         break;  // only unroll one loop per function per pass
     }
 }

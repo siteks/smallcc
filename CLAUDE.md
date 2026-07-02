@@ -32,6 +32,7 @@ echo 'int main(){return 5+3;}' > t.c
 ./smallcc -arch cpu4 -oos t.oos -o out.s t.c                   # dump post-OOS IR to t.oos
 ./smallcc -arch cpu4 -irc t.irc -o out.s t.c                   # dump post-IRC IR to t.irc
 DUMP_IR=1 ./smallcc -arch cpu4 -o out.s t.c                    # dump post-OOS and post-IRC IR to stderr
+IR_VERIFY=1 ./smallcc -arch cpu4 -o out.s t.c                  # run the IR verifier after every pass group (verify.c)
 ```
 
 Tests are pytest-collected `.c` files under `tests/cases/` with `EXPECT_R0`/`EXPECT_STDOUT`/`EXPECT_COMPILE_FAIL` magic comments (harness: `tests/conftest.py`). `make test` runs them against `sim_c`; `make test_irsim` runs the same corpus through the in-process IR interpreter (`-runoos` and `-runirc`), giving a three-way differential oracle that localizes bugs to legalize/IRC vs emission. Tests under `tests/cases/hw/` exercise sim_c's MMIO device model and are skipped in irsim mode.

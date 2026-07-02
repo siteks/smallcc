@@ -99,6 +99,7 @@ make test_irsim_p   # same, parallel
 
 | Mechanism | What it shows |
 |---|---|
+| `IR_VERIFY=1` | Runs the IR verifier (`verify.c`) after every pass group: pred/succ symmetry, terminator discipline, phi arity, dead-def uses, use_count exactness (post-OOS), phys_reg assignment (post-IRC). On violation it prints all findings plus an IR dump and exits — the failing stage name localizes the broken pass |
 | `-ssa file` / `-oos file` / `-irc file` | Per-function IR dump after Braun / OOS / IRC |
 | `DUMP_IR=1` | Post-OOS and post-IRC IR to stderr |
 | `-ann` | Annotate emitted assembly with source lines |

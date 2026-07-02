@@ -10,6 +10,7 @@
 #include "alloc.h"
 #include "emit.h"
 #include "irsim.h"
+#include "verify.h"
 #include <dirent.h>
 #ifdef __APPLE__
 #  include <mach-o/dyld.h>
@@ -309,16 +310,22 @@ static int collect_runtime_files(const char *runtime_dir,
 // orphans are still cleaned up.
 static void run_post_oos_pipeline(Function *f) {
     if (opt_flags & OPT_COPY_PROP)      STAT("post3", opt_stat_copy_alias, opt_copy_prop(f));
+    verify_function(f, "copy_prop", VERIFY_POST_OOS);
     if (opt_flags & OPT_CSE)            { compute_dominators(f);
                                           STAT("post4", opt_stat_cse_alias, opt_cse(f)); }
+    verify_function(f, "cse", VERIFY_POST_OOS);
     if (opt_flags & OPT_LICM)           opt_licm_const(f);
     if (opt_flags & OPT_LICM)           opt_licm(f);
+    verify_function(f, "licm", VERIFY_POST_OOS);
     if (opt_flags & OPT_JUMP_THREAD)    opt_jump_thread(f);
     if (opt_flags & OPT_UNROLL)         opt_unroll_loops(f);
+    verify_function(f, "jump_thread+unroll", VERIFY_POST_OOS);
     if (opt_flags & OPT_COPY_PROP)      STAT("post5", opt_stat_copy_alias, opt_copy_prop(f));
     compute_dominators(f);
     legalize_function(f);
+    verify_function(f, "legalize", VERIFY_POST_OOS);
     irc_allocate(f);
+    verify_function(f, "irc", VERIFY_POST_IRC);
 }
 
 int main(int argc, char **argv)
@@ -724,9 +731,11 @@ int main(int argc, char **argv)
                 if (f) {
                     if (ssa_out) { fprintf(ssa_out, "=== SSA: %s ===\n", f->name); print_function(f, ssa_out); }
                     split_critical_edges(f);
+                    verify_function(f, "braun+split", VERIFY_PRE_OOS);
                     // Pre-OOS cleanup: CFG-structural, no phis/copies needed
                     if (opt_flags & OPT_FOLD_BR)        STAT("pre", opt_stat_fold_br,  opt_fold_branches(f));
                     if (opt_flags & OPT_DEAD_BLOCKS)    STAT("pre", opt_stat_dead_blk, opt_remove_dead_blocks(f));
+                    verify_function(f, "pre-cleanup", VERIFY_PRE_OOS);
                     compute_dominators(f);
                     // Pre-OOS pattern simplification: feed cleaner IR to GVN
                     if (opt_flags & OPT_REDUNDANT_BOOL) opt_redundant_bool(f);
@@ -738,10 +747,13 @@ int main(int argc, char **argv)
                     if (getenv("OPT_STATS"))
                         STAT("r2k-retry", opt_stat_kb_change, opt_known_bits(f));
                     if (opt_flags & OPT_CSE) STAT("pre-cse", opt_stat_cse_alias, opt_pre_oos_cse(f));
+                    verify_function(f, "pre-simplify+cse", VERIFY_PRE_OOS);
                     opt_scalar_promote(f);
                     opt_addr_iv(f);
                     opt_lsr(f);
+                    verify_function(f, "loop-opts", VERIFY_PRE_OOS);
                     out_of_ssa(f);
+                    verify_function(f, "oos", VERIFY_OOS);
                     if (oos_out) { fprintf(oos_out, "=== OOS: %s ===\n", f->name); print_function(f, oos_out); }
                     if (run_oos && irsim) { irsim_add_function(irsim, f); continue; }
                     run_post_oos_pipeline(f);

@@ -964,6 +964,8 @@ static void rewrite_spills(Function *f, IGraph *g) {
                         // Rematerialize: clone the IK_CONST/IK_GADDR before this use
                         Value *tmp = insert_remat(f, b, inst, v);
                         inst->ops[oi] = tmp;
+                        if (v->use_count > 0) v->use_count--;
+                        tmp->use_count++;
                     } else {
                         // Spill load from stack slot
                         Inst *insert_before = inst;
@@ -974,6 +976,8 @@ static void rewrite_spills(Function *f, IGraph *g) {
                         }
                         Value *tmp = insert_spill_load(f, b, insert_before, v, spill_offset[v->id]);
                         inst->ops[oi] = tmp;
+                        if (v->use_count > 0) v->use_count--;
+                        tmp->use_count++;
                     }
                 }
             }
@@ -990,6 +994,15 @@ static void rewrite_spills(Function *f, IGraph *g) {
         }
     }
 
+    // Rematerialized values: every use has been replaced by a clone at the
+    // use site, so the original def is now unused. Mark it dead so it is
+    // neither colored by the next IRC iteration nor emitted.
+    for (int i = 0; i < nv; i++) {
+        if (!g->spilled[i] || !newly_spilled[i]) continue;
+        Value *v = f->values[i];
+        if (is_rematerializable(v) && v->use_count == 0 && v->def)
+            v->def->is_dead = 1;
+    }
 }
 
 // ============================================================
