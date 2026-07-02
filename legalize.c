@@ -182,7 +182,8 @@ void legalize_function(Function *f) {
                 // loop-carried phis can be CYCLIC (a = copy b in one pred,
                 // b = copy a on the back edge) — an unbounded walk here
                 // hangs the compiler (found by tools/fuzz.py, seed 77).
-                Value *inner = val_resolve(inst->ops[0]);
+                Value *orig0 = val_resolve(inst->ops[0]);  // the value the AND actually uses
+                Value *inner = orig0;
                 for (int hops = 0;
                      inner && inner->kind == VAL_INST && inner->def &&
                      inner->def->kind == IK_COPY && inner->def->nops >= 1 &&
@@ -207,8 +208,12 @@ void legalize_function(Function *f) {
                 if (inner_const_pos < 0) continue;
 
                 int combined = c1 & c2;
-                // Repoint outer AND's first operand past the inner AND (and any copies)
-                inner->use_count--;   // outer AND no longer uses the inner AND's dst
+                // Repoint outer AND's first operand past the inner AND (and any
+                // copies). The use being dropped is on orig0 — the head of the
+                // copy chain — not on `inner` (they differ when a chain was
+                // walked; decrementing inner undercounted it, tripping the
+                // verifier once const canonicalization made chains common).
+                orig0->use_count--;
                 inst->ops[0] = val_resolve(inner->def->ops[1 - inner_const_pos]);
                 inst->ops[0]->use_count++;
 

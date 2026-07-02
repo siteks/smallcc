@@ -1688,12 +1688,19 @@ void opt_jump_thread(Function *f) {
         Block *bt = br->target;   // true target
         Block *bf = br->target2;  // false target
 
-        // Rewrite P's terminator: IK_JMP → IK_BR
+        // Rewrite P's terminator: IK_JMP → IK_BR.
+        // Deep-copy the operand array: sharing br->ops between two live
+        // instructions means a later in-place operand rewrite (e.g.
+        // rewrite_spills replacing a use with a reload temp) silently
+        // mutates BOTH branches while bumping use_count once (fuzz seed
+        // 70104 tripped the verifier's undercount check on exactly this).
         term->kind    = IK_BR;
         term->target  = bt;
         term->target2 = bf;
-        term->ops     = br->ops;
         term->nops    = br->nops;
+        term->ops     = arena_alloc(br->nops * sizeof(Value *));
+        for (int oi = 0; oi < br->nops; oi++)
+            term->ops[oi] = br->ops[oi];
 
         // Update P's succs: remove B, add bt and bf
         block_remove_succ(p, b);

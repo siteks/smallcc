@@ -878,6 +878,17 @@ static int binop_const(Value *v, int32_t *out) {
 }
 
 static Value *emit_binop(BraunCtx *ctx, Block *b, InstKind kind, Value *lhs, Value *rhs, ValType vt) {
+    // Canonicalize const-through-coercion operands to plain VAL_CONSTs,
+    // keeping the coerced vtype. Same-size coercion copies preserve bits,
+    // so this is value-neutral — and every downstream const consumer
+    // (the fold below, R2C strength reduction, LICM, legalize Pass F,
+    // emission P11/P13/P16/P19) only recognizes VAL_CONST operands.
+    int32_t kk;
+    if (lhs && lhs->kind != VAL_CONST && binop_const(lhs, &kk))
+        lhs = new_const(ctx->f, kk, lhs->vtype);
+    if (rhs && rhs->kind != VAL_CONST && binop_const(rhs, &kk))
+        rhs = new_const(ctx->f, kk, rhs->vtype);
+
     int32_t kl, kr;
     if (binop_const(lhs, &kl) && binop_const(rhs, &kr) && can_fold_binop(kind)) {
         int32_t result = fold_binop(kind, kl, kr);
@@ -981,14 +992,25 @@ static Value *addr_at(BraunCtx *ctx, Block *b, Value *base, int off) {
     return emit_binop(ctx, b, IK_ADD, base, new_const(ctx->f, off, VT_I16), VT_PTR);
 }
 
+// Can constant k be carried as a load/store offset for this access size?
+// F3c offsets are 10-bit signed, scaled by the access width — a folded
+// full address (e.g. 0xF000 + idx) must NOT be absorbed as an offset.
+static int absorbable_offset(int k, int size) {
+    if (k % size != 0) return 0;
+    int scaled = k / size;
+    return scaled >= -512 && scaled <= 511;
+}
+
 static Value *emit_load(BraunCtx *ctx, Block *b, Value *ptr, int size, int offset, ValType vt) {
     // Absorb constant ADD offset into load: LOAD(ADD(base, k), 0) → LOAD(base, k)
     if (offset == 0 && ptr && ptr->kind == VAL_INST && ptr->def &&
         ptr->def->kind == IK_ADD && ptr->def->nops >= 2) {
         Value *a0 = ptr->def->ops[0];
         Value *a1 = ptr->def->ops[1];
-        if (a1 && a1->kind == VAL_CONST) { ptr = a0; offset = a1->iconst; }
-        else if (a0 && a0->kind == VAL_CONST) { ptr = a1; offset = a0->iconst; }
+        if (a1 && a1->kind == VAL_CONST && absorbable_offset(a1->iconst, size))
+            { ptr = a0; offset = a1->iconst; }
+        else if (a0 && a0->kind == VAL_CONST && absorbable_offset(a0->iconst, size))
+            { ptr = a1; offset = a0->iconst; }
     }
     // Materialize a fully-constant address (e.g. MMIO: *(u32*)0xff00, or a
     // folded base+offset) — emission expects load bases in registers.
@@ -1014,8 +1036,10 @@ static void emit_store(BraunCtx *ctx, Block *b, Value *ptr, Value *val, int size
         ptr->def->kind == IK_ADD && ptr->def->nops >= 2) {
         Value *a0 = ptr->def->ops[0];
         Value *a1 = ptr->def->ops[1];
-        if (a1 && a1->kind == VAL_CONST) { ptr = a0; offset = a1->iconst; }
-        else if (a0 && a0->kind == VAL_CONST) { ptr = a1; offset = a0->iconst; }
+        if (a1 && a1->kind == VAL_CONST && absorbable_offset(a1->iconst, size))
+            { ptr = a0; offset = a1->iconst; }
+        else if (a0 && a0->kind == VAL_CONST && absorbable_offset(a0->iconst, size))
+            { ptr = a1; offset = a0->iconst; }
     }
     // Materialize a fully-constant address (see emit_load).
     if (ptr && ptr->kind == VAL_CONST) {
