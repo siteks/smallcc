@@ -2340,7 +2340,7 @@ void opt_scalar_promote(Function *f) {
         int *in_body = calloc(mark_sz, sizeof(int));
         if (!in_body) continue;
         in_body[h->id] = 1;
-        Block *wl[256]; int wl_n = 0;
+        Block *wl[256]; int wl_n = 0, wl_overflow = 0;
         if (latch != h) { in_body[latch->id] = 1; wl[wl_n++] = latch; }
         while (wl_n > 0) {
             Block *c = wl[--wl_n];
@@ -2349,9 +2349,13 @@ void opt_scalar_promote(Function *f) {
                 if (pr->id < mark_sz && !in_body[pr->id]) {
                     in_body[pr->id] = 1;
                     if (wl_n < 256) wl[wl_n++] = pr;
+                    else wl_overflow = 1;
                 }
             }
         }
+        // An under-approximated body would make in-loop defs look invariant
+        // (wrong code), so bail on this loop rather than promote from it.
+        if (wl_overflow) { free(in_body); continue; }
 
         // Single exit block
         Block *exit_blk = NULL;
@@ -2570,7 +2574,7 @@ void opt_addr_iv(Function *f) {
         int *in_body = calloc(mark_sz, sizeof(int));
         if (!in_body) continue;
         in_body[h->id] = 1;
-        Block *wl[256]; int wl_n = 0;
+        Block *wl[256]; int wl_n = 0, wl_overflow = 0;
         if (latch != h) { in_body[latch->id] = 1; wl[wl_n++] = latch; }
         while (wl_n > 0) {
             Block *c = wl[--wl_n];
@@ -2579,9 +2583,13 @@ void opt_addr_iv(Function *f) {
                 if (pr->id < mark_sz && !in_body[pr->id]) {
                     in_body[pr->id] = 1;
                     if (wl_n < 256) wl[wl_n++] = pr;
+                    else wl_overflow = 1;
                 }
             }
         }
+        // An under-approximated body would make in-loop defs look invariant
+        // (wrong code), so bail on this loop rather than rewrite it.
+        if (wl_overflow) { free(in_body); continue; }
 
         // Detect basic induction variables (same as LSR)
         IVInfo ivs[LSR_MAX_IVS];

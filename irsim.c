@@ -40,6 +40,7 @@
 
 struct IrSim {
     uint8_t  mem[IRSIM_MEM_SIZE];
+    uint8_t *sdram;                  /* 32 MB SDRAM (addrs >= 0x10000), lazy */
     uint16_t data_ptr;               /* next free data byte */
     uint32_t cycles;                 /* instruction step counter (MMIO at 0xFF00) */
 
@@ -58,11 +59,26 @@ struct IrSim {
  * Memory helpers
  * ========================================================================= */
 
-static uint32_t mem_read(IrSim *sim, uint16_t addr, int size)
+/* Data addresses are full 32-bit values (ILP32). The low 64 KB is BRAM
+ * (sim->mem); anything above is SDRAM, lazily allocated and aliased on a
+ * 32 MB window — mirrors sim_c's memory model. */
+#define IRSIM_SDRAM_SIZE (32u * 1024u * 1024u)
+
+static uint8_t *mem_at(IrSim *sim, uint32_t addr)
 {
-    if (addr >= IRSIM_MMIO_BASE) {
+    if (addr < IRSIM_MEM_SIZE) return &sim->mem[addr];
+    if (!sim->sdram) {
+        sim->sdram = calloc(IRSIM_SDRAM_SIZE, 1);
+        if (!sim->sdram) { fprintf(stderr, "irsim: SDRAM allocation failed\n"); exit(1); }
+    }
+    return &sim->sdram[addr & (IRSIM_SDRAM_SIZE - 1)];
+}
+
+static uint32_t mem_read(IrSim *sim, uint32_t addr, int size)
+{
+    if (addr >= IRSIM_MMIO_BASE && addr < IRSIM_MEM_SIZE) {
         /* 32-bit cycle counter at 0xFF00, little-endian */
-        uint32_t off = (uint32_t)(addr - IRSIM_MMIO_BASE);
+        uint32_t off = addr - IRSIM_MMIO_BASE;
         if (off < 4) {
             switch (size) {
             case 1: return (sim->cycles >> (off * 8)) & 0xff;
@@ -72,21 +88,17 @@ static uint32_t mem_read(IrSim *sim, uint16_t addr, int size)
         }
         return 0;
     }
-    switch (size) {
-    case 1: return sim->mem[addr];
-    case 4: { uint32_t v; memcpy(&v, &sim->mem[addr], 4); return v; }
-    default: { uint16_t v; memcpy(&v, &sim->mem[addr], 2); return v; }
-    }
+    uint32_t v = 0;
+    for (int j = 0; j < size; j++)
+        v |= (uint32_t)*mem_at(sim, addr + (uint32_t)j) << (j * 8);
+    return v;
 }
 
-static void mem_write(IrSim *sim, uint16_t addr, int size, uint32_t val)
+static void mem_write(IrSim *sim, uint32_t addr, int size, uint32_t val)
 {
-    if (addr >= IRSIM_MMIO_BASE) return;  /* MMIO writes silently ignored */
-    switch (size) {
-    case 1: sim->mem[addr] = val & 0xff; return;
-    case 4: memcpy(&sim->mem[addr], &val, 4); return;
-    default: { uint16_t v = (uint16_t)(val & 0xffff); memcpy(&sim->mem[addr], &v, 2); }
-    }
+    if (addr >= IRSIM_MMIO_BASE && addr < IRSIM_MEM_SIZE) return;  /* MMIO writes ignored */
+    for (int j = 0; j < size; j++)
+        *mem_at(sim, addr + (uint32_t)j) = (uint8_t)((val >> (j * 8)) & 0xff);
 }
 
 /* =========================================================================
@@ -116,8 +128,9 @@ static int vt_size(ValType vt)
 {
     switch (vt) {
     case VT_I8: case VT_U8:  return 1;
+    case VT_I16: case VT_U16: return 2;
     case VT_I32: case VT_U32: case VT_F32: return 4;
-    case VT_PTR: return 2;
+    case VT_PTR: return PTR_SIZE;   /* ILP32: pointers are 4 bytes */
     default: return 2;
     }
 }
@@ -209,7 +222,7 @@ static uint32_t call_stub(IrSim *sim, const char *name, uint32_t *args, int narg
         float ipart;
         float frac = modff(fv, &ipart);
         uint32_t ibits; memcpy(&ibits, &ipart, 4);
-        mem_write(sim, (uint16_t)args[1], 4, ibits);
+        mem_write(sim, args[1], 4, ibits);
         uint32_t fbits; memcpy(&fbits, &frac, 4);
         return fbits;
     }
@@ -436,7 +449,7 @@ static Block *execute_block(IrSim *sim, Block *b, SimFrame *frame)
         /* ---- Conversions ---- */
         case IK_ITOF: {
             if (!dst || inst->nops < 1) break;
-            /* Sign-extend before converting (target: int is 16-bit) */
+            /* Sign-extend before converting */
             int32_t iv = (int32_t)get_val(vreg, inst->ops[0]);
             float fv = (float)iv;
             uint32_t rv; memcpy(&rv, &fv, 4);
@@ -489,11 +502,11 @@ static Block *execute_block(IrSim *sim, Block *b, SimFrame *frame)
             Value *base = val_resolve(inst->ops[0]);
             int off  = inst->imm;
             int size = inst->size ? inst->size : vt_size(dst ? dst->vtype : VT_I16);
-            uint16_t addr;
+            uint32_t addr;
             if (!base || base->kind == VAL_UNDEF)
-                addr = (uint16_t)((int32_t)frame->bp + off);
+                addr = (uint32_t)(uint16_t)((int32_t)frame->bp + off);
             else
-                addr = (uint16_t)((int32_t)get_val(vreg, base) + off);
+                addr = get_val(vreg, base) + (uint32_t)off;  /* 32-bit data address */
             uint32_t val = mem_read(sim, addr, size);
             /* Apply sign extension for signed destination types */
             if (size == 1 && vt_signed(dst->vtype))
@@ -520,11 +533,11 @@ static Block *execute_block(IrSim *sim, Block *b, SimFrame *frame)
             int off  = inst->imm;
             int size = inst->size ? inst->size
                                   : (val_v ? vt_size(val_v->vtype) : 2);
-            uint16_t addr;
+            uint32_t addr;
             if (!base || base->kind == VAL_UNDEF)
-                addr = (uint16_t)((int32_t)frame->bp + off);
+                addr = (uint32_t)(uint16_t)((int32_t)frame->bp + off);
             else
-                addr = (uint16_t)((int32_t)get_val(vreg, base) + off);
+                addr = get_val(vreg, base) + (uint32_t)off;  /* 32-bit data address */
             mem_write(sim, addr, size, val_v ? get_val(vreg, val_v) : 0);
             break;
         }
@@ -543,9 +556,10 @@ static Block *execute_block(IrSim *sim, Block *b, SimFrame *frame)
         }
         case IK_MEMCPY: {
             if (inst->nops < 2) break;
-            uint16_t d = (uint16_t)get_val(vreg, inst->ops[0]);
-            uint16_t s = (uint16_t)get_val(vreg, inst->ops[1]);
-            memmove(&sim->mem[d], &sim->mem[s], (size_t)inst->imm);
+            uint32_t d = get_val(vreg, inst->ops[0]);
+            uint32_t s = get_val(vreg, inst->ops[1]);
+            for (int j = 0; j < inst->imm; j++)
+                *mem_at(sim, d + (uint32_t)j) = *mem_at(sim, s + (uint32_t)j);
             break;
         }
 
@@ -623,6 +637,15 @@ static Block *execute_block(IrSim *sim, Block *b, SimFrame *frame)
 
         case IK_JMP:
             return inst->target;
+
+        case IK_SWITCH: {
+            /* Jump-table dispatch: match selector against per-case values. */
+            uint32_t sel = (inst->nops >= 1) ? get_val(vreg, inst->ops[0]) : 0u;
+            for (int ci = 0; ci < inst->switch_ncase; ci++)
+                if (sel == (uint32_t)inst->switch_vals[ci])
+                    return inst->switch_targets[ci];
+            return inst->switch_default;
+        }
 
         case IK_RET:
             frame->retval = (inst->nops >= 1)
@@ -762,7 +785,7 @@ static void write_global_data(IrSim *sim, Sx *item, uint16_t base_addr)
             Sx *lbl_sx = init_sx->cdr ? init_sx->cdr->car : NULL;
             const char *lbl = (lbl_sx && (lbl_sx->kind == SX_STR || lbl_sx->kind == SX_SYM))
                               ? lbl_sx->s : NULL;
-            if (lbl) mem_write(sim, addr, 2, lookup_gaddr(sim, lbl));
+            if (lbl) mem_write(sim, addr, PTR_SIZE, lookup_gaddr(sim, lbl));
             return;
         }
         if (strcmp(itag, "strbytes") == 0) {
@@ -772,6 +795,35 @@ static void write_global_data(IrSim *sim, Sx *item, uint16_t base_addr)
                 Sx *b = cur->car;
                 if (b && b->kind == SX_INT)
                     sim->mem[addr++] = (uint8_t)(b->i & 0xff);
+                cur = cur->cdr;
+            }
+            return;
+        }
+        if (strcmp(itag, "gfields") == 0) {
+            /* Struct initializer: (gfields (size value) ...) — heterogeneous
+             * per-field sizes; (0 N) is N pad bytes; (strref "label") is a
+             * pointer-typed field. Mirrors emit_sx_data in emit.c. */
+            Sx *cur = init_sx->cdr;
+            int written = 0;
+            while (cur && cur->kind == SX_PAIR && written < size) {
+                Sx *pair = cur->car;
+                if (pair && pair->kind == SX_PAIR) {
+                    Sx *sz_sx  = pair->car;
+                    Sx *val_sx = pair->cdr ? pair->cdr->car : NULL;
+                    if (sz_sx && sz_sx->kind == SX_SYM && strcmp(sz_sx->s, "strref") == 0) {
+                        const char *lbl = (val_sx && (val_sx->kind == SX_STR || val_sx->kind == SX_SYM))
+                                          ? val_sx->s : NULL;
+                        if (lbl) mem_write(sim, addr, PTR_SIZE, lookup_gaddr(sim, lbl));
+                        addr += PTR_SIZE; written += PTR_SIZE;
+                    } else if (sz_sx && sz_sx->kind == SX_INT && val_sx && val_sx->kind == SX_INT) {
+                        int sz = sz_sx->i;
+                        if (sz == 0) { addr += val_sx->i; written += val_sx->i; } /* pad */
+                        else {
+                            mem_write(sim, addr, sz, (uint32_t)val_sx->i);
+                            addr += sz; written += sz;
+                        }
+                    }
+                }
                 cur = cur->cdr;
             }
             return;
@@ -793,8 +845,8 @@ static void write_global_data(IrSim *sim, Sx *item, uint16_t base_addr)
                         Sx *lbl_sx = v->cdr ? v->cdr->car : NULL;
                         const char *lbl = (lbl_sx && (lbl_sx->kind == SX_STR || lbl_sx->kind == SX_SYM))
                                           ? lbl_sx->s : NULL;
-                        if (lbl) mem_write(sim, addr, 2, lookup_gaddr(sim, lbl));
-                        addr += 2; written += 2;
+                        if (lbl) mem_write(sim, addr, PTR_SIZE, lookup_gaddr(sim, lbl));
+                        addr += PTR_SIZE; written += PTR_SIZE;
                     }
                 }
                 vals = vals->cdr;
@@ -928,5 +980,6 @@ void irsim_free(IrSim *sim)
     if (!sim) return;
     for (int i = 0; i < sim->nfns;    i++) free(sim->fn_names[i]);
     for (int i = 0; i < sim->ngaddrs; i++) free(sim->ga_names[i]);
+    free(sim->sdram);
     free(sim);
 }

@@ -233,6 +233,7 @@ static int collect_needed_libs(char **user_files, int user_count,
             fclose(lf);
 
             // Record it
+            if (seen_count >= 64) continue;
             strncpy(seen[seen_count++], stem, 63);
             if (lib_count < max_files)
             {
@@ -700,13 +701,23 @@ int main(int argc, char **argv)
                 Function *f = braun_function(d, tu, &cpu4_strlit_id);
                 braun_register_inline_candidate(d, tu);
                 if (irsim) {
-                    // Register function-body string literals with the irsim
-                    // before braun_emit_strlits clears them.
+                    // Register function-body string literals and static
+                    // locals with the irsim before braun_emit_strlits
+                    // clears them.
                     int ns = braun_nstrlits();
                     for (int _si = 0; _si < ns; _si++) {
                         char _lbl[32]; const char *_dat; int _len;
                         braun_get_strlit(_si, _lbl, &_dat, &_len);
                         irsim_add_strlit(irsim, _lbl, _dat, _len);
+                    }
+                    int nsl = braun_nstatic_locals();
+                    for (int _si = 0; _si < nsl; _si++) {
+                        char _lbl[32]; int _len;
+                        unsigned char *_img = braun_render_static_local(_si, _lbl, &_len);
+                        if (_img) {
+                            irsim_add_strlit(irsim, _lbl, (const char *)_img, _len);
+                            free(_img);
+                        }
                     }
                 }
                 braun_emit_strlits(init_buf, bss_buf);

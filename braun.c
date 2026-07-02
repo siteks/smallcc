@@ -146,6 +146,61 @@ void braun_get_strlit(int i, char label_buf[32], const char **data, int *len) {
     *len  = g_strlits[i].len;
 }
 
+int braun_nstatic_locals(void) { return g_nsl; }
+
+// Little-endian byte image of a static local's data, for callers (irsim)
+// that need the raw bytes rather than assembly directives. Mirrors the
+// cases of emit_static_local_data. Returns a calloc'd buffer (caller
+// frees); *len_out gets the image size.
+unsigned char *braun_render_static_local(int i, char label_buf[32], int *len_out) {
+    BStaticLocal *sl  = &g_static_locals[i];
+    Node   *init = sl->init_node;
+    Type   *ty   = sl->sym->type;
+    int     size = ty ? ty->size : INT_SIZE;
+    snprintf(label_buf, 32, "_ls%d", sl->id);
+
+    // String-literal initializer may be longer than the declared size
+    // (static char s[] = "..." has size len+1 already; be safe either way).
+    int cap = size;
+    if (init && init->kind == ND_LITERAL && init->u.literal.strval &&
+        init->u.literal.strval_len + 1 > cap)
+        cap = init->u.literal.strval_len + 1;
+    if (cap <= 0) cap = 1;
+    unsigned char *buf = calloc(1, (size_t)cap);
+    if (!buf) { *len_out = 0; return NULL; }
+    *len_out = cap;
+
+    if (ty && istype_array(ty) && init && init->kind == ND_LITERAL && init->u.literal.strval) {
+        memcpy(buf, init->u.literal.strval, (size_t)init->u.literal.strval_len);
+        return buf;  // trailing NUL from calloc
+    }
+    if (!istype_array(ty) && ty && ty->base != TB_STRUCT && init && init->kind == ND_LITERAL) {
+        long long v = init->u.literal.ival;
+        for (int j = 0; j < size && j < 4; j++)
+            buf[j] = (unsigned char)((v >> (j * 8)) & 0xff);
+        return buf;
+    }
+    if (ty && istype_array(ty) && init && init->kind == ND_INITLIST) {
+        Type *etype = array_elem_type(ty);
+        int   esize = etype ? etype->size : 1;
+        int   off = 0;
+        for (Node *el = init->ch[0]; el && off + esize <= cap; el = el->next) {
+            Node *r = el;
+            int   neg = 1;
+            while (r && r->kind == ND_CAST) r = r->ch[1];
+            if (r && r->kind == ND_UNARYOP && r->op_kind == TK_MINUS) { neg = -1; r = r->ch[0]; }
+            while (r && r->kind == ND_CAST) r = r->ch[1];
+            int v = (r && r->kind == ND_LITERAL) ? (int)r->u.literal.ival * neg : 0;
+            for (int j = 0; j < esize && j < 4; j++)
+                buf[off + j] = (unsigned char)(((unsigned)v >> (j * 8)) & 0xff);
+            off += esize;
+        }
+        return buf;
+    }
+    // Zero-initialized or unsupported: all zeros from calloc.
+    return buf;
+}
+
 void braun_emit_strlits(FILE *init_out, FILE *bss_out) {
     // String literals are always initialized RODATA.
     for (int i = 0; i < g_nstrlits; i++) {
@@ -1342,7 +1397,7 @@ static Value *cg_expr(BraunCtx *ctx, Block **cur, Node *n) {
             Value *fp = cg_expr(ctx, cur, n->ch[0]); b = *cur;
             // If fp is from a binop (array subscript of fn ptrs), it might need a load
             if (n->ch[0]->kind == ND_BINOP) {
-                fp = emit_load(ctx, b, fp, 2, 0, VT_PTR);
+                fp = emit_load(ctx, b, fp, PTR_SIZE, 0, VT_PTR);
             }
             Value *landing = new_value(ctx->f, VAL_INST, call_vt);
             Inst  *call = bi(ctx, b, IK_ICALL, landing);
@@ -1646,7 +1701,7 @@ static Value *cg_expr(BraunCtx *ctx, Block **cur, Node *n) {
             ValType call_vt = n->type ? type_to_valtype(n->type) : VT_I16;
             if (call_vt == VT_VOID) call_vt = VT_I16;
             Value *fp_addr = cg_addr(ctx, cur, n); b = *cur;
-            Value *fp = emit_load(ctx, b, fp_addr, 2, 0, VT_PTR);
+            Value *fp = emit_load(ctx, b, fp_addr, PTR_SIZE, 0, VT_PTR);
             Value *landing = new_value(ctx->f, VAL_INST, call_vt);
             Inst  *call = bi(ctx, b, IK_ICALL, landing);
             // Find function type from member
@@ -1690,7 +1745,7 @@ static Value *cg_expr(BraunCtx *ctx, Block **cur, Node *n) {
             old_ap = read_var(ctx, b, ap_sym);
         } else {
             Value *ap_addr = cg_addr(ctx, cur, n->ch[0]); b = *cur;
-            old_ap = emit_load(ctx, b, ap_addr, 2, 0, VT_PTR);
+            old_ap = emit_load(ctx, b, ap_addr, PTR_SIZE, 0, VT_PTR);
         }
 
         // Advance: new_ap = old_ap + slot
@@ -1702,7 +1757,7 @@ static Value *cg_expr(BraunCtx *ctx, Block **cur, Node *n) {
             write_var(b, ap_sym, new_ap);
         } else {
             Value *ap_addr = cg_addr(ctx, cur, n->ch[0]); b = *cur;
-            emit_store(ctx, b, ap_addr, new_ap, 2, 0);
+            emit_store(ctx, b, ap_addr, new_ap, PTR_SIZE, 0);
         }
 
         // Load value from old ap
@@ -1725,7 +1780,7 @@ static Value *cg_expr(BraunCtx *ctx, Block **cur, Node *n) {
             write_var(b, n->ch[0]->symbol, ap_val);
         } else {
             Value *ap_addr = cg_addr(ctx, cur, n->ch[0]); b = *cur;
-            emit_store(ctx, b, ap_addr, ap_val, 2, 0);
+            emit_store(ctx, b, ap_addr, ap_val, PTR_SIZE, 0);
         }
         return new_const(ctx->f, 0, VT_I16);
     }

@@ -158,8 +158,8 @@ Type *get_basic_type(Type_base base)
         t->align = 4;
         break;
     default:
-        t->size  = 2;
-        t->align = 2;
+        t->size  = 4;   // ILP32: anything unhandled gets int/pointer size
+        t->align = 4;
         break;
     }
     append_type(t);
@@ -270,8 +270,8 @@ Type *get_enum_type(Symbol *tag)
     Type *t      = arena_alloc(sizeof(Type));
     t->base      = TB_ENUM;
     t->u.enu.tag = tag;
-    t->size      = 2;
-    t->align     = 2;
+    t->size      = INT_SIZE;   // ILP32: enum follows int (4 bytes)
+    t->align     = INT_SIZE;
     append_type(t);
     derived_insert(t);
     return t;

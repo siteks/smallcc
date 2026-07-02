@@ -799,9 +799,13 @@ static void assemble_cpu4(const char *src)
                 /* F2: rx, imm7 */
                 int rx2 = (nops > 0) ? parse_reg4(ops[0]) : 0;
                 int32_t imm7 = (nops > 1) ? (int32_t)strtol(ops[1], NULL, 0) : 0;
-                if (pass == 2 && (imm7 < -64 || imm7 > 63)) {
-                    fprintf(stderr, "asm error (line %d): %s imm7 value %d out of signed 7-bit range [-64..63] at 0x%04x\n",
-                            cur_lineno+1, real_mnem, (int)imm7, (unsigned)instr_addr);
+                /* andi (0xa8) takes a raw unsigned 7-bit mask 0..127 (no
+                   sign-extension at execute); everything else is signed. */
+                int imm7_lo = (instr->first_byte == 0xa8) ? 0 : -64;
+                int imm7_hi = (instr->first_byte == 0xa8) ? 127 : 63;
+                if (pass == 2 && (imm7 < imm7_lo || imm7 > imm7_hi)) {
+                    fprintf(stderr, "asm error (line %d): %s imm7 value %d out of 7-bit range [%d..%d] at 0x%04x\n",
+                            cur_lineno+1, real_mnem, (int)imm7, imm7_lo, imm7_hi, (unsigned)instr_addr);
                     exit(1);
                 }
                 uint8_t b0 = instr->first_byte | (uint8_t)(rx2 >> 1);

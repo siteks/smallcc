@@ -62,7 +62,7 @@ static Sx *lower_global(int tu_index, Node *decl, Symbol *sym) {
         }
     }
 
-    int size = sym->type ? sym->type->size : 2;
+    int size = sym->type ? sym->type->size : INT_SIZE;
     Sx *gv = sx_list(2, sx_sym("gvar"), sx_str(name));
     Sx **tail = &gv->cdr->cdr;
     *tail = sx_cons(sx_int(size), NULL); tail = &(*tail)->cdr;
@@ -138,7 +138,7 @@ static Sx *lower_global(int tu_index, Node *decl, Symbol *sym) {
                 *gt = sx_cons(sx_list(2, sx_int(0), sx_int(f->offset - cur_off)), NULL);
                 gt = &(*gt)->cdr;
             }
-            int fsz = f->type ? f->type->size : 2;
+            int fsz = f->type ? f->type->size : INT_SIZE;
             Node *r = el;
             int neg = 1;
             while (r && r->kind == ND_CAST) r = r->ch[1];
@@ -155,7 +155,7 @@ static Sx *lower_global(int tu_index, Node *decl, Symbol *sym) {
                         *gt = sx_cons(sx_list(2, sx_int(0), sx_int(sf->offset - sub_off)), NULL);
                         gt = &(*gt)->cdr;
                     }
-                    int ssz = sf->type ? sf->type->size : 2;
+                    int ssz = sf->type ? sf->type->size : INT_SIZE;
                     Node *sr = se;
                     while (sr && sr->kind == ND_CAST) sr = sr->ch[1];
                     int sv = (sr && sr->kind == ND_LITERAL) ? (int)sr->u.literal.ival : 0;
@@ -208,7 +208,7 @@ static Sx *lower_global(int tu_index, Node *decl, Symbol *sym) {
     if (init->kind == ND_INITLIST) {
         Type *etype = (sym->type && sym->type->base == TB_ARRAY)
                       ? sym->type->u.arr.elem : NULL;
-        int esize = etype ? etype->size : 2;
+        int esize = etype ? etype->size : INT_SIZE;
         Sx *gi = sx_list(2, sx_sym("ginit"), sx_int(esize));
         Sx **gt = &gi->cdr->cdr;
 

@@ -64,6 +64,11 @@ class CTestFile(pytest.File):
             yield CTestItem.from_parent(self, name=self.path.stem,
                                         path=self.path, arch='cpu4')
         else:
+            if irsim and (meta.get('TARGET') == 'hw' or self.path.parent.name == 'hw'):
+                # Hardware/MMIO device-model tests (framebuffer, SDRAM keyhole,
+                # DISP_MODE, ...) exercise sim_c's device model; the IR
+                # interpreter has no devices, so they cannot run under irsim.
+                return
             modes = IRSIM_MODES if irsim else ARCHES
             for arch in modes:
                 yield CTestItem.from_parent(self, name=arch,
