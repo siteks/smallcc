@@ -410,7 +410,7 @@ static void gvn_walk(Block *b, Function *f) {
                             if (ov) ov = val_resolve(ov);
                             if (ov && ov->kind != VAL_CONST) { all_const = 0; break; }
                         }
-                        if (all_const && inst->nops >= 0) {
+                        if (all_const) {
                             /* rematerializable — keep the local copy */
                         } else {
                             int crosses = 0;
@@ -1177,10 +1177,6 @@ void opt_licm_const(Function *f) {
         // as a proxy for phi-variables that are live across the back edge.
         // If these already consume most of K=8 registers, hoisting would
         // cause spill cascades.
-        int body_size = 0;
-        for (int bi = 0; bi < f->nblocks; bi++)
-            if (dominates(h, f->blocks[bi])) body_size++;
-
         #define LIVE_CAP 32
         int live_ids[LIVE_CAP];
         int nlive = 0;
@@ -1254,7 +1250,6 @@ void opt_licm_const(Function *f) {
                 Value *nv = new_value(f, VAL_INST, v->vtype);
                 Inst *ni = new_inst(f, preheader, IK_CONST, nv);
                 ni->imm = v->iconst;
-                nv->iconst = v->iconst;
                 inst_insert_before(preheader->tail, ni);
                 for (int bi2 = 0; bi2 < f->nblocks; bi2++) {
                     Block *b2 = f->blocks[bi2];
@@ -1328,7 +1323,6 @@ void opt_licm_const(Function *f) {
             Value *nv = new_value(f, VAL_INST, cands[best].vtype);
             Inst *ni = new_inst(f, preheader, IK_CONST, nv);
             ni->imm = cands[best].iconst;
-            nv->iconst = cands[best].iconst;
             inst_insert_before(preheader->tail, ni);
 
             cands[best].hoisted = nv;
@@ -1808,7 +1802,6 @@ static Inst *clone_inst_mapped(Function *f, Block *b, Inst *orig, Value **vmap) 
     ci->imm   = orig->imm;
     ci->size  = orig->size;
     ci->fname = orig->fname;
-    ci->label = orig->label;
     ci->line  = orig->line;
     ci->calldesc = orig->calldesc;
     for (int j = 0; j < orig->nops; j++) {
@@ -1979,9 +1972,7 @@ void opt_unroll_loops(Function *f) {
 
         // === Iterations 1..N-1: build continuation blocks ===
         for (int k = 1; k < N; k++) {
-            Block *cb = (k < N - 1) ? cont_blks[k] : NULL;
-            Block *dst_blk = (k < N - 1) ? cont_blks[k - 1] : cont_blks[N - 2];
-            // Actually: iteration k's instructions go into cont_blks[k-1]
+            // Iteration k's instructions go into cont_blks[k-1]
             // (cont_blks[0] holds iteration 1, cont_blks[1] holds iteration 2, etc.)
             Block *ib = cont_blks[k - 1];
 

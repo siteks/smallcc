@@ -28,3 +28,9 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .claude/
+
+# Compiler/simulator binaries and profiling output
+smallcc
+smallcc_asan
+cm_results*.txt
+git_log.txt

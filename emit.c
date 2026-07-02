@@ -1041,8 +1041,6 @@ static void emit_inst(Inst *inst, FILE *out) {
     case IK_JMP: {
         if (inst->target)
             fprintf(out, "    j _%s_B%d\n", g_cur_func_name, inst->target->id);
-        else if (inst->label)
-            fprintf(out, "    j %s\n", inst->label);
         break;
     }
 

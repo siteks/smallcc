@@ -279,16 +279,14 @@ static Node *primary_expr()
         // classified the token as a float (TK_CONSTFLT).  For TK_CONSTINT we
         // only look for the integer suffixes (l/L/u/U/UL/LU).
         if (tk->kind == TK_CONSTINT) {
-            if (tk->val[slen - 1] == 'l' || tk->val[slen - 1] == 'L')
+            if (tk->val[slen - 1] == 'l' || tk->val[slen - 1] == 'L') {
                 if (slen >= 2 && !isdigit(tk->val[slen - 2]))
                     cs = CS_UL;
                 else
                     cs = CS_L;
-            else if (tk->val[slen - 1] == 'u' || tk->val[slen - 1] == 'U')
+            } else if (tk->val[slen - 1] == 'u' || tk->val[slen - 1] == 'U') {
                 cs = CS_U;
-        } else {
-            if (tk->val[slen - 1] == 'f' || tk->val[slen - 1] == 'F')
-                cs = CS_F;
+            }
         }
         if (tk->val[0] == '0') // leading zero is octal or hex
             cs |= CS_OX;
@@ -1246,7 +1244,7 @@ static Node *declaration(int depth)
                 Node *node = make_decl_node(&ds, spec, decls.head);
                 add_types_and_symbols(node, ds, false, false);
                 // If the function returns a struct, shift all param offsets up by
-                // WORD_SIZE to make room for the hidden retbuf pointer at bp+FRAME_OVERHEAD.
+                // PTR_SIZE to make room for the hidden retbuf pointer at bp+FRAME_OVERHEAD.
                 if (node->type && istype_function(node->type)
                     && node->type->u.fn.ret
                     && node->type->u.fn.ret->base == TB_STRUCT)
@@ -1520,7 +1518,6 @@ const char *nodestr(Node_kind k)
         case ND_DECLARATOR: return "DECLARATOR  ";
         case ND_DIRECT_DECL:return "DIRECT_DECL ";
         case ND_PTYPE_LIST: return "PTYPE_LIST  ";
-        case ND_TYPE_NAME:  return "TYPE_NAME   ";
         case ND_ARRAY_DECL: return "ARRAY_DECL  ";
         case ND_FUNC_DECL:  return "FUNC_DECL   ";
         case ND_MEMBER:      return "MEMBER      ";
@@ -1633,7 +1630,6 @@ static const NodeShape node_shapes[ND_UNDEFINED] = {
     [ND_DECLARATOR]      = {{D, D, U, U}},
     [ND_DIRECT_DECL]     = {{D, L, U, U}},  // ch[0]=name, ch[1]=suffixes list
     [ND_PTYPE_LIST]      = {{L, U, U, U}},  // ch[0]=params list
-    [ND_TYPE_NAME]       = {{D, U, U, U}},  // ch[0]=decl
     [ND_ARRAY_DECL]      = {{D, U, U, U}},  // ch[0]=size
     [ND_FUNC_DECL]       = {{D, U, U, U}},  // ch[0]=params
     [ND_STRUCT]          = {{D, L, U, U}},  // ch[0]=tag, ch[1]=members list
@@ -2027,117 +2023,3 @@ void insert_coercions(Node *root)
 {
     post_order_walk(root, insert_coercions_step);
 }
-
-// --- Pass 4: label_su (Sethi-Ullman numbering + commutative child reordering) ---
-// Computes, for each expression node, the minimum number of stack slots needed
-// to evaluate it. For commutative ops with pure children, swaps ch[0]/ch[1] so
-// the heavier subtree is evaluated first, reducing peak stack depth and enabling
-// the peephole constant-folder to fire more often.
-
-static bool is_commutative_op(Token_kind op)
-{
-    return op == TK_PLUS || op == TK_STAR || op == TK_AMPERSAND ||
-           op == TK_BITOR || op == TK_BITXOR || op == TK_EQ || op == TK_NE;
-}
-
-static bool is_pure_expr(Node *n)
-{
-    if (!n) return true;
-    switch (n->kind)
-    {
-    case ND_LITERAL:
-        return true;
-    case ND_IDENT:
-        return !n->u.ident.is_function;
-    case ND_UNARYOP:
-        if (n->u.unaryop.is_function) return false;
-        if (n->op_kind == TK_INC || n->op_kind == TK_DEC ||
-            n->op_kind == TK_POST_INC || n->op_kind == TK_POST_DEC)
-            return false;
-        return is_pure_expr(n->ch[0]);
-    case ND_MEMBER:
-        if (n->u.member.is_function) return false;
-        return is_pure_expr(n->ch[0]);
-    case ND_BINOP:
-        if (n->op_kind == TK_COMMA || n->op_kind == TK_LOGOR ||
-            n->op_kind == TK_LOGAND)
-            return false;
-        return is_pure_expr(n->ch[0]) && is_pure_expr(n->ch[1]);
-    case ND_CAST:
-        return is_pure_expr(n->ch[1]);
-    default:
-        return false;
-    }
-}
-
-static void label_su_step(Node *n)
-{
-    if (!n->is_expr) return;
-
-    switch (n->kind)
-    {
-    case ND_LITERAL:
-    case ND_IDENT:
-        n->su_label = 0;
-        return;
-
-    case ND_BINOP:
-    {
-        // Comma / short-circuit: no reordering
-        if (n->op_kind == TK_COMMA || n->op_kind == TK_LOGOR ||
-            n->op_kind == TK_LOGAND)
-        {
-            n->su_label = 0;
-            return;
-        }
-        int l = n->ch[0] ? n->ch[0]->su_label : 0;
-        int r = n->ch[1] ? n->ch[1]->su_label : 0;
-
-        if (is_commutative_op(n->op_kind) &&
-            is_pure_expr(n->ch[0]) && is_pure_expr(n->ch[1]) &&
-            r > l)
-        {
-            // Swap: evaluate heavier child first
-            Node *tmp = n->ch[0]; n->ch[0] = n->ch[1]; n->ch[1] = tmp;
-            int t = l; l = r; r = t;
-        }
-        if (is_commutative_op(n->op_kind))
-            n->su_label = (l == r) ? l + 1 : l;
-        else
-            n->su_label = (l > r + 1) ? l : r + 1;  // max(l, 1+r)
-        return;
-    }
-
-    case ND_UNARYOP:
-        n->su_label = n->ch[0] ? n->ch[0]->su_label : 0;
-        return;
-
-    case ND_CAST:
-        // ch[0] = type-decl node (not evaluated); ch[1] = expression
-        n->su_label = n->ch[1] ? n->ch[1]->su_label : 0;
-        return;
-
-    case ND_MEMBER:
-        n->su_label = n->ch[0] ? n->ch[0]->su_label : 0;
-        return;
-
-    case ND_TERNARY:
-    {
-        int a = n->ch[0] ? n->ch[0]->su_label : 0;
-        int b = n->ch[1] ? n->ch[1]->su_label : 0;
-        int c = n->ch[2] ? n->ch[2]->su_label : 0;
-        n->su_label = a > b ? (a > c ? a : c) : (b > c ? b : c);
-        return;
-    }
-
-    default:
-        n->su_label = 0;
-        return;
-    }
-}
-
-void label_su(Node *root)
-{
-    post_order_walk(root, label_su_step);
-}
-

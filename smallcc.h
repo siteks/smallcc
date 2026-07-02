@@ -47,11 +47,8 @@ char  *arena_strdup(const char *s);
 // pointers are stored as 4-byte values so user code can address the 32 MB SDRAM
 // behind the pbus through ordinary C pointers.
 //
-// WORD_SIZE is retained for code that still wants the "natural integer / pointer
-// slot" abstraction. PTR_SIZE / INT_SIZE are explicit aliases for clarity.
 #define INT_SIZE       4
 #define PTR_SIZE       4
-#define WORD_SIZE      4   // back-compat alias; equals INT_SIZE == PTR_SIZE
 #define FRAME_OVERHEAD 4   // CPU4 enter packs (lr<<16)|bp into one 4-byte word; params start at bp+4
 
 // ===============================================================
@@ -79,7 +76,6 @@ char  *arena_strdup(const char *s);
 struct TypeContext;
 struct TokenContext;
 struct ParserContext;
-struct CodegenContext;
 
 // ---------------------------------------------------------------
 // Tokeniser
@@ -109,7 +105,7 @@ typedef enum
 struct Keyword
 {
     char        *keyword;
-    Token_kind  kind;   // renamed from 'token' to avoid conflict with token_ctx.current macro
+    Token_kind  kind;
 };
 typedef struct Token Token;
 
@@ -122,7 +118,6 @@ struct Token
     char        *val;
     double      fval;
     long long   ival;
-    int         loc;
     int         line;           // 1-based logical line number (original source file)
     int         col;            // 1-based column number
     const char *filename;       // original source file for this token
@@ -153,7 +148,7 @@ typedef enum
 {
     ND_PROGRAM, ND_EXPRSTMT, ND_COMPSTMT, ND_IFSTMT, ND_WHILESTMT,
     ND_RETURNSTMT, ND_STMT, ND_BINOP, ND_UNARYOP, ND_CAST, ND_ASSIGN, ND_COMPOUND_ASSIGN,
-    ND_IDENT, ND_LITERAL, ND_INITLIST, ND_DECLARATION, ND_DECLARATOR, ND_DIRECT_DECL, ND_PTYPE_LIST, ND_TYPE_NAME,
+    ND_IDENT, ND_LITERAL, ND_INITLIST, ND_DECLARATION, ND_DECLARATOR, ND_DIRECT_DECL, ND_PTYPE_LIST,
     ND_ARRAY_DECL, ND_FUNC_DECL, ND_STRUCT, ND_MEMBER, ND_FORSTMT, ND_DOWHILESTMT, ND_SWITCHSTMT,
     ND_CASESTMT, ND_DEFAULTSTMT, ND_BREAKSTMT, ND_CONTINUESTMT, ND_EMPTY, ND_LABELSTMT, ND_GOTOSTMT, ND_TERNARY,
     ND_VA_START, ND_VA_ARG, ND_VA_END,
@@ -165,7 +160,6 @@ typedef enum
     CS_U,
     CS_L,
     CS_UL,
-    CS_F,
     CS_OX = 0x100,
 } Const_suffix;
 
@@ -319,7 +313,6 @@ struct Symbol
     SymbolKind kind;
     Namespace  ns;          // NS_IDENT | NS_TAG | NS_TYPEDEF
     int     tu_index;       // TU that defined a static (SYM_STATIC_GLOBAL / SYM_STATIC_LOCAL)
-    bool    address_taken;  // true if &sym appears anywhere in the function (set by mark_address_taken)
     Symbol  *next;
 };
 
@@ -387,7 +380,6 @@ struct Node
                                 // ND_STRUCT: the struct-member parsing scope.
     Symbol          *symbol;
     Type           *type;
-    int             su_label;   // Sethi-Ullman stack-depth label (set by label_su pass)
 };
 
 Node *program();
@@ -460,8 +452,6 @@ void shift_param_offsets_for_struct_ret(Symbol_table *param_scope);
 void insert_extern_sym(const char *name, Type *type);
 void reset_parser(void);
 
-extern int current_global_tu;
-
 // Starting at scope of node, search for symbol in given namespace.
 Symbol *find_symbol(Node *node, const char *name, Namespace nspace);
 
@@ -505,9 +495,6 @@ const char *sym_label(Symbol *sym);
 
 // ===============================================================
 // Capacity constants for fixed-size arrays in context structs
-#define MAX_STRLITS         512
-#define MAX_LOCAL_STATICS   512
-#define MAX_LABEL_TABLE     64
 #define MAX_SCOPES          2048
 
 // Context Struct Definitions (must come after type definitions)

@@ -252,7 +252,6 @@ Token *new_token(Token_kind kind, Token *cur, char *str, int len)
     Token *tok  = arena_alloc(sizeof(Token));
     tok->kind   = kind;
     tok->val    = arena_alloc(len + 1);
-    tok->loc    = str - token_ctx.user_input;
     if (len)
         memcpy(tok->val, str, len);
     cur->next   = tok;
@@ -517,7 +516,6 @@ Token *tokenise(char *p)
             strtok->val  = arena_strdup(buf);
             free(buf);
             strtok->ival = len;
-            strtok->loc  = start - token_ctx.user_input;
             strtok->line     = tok_line;
             strtok->col      = tok_col;
             strtok->filename = cur_file;

@@ -51,7 +51,7 @@ static const char *assign_strlit(const char *data, int len) {
 // Global variable lowering
 // ============================================================
 
-static Sx *lower_global(int tu_index, Node *decl, Symbol *sym) {
+static Sx *lower_global(Node *decl, Symbol *sym) {
     const char *name = sym_label(sym);
 
     // Find initializer node
@@ -267,7 +267,7 @@ static Sx *lower_global(int tu_index, Node *decl, Symbol *sym) {
 // lower_globals — entry point
 // ============================================================
 
-Sx *lower_globals(Node *root, int tu_index, int *strlit_id) {
+Sx *lower_globals(Node *root, int *strlit_id) {
     if (!root) return NULL;
 
     g_strlit_id = *strlit_id;
@@ -289,7 +289,7 @@ Sx *lower_globals(Node *root, int tu_index, int *strlit_id) {
             if (sym->kind == SYM_EXTERN || sym->kind == SYM_ENUM_CONST) continue;
             if (istype_function(sym->type)) continue;
 
-            Sx *gv = lower_global(tu_index, d, sym);
+            Sx *gv = lower_global(d, sym);
             *tail = sx_cons(gv, NULL); tail = &(*tail)->cdr;
         }
     }

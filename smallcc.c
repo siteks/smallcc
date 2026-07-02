@@ -691,7 +691,7 @@ int main(int argc, char **argv)
         {
             // Nanopass pipeline: Node* → SSA → IRC → CPU4
             // Phase 1: emit global variables and top-level string literals
-            Sx *sx_prog = lower_globals(node, tu, &cpu4_strlit_id);
+            Sx *sx_prog = lower_globals(node, &cpu4_strlit_id);
             emit_globals(sx_prog, init_buf, bss_buf);
             if (irsim) irsim_populate_globals(irsim, sx_prog);
             // Phase 2: compile each function directly from Node* to SSA

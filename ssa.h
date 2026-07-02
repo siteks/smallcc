@@ -4,12 +4,36 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
-#include "sx.h"   // ValType, CallDesc
-#include "smallcc.h"  // Symbol
+#include "smallcc.h"  // Symbol, Type
 
 // ============================================================
 // SSA IR — Regime 2 data structures
 // ============================================================
+
+// ValType: the types that survive through the SSA IR.
+typedef enum {
+    VT_VOID,
+    VT_I8,
+    VT_I16,
+    VT_I32,
+    VT_U8,
+    VT_U16,
+    VT_U32,
+    VT_PTR,
+    VT_F32,
+} ValType;
+
+// Convert a C Type* to the corresponding ValType
+ValType type_to_valtype(Type *t);
+
+// CallDesc: ABI descriptor for call sites; attached to IK_CALL / IK_ICALL
+typedef struct {
+    Type  *return_type;     // C return type (for sret detection, widening)
+    int    nparams;
+    Type **param_types;     // array of C param types
+    bool   is_variadic;
+    bool   hidden_sret;     // struct-returning: first arg is hidden sret pointer
+} CallDesc;
 
 // Instruction kinds (prefix IK_ to avoid collision with stack-IR IR_ names)
 typedef enum {
@@ -87,7 +111,6 @@ struct Inst {
     Block    *target;       // IK_BR true / IK_JMP
     Block    *target2;      // IK_BR false
     char     *fname;        // IK_CALL / IK_GADDR
-    char     *label;        // IK_JMP to named label (goto)
     CallDesc *calldesc;
     // IK_SWITCH fields
     Block   **switch_targets;  // per-case target blocks

@@ -150,26 +150,8 @@ void compute_liveness(Function *f) {
                 }
             }
 
-            // Also handle phi operands for successors:
-            // The operand corresponding to this block is used in the successor's phi,
-            // so it's live at the end of this block.
-            for (int si = 0; si < b->nsuccs; si++) {
-                Block *s = b->succs[si];
-                // Find which predecessor index we are
-                int pidx = -1;
-                for (int pi = 0; pi < s->npreds; pi++) {
-                    if (s->preds[pi] == b) { pidx = pi; break; }
-                }
-                if (pidx < 0) continue;
-                for (Inst *inst = s->head; inst; inst = inst->next) {
-                    if (inst->kind != IK_PHI) continue;
-                    if (pidx < inst->nops) {
-                        Value *v = val_resolve(inst->ops[pidx]);
-                        if (v && v->kind == VAL_INST && v->id >= 0 && v->id < nv)
-                            bv_set(new_out, v->id);
-                    }
-                }
-            }
+            // No phi handling needed: compute_liveness only runs from
+            // irc_allocate, strictly after out_of_ssa has removed all phis.
 
             // Update live_in and live_out
             if (memcmp(b->live_in, live, nw * sizeof(uint32_t)) != 0) {
