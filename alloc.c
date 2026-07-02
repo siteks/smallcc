@@ -560,10 +560,7 @@ static int assign_colors(IGraph *g, Function *f, int K, int pessimistic,
             def->nops >= 2) {
             Value *o0 = val_resolve(def->ops[0]);
             Value *o1 = val_resolve(def->ops[1]);
-            int c0 = o0 && (o0->kind == VAL_CONST ||
-                           (o0->kind == VAL_INST && o0->def && o0->def->kind == IK_CONST));
-            int c1 = o1 && (o1->kind == VAL_CONST ||
-                           (o1->kind == VAL_INST && o1->def && o1->def->kind == IK_CONST));
+            int k, c0 = get_iconst(o0, &k), c1 = get_iconst(o1, &k);
             // Exactly one const operand → hint the non-const one.
             Value *src = NULL;
             if (c1 && !c0) src = o0;
@@ -774,6 +771,15 @@ static int assign_colors(IGraph *g, Function *f, int K, int pessimistic,
     return 1;
 }
 
+// Spill slot size in bytes: 32-bit types take 4, everything else takes 2.
+// Deliberately min-2 (do NOT use vtype_size): sub-word values spill as a
+// full 16-bit word.
+static int spill_size(ValType vt) {
+    // ILP32: VT_PTR must be in the 4-byte set — a spilled pointer in a
+    // 2-byte slot round-trips through lw/sw and loses its high half.
+    return (vt == VT_F32 || vt == VT_I32 || vt == VT_U32 || vt == VT_PTR) ? 4 : 2;
+}
+
 // F2 bp-relative range: same thresholds as emit.c
 // When a spill offset falls outside these ranges, emit.c cannot use the F2
 // encoding and instead picks an arbitrary tmp register — potential clobber.
@@ -790,12 +796,7 @@ static Value *insert_spill_addr(Function *f, Block *b, Inst *anchor, int slot_of
     Inst  *la    = new_inst(f, b, IK_ADDR, addr);
     la->imm      = slot_offset;
     la->line     = anchor->line;
-    la->block    = b;
-    la->prev     = anchor->prev;
-    la->next     = anchor;
-    if (anchor->prev) anchor->prev->next = la;
-    else              b->head = la;
-    anchor->prev = la;
+    inst_insert_before(anchor, la);
     return addr;
 }
 
@@ -803,8 +804,7 @@ static Value *insert_spill_addr(Function *f, Block *b, Inst *anchor, int slot_of
 // Returns a fresh Value* that holds the loaded value
 static Value *insert_spill_load(Function *f, Block *b, Inst *before,
                                  Value *spilled_val, int slot_offset) {
-    int sz = (spilled_val->vtype == VT_F32 || spilled_val->vtype == VT_I32 ||
-              spilled_val->vtype == VT_U32 || spilled_val->vtype == VT_PTR) ? 4 : 2;
+    int sz = spill_size(spilled_val->vtype);
 
     Value *tmp  = new_value(f, VAL_INST, spilled_val->vtype);
     Inst  *load = new_inst(f, b, IK_LOAD, tmp);
@@ -812,16 +812,8 @@ static Value *insert_spill_load(Function *f, Block *b, Inst *before,
     if (before) load->line = before->line;
 
     // Insert before 'before' first (sets load->block, prev/next)
-    load->block = b;
-    if (!before) {
-        inst_append(b, load);
-    } else {
-        load->prev = before->prev;
-        load->next = before;
-        if (before->prev) before->prev->next = load;
-        else              b->head = load;
-        before->prev = load;
-    }
+    if (!before) inst_append(b, load);
+    else         inst_insert_before(before, load);
 
     if (spill_in_f2_range(slot_offset, sz)) {
         // F2 bp-relative: NULL base + imm encodes the offset
@@ -839,24 +831,15 @@ static Value *insert_spill_load(Function *f, Block *b, Inst *before,
 
 static void insert_spill_store(Function *f, Block *b, Inst *after,
                                 Value *src, int slot_offset) {
-    int sz = (src->vtype == VT_F32 || src->vtype == VT_I32 ||
-              src->vtype == VT_U32 || src->vtype == VT_PTR) ? 4 : 2;
+    int sz = spill_size(src->vtype);
 
     Inst *store  = new_inst(f, b, IK_STORE, NULL);
     store->size  = sz;
-    store->block = b;
     if (after) store->line = after->line;
 
     // Link after 'after' first
-    if (!after) {
-        inst_append(b, store);
-    } else {
-        store->prev = after;
-        store->next = after->next;
-        if (after->next) after->next->prev = store;
-        else             b->tail = store;
-        after->next = store;
-    }
+    if (!after) inst_append(b, store);
+    else        inst_insert_after(after, store);
 
     if (spill_in_f2_range(slot_offset, sz)) {
         // F2 bp-relative: NULL base signals bp-relative encoding in emit.c
@@ -888,19 +871,11 @@ static Value *insert_remat(Function *f, Block *b, Inst *before, Value *orig) {
     Inst *clone = new_inst(f, b, def->kind, tmp);
     clone->imm   = def->imm;
     clone->fname = def->fname;
-    clone->block = b;
     if (before) clone->line = before->line;
 
     // Insert before 'before'
-    if (!before) {
-        inst_append(b, clone);
-    } else {
-        clone->prev = before->prev;
-        clone->next = before;
-        if (before->prev) before->prev->next = clone;
-        else              b->head = clone;
-        before->prev = clone;
-    }
+    if (!before) inst_append(b, clone);
+    else         inst_insert_before(before, clone);
     return tmp;
 }
 
@@ -929,13 +904,7 @@ static void rewrite_spills(Function *f, IGraph *g) {
             continue;
         }
         newly_spilled[i] = 1;
-        // ILP32: pointers are also 4 bytes — without VT_PTR in this set,
-        // a spilled pointer would get a 2-byte slot and rewrite_spills would
-        // emit `lw`/`sw` (16-bit) instead of `ll`/`sl` (32-bit), corrupting
-        // the high half of the address. The misaligned spill offset also
-        // triggers the "32-bit access to unaligned address" trap in sim_c.
-        int sz = (v->vtype == VT_F32 || v->vtype == VT_I32 || v->vtype == VT_U32 ||
-                  v->vtype == VT_PTR) ? 4 : 2;
+        int sz = spill_size(v->vtype);
         // Align FIRST so the resulting offset is naturally aligned for `sz`.
         // The previous `+= 2` / `+= 1` heuristics only worked when frame_size
         // was already at a specific residue; under ILP32 the new mix of int

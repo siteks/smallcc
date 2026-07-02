@@ -68,13 +68,7 @@ static void insert_copy_before_terminator(Block *b, Value *dst, Value *src) {
     }
     // Check if tail is a terminator
     if (term->kind == IK_BR || term->kind == IK_JMP || term->kind == IK_RET || term->kind == IK_SWITCH) {
-        // Insert before term
-        copy->prev = term->prev;
-        copy->next = term;
-        if (term->prev) term->prev->next = copy;
-        else             b->head = copy;
-        term->prev = copy;
-        copy->block = b;
+        inst_insert_before(term, copy);
     } else {
         inst_append(b, copy);
     }

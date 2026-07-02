@@ -84,6 +84,16 @@ void inst_insert_before(Inst *next, Inst *ins) {
     next->prev = ins;
 }
 
+void inst_insert_after(Inst *prev, Inst *ins) {
+    Block *b   = prev->block;
+    ins->block = b;
+    ins->prev  = prev;
+    ins->next  = prev->next;
+    if (prev->next) prev->next->prev = ins;
+    else            b->tail = ins;
+    prev->next = ins;
+}
+
 int vtype_size(ValType vt) {
     switch (vt) {
     case VT_I8:  case VT_U8:  return 1;
@@ -115,6 +125,26 @@ void block_add_pred(Block *to, Block *from) {
     memcpy(np, to->preds, to->npreds * sizeof(Block *));
     to->preds = np;
     to->preds[to->npreds++] = from;
+}
+
+// Remove one occurrence of pred from b's predecessor list (swap-with-last).
+void block_remove_pred(Block *b, Block *pred) {
+    for (int k = 0; k < b->npreds; k++) {
+        if (b->preds[k] == pred) {
+            b->preds[k] = b->preds[--b->npreds];
+            break;
+        }
+    }
+}
+
+// Remove one occurrence of succ from b's successor list (swap-with-last).
+void block_remove_succ(Block *b, Block *succ) {
+    for (int k = 0; k < b->nsuccs; k++) {
+        if (b->succs[k] == succ) {
+            b->succs[k] = b->succs[--b->nsuccs];
+            break;
+        }
+    }
 }
 
 // ============================================================

@@ -4,14 +4,6 @@
 #include "dom.h"     // dominates, compute_dominators
 #include "alloc.h"   // IRC_CALLER_REGS
 
-// Return 1 and set *out if v is a compile-time integer constant (VAL_CONST or IK_CONST).
-static int get_iconst(Value *v, int *out) {
-    if (!v) return 0;
-    if (v->kind == VAL_CONST)                            { *out = v->iconst;   return 1; }
-    if (v->kind == VAL_INST && v->def->kind == IK_CONST) { *out = v->def->imm; return 1; }
-    return 0;
-}
-
 void legalize_function(Function *f) {
     if (!f || f->nblocks == 0) return;
 

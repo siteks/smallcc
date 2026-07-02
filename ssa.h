@@ -185,6 +185,8 @@ void      inst_append(Block *b, Inst *inst);
 void      inst_add_op(Inst *inst, Value *v);
 void      block_add_succ(Block *from, Block *to);
 void      block_add_pred(Block *to, Block *from);
+void      block_remove_succ(Block *b, Block *succ);
+void      block_remove_pred(Block *b, Block *pred);
 
 // IR printer
 void print_function(Function *f, FILE *out);
@@ -196,8 +198,21 @@ static inline Value *val_resolve(Value *v) {
     return v;
 }
 
+// Return 1 and set *out if v is a compile-time integer constant
+// (VAL_CONST or the result of an IK_CONST instruction).
+static inline int get_iconst(Value *v, int *out) {
+    if (!v) return 0;
+    if (v->kind == VAL_CONST) { *out = v->iconst; return 1; }
+    if (v->kind == VAL_INST && v->def && v->def->kind == IK_CONST) {
+        *out = v->def->imm;
+        return 1;
+    }
+    return 0;
+}
+
 // Instruction insertion
 void inst_insert_before(Inst *next, Inst *new_inst);
+void inst_insert_after(Inst *prev, Inst *new_inst);
 
 // ValType size in bytes
 int vtype_size(ValType vt);

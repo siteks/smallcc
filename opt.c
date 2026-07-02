@@ -182,6 +182,66 @@ static int find_loops(Function *f, LoopInfo **out) {
     return nloops;
 }
 
+/*
+ * Compute the natural loop body for header h with back-edge latch: mark h,
+ * then walk predecessors backward from the latch.  Returns a calloc'd array
+ * indexed by block id (size f->next_blk_id) with 1 for in-body blocks —
+ * caller frees — or NULL on allocation failure (caller skips the loop).
+ * Blocks beyond the fixed worklist capacity are marked but not explored.
+ */
+static int *loop_body_marks(Function *f, Block *h, Block *latch) {
+    int mark_sz = f->next_blk_id;
+    int *in_body = calloc(mark_sz, sizeof(int));
+    if (!in_body) return NULL;
+    in_body[h->id] = 1;
+    Block *wl[256]; int wl_n = 0, wl_overflow = 0;
+    if (latch != h) { in_body[latch->id] = 1; wl[wl_n++] = latch; }
+    while (wl_n > 0) {
+        Block *c = wl[--wl_n];
+        for (int p = 0; p < c->npreds; p++) {
+            Block *pr = c->preds[p];
+            if (pr->id < mark_sz && !in_body[pr->id]) {
+                in_body[pr->id] = 1;
+                if (wl_n < 256) wl[wl_n++] = pr;
+                else wl_overflow = 1;
+            }
+        }
+    }
+    // An under-approximated body would make in-loop defs look invariant
+    // (wrong code), so refuse the loop entirely on worklist overflow.
+    if (wl_overflow) { free(in_body); return NULL; }
+    return in_body;
+}
+
+/*
+ * Register-pressure proxy shared by opt_licm_const and opt_lsr: append to
+ * live_ids[] (starting at nlive entries, dedup'd, capped) the ids of values
+ * defined outside the loop headed by h but used inside it.  Returns the new
+ * count.  opt_licm keeps its own walk — it interleaves loop-def counting in
+ * the same array, which this helper does not model.
+ */
+static int count_loop_liveins(Function *f, Block *h, int *live_ids,
+                              int nlive, int cap) {
+    for (int bi = 0; bi < f->nblocks; bi++) {
+        Block *b = f->blocks[bi];
+        if (!dominates(h, b)) continue;
+        for (Inst *inst = b->head; inst; inst = inst->next) {
+            if (inst->is_dead) continue;
+            for (int j = 0; j < inst->nops; j++) {
+                Value *v = val_resolve(inst->ops[j]);
+                if (!v || v->kind != VAL_INST || !v->def) continue;
+                if (dominates(h, v->def->block)) continue;  // defined inside
+                int vid = v->id, dup = 0;
+                for (int k = 0; k < nlive && !dup; k++)
+                    if (live_ids[k] == vid) dup = 1;
+                if (!dup && nlive < cap)
+                    live_ids[nlive++] = vid;
+            }
+        }
+    }
+    return nlive;
+}
+
 // ── R2A: Constant-condition branch folding ────────────────────────────────
 
 void opt_fold_branches(Function *f) {
@@ -196,20 +256,8 @@ void opt_fold_branches(Function *f) {
         Block *taken   = cond->iconst ? term->target  : term->target2;
         Block *dropped = cond->iconst ? term->target2 : term->target;
 
-        // Remove b from dropped->preds
-        for (int k = 0; k < dropped->npreds; k++) {
-            if (dropped->preds[k] == b) {
-                dropped->preds[k] = dropped->preds[--dropped->npreds];
-                break;
-            }
-        }
-        // Remove dropped from b->succs
-        for (int k = 0; k < b->nsuccs; k++) {
-            if (b->succs[k] == dropped) {
-                b->succs[k] = b->succs[--b->nsuccs];
-                break;
-            }
-        }
+        block_remove_pred(dropped, b);
+        block_remove_succ(b, dropped);
 
         // Rewrite terminator to unconditional jump
         term->kind    = IK_JMP;
@@ -1114,11 +1162,7 @@ void opt_bitwise_dist(Function *f) {
             ni->ops[0] = lv;
             ni->ops[1] = rv;
             nv->def = ni;
-            ni->prev = inst->prev;
-            ni->next = inst;
-            if (inst->prev) inst->prev->next = ni;
-            else b->head = ni;
-            inst->prev = ni;
+            inst_insert_before(inst, ni);
 
             // Rewrite inst to AND(nv, c)
             inst->kind = IK_AND;
@@ -1179,30 +1223,7 @@ void opt_licm_const(Function *f) {
         // cause spill cascades.
         #define LIVE_CAP 32
         int live_ids[LIVE_CAP];
-        int nlive = 0;
-        for (int bi = 0; bi < f->nblocks; bi++) {
-            Block *b = f->blocks[bi];
-            if (!dominates(h, b)) continue;
-            for (Inst *inst = b->head; inst; inst = inst->next) {
-                if (inst->is_dead) continue;
-                for (int j = 0; j < inst->nops; j++) {
-                    Value *v = val_resolve(inst->ops[j]);
-                    if (!v || v->kind != VAL_INST || !v->def) continue;
-                    // Cross-loop: defined outside the loop body
-                    if (!dominates(h, v->def->block)) {
-                        int vid = v->id, dup = 0;
-                        for (int k = 0; k < nlive && !dup; k++)
-                            if (live_ids[k] == vid) dup = 1;
-                        if (!dup && nlive < LIVE_CAP)
-                            live_ids[nlive++] = vid;
-                    }
-                }
-                // Also count dst values that are redefined across the loop
-                // header (phi-variables): if an instruction defines a value
-                // that is ALSO defined outside the loop, it's live across the
-                // header and occupies a register throughout.
-            }
-        }
+        int nlive = count_loop_liveins(f, h, live_ids, 0, LIVE_CAP);
         // Also count operands of the header block itself — these are
         // live at loop entry and include phi-variables.
         for (Inst *inst = h->head; inst; inst = inst->next) {
@@ -1656,18 +1677,8 @@ void opt_jump_thread(Function *f) {
                 for (int k = 0; k < p->nsuccs; k++) {
                     if (p->succs[k] == b) { p->succs[k] = taken; break; }
                 }
-                // Remove P from B's preds
-                for (int k = 0; k < b->npreds; k++) {
-                    if (b->preds[k] == p) {
-                        b->preds[k] = b->preds[--b->npreds];
-                        break;
-                    }
-                }
-                // Add P to taken's preds
-                Block **np = arena_alloc((taken->npreds + 1) * sizeof(Block *));
-                for (int k = 0; k < taken->npreds; k++) np[k] = taken->preds[k];
-                np[taken->npreds++] = p;
-                taken->preds = np;
+                block_remove_pred(b, p);
+                block_add_pred(taken, p);
 
                 changed = 1;
             }
@@ -1685,13 +1696,7 @@ void opt_jump_thread(Function *f) {
         term->nops    = br->nops;
 
         // Update P's succs: remove B, add bt and bf
-        // First, remove B from P's succs
-        for (int k = 0; k < p->nsuccs; k++) {
-            if (p->succs[k] == b) {
-                p->succs[k] = p->succs[--p->nsuccs];
-                break;
-            }
-        }
+        block_remove_succ(p, b);
         // Add bt and bf (avoid duplicates if bt == bf)
         {
             int need = (bt == bf) ? 1 : 2;
@@ -1707,27 +1712,11 @@ void opt_jump_thread(Function *f) {
             p->succs = ns;
         }
 
-        // Remove P from B's preds
-        for (int k = 0; k < b->npreds; k++) {
-            if (b->preds[k] == p) {
-                b->preds[k] = b->preds[--b->npreds];
-                break;
-            }
-        }
-
-        // Add P to bt's preds and bf's preds
-        {
-            Block **np = arena_alloc((bt->npreds + 1) * sizeof(Block *));
-            for (int k = 0; k < bt->npreds; k++) np[k] = bt->preds[k];
-            np[bt->npreds++] = p;
-            bt->preds = np;
-        }
-        if (bf != bt) {
-            Block **np = arena_alloc((bf->npreds + 1) * sizeof(Block *));
-            for (int k = 0; k < bf->npreds; k++) np[k] = bf->preds[k];
-            np[bf->npreds++] = p;
-            bf->preds = np;
-        }
+        // Remove P from B's preds; add P to bt's preds and bf's preds
+        block_remove_pred(b, p);
+        block_add_pred(bt, p);
+        if (bf != bt)
+            block_add_pred(bf, p);
 
         changed = 1;
     }
@@ -1763,6 +1752,7 @@ void opt_remove_dead_blocks(Function *f) {
                 // [B_live]; OOS picked the first phi op (0) for B_live and
                 // emitted `v = copy 0` on what should have been v_c, NULLing
                 // the pointer used by the next c->ssx access.
+                // (A bare block_remove_pred is NOT safe here for that reason.)
                 for (int k = 0; k < b->nsuccs; k++) {
                     Block *succ = b->succs[k];
                     int dead_pred_idx = -1;
@@ -2033,12 +2023,8 @@ void opt_unroll_loops(Function *f) {
             ns[0] = cont_blks[0]; ns[1] = exit_fixups[0];
             b->succs = ns; b->nsuccs = 2;
         }
-        for (int k = 0; k < b->npreds; k++) {
-            if (b->preds[k] == b) { b->preds[k] = b->preds[--b->npreds]; break; }
-        }
-        for (int k = 0; k < exit_blk->npreds; k++) {
-            if (exit_blk->preds[k] == b) { exit_blk->preds[k] = exit_blk->preds[--exit_blk->npreds]; break; }
-        }
+        block_remove_pred(b, b);
+        block_remove_pred(exit_blk, b);
         // Last continuation block: back-edge to B and edge to exit_blk
         block_add_pred(b, cont_blks[N - 2]);
         block_add_pred(exit_blk, cont_blks[N - 2]);
@@ -2084,12 +2070,55 @@ void opt_unroll_loops(Function *f) {
 typedef struct {
     Value *phi_val;    // the phi's dst value
     Inst  *phi_inst;   // the IK_PHI instruction
-    int    init_idx;   // index in ops[] of the pre-header operand
     int    back_idx;   // index in ops[] of the back-edge operand
     Value *init_val;   // initial value (from pre-header)
     Value *step_val;   // constant step value
     Inst  *add_inst;   // the IK_ADD instruction (iv_next = iv + step)
 } IVInfo;
+
+/*
+ * Detect basic induction variables among the header phis: a phi whose
+ * back-edge operand is phi + step_const (or step_const + phi), with the
+ * ADD inside the loop.  The containment test uses in_body[] when given
+ * (natural loop body, opt_addr_iv) or dominates(h, ...) otherwise
+ * (opt_lsr).  Fills ivs[] and returns the count.
+ */
+static int find_basic_ivs(Block *h, int pre_idx, int back_idx, int *in_body,
+                          IVInfo *ivs, int max) {
+    int niv = 0;
+    for (Inst *inst = h->head; inst; inst = inst->next) {
+        if (inst->is_dead || inst->kind != IK_PHI) continue;
+        if (inst->nops != h->npreds) continue;
+        if (niv >= max) break;
+
+        Value *init = val_resolve(inst->ops[pre_idx]);
+        Value *back = val_resolve(inst->ops[back_idx]);
+
+        // back must be iv + step_const (or step_const + iv)
+        if (back->kind != VAL_INST || !back->def) continue;
+        Inst *add = back->def;
+        if (add->kind != IK_ADD || add->nops != 2) continue;
+        if (in_body ? !in_body[add->block->id]
+                    : !dominates(h, add->block)) continue;  // must be inside loop
+
+        Value *a0 = val_resolve(add->ops[0]);
+        Value *a1 = val_resolve(add->ops[1]);
+        Value *step = NULL;
+        int k;
+        if      (a0 == inst->dst && get_iconst(a1, &k)) step = a1;
+        else if (a1 == inst->dst && get_iconst(a0, &k)) step = a0;
+        if (!step) continue;
+
+        ivs[niv].phi_val  = inst->dst;
+        ivs[niv].phi_inst = inst;
+        ivs[niv].back_idx = back_idx;
+        ivs[niv].init_val = init;
+        ivs[niv].step_val = step;
+        ivs[niv].add_inst = add;
+        niv++;
+    }
+    return niv;
+}
 
 void opt_lsr(Function *f) {
     LoopInfo *loops;
@@ -2122,65 +2151,14 @@ void opt_lsr(Function *f) {
                 if (nlive < live_cap) live_ids[nlive++] = inst->dst->id;
             }
             // Count external values used inside the loop
-            for (int bi = 0; bi < f->nblocks; bi++) {
-                Block *bb = f->blocks[bi];
-                if (!dominates(h, bb)) continue;
-                for (Inst *inst = bb->head; inst; inst = inst->next) {
-                    if (inst->is_dead) continue;
-                    for (int j = 0; j < inst->nops; j++) {
-                        Value *v = val_resolve(inst->ops[j]);
-                        if (!v || v->kind != VAL_INST || !v->def) continue;
-                        if (dominates(h, v->def->block)) continue;  // internal
-                        int dup = 0;
-                        for (int k = 0; k < nlive; k++)
-                            if (live_ids[k] == v->id) { dup = 1; break; }
-                        if (!dup && nlive < live_cap) live_ids[nlive++] = v->id;
-                    }
-                }
-            }
+            nlive = count_loop_liveins(f, h, live_ids, nlive, live_cap);
         }
         int lsr_budget = 8 - 4 - nlive;  // K - scratch - existing cross-loop values
         if (lsr_budget <= 0) continue;
 
         // Step 2: Detect basic induction variables in header phis.
         IVInfo ivs[LSR_MAX_IVS];
-        int niv = 0;
-
-        for (Inst *inst = h->head; inst; inst = inst->next) {
-            if (inst->is_dead || inst->kind != IK_PHI) continue;
-            if (inst->nops != h->npreds) continue;
-            if (niv >= LSR_MAX_IVS) break;
-
-            Value *init = val_resolve(inst->ops[pre_idx]);
-            Value *back = val_resolve(inst->ops[back_idx]);
-
-            // back must be iv + step_const (or step_const + iv)
-            if (back->kind != VAL_INST || !back->def) continue;
-            Inst *add = back->def;
-            if (add->kind != IK_ADD || add->nops != 2) continue;
-            if (!dominates(h, add->block)) continue;  // must be inside loop
-
-            Value *a0 = val_resolve(add->ops[0]);
-            Value *a1 = val_resolve(add->ops[1]);
-            Value *step = NULL;
-            if (a0 == inst->dst && (a1->kind == VAL_CONST ||
-                (a1->kind == VAL_INST && a1->def && a1->def->kind == IK_CONST))) {
-                step = a1;
-            } else if (a1 == inst->dst && (a0->kind == VAL_CONST ||
-                (a0->kind == VAL_INST && a0->def && a0->def->kind == IK_CONST))) {
-                step = a0;
-            }
-            if (!step) continue;
-
-            ivs[niv].phi_val  = inst->dst;
-            ivs[niv].phi_inst = inst;
-            ivs[niv].init_idx = pre_idx;
-            ivs[niv].back_idx = back_idx;
-            ivs[niv].init_val = init;
-            ivs[niv].step_val = step;
-            ivs[niv].add_inst = add;
-            niv++;
-        }
+        int niv = find_basic_ivs(h, pre_idx, back_idx, NULL, ivs, LSR_MAX_IVS);
         if (niv == 0) continue;
 
         // Step 3: Find MUL candidates in loop body.
@@ -2334,25 +2312,8 @@ void opt_scalar_promote(Function *f) {
 
         // Compute natural loop body via worklist
         int mark_sz = f->next_blk_id;
-        int *in_body = calloc(mark_sz, sizeof(int));
+        int *in_body = loop_body_marks(f, h, latch);
         if (!in_body) continue;
-        in_body[h->id] = 1;
-        Block *wl[256]; int wl_n = 0, wl_overflow = 0;
-        if (latch != h) { in_body[latch->id] = 1; wl[wl_n++] = latch; }
-        while (wl_n > 0) {
-            Block *c = wl[--wl_n];
-            for (int p = 0; p < c->npreds; p++) {
-                Block *pr = c->preds[p];
-                if (pr->id < mark_sz && !in_body[pr->id]) {
-                    in_body[pr->id] = 1;
-                    if (wl_n < 256) wl[wl_n++] = pr;
-                    else wl_overflow = 1;
-                }
-            }
-        }
-        // An under-approximated body would make in-loop defs look invariant
-        // (wrong code), so bail on this loop rather than promote from it.
-        if (wl_overflow) { free(in_body); continue; }
 
         // Single exit block
         Block *exit_blk = NULL;
@@ -2567,62 +2528,12 @@ void opt_addr_iv(Function *f) {
         if (!preh || back_idx < 0) continue;
 
         // Compute natural loop body
-        int mark_sz = f->next_blk_id;
-        int *in_body = calloc(mark_sz, sizeof(int));
+        int *in_body = loop_body_marks(f, h, latch);
         if (!in_body) continue;
-        in_body[h->id] = 1;
-        Block *wl[256]; int wl_n = 0, wl_overflow = 0;
-        if (latch != h) { in_body[latch->id] = 1; wl[wl_n++] = latch; }
-        while (wl_n > 0) {
-            Block *c = wl[--wl_n];
-            for (int p = 0; p < c->npreds; p++) {
-                Block *pr = c->preds[p];
-                if (pr->id < mark_sz && !in_body[pr->id]) {
-                    in_body[pr->id] = 1;
-                    if (wl_n < 256) wl[wl_n++] = pr;
-                    else wl_overflow = 1;
-                }
-            }
-        }
-        // An under-approximated body would make in-loop defs look invariant
-        // (wrong code), so bail on this loop rather than rewrite it.
-        if (wl_overflow) { free(in_body); continue; }
 
         // Detect basic induction variables (same as LSR)
         IVInfo ivs[LSR_MAX_IVS];
-        int niv = 0;
-        for (Inst *inst = h->head; inst; inst = inst->next) {
-            if (inst->is_dead || inst->kind != IK_PHI) continue;
-            if (inst->nops != h->npreds) continue;
-            if (niv >= LSR_MAX_IVS) break;
-
-            Value *init = val_resolve(inst->ops[pre_idx]);
-            Value *back = val_resolve(inst->ops[back_idx]);
-            if (back->kind != VAL_INST || !back->def) continue;
-            Inst *add = back->def;
-            if (add->kind != IK_ADD || add->nops != 2) continue;
-            if (!in_body[add->block->id]) continue;
-
-            Value *a0 = val_resolve(add->ops[0]);
-            Value *a1 = val_resolve(add->ops[1]);
-            Value *step = NULL;
-            if (a0 == inst->dst && (a1->kind == VAL_CONST ||
-                (a1->kind == VAL_INST && a1->def && a1->def->kind == IK_CONST)))
-                step = a1;
-            else if (a1 == inst->dst && (a0->kind == VAL_CONST ||
-                (a0->kind == VAL_INST && a0->def && a0->def->kind == IK_CONST)))
-                step = a0;
-            if (!step) continue;
-
-            ivs[niv].phi_val  = inst->dst;
-            ivs[niv].phi_inst = inst;
-            ivs[niv].init_idx = pre_idx;
-            ivs[niv].back_idx = back_idx;
-            ivs[niv].init_val = init;
-            ivs[niv].step_val = step;
-            ivs[niv].add_inst = add;
-            niv++;
-        }
+        int niv = find_basic_ivs(h, pre_idx, back_idx, in_body, ivs, LSR_MAX_IVS);
         if (niv == 0) { free(in_body); continue; }
 
         // Scan loads in loop body for reducible address patterns
