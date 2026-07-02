@@ -24,4 +24,11 @@
 void compute_liveness(Function *f);
 void irc_allocate(Function *f);
 
+// OR extra caller-saved clobber bits into a function's recorded clobber
+// mask. Called by emit_function AFTER emission: scratch registers borrowed
+// at emit time (find_free_scratch / pick_scratch / const-base paths) are
+// invisible to the IR-level record_function_clobbers walk, and callers
+// compiled later must not keep values in them across a call.
+void irc_add_clobbers(const char *name, uint8_t mask);
+
 #endif // ALLOC_H

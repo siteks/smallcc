@@ -859,9 +859,28 @@ static void lvn_insert(BraunCtx *ctx, Block *b, InstKind kind, int k0, int k1, V
     }
 }
 
+// Look through type-coercing IK_COPYs (and materialized IK_CONSTs) to find
+// a compile-time constant. insert_coercions wraps literals in conversion
+// casts, which braun lowers to copies — without this look-through,
+// `0xffffffff << 4` never const-folds (the shift amount arrives as
+// `copy 4` with a different vtype), and CoreMark's bit_extract macro
+// computes its masks at runtime in the hottest loop.
+static int binop_const(Value *v, int32_t *out) {
+    for (int hops = 0; v && hops < 4; hops++) {
+        v = val_resolve(v);
+        if (v->kind == VAL_CONST) { *out = v->iconst; return 1; }
+        if (v->kind != VAL_INST || !v->def) return 0;
+        if (v->def->kind == IK_CONST) { *out = v->def->imm; return 1; }
+        if (v->def->kind == IK_COPY && v->def->nops >= 1) { v = v->def->ops[0]; continue; }
+        return 0;
+    }
+    return 0;
+}
+
 static Value *emit_binop(BraunCtx *ctx, Block *b, InstKind kind, Value *lhs, Value *rhs, ValType vt) {
-    if (lhs && lhs->kind == VAL_CONST && rhs && rhs->kind == VAL_CONST && can_fold_binop(kind)) {
-        int32_t result = fold_binop(kind, lhs->iconst, rhs->iconst);
+    int32_t kl, kr;
+    if (binop_const(lhs, &kl) && binop_const(rhs, &kr) && can_fold_binop(kind)) {
+        int32_t result = fold_binop(kind, kl, kr);
         return new_const(ctx->f, result, vt);
     }
 
@@ -971,6 +990,15 @@ static Value *emit_load(BraunCtx *ctx, Block *b, Value *ptr, int size, int offse
         if (a1 && a1->kind == VAL_CONST) { ptr = a0; offset = a1->iconst; }
         else if (a0 && a0->kind == VAL_CONST) { ptr = a1; offset = a0->iconst; }
     }
+    // Materialize a fully-constant address (e.g. MMIO: *(u32*)0xff00, or a
+    // folded base+offset) — emission expects load bases in registers.
+    if (ptr && ptr->kind == VAL_CONST) {
+        Value *mat = new_value(ctx->f, VAL_INST, VT_PTR);
+        Inst  *ci  = bi(ctx, b, IK_CONST, mat);
+        ci->imm = ptr->iconst;
+        inst_append(b, ci);
+        ptr = mat;
+    }
     Value *dst  = new_value(ctx->f, VAL_INST, vt);
     Inst  *inst = bi(ctx, b, IK_LOAD, dst);
     inst_add_op(inst, ptr);
@@ -988,6 +1016,14 @@ static void emit_store(BraunCtx *ctx, Block *b, Value *ptr, Value *val, int size
         Value *a1 = ptr->def->ops[1];
         if (a1 && a1->kind == VAL_CONST) { ptr = a0; offset = a1->iconst; }
         else if (a0 && a0->kind == VAL_CONST) { ptr = a1; offset = a0->iconst; }
+    }
+    // Materialize a fully-constant address (see emit_load).
+    if (ptr && ptr->kind == VAL_CONST) {
+        Value *mat = new_value(ctx->f, VAL_INST, VT_PTR);
+        Inst  *ci  = bi(ctx, b, IK_CONST, mat);
+        ci->imm = ptr->iconst;
+        inst_append(b, ci);
+        ptr = mat;
     }
     if (val && val->kind == VAL_CONST) {
         ValType vt = val->vtype != VT_VOID ? val->vtype : VT_I16;
@@ -1533,7 +1569,17 @@ static Value *cg_expr(BraunCtx *ctx, Block **cur, Node *n) {
         Value *lv = cg_expr(ctx, cur, n->ch[0]); b = *cur;
         Value *rv = cg_expr(ctx, cur, n->ch[1]); b = *cur;
 
-        ValType op_vt = lv->vtype != VT_VOID ? lv->vtype : vt;
+        // Signedness for div/mod/shift-right/compares comes from the C
+        // static type of the (coerced) operands, NOT from the lhs value's
+        // vtype: a folded constant or inlined argument can carry a vtype
+        // from its ORIGIN context (e.g. i32 from `150 - 255` flowing into
+        // an unsigned parameter), which would silently flip the operation
+        // to the wrong signedness (fuzz seed 9152).
+        ValType op_vt;
+        if (n->ch[0]->type && n->ch[0]->type->base != TB_VOID)
+            op_vt = type_to_valtype(n->ch[0]->type);
+        else
+            op_vt = lv->vtype != VT_VOID ? lv->vtype : vt;
 
         // GT/GE: swap operands (use LT/LE with args reversed)
         bool swap = (op == TK_GT || op == TK_GE);

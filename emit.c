@@ -4,6 +4,7 @@
 #include <ctype.h>
 #include "smallcc.h"
 #include "emit.h"
+#include "alloc.h"   // irc_add_clobbers
 
 // ============================================================
 // Source annotation (-ann)
@@ -100,6 +101,15 @@ static void emit_mov(FILE *out, int rd, int rs) {
         fprintf(out, "    or %s, %s, %s\n", regname(rd), regname(rs), regname(rs));
 }
 
+// Emit-time scratch borrows are invisible to the IR walk that records
+// per-function clobber masks (record_function_clobbers runs at the end of
+// IRC, before emission). Every borrow is accumulated here and fed back via
+// irc_add_clobbers at the end of emit_function, so callers compiled later
+// don't keep live values in a register the callee silently writes.
+// (Found by tools/fuzz.py seed 9199: a caller kept a value in r2 across a
+// call whose callee borrowed r2 for an unmaterialized large constant.)
+static uint8_t g_scratch_borrows;
+
 // Find a caller-saved scratch register (r0-r3) that is genuinely dead at `inst`.
 // `exclude` is a bitmask of registers that must not be chosen (operands of inst).
 // Returns register number 0-3, or -1 if none is provably free.
@@ -125,7 +135,7 @@ static int find_free_scratch(Inst *inst, int exclude) {
 
     // Pick first free caller-saved register
     for (int r = 0; r <= 3; r++)
-        if (!(busy & (1u << r))) return r;
+        if (!(busy & (1u << r))) { g_scratch_borrows |= (uint8_t)(1u << r); return r; }
     return -1;
 }
 
@@ -136,11 +146,16 @@ static int find_free_scratch(Inst *inst, int exclude) {
 // arg registers).  Prefer find_free_scratch() when the busy set depends on
 // forward uses within the block.
 static int pick_scratch(unsigned forbidden) {
-    for (int r = 0; r < 8; r++) {
-        if (!(forbidden & (1u << r)))
+    // Caller-saved only: a borrowed r4-r7 would bypass the callee-save
+    // prologue (computed from IR-assigned registers before emission).
+    for (int r = 0; r < 4; r++) {
+        if (!(forbidden & (1u << r))) {
+            g_scratch_borrows |= (uint8_t)(1u << r);
             return r;
+        }
     }
-    return 0; // fallback
+    g_scratch_borrows |= 1u;
+    return 0; // fallback — callers must tolerate (pushr/popr around the use)
 }
 
 // Get the physical register for a value (must be allocated)
@@ -858,6 +873,7 @@ static void emit_inst(Inst *inst, FILE *out) {
             if (base->kind == VAL_CONST && base->iconst == 0) {
                 // null base, use imm as absolute (unusual)
                 int tmp = (rd == 0) ? 1 : 0;
+                g_scratch_borrows |= (uint8_t)(1u << tmp);
                 emit_imm(out, tmp, off);
                 fprintf(out, "    %s %s, %s, 0\n", load_f3c(size, is_s), regname(rd), regname(tmp));
             } else {
@@ -883,10 +899,14 @@ static void emit_inst(Inst *inst, FILE *out) {
         // Materialize constants
         int rv_scratch = 0; // default scratch for value
         if (rb == 0) rv_scratch = 1;
+        if (val && (val->kind == VAL_CONST || val->kind == VAL_UNDEF ||
+                    val->phys_reg < 0))
+            g_scratch_borrows |= (uint8_t)(1u << rv_scratch);
         int rv = get_val_reg(out, val, rv_scratch);
 
         int rb_scratch = (rv == 0) ? 1 : 0;
         if (base && base->kind == VAL_CONST) {
+            g_scratch_borrows |= (uint8_t)(1u << rb_scratch);
             emit_const_into(out, base, rb_scratch);
             rb = rb_scratch;
         }
@@ -2408,6 +2428,7 @@ void emit_function(Function *f, FILE *out) {
     }
 
     g_cur_func_name = f->name;
+    g_scratch_borrows = 0;
     fprintf(out, "    align\n");
     fprintf(out, "%s:\n", f->name);
 
@@ -2513,6 +2534,10 @@ void emit_function(Function *f, FILE *out) {
     emit_function_body(f, out, fuse, blk_live_regs, callee_frame,
                        callee_save, frame, ann_live,
                        block_start, block_size, no_rotate);
+
+    // Report emit-time scratch borrows so callers' clobber masks include
+    // registers this function writes that never appear as IR-level dsts.
+    irc_add_clobbers(f->name, (uint8_t)(g_scratch_borrows & 0x0F));
 }
 
 // ============================================================

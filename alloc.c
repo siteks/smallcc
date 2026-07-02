@@ -50,6 +50,13 @@ static void record_clobbers(const char *name, uint8_t mask) {
     clobber_head = e;
 }
 
+void irc_add_clobbers(const char *name, uint8_t mask) {
+    if (!name || !mask) return;
+    ClobberEntry *e = find_clobber_entry(name);
+    if (e) e->mask |= mask;
+    else   record_clobbers(name, (uint8_t)(mask | 0x0F));  // unknown base: conservative
+}
+
 static void record_function_clobbers(Function *f) {
     if (!f->name) return;
     uint8_t mask = 0;
