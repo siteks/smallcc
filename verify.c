@@ -183,19 +183,44 @@ void verify_function(Function *f, const char *stage, VerifyPhase phase)
         for (int bi = 0; bi < f->nblocks; bi++) {
             for (Inst *inst = f->blocks[bi]->head; inst; inst = inst->next) {
                 if (inst->is_dead) continue;
+                // Spilled values (spill_slot >= 0) legitimately carry
+                // phys_reg -1: their def feeds the spill store through an
+                // emission scratch register, and every real use was
+                // replaced by a reload. Uncolored AND slotless is the
+                // failure mode (the IRC livelock bug).
                 if (inst->dst) {
                     Value *d = val_resolve(inst->dst);
-                    if (d->phys_reg < 0 || d->phys_reg > 7)
-                        verr("B%d: dst v%d has phys_reg %d",
-                             f->blocks[bi]->id, d->id, d->phys_reg);
+                    if ((d->phys_reg < 0 && d->spill_slot < 0) || d->phys_reg > 7) {
+                        // One benign shape: a def that was spilled via an
+                        // IG-coalescing alias (its slot lives on the
+                        // union-find canonical, invisible here) is emitted
+                        // into scratch r0 and consumed by the IMMEDIATELY
+                        // following spill store. Fragile-but-correct today;
+                        // anything else uncolored is the IRC livelock bug.
+                        Inst *nx = inst->next;
+                        while (nx && nx->is_dead) nx = nx->next;
+                        int spill_def = nx && nx->kind == IK_STORE &&
+                                        nx->nops == 1 && nx->ops[0] &&
+                                        val_resolve(nx->ops[0]) == d;
+                        if (!spill_def)
+                            verr("B%d: dst v%d has phys_reg %d (no spill slot)",
+                                 f->blocks[bi]->id, d->id, d->phys_reg);
+                    }
                 }
                 for (int j = 0; j < inst->nops; j++) {
                     Value *v = inst->ops[j];
                     if (!v) continue;
                     v = val_resolve(v);
-                    if (v->kind == VAL_INST && (v->phys_reg < 0 || v->phys_reg > 7))
-                        verr("B%d: operand v%d has phys_reg %d",
-                             f->blocks[bi]->id, v->id, v->phys_reg);
+                    if (v->kind == VAL_INST &&
+                        ((v->phys_reg < 0 && v->spill_slot < 0) || v->phys_reg > 7)) {
+                        // Matching exemption: the spill store itself reads
+                        // the uncolored def (see above).
+                        int is_spill_store_use =
+                            inst->kind == IK_STORE && inst->nops == 1;
+                        if (!is_spill_store_use)
+                            verr("B%d: operand v%d has phys_reg %d (no spill slot)",
+                                 f->blocks[bi]->id, v->id, v->phys_reg);
+                    }
                 }
             }
         }

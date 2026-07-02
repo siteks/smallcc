@@ -742,11 +742,21 @@ int main(int argc, char **argv)
                     if (opt_flags & OPT_NARROW_LOADS)   opt_narrow_loads(f);
                     STAT("pre",  opt_stat_kb_change, opt_known_bits(f));
                     STAT("pre",  opt_stat_bd_change, opt_bitwise_dist(f));
+                    opt_range_check(f);
+                    // Re-run the CFG cleanup: R2K's phi-select fold turns
+                    // inlined `pred ? 1 : 0` skeletons into convergent
+                    // branches that opt_fold_branches can now remove.
+                    // Dominators are recomputed below for the passes that
+                    // need them.
+                    if (opt_flags & OPT_FOLD_BR)     STAT("pre2", opt_stat_fold_br,  opt_fold_branches(f));
+                    if (opt_flags & OPT_DEAD_BLOCKS) STAT("pre2", opt_stat_dead_blk, opt_remove_dead_blocks(f));
+                    compute_dominators(f);
                     // R2K-retry probe: re-run known_bits after bitwise_dist to
                     // measure whether fusing them into a fixpoint would help.
                     if (getenv("OPT_STATS"))
                         STAT("r2k-retry", opt_stat_kb_change, opt_known_bits(f));
                     if (opt_flags & OPT_CSE) STAT("pre-cse", opt_stat_cse_alias, opt_pre_oos_cse(f));
+                    if (opt_flags & OPT_CSE) opt_load_cse(f);
                     verify_function(f, "pre-simplify+cse", VERIFY_PRE_OOS);
                     opt_scalar_promote(f);
                     opt_addr_iv(f);

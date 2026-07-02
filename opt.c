@@ -245,6 +245,45 @@ static int count_loop_liveins(Function *f, Block *h, int *live_ids,
 
 // ── R2A: Constant-condition branch folding ────────────────────────────────
 
+// Remove the CFG edge pred→succ, dropping succ's positionally-paired phi
+// operand along with the pred entry. Phi operands are paired with the pred
+// list by index; removing one without the other mis-pairs every phi in succ
+// (the NanoJPEG njDecodeSOF failure mode — see opt_remove_dead_blocks).
+static void remove_edge_paired(Block *pred, Block *succ) {
+    int idx = -1;
+    for (int i = 0; i < succ->npreds; i++)
+        if (succ->preds[i] == pred) { idx = i; break; }
+    if (idx >= 0) {
+        for (Inst *inst = succ->head; inst; inst = inst->next) {
+            if (inst->kind != IK_PHI) continue;
+            if (idx < inst->nops) {
+                inst->ops[idx] = inst->ops[inst->nops - 1];
+                inst->nops--;
+            }
+        }
+        succ->preds[idx] = succ->preds[--succ->npreds];
+    }
+    block_remove_succ(pred, succ);
+}
+
+// Chase a branch target through empty blocks (only dead instructions and a
+// single IK_JMP; no live phis). Returns where the chain converges.
+static Block *chase_empty_chain(Block *b) {
+    for (int hops = 0; b && hops < 4; hops++) {
+        Inst *only = NULL;
+        int empty = 1;
+        for (Inst *inst = b->head; inst; inst = inst->next) {
+            if (inst->is_dead) continue;
+            if (inst->kind == IK_JMP && !only) { only = inst; continue; }
+            empty = 0;
+            break;
+        }
+        if (!empty || !only || !only->target) return b;
+        b = only->target;
+    }
+    return b;
+}
+
 void opt_fold_branches(Function *f) {
     for (int bi = 0; bi < f->nblocks; bi++) {
         Block *b    = f->blocks[bi];
@@ -252,19 +291,97 @@ void opt_fold_branches(Function *f) {
         if (!term || term->kind != IK_BR || term->nops < 1) continue;
 
         Value *cond = val_resolve(term->ops[0]);
-        if (!cond || cond->kind != VAL_CONST) continue;
+        if (cond && cond->kind == VAL_CONST) {
+            Block *taken   = cond->iconst ? term->target  : term->target2;
+            Block *dropped = cond->iconst ? term->target2 : term->target;
 
-        Block *taken   = cond->iconst ? term->target  : term->target2;
-        Block *dropped = cond->iconst ? term->target2 : term->target;
+            remove_edge_paired(b, dropped);
 
-        block_remove_pred(dropped, b);
-        block_remove_succ(b, dropped);
+            // Rewrite terminator to unconditional jump
+            term->kind    = IK_JMP;
+            term->target  = taken;
+            term->target2 = NULL;
+            term->nops    = 0;  // drop the condition operand reference
+            opt_stat_fold_br++;
+            continue;
+        }
 
-        // Rewrite terminator to unconditional jump
+        // Convergent branch: both targets reach the same block through
+        // empty chains, and that block either has no phis or its phi
+        // operands for the two incoming edges are identical — the branch
+        // decides nothing. Typical source: the skeleton of an inlined
+        // `pred ? 1 : 0` ternary after the phi-select fold removed the
+        // phi (CoreMark's ee_isdigit).
+        if (!term->target || !term->target2 || term->target == term->target2)
+            continue;
+        Block *tx = chase_empty_chain(term->target);
+        Block *fx = chase_empty_chain(term->target2);
+        if (tx != fx) continue;
+
+        // Which edges feed tx from the two chains?
+        Block *e_t = term->target  == tx ? b : NULL;
+        Block *e_f = term->target2 == tx ? b : NULL;
+        if (!e_t) {
+            Block *c = term->target;
+            while (c && c->tail && c->tail->target != tx) c = c->tail->target;
+            e_t = c;
+        }
+        if (!e_f) {
+            Block *c = term->target2;
+            while (c && c->tail && c->tail->target != tx) c = c->tail->target;
+            e_f = c;
+        }
+        if (!e_t || !e_f) continue;
+
+        // Phi safety: the converged block's phis must not distinguish the
+        // two paths.
+        int it = -1, jf = -1;
+        for (int i = 0; i < tx->npreds; i++) {
+            if (tx->preds[i] == e_t) it = i;
+            if (tx->preds[i] == e_f) jf = i;
+        }
+        if (it < 0 || jf < 0) continue;
+        int phi_ok = 1;
+        for (Inst *inst = tx->head; inst && phi_ok; inst = inst->next) {
+            if (inst->is_dead || inst->kind != IK_PHI) continue;
+            if (it >= inst->nops || jf >= inst->nops ||
+                val_resolve(inst->ops[it]) != val_resolve(inst->ops[jf]))
+                phi_ok = 0;
+        }
+        if (!phi_ok) continue;
+
+        if (tx == b) continue;   // degenerate self-convergence
+
+        // Retarget b straight to the convergence block. The empty chains
+        // lose our edge and (if otherwise unreferenced) become unreachable;
+        // opt_remove_dead_blocks — which runs immediately after — deletes
+        // them, dropping their edges into tx with the paired phi-operand
+        // removal. Jumping directly to tx (rather than keeping the true
+        // chain) lets post-OOS jump threading fold tx's own branch into b
+        // when its condition is defined here.
+        Value *phi_sel[8];
+        Inst  *phi_ins[8];
+        int nphi = 0, overflow = 0;
+        for (Inst *inst = tx->head; inst; inst = inst->next) {
+            if (inst->is_dead || inst->kind != IK_PHI) continue;
+            if (nphi >= 8) { overflow = 1; break; }
+            phi_ins[nphi] = inst;
+            phi_sel[nphi] = inst->ops[it];
+            nphi++;
+        }
+        if (overflow) continue;
+
+        remove_edge_paired(b, term->target);
+        remove_edge_paired(b, term->target2);
+        block_add_succ(b, tx);
+        block_add_pred(tx, b);
+        for (int i = 0; i < nphi; i++)
+            inst_add_op(phi_ins[i], phi_sel[i]);
+
         term->kind    = IK_JMP;
-        term->target  = taken;
+        term->target  = tx;
         term->target2 = NULL;
-        term->nops    = 0;  // drop the condition operand reference
+        term->nops    = 0;
         opt_stat_fold_br++;
     }
 }
@@ -1046,6 +1163,28 @@ void opt_known_bits(Function *f) {
                 }
             }
 
+            // TRUNC/ZEXT(x) where every bit the operation would clear is
+            // already known zero is a no-op. Aliasing across vtypes is safe
+            // when the value is boolean (same rationale as the EQ/NE clause
+            // below: {0,1} is identical under sign- and zero-extension) or
+            // when the vtypes match. Typical source: (ee_u8)bool_expr — the
+            // cast of an inlined predicate's result (CoreMark ee_isdigit).
+            if ((inst->kind == IK_TRUNC || inst->kind == IK_ZEXT) &&
+                inst->nops >= 1) {
+                Value *src = val_resolve(inst->ops[0]);
+                uint32_t wmask = kb_trunc_mask(inst->dst->vtype);
+                KnownBits kb = kb_get(src);
+                int is_bool = (~kb.zero & ~1u) == 0;
+                if ((~wmask & ~kb.zero) == 0 &&
+                    (src->vtype == inst->dst->vtype || is_bool)) {
+                    inst->dst->alias = src;
+                    inst->is_dead = 1;
+                    changed = 1;
+                    opt_stat_kb_change++;
+                    continue;
+                }
+            }
+
             // Boolean comparison simplification for known-boolean sources
             // (bits 1-31 known zero, bit 0 possibly set — i.e. value ∈ {0, 1}):
             //   EQ(x, 1) → x         (alias)
@@ -1106,6 +1245,197 @@ void opt_known_bits(Function *f) {
 
     if (!changed) return;
     recount_uses(f);
+}
+
+static int chase_const(Value *v, int *out);   // defined with opt_downcount below
+
+// ── Redundant load elimination ───────────────────────────────────────────
+//
+// LOAD(base, off, size) whose value is already available from an identical
+// dominating load, with no store/call/memcpy on any path in between, reuses
+// the earlier result. GVN deliberately excludes loads; this pass adds the
+// narrow memory-aware case that the CoreMark state machine hits twice per
+// character (`*str` tested for NUL, then reloaded as the switch selector).
+//
+// Conservative in four ways: the earlier load must dominate; the backward
+// region from the late load to the early one is bounded and must be
+// entirely clobber-free and closed (every path bottoms out at the early
+// load's block); re-reaching the late load's own block (a loop) bails; and
+// constant addresses are skipped — `volatile` is parsed but not enforced,
+// and folding repeated MMIO reads (cycle counter, device registers) would
+// change device semantics.
+
+static int lc_clobbers(Inst *inst) {
+    switch (inst->kind) {
+    case IK_STORE: case IK_CALL: case IK_ICALL: case IK_MEMCPY:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static int lc_block_clobber_free(Block *b) {
+    for (Inst *inst = b->head; inst; inst = inst->next)
+        if (!inst->is_dead && lc_clobbers(inst)) return 0;
+    return 1;
+}
+
+void opt_load_cse(Function *f) {
+    int changed = 0;
+    for (int bi = 0; bi < f->nblocks; bi++) {
+        Block *b = f->blocks[bi];
+        for (Inst *l2 = b->head; l2; l2 = l2->next) {
+            if (l2->is_dead || l2->kind != IK_LOAD || l2->nops < 1 || !l2->dst)
+                continue;
+            Value *base = l2->ops[0] ? val_resolve(l2->ops[0]) : NULL;
+            if (!base || base->kind != VAL_INST) continue;   // skip bp-relative & const
+            int kdummy;
+            if (chase_const(base, &kdummy)) continue;        // MMIO / absolute
+
+            // 1) Same block, above l2: nearest identical load with no
+            //    clobber in between.
+            Inst *l1 = NULL;
+            int blocked = 0;
+            for (Inst *p = l2->prev; p; p = p->prev) {
+                if (p->is_dead) continue;
+                if (lc_clobbers(p)) { blocked = 1; break; }
+                if (p->kind == IK_LOAD && p->nops >= 1 && p->dst &&
+                    p->ops[0] && val_resolve(p->ops[0]) == base &&
+                    p->imm == l2->imm && p->size == l2->size &&
+                    p->dst->vtype == l2->dst->vtype) { l1 = p; break; }
+            }
+
+            // 2) Cross-block: candidate loads in dominating blocks, with a
+            //    closed clobber-free backward region.
+            if (!l1 && !blocked && b->npreds > 0) {
+                for (Block *d = b->idom; d && !l1; d = d->idom) {
+                    // find last identical load in d with no clobber after it
+                    Inst *cand = NULL;
+                    for (Inst *p = d->tail; p; p = p->prev) {
+                        if (p->is_dead) continue;
+                        if (lc_clobbers(p)) break;
+                        if (p->kind == IK_LOAD && p->nops >= 1 && p->dst &&
+                            p->ops[0] && val_resolve(p->ops[0]) == base &&
+                            p->imm == l2->imm && p->size == l2->size &&
+                            p->dst->vtype == l2->dst->vtype) { cand = p; break; }
+                    }
+                    if (!cand) continue;
+                    // region walk: preds of b (and their preds) must be
+                    // clobber-free and bottom out at d; bail on loops back
+                    // to b or region overflow.
+                    Block *region[8]; int nregion = 0, ok = 1;
+                    Block *wl[8]; int wn = 0;
+                    for (int pi = 0; pi < b->npreds && ok; pi++) {
+                        Block *p = b->preds[pi];
+                        if (p == d) continue;
+                        if (p == b) { ok = 0; break; }
+                        if (wn < 8) wl[wn++] = p; else ok = 0;
+                    }
+                    while (ok && wn > 0) {
+                        Block *r = wl[--wn];
+                        int seen = 0;
+                        for (int i = 0; i < nregion; i++)
+                            if (region[i] == r) { seen = 1; break; }
+                        if (seen) continue;
+                        if (nregion >= 8) { ok = 0; break; }
+                        region[nregion++] = r;
+                        if (!lc_block_clobber_free(r)) { ok = 0; break; }
+                        if (r->npreds == 0) { ok = 0; break; }  // entry: path misses d
+                        for (int pi = 0; pi < r->npreds && ok; pi++) {
+                            Block *p = r->preds[pi];
+                            if (p == d) continue;
+                            if (p == b) { ok = 0; break; }
+                            if (wn < 8) wl[wn++] = p; else ok = 0;
+                        }
+                    }
+                    if (ok) l1 = cand;
+                }
+            }
+
+            if (l1) {
+                l2->dst->alias = l1->dst;
+                l2->is_dead = 1;
+                changed = 1;
+                opt_stat_kb_change++;
+            }
+        }
+    }
+    if (changed) recount_uses(f);
+}
+
+// ── Range-check fusion ───────────────────────────────────────────────────
+//
+// AND(LE(a, x), LE(x, b)) with constants a <= b  →  ULE(SUB(x, a), b - a)
+//
+// The classic branchless range test: for both signed and unsigned
+// compares, a <= x && x <= b is equivalent to (unsigned)(x - a) <= b - a
+// for any constants a <= b (out-of-range x wraps the subtraction to a
+// large unsigned value). Saves one instruction and one register per
+// range check; CoreMark's ee_isdigit is the motivating case.
+//
+// The two compares may read x through distinct widening copies (u8
+// operands each get their own coercion copy) — identity is checked on
+// the chased value, but the SUB uses one original (widened) operand so
+// 32-bit semantics are untouched.
+static Value *rc_chase_copies(Value *v) {
+    for (int hops = 0; v && hops < 6; hops++) {
+        v = val_resolve(v);
+        if (v->kind != VAL_INST || !v->def || v->def->kind != IK_COPY ||
+            v->def->nops < 1) break;
+        v = v->def->ops[0];
+    }
+    return val_resolve(v);
+}
+
+void opt_range_check(Function *f) {
+    int changed = 0;
+    for (int bi = 0; bi < f->nblocks; bi++) {
+        Block *b = f->blocks[bi];
+        for (Inst *inst = b->head; inst; inst = inst->next) {
+            if (inst->is_dead || inst->kind != IK_AND || inst->nops < 2 ||
+                !inst->dst) continue;
+            Value *c1 = val_resolve(inst->ops[0]);
+            Value *c2 = val_resolve(inst->ops[1]);
+            if (c1->kind != VAL_INST || !c1->def || c1->use_count != 1) continue;
+            if (c2->kind != VAL_INST || !c2->def || c2->use_count != 1) continue;
+            Inst *lo = c1->def, *hi = c2->def;
+            // Accept either operand order; both compares must be the same
+            // signedness family.
+            for (int swap = 0; swap < 2; swap++) {
+                if (swap) { Inst *t = lo; lo = hi; hi = t; }
+                if (lo->kind != hi->kind) continue;
+                if (lo->kind != IK_LE && lo->kind != IK_ULE) continue;
+                if (lo->nops < 2 || hi->nops < 2) continue;
+                int a, bnd;
+                // lo: LE(a, x); hi: LE(x, b)
+                if (!get_iconst(val_resolve(lo->ops[0]), &a)) continue;
+                if (!get_iconst(val_resolve(hi->ops[1]), &bnd)) continue;
+                Value *x1 = val_resolve(lo->ops[1]);
+                Value *x2 = val_resolve(hi->ops[0]);
+                if (rc_chase_copies(x1) != rc_chase_copies(x2)) continue;
+                if (lo->kind == IK_LE  && a > bnd) continue;
+                if (lo->kind == IK_ULE && (uint32_t)a > (uint32_t)bnd) continue;
+
+                // x - a, inserted before the AND.
+                Value *sub_v = new_value(f, VAL_INST, x1->vtype);
+                Inst  *sub_i = new_inst(f, b, IK_SUB, sub_v);
+                sub_i->line = inst->line;
+                inst_add_op(sub_i, x1);
+                inst_add_op(sub_i, new_const(f, a, x1->vtype));
+                inst_insert_before(inst, sub_i);
+
+                // Repurpose the AND as the unsigned upper-bound compare.
+                inst->kind   = IK_ULE;
+                inst->ops[0] = sub_v;
+                inst->ops[1] = new_const(f, bnd - a, x1->vtype);
+                sub_v->use_count++;
+                changed = 1;
+                opt_stat_kb_change++;
+                break;
+            }
+        }
+    }
+    if (changed) recount_uses(f);
 }
 
 // ── R2L: Bitwise distribution ────────────────────────────────────────────

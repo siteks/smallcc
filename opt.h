@@ -79,6 +79,15 @@ void opt_narrow_loads(Function *f);
 // forward known-bits analysis + unwrap_for_mask.
 void opt_known_bits(Function *f);
 
+// Redundant load elimination: reuse an identical dominating load when all
+// paths between are store/call-free (bounded region walk; skips constant
+// addresses because volatile is not enforced).
+void opt_load_cse(Function *f);
+
+// Range-check fusion: AND(LE(a,x), LE(x,b)) → ULE(SUB(x,a), b-a) for
+// constant bounds (the branchless isdigit idiom).
+void opt_range_check(Function *f);
+
 // R2L: Bitwise distribution: OP(AND(a,c),AND(b,c)) → AND(OP(a,b),c).
 // Uses unwrap_for_mask to see through casts invisible to the mask.
 void opt_bitwise_dist(Function *f);

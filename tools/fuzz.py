@@ -54,8 +54,12 @@ class Gen:
     def expr(self, depth=0):
         r = self.r
         if depth > 3 or r.random() < 0.3:
-            if r.random() < 0.5:
+            k = r.random()
+            if k < 0.45:
                 return r.choice(self.vars)
+            if k < 0.6:
+                # global array read — exercises load CSE + clobber tracking
+                return f"garr[({self.expr(4) if depth <= 3 else r.choice(self.vars)}) & 7]"
             return str(r.randint(0, 300))
         k = r.random()
         a = self.expr(depth + 1)
@@ -96,8 +100,11 @@ class Gen:
             body = self.block(indent + 1, depth + 1)
             return (f"{pad}{{ int {c};\n"
                     f"{pad}for ({c} = 0; {c} < {n}; {c}++)\n{body}{pad}}}\n")
-        if k < 0.55:
+        if k < 0.45:
             return f"{pad}{v} = {self.expr()};\n"
+        if k < 0.6:
+            # global array write — the clobber that load CSE must respect
+            return f"{pad}garr[({self.expr(2)}) & 7] = {self.expr(1)};\n"
         op = r.choice(["+=", "-=", "^=", "|=", "&="])
         return f"{pad}{v} {op} {self.expr(1)};\n"
 
@@ -122,7 +129,7 @@ class Gen:
         return f"unsigned {name}({params})\n{{\n{body}{ret}}}\n\n"
 
     def program(self):
-        src = ""
+        src = "unsigned garr[8];\n"
         for i in range(self.r.randint(0, 2)):
             src += self.helper(i)
         decls = "".join(f"    unsigned {v} = {self.r.randint(0, 99)};\n"

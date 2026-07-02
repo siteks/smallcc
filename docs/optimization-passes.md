@@ -23,7 +23,11 @@ opt_redundant_bool()         R2G   OPT_REDUNDANT_BOOL
 opt_narrow_loads()           R2H   OPT_NARROW_LOADS
 opt_known_bits()             R2K   (always on)
 opt_bitwise_dist()           R2L   (always on)
+opt_range_check()                  (always on)
+opt_fold_branches()          R2A   re-run: R2K's phi-select fold exposes
+opt_remove_dead_blocks()     R2B   convergent branches; dominators recomputed
 opt_pre_oos_cse()            GVN   OPT_CSE
+opt_load_cse()                     OPT_CSE (dominating-load reuse)
 opt_scalar_promote()                (always on)
 opt_addr_iv()                       (always on)
 opt_lsr()                           (always on)
@@ -101,6 +105,8 @@ detection and accumulator promotion.
 | R2K | — | `opt_known_bits` | Known-bits: eliminate redundant AND/TRUNC/ZEXT |
 | R2L | — | `opt_bitwise_dist` | `OP(AND(a,c),AND(b,c))` → `AND(OP(a,b),c)` |
 | GVN | `OPT_CSE` | `opt_pre_oos_cse` | Dominator-tree CSE on true SSA form |
+| — | `OPT_CSE` | `opt_load_cse` | Reuse identical dominating loads (clobber-free region; const addrs skipped) |
+| — | — | `opt_range_check` | `AND(LE(a,x), LE(x,b))` → `ULE(SUB(x,a), b-a)` |
 | — | — | `opt_scalar_promote` | Hoist load-modify-store to register accumulator phi |
 | — | — | `opt_addr_iv` | Address induction variables: replace recomputation with pointer IV |
 | — | — | `opt_lsr` | Loop strength reduction: `iv*invariant` → ADD chain |
