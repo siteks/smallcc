@@ -485,6 +485,7 @@ static int known_bits_mask(Value *v, int depth) {
 // P16: bitex fusion tables (populated by detect_bitex_fusions, read by emit_inst)
 static int *g_bitex_src;   // [value_id] → phys reg of SHR source, or -1
 static int *g_bitex_imm;   // [value_id] → bitex imm9 encoding
+static uint8_t *g_dbnz_latch; // [block index] → latch committed for P20 dbnz fusion
 
 // ============================================================
 // Emit one instruction
@@ -2099,6 +2100,91 @@ static void emit_fused_branch(FILE *out, const BranchFuse *bf, int cond_reg,
     }
 }
 
+// ── P20: dbnz fusion (down-count latch: dec + rotated jnz → dbnz) ────────
+// After opt_downcount, a counted loop's latch ends with the counter
+// decrement, and P12 rotation duplicates the header's P6 zero-test (jnz)
+// right after it. dbnz (F3d) performs both in one 3-byte PC-relative
+// instruction: rx -= 1; if (rx != 0) pc += disp10.
+//
+// Committed stickily during the emit fixpoint loop once measured offsets
+// show the ±511-byte displacement is in range. Block sizes only shrink as
+// fusions commit and the branch is backward (loop body), so a committed
+// dbnz cannot drift back out of range. The decrement instruction is marked
+// dead — dbnz performs it.
+static int detect_dbnz(Function *f, BranchFuse *fuse,
+                       const int *block_start, const int *block_size,
+                       const uint8_t *no_rotate) {
+    if (!block_start || !g_dbnz_latch) return 0;
+    int committed = 0;
+    for (int bi = 0; bi < f->nblocks; bi++) {
+        if (g_dbnz_latch[bi]) continue;
+        if (no_rotate && no_rotate[bi]) continue;
+        Block *b = f->blocks[bi];
+        Inst *term = b->tail;
+        while (term && term->is_dead) term = term->prev;
+        if (!term || term->kind != IK_JMP || !term->target) continue;
+        Block *hdr = term->target;
+
+        // Header must be rotation-clean (mirrors emit_rotated_branch):
+        // only dead instructions, IK_JMPs, and the IK_BR itself.
+        Inst *hdr_br = NULL;
+        int clean = 1;
+        for (Inst *hi = hdr->head; hi; hi = hi->next) {
+            if (hi->kind == IK_BR && !hi->is_dead && hi->nops >= 1) hdr_br = hi;
+            else if (!hi->is_dead && hi->kind != IK_JMP) { clean = 0; break; }
+        }
+        if (!clean || !hdr_br || !hdr_br->target) continue;
+        int hbi = -1;
+        for (int i = 0; i < f->nblocks; i++)
+            if (f->blocks[i] == hdr) { hbi = i; break; }
+        if (hbi < 0) continue;
+        if (fuse[hbi].fused != 3 || fuse[hbi].is_eq) continue;  // jnz form only
+
+        // Find the in-place decrement of the tested register in the latch.
+        // It need not be the last instruction: dbnz effectively moves the
+        // decrement to the branch, which is safe as long as nothing between
+        // the decrement and the latch end reads or writes that register —
+        // so scanning backward, the FIRST instruction touching the register
+        // must be the decrement itself.
+        int p0 = fuse[hbi].p0;
+        Inst *dec = NULL;
+        for (Inst *p = term->prev; p; p = p->prev) {
+            if (p->is_dead) continue;
+            int touches = 0;
+            if (p->dst) {
+                Value *pd = val_resolve(p->dst);
+                if (pd && pd->phys_reg == p0) touches = 1;
+            }
+            for (int oi = 0; oi < p->nops && !touches; oi++) {
+                Value *v = p->ops[oi] ? val_resolve(p->ops[oi]) : NULL;
+                if (v && v->kind == VAL_INST && v->phys_reg == p0) touches = 1;
+            }
+            if (!touches) continue;
+            if (p->kind == IK_SUB && p->nops >= 2 && p->dst) dec = p;
+            break;   // first toucher must be the dec; anything else disqualifies
+        }
+        if (!dec) continue;
+        Value *d  = val_resolve(dec->dst);
+        Value *s0 = val_resolve(dec->ops[0]);
+        Value *s1 = dec->ops[1] ? val_resolve(dec->ops[1]) : NULL;
+        int k;
+        if (!s1 || !get_iconst(s1, &k) || k != 1) continue;
+        if (!d || !s0 || d->phys_reg < 0 || d->phys_reg != s0->phys_reg) continue;
+        if (d->phys_reg != p0) continue;
+
+        // Range: the dbnz sits at the end of the latch, PC-relative to the
+        // loop body (the header BR's true target).
+        int end  = block_start[b->id] + block_size[bi];
+        int disp = block_start[hdr_br->target->id] - end;
+        if (disp < -512 || disp > 511) continue;
+
+        g_dbnz_latch[bi] = 1;
+        dec->is_dead = 1;
+        committed++;
+    }
+    return committed;
+}
+
 // Emit a rotated branch (P12): duplicate header's IK_BR at the end of a latch block.
 //
 // `block_start` (may be NULL) carries the dry-run measured starting offset of
@@ -2141,6 +2227,17 @@ static int emit_rotated_branch(Function *f, FILE *out, Inst *inst,
         if (f->blocks[hi] == hdr) { hbi = hi; break; }
     }
     if (hbi < 0) return 0;
+
+    // P20: committed dbnz latch — the decrement was suppressed in the body
+    // (marked dead by detect_dbnz); one instruction does dec + test + branch.
+    if (g_dbnz_latch && g_dbnz_latch[bi]) {
+        if (hdr_br->target)
+            fprintf(out, "    dbnz %s, _%s_B%d\n",
+                    regname(fuse[hbi].p0), f->name, hdr_br->target->id);
+        if (hdr_br->target2 && hdr_br->target2 != next_blk)
+            fprintf(out, "    j _%s_B%d\n", f->name, hdr_br->target2->id);
+        return 1;
+    }
 
     // Range check for fused F3c / F0c forms (fused == 1, 2, 4). The fused == 0
     // path emits an unfused jnz/jz (F3e, 16-bit absolute) which has no range
@@ -2486,6 +2583,8 @@ void emit_function(Function *f, FILE *out) {
     int *block_size  = arena_alloc(f->nblocks * sizeof(int));
     uint8_t *no_rotate = arena_alloc(f->nblocks * sizeof(uint8_t));
     memset(no_rotate, 0, f->nblocks * sizeof(uint8_t));
+    g_dbnz_latch = arena_alloc(f->nblocks * sizeof(uint8_t));
+    memset(g_dbnz_latch, 0, f->nblocks * sizeof(uint8_t));
     // First pass: pass NULL block_start so emit_rotated_branch skips the
     // range-sensitive fused forms entirely. Subsequent passes use measured
     // block_start; emit_rotated_branch's range check sets no_rotate[bi]
@@ -2507,7 +2606,8 @@ void emit_function(Function *f, FILE *out) {
         for (int bi = 0; bi < f->nblocks; bi++)
             block_size[bi] = block_size_from_offsets(f, bi, block_start, total_bytes);
         cur_block_start = block_start;   // available from iter 2 onward
-        committed = detect_branch_fusions(f, fuse, block_size);
+        committed = detect_branch_fusions(f, fuse, block_size)
+                  + detect_dbnz(f, fuse, cur_block_start, block_size, no_rotate);
     } while (committed > 0);
 
     // One final dry-run with the now-stable block_start so emit_rotated_branch

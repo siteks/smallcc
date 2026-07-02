@@ -47,6 +47,7 @@ extern int opt_stat_dead_blk;     // blocks removed in opt_remove_dead_blocks
 extern int opt_stat_copy_alias;   // alias sets in opt_copy_prop
 extern int opt_stat_cse_alias;    // alias sets in gvn_walk (opt_cse/opt_pre_oos_cse)
 extern int opt_stat_kb_change;    // rewrites in opt_known_bits
+extern int opt_stat_downcount;    // loops converted by opt_downcount
 extern int opt_stat_bd_change;    // rewrites in opt_bitwise_dist
 
 // ============================================================
@@ -97,6 +98,11 @@ void opt_unroll_loops(Function *f);
 // Loop strength reduction: replace iv*invariant with an incrementing induction variable.
 // Runs pre-OOS on true SSA form where phis are explicit.
 void opt_lsr(Function *f);
+
+// Down-count conversion: counted loops whose IV is trip-count-only become
+// countdown loops (c = phi(bound, c-1); exit when c == 0) so emission can
+// fuse the back edge into dbnz and no bound register is live in the loop.
+void opt_downcount(Function *f);
 
 // Scalar promotion: hoist load-modify-store to loop-invariant address into a register
 // accumulator phi.  Runs pre-OOS after GVN (so addresses are CSE'd).

@@ -165,6 +165,7 @@ import sys
 #   Format 3d - one op + imm10 (8 slots) (escape from 3d with op=0xf)
 #   beqz    pc = rx==0 ? (pc + sxt(imm10)) : pc
 #   bnez    pc = rx!=0 ? (pc + sxt(imm10)) : pc
+#   dbnz    pc = --rx!=0 ? (pc + sxt(imm10)) : pc
 #
 #   Format 3e - one op + imm16 (4 slots)
 #   immw    rd = imm16
@@ -320,6 +321,7 @@ class G:
         # format 3d - one op + imm10    11011111xxxoooiiiiiiiiii
         'beqz'  :   (0xdf, 2, 3, 0x00),
         'bnez'  :   (0xdf, 2, 3, 0x01),
+        'dbnz'  :   (0xdf, 2, 3, 0x02),
         # format 3e - one op + imm16    111ooxxxiiiiiiiiiiiiiiii
         'immw'  :   (0xe0, 2, 4, 0),
         'immwh' :   (0xe8, 2, 4, 0),
@@ -681,6 +683,7 @@ class CPU:
         # f3d
         elif    i == 'beqz':    s.pc = s.pc + sext(imm, 10) if s.r[src0] == 0 else s.pc
         elif    i == 'bnez':    s.pc = s.pc + sext(imm, 10) if s.r[src0] != 0 else s.pc
+        elif    i == 'dbnz':    s.r[src0] -= 1; s.pc = s.pc + sext(imm, 10) if s.r[src0] != 0 else s.pc
         # f3e
         elif    i == 'immw':    s.r[dst] = imm
         elif    i == 'immwh':   s.r[dst] = (s.r[dst] & 0xffff) | (imm << 16)

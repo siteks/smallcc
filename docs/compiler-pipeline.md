@@ -64,6 +64,7 @@ Node* parse tree  (output of resolve_symbols / derive_types / insert_coercions)
       ├─ opt_scalar_promote() opt.c      hoist load-modify-store to register accumulator phi
       ├─ opt_addr_iv()        opt.c      address induction variables
       ├─ opt_lsr()            opt.c      loop strength reduction (iv*invariant → ADD chain)
+      ├─ opt_downcount()      opt.c      counted loops w/ trip-count-only IV → countdown (dbnz)
       │
       ├─ out_of_ssa()       oos.c        eliminate φ-nodes (Boissinot 2009 parallel copies)
       │
@@ -823,6 +824,7 @@ See **@docs/optimization-passes.md** for the full catalog with dependencies and 
 | scalar promotion (pre-OOS) | `opt.c` | Hoist load-modify-store to register accumulator phi |
 | address IV (pre-OOS) | `opt.c` | Replace address recomputation with pointer IV |
 | LSR (pre-OOS) | `opt.c` | Loop strength reduction: iv*invariant → ADD chain |
+| down-count conversion (pre-OOS) | `opt.c` | Trip-count-only IVs → countdown; latch fuses to dbnz (P20) |
 | out-of-SSA | `oos.c` | Boissinot 2009 parallel copies |
 | R2A branch folding | `opt.c` | Fold IK_BR(VAL_CONST) → IK_JMP |
 | R2B dead block elimination | `opt.c` | Remove zero-predecessor blocks; iterates to fixpoint |

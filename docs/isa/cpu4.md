@@ -408,12 +408,19 @@ pointer costs one instruction regardless of whether the base is `bp` or a genera
 |---|---|---|
 | 0x00 | `beqz rx, imm10` | if rx == 0: pc += sext10(imm10) |
 | 0x01 | `bnez rx, imm10` | if rx != 0: pc += sext10(imm10) |
+| 0x02 | `dbnz rx, imm10` | rx −= 1; if rx != 0: pc += sext10(imm10) |
 
-*(6 slots available.)*
+*(5 slots available.)*
 
 `beqz`/`bnez` are PC-relative branches that test a single register against zero. They are
 the short-range (10-bit offset) counterpart to `jz`/`jnz` (F3e, 16-bit absolute address).
 Both test any register, not just r0.
+
+`dbnz` (decrement and branch if nonzero) is the counted-loop primitive: it replaces the
+`dec rx; bnez rx, loop` pair (5 bytes, 2 cycles) with one 3-byte, 1-cycle instruction.
+The decrement wraps: `dbnz` on rx == 0 leaves 0xFFFFFFFF and takes the branch. The
+compiler emits it for down-counting loops whose induction variable exists only for trip
+counting (see the down-count conversion pass).
 
 ---
 

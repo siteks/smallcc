@@ -119,7 +119,7 @@ Pass E).
 | `DUMP_IR=1` | Post-OOS and post-IRC IR to stderr |
 | `-ann` | Annotate emitted assembly with source lines |
 | `OPT_STATS=1` | Per-pass fire counters |
-| `CSE_DEBUG` / `LICM_DEBUG` / `LSR_DEBUG` / `DBG_IRC` | Per-pass tracing to stderr |
+| `CSE_DEBUG` / `LICM_DEBUG` / `LSR_DEBUG` / `DOWNCOUNT_DEBUG` / `DBG_IRC` | Per-pass tracing to stderr |
 
 **Debugging rule:** debug failures at the earliest pipeline stage where they
 appear (Braun SSA → OOS → legalize → IRC → emission). The irsim modes are the

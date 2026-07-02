@@ -8,6 +8,7 @@ unsigned opt_flags = OPT_ALL;
 
 // Phase 1 measurement counters (see opt.h)
 int opt_stat_fold_br    = 0;
+int opt_stat_downcount  = 0;
 int opt_stat_dead_blk   = 0;
 int opt_stat_copy_alias = 0;
 int opt_stat_cse_alias  = 0;
@@ -2125,6 +2126,248 @@ static int find_basic_ivs(Block *h, int pre_idx, int back_idx, int *in_body,
         niv++;
     }
     return niv;
+}
+
+/*
+ * Down-count loop conversion: rewrite counted loops whose induction
+ * variable exists only for trip counting into countdown form, so no bound
+ * register stays live in the loop and emission can fuse the back edge
+ * into the F3d `dbnz` instruction.
+ *
+ * Matched shape (pre-OOS, phis explicit; runs after addr-IV/LSR so
+ * addressing uses of the IV have already been rewritten away):
+ *
+ *     iv     = phi(0 @pre, ivnext @back)     init must be const 0
+ *     ivnext = iv + 1                        step must be +1
+ *     cond   = ULT(iv, bound)                or LT with const bound > 0
+ *     header: br cond ? body : exit
+ *
+ *     iv used ONLY by {ivnext's add, cond's compare};
+ *     ivnext used ONLY by {phi}; cond used only by the branch;
+ *     bound loop-invariant (SSA guarantees its def dominates the header;
+ *     rejecting defs in the header itself excludes loop-variant phis).
+ *
+ * Rewritten to:
+ *     c      = phi(bound @pre, cnext @back)
+ *     cnext  = c - 1
+ *     cond   = NE(c, 0)
+ *
+ * Trip counts match: up-counting runs `bound` iterations (0 when bound is
+ * 0), and c walks bound, bound-1, ..., 1 — also `bound` iterations. The
+ * signed-LT form is restricted to a positive constant bound because a
+ * negative signed bound runs 0 iterations up-counting but 2^32-|bound|
+ * counting down.
+ */
+// Chase a value through IK_COPY chains (bounded — pre-OOS chains are
+// acyclic but stay defensive) to a compile-time constant. Braun emits
+// variable initializations as `copy 0`, so a plain get_iconst misses them.
+static int chase_const(Value *v, int *out) {
+    for (int hops = 0; v && hops < 8; hops++) {
+        v = val_resolve(v);
+        if (get_iconst(v, out)) return 1;
+        if (v->kind == VAL_INST && v->def && v->def->kind == IK_COPY &&
+            v->def->nops >= 1) { v = v->def->ops[0]; continue; }
+        // Narrow-counter initializers arrive as TRUNC(const) pre-legalize;
+        // fold the mask here.
+        if (v->kind == VAL_INST && v->def && v->def->kind == IK_TRUNC &&
+            v->def->nops >= 1) {
+            int inner;
+            if (!chase_const(v->def->ops[0], &inner)) return 0;
+            int mask = (vtype_size(v->vtype) == 1) ? 0xff
+                     : (vtype_size(v->vtype) == 2) ? 0xffff : -1;
+            *out = inner & mask;
+            return 1;
+        }
+        return 0;
+    }
+    return 0;
+}
+
+// Mark transitively-live values (rooted at side-effecting instructions and
+// terminators). addr-IV/LSR replace addressing chains by ALIASING their
+// results; the replaced instructions stay in the IR until post-OOS DCE and
+// still reference the loop IV. opt_downcount's use scan must ignore those
+// dead-in-waiting references, or every IV that ever fed (since-replaced)
+// address math looks like it has extra uses. Liveness keys on the RAW dst
+// id: an aliased dst never appears as a resolved operand, so its defining
+// instruction stays dead here — exactly the semantics IRC's DCE applies
+// later.
+static void mark_live_values(Function *f, uint8_t *live) {
+    int changed = 1;
+    while (changed) {
+        changed = 0;
+        for (int bi = 0; bi < f->nblocks; bi++) {
+            for (Inst *inst = f->blocks[bi]->head; inst; inst = inst->next) {
+                if (inst->is_dead) continue;
+                int is_root;
+                switch (inst->kind) {
+                case IK_STORE: case IK_CALL: case IK_ICALL: case IK_PUTCHAR:
+                case IK_MEMCPY: case IK_BR: case IK_JMP: case IK_RET:
+                case IK_SWITCH:
+                    is_root = 1; break;
+                default:
+                    is_root = 0; break;
+                }
+                if (!is_root && (!inst->dst || !live[inst->dst->id])) continue;
+                for (int oi = 0; oi < inst->nops; oi++) {
+                    Value *v = inst->ops[oi] ? val_resolve(inst->ops[oi]) : NULL;
+                    if (v && v->kind == VAL_INST && v->id >= 0 &&
+                        v->id < f->nvalues && !live[v->id]) {
+                        live[v->id] = 1;
+                        changed = 1;
+                    }
+                }
+            }
+        }
+    }
+}
+
+void opt_downcount(Function *f) {
+    if (!f || f->nblocks < 2) return;
+    LoopInfo *loops;
+    int nloops = find_loops(f, &loops);
+    int changed = 0;
+    uint8_t *live = NULL;
+    if (nloops > 0) {
+        live = calloc((size_t)f->nvalues, 1);
+        if (!live) return;
+        mark_live_values(f, live);
+    }
+
+    for (int li = 0; li < nloops; li++) {
+        Block *h       = loops[li].header;
+        Block *preh    = loops[li].preheader;
+        int    pre_idx = loops[li].pre_idx;
+        int    back_idx = loops[li].back_idx;
+        if (!preh || back_idx < 0) continue;
+        if (h->npreds != 2) continue;   // single latch only
+
+        // Header terminator: br cond ? body : exit, cond computed in h.
+        Inst *term = h->tail;
+        while (term && term->is_dead) term = term->prev;
+        if (!term || term->kind != IK_BR || term->nops < 1) continue;
+        Value *cond = val_resolve(term->ops[0]);
+        if (cond->kind != VAL_INST || !cond->def || cond->def->block != h) continue;
+        Inst *cmp = cond->def;
+        if ((cmp->kind != IK_ULT && cmp->kind != IK_LT) || cmp->nops < 2) continue;
+
+        // The compare may read the phi through one widening coercion copy
+        // (narrow u8/u16 counters get widened before arithmetic).
+        Value *cmp_iv   = val_resolve(cmp->ops[0]);
+        Value *bound    = val_resolve(cmp->ops[1]);
+        Inst  *cmp_copy = NULL;
+        Value *iv       = cmp_iv;
+        if (iv->kind == VAL_INST && iv->def && iv->def->kind == IK_COPY &&
+            iv->def->nops >= 1) {
+            cmp_copy = iv->def;
+            iv = val_resolve(cmp_copy->ops[0]);
+        }
+
+        // iv: a phi in h with init const 0 and back-edge value iv+1
+        // (possibly TRUNC(iv+1) for narrow counters — wrap-equivalent
+        // when the trip count fits the narrow width).
+        if (iv->kind != VAL_INST || !iv->def || iv->def->kind != IK_PHI ||
+            iv->def->block != h) continue;
+        Inst *phi = iv->def;
+        if (phi->nops != h->npreds) continue;
+        Value *init = val_resolve(phi->ops[pre_idx]);
+        Value *back = val_resolve(phi->ops[back_idx]);
+        int initk;
+        if (!chase_const(init, &initk) || initk != 0) continue;
+
+        Inst *trunc = NULL;
+        Value *add_val = back;
+        if (back->kind == VAL_INST && back->def && back->def->kind == IK_TRUNC &&
+            back->def->nops >= 1) {
+            trunc   = back->def;
+            add_val = val_resolve(trunc->ops[0]);
+        }
+        if (add_val->kind != VAL_INST || !add_val->def ||
+            add_val->def->kind != IK_ADD || add_val->def->nops < 2) continue;
+        Inst *add = add_val->def;
+        if (!dominates(h, add->block)) continue;   // increment inside the loop
+
+        // The add may also read the phi through one coercion copy.
+        Value *a0 = val_resolve(add->ops[0]);
+        Value *a1 = val_resolve(add->ops[1]);
+        Inst  *add_copy = NULL;
+        Value *step = NULL;
+        Value *iv_side = NULL;
+        for (int side = 0; side < 2; side++) {
+            Value *cand = side ? a1 : a0, *other = side ? a0 : a1;
+            if (cand == iv) { iv_side = cand; step = other; break; }
+            if (cand->kind == VAL_INST && cand->def &&
+                cand->def->kind == IK_COPY && cand->def->nops >= 1 &&
+                val_resolve(cand->def->ops[0]) == iv) {
+                add_copy = cand->def; iv_side = cand; step = other; break;
+            }
+        }
+        int k;
+        if (!iv_side || !step || !get_iconst(step, &k) || k != 1) continue;
+
+        // bound: loop-invariant; positive const required for signed compares;
+        // for narrow (trunc-wrapped) counters the trip count must fit the
+        // narrow width or the down-counter would wrap differently.
+        int bk;
+        int bound_is_const = chase_const(bound, &bk);
+        if (cmp->kind == IK_LT && !(bound_is_const && bk > 0)) continue;
+        if (trunc) {
+            int cap = (vtype_size(back->vtype) == 1) ? 255 : 65535;
+            if (!(bound_is_const && bk >= 0 && bk <= cap)) continue;
+        }
+        if (!bound_is_const && bound->kind == VAL_INST && bound->def &&
+            dominates(h, bound->def->block)) continue;
+
+        // Use discipline, by direct scan (pre-OOS use_counts are
+        // approximate): iv used only by {add, cmp}; back only by {phi};
+        // cond only by {term}.
+        int bad = 0;
+        Inst *bad_inst = NULL;
+        for (int bi = 0; bi < f->nblocks && !bad; bi++) {
+            for (Inst *inst = f->blocks[bi]->head; inst; inst = inst->next) {
+                if (inst->is_dead) continue;
+                // Skip dead-in-waiting instructions: pure defs whose result
+                // is not transitively live (addr-IV/LSR leftovers) will be
+                // removed by post-OOS DCE; their IV references don't count.
+                if (inst->dst && !live[inst->dst->id] &&
+                    inst->kind != IK_CALL && inst->kind != IK_ICALL)
+                    continue;
+                for (int oi = 0; oi < inst->nops; oi++) {
+                    Value *v = inst->ops[oi] ? val_resolve(inst->ops[oi]) : NULL;
+                    if (v == iv && inst != add && inst != cmp &&
+                        inst != cmp_copy && inst != add_copy) { bad = 1; bad_inst = inst; break; }
+                    if (cmp_copy && v == cmp_iv  && inst != cmp) { bad = 1; bad_inst = inst; break; }
+                    if (add_copy && v == iv_side && inst != add) { bad = 1; bad_inst = inst; break; }
+                    if (trunc    && v == add_val && inst != trunc) { bad = 1; bad_inst = inst; break; }
+                    if (v == back && inst != phi)                { bad = 1; bad_inst = inst; break; }
+                    if (v == cond && inst != term)               { bad = 1; bad_inst = inst; break; }
+                }
+                if (bad) break;
+            }
+        }
+        if (bad) {
+            if (getenv("DOWNCOUNT_DEBUG")) {
+                fprintf(stderr, "downcount %s: loop B%d rejected, extra use in: ", f->name, h->id);
+                print_inst(bad_inst, stderr);
+            }
+            continue;
+        }
+
+        // Rewrite: c = phi(bound, c-1); cond = NE(c, 0). The coercion
+        // copies and back-edge trunc (if any) are kept in place — they are
+        // value-preserving for the down-counter too.
+        phi->ops[pre_idx] = bound;
+        add->kind   = IK_SUB;
+        add->ops[0] = iv_side;
+        add->ops[1] = new_const(f, 1, add_val->vtype);
+        cmp->kind   = IK_NE;
+        cmp->ops[1] = new_const(f, 0, cmp_iv->vtype);
+        changed = 1;
+        opt_stat_downcount++;
+    }
+
+    free(live);
+    if (changed) recount_uses(f);
 }
 
 void opt_lsr(Function *f) {

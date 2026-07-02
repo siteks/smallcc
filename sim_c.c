@@ -494,7 +494,7 @@ static const Instr4 itab4[] = {
     {"blt",    0xda,2,1,0}, {"ble",    0xdb,2,1,0},
     {"blts",   0xdc,2,1,0}, {"bles",   0xdd,2,1,0},
     /* F3d — 3 bytes, rx + PC-relative imm10; subfmt=4 */
-    {"beqz",   0xdf,2,4,0x00}, {"bnez",  0xdf,2,4,0x01},
+    {"beqz",   0xdf,2,4,0x00}, {"bnez",  0xdf,2,4,0x01}, {"dbnz", 0xdf,2,4,0x02},
     /* F3e — 3 bytes, rd imm16 */
     {"immw",   0xe0,2,2,0}, {"immwh",  0xe8,2,2,0},
     {"jz",     0xf0,2,2,0}, {"jnz",    0xf8,2,2,0},
@@ -1617,6 +1617,7 @@ static void run_cpu4(void)
         case 0xdf:
             if      (subop==0x00) { if(!r[rd]) pc=(uint16_t)(pc+sx10(imm)); } /* beqz */
             else if (subop==0x01) { if( r[rd]) pc=(uint16_t)(pc+sx10(imm)); } /* bnez */
+            else if (subop==0x02) { r[rd]-=1; if(r[rd]) pc=(uint16_t)(pc+sx10(imm)); } /* dbnz */
             break;
         /* F3e: one-reg + imm16 */
         case 0xe0: r[rd]=(uint32_t)(uint16_t)imm; break;                              /* immw  */

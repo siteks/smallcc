@@ -27,6 +27,7 @@ opt_pre_oos_cse()            GVN   OPT_CSE
 opt_scalar_promote()                (always on)
 opt_addr_iv()                       (always on)
 opt_lsr()                           (always on)
+opt_downcount()                     (always on)
 
 ── Phi elimination ────────────────────────────────────────────────
 
@@ -63,6 +64,7 @@ emit_function()
   remap_single_use_values()   register assignment refinement
   detect_bitex_fusions()      P16 detection (SHR+AND → bitex)
   detect_branch_fusions()     P5/P5+/P6/P17 detection
+  detect_dbnz()               P20 detection (down-count latch → dbnz)
   emit_inst()                 P2/P3/P4/P7/P8/P9/P10/P11/P13/P14/P15/P16/P18/P19
   emit_rotated_branch()       P12
   inline IK_BR dispatch       P1/P15 (branch inversion)/P17 (cbeq/cbne)
@@ -102,6 +104,7 @@ detection and accumulator promotion.
 | — | — | `opt_scalar_promote` | Hoist load-modify-store to register accumulator phi |
 | — | — | `opt_addr_iv` | Address induction variables: replace recomputation with pointer IV |
 | — | — | `opt_lsr` | Loop strength reduction: `iv*invariant` → ADD chain |
+| — | — | `opt_downcount` | Counted loops with trip-count-only IVs → countdown form (enables P20 dbnz) |
 
 R2A+R2B run as a pre-OOS cleanup pass (before `compute_dominators`) to reduce the
 block count for all subsequent passes. They are **not** re-run post-OOS: OOS only
@@ -187,6 +190,7 @@ Pass F after E        (F should see folded AND chains from E)
 | P17 | `EQ/NE(x,const7)+BR` → `cbeq`/`cbne` | F0c | 2-3 (5-6→3) |
 | P18 | `MUL(x, const)` → `mulli` | F0b | 2 (5→3) |
 | P19 | General F0b imm ALU (cmp/div/mod/or/xor) | F0b | 2 (5→3) |
+| P20 | Down-count latch `dec + rotated jnz` → `dbnz` | F3d | 2 (5→3) + 1 cycle/iter |
 
 Peepholes are purely local and have no ordering dependencies on each other.
 They fire during the single emission walk based on pattern matching.

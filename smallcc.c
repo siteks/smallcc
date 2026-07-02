@@ -751,6 +751,7 @@ int main(int argc, char **argv)
                     opt_scalar_promote(f);
                     opt_addr_iv(f);
                     opt_lsr(f);
+                    opt_downcount(f);
                     verify_function(f, "loop-opts", VERIFY_PRE_OOS);
                     out_of_ssa(f);
                     verify_function(f, "oos", VERIFY_OOS);
