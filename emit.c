@@ -74,6 +74,16 @@ static void emit_src_comment(int line, FILE *out)
 // Helpers
 // ============================================================
 
+// Immediate-range limits used by the peephole range checks.
+// See docs/isa/cpu4.md for the encodings.
+#define IMM7_MIN      (-64)  // F2 signed 7-bit (addi, imm7-scaled load/store)
+#define IMM7_MAX        63
+#define IMM9_MIN     (-256)  // F0b signed 9-bit (addli/mulli/orli/...)
+#define IMM9_MAX       255
+#define ANDI_MAX       127   // F2 andi raw (unsigned) 7-bit mask
+#define CB_CONST_MAX   127   // F0c cbeq/cbne 7-bit unsigned compare value
+#define BR_DISP_RANGE  511   // F3c/F0c/F3d 10-bit signed branch displacement
+
 static const char *regname(int r) {
     static const char *names[] = {"r0","r1","r2","r3","r4","r5","r6","r7"};
     if (r >= 0 && r < 8) return names[r];
@@ -82,6 +92,13 @@ static const char *regname(int r) {
 
 static const char *g_cur_func_name = "";
 static uint8_t     g_blk_live_out_regs = 0xff; // conservative default: all busy
+
+// Emit a register move (mov pseudo-op: or rd, rs, rs), skipped when the
+// value is already in the destination register.
+static void emit_mov(FILE *out, int rd, int rs) {
+    if (rs != rd)
+        fprintf(out, "    or %s, %s, %s\n", regname(rd), regname(rs), regname(rs));
+}
 
 // Find a caller-saved scratch register (r0-r3) that is genuinely dead at `inst`.
 // `exclude` is a bitmask of registers that must not be chosen (operands of inst).
@@ -112,15 +129,15 @@ static int find_free_scratch(Inst *inst, int exclude) {
     return -1;
 }
 
-// Pick a scratch register not in (already_used | forbidden).  Falls back to r0
-// if nothing is clean — callers must tolerate the fallback (typically by
-// pushr/popr around the use).  Use this when the caller has already built a
-// precise busy mask for the surrounding context (e.g. call-arg emission with
-// known arg registers).  Prefer find_free_scratch() when the busy set depends
-// on forward uses within the block.
-static int pick_scratch(unsigned already_used, unsigned forbidden) {
+// Pick a scratch register not in `forbidden`.  Falls back to r0 if nothing
+// is clean — callers must tolerate the fallback (typically by pushr/popr
+// around the use).  Use this when the caller has already built a precise
+// busy mask for the surrounding context (e.g. call-arg emission with known
+// arg registers).  Prefer find_free_scratch() when the busy set depends on
+// forward uses within the block.
+static int pick_scratch(unsigned forbidden) {
     for (int r = 0; r < 8; r++) {
-        if (!((already_used | forbidden) & (1u << r)))
+        if (!(forbidden & (1u << r)))
             return r;
     }
     return 0; // fallback
@@ -177,15 +194,21 @@ static int get_val_reg(FILE *out, Value *v, int scratch_rd) {
 // ll/sl: offset is imm7 * 4, range -256..+252 (must be mult of 4)
 // lb/sb: offset is imm7, range -64..+63
 
-static int f2_range_byte(int off) { return off >= -64 && off <= 63; }
-static int f2_range_word(int off) { return (off % 2) == 0 && off >= -128 && off <= 126; }
-static int f2_range_long(int off) { return (off % 4) == 0 && off >= -256 && off <= 252; }
+static int f2_range_byte(int off) { return off >= IMM7_MIN && off <= IMM7_MAX; }
+static int f2_range_word(int off) { return (off % 2) == 0 && off >= IMM7_MIN*2 && off <= IMM7_MAX*2; }
+static int f2_range_long(int off) { return (off % 4) == 0 && off >= IMM7_MIN*4 && off <= IMM7_MAX*4; }
 
 static int f2_range(int off, int size) {
     if (size == 1) return f2_range_byte(off);
     if (size == 2) return f2_range_word(off);
     if (size == 4) return f2_range_long(off);
     return 0;
+}
+
+// Scale a byte offset to the width-scaled immediate used by the F2/F3c
+// load/store encodings (the immediate is multiplied by the access width).
+static int f_scaled(int off, int size) {
+    return (size >= 4) ? off / 4 : (size == 2) ? off / 2 : off;
 }
 
 // CPU4 load mnemonic for size (bp-relative F2)
@@ -223,9 +246,8 @@ static const char *store_f3c(int size) {
 // temp and destination.
 static void emit_bp_load(FILE *out, int rd, int off, int size, int is_signed) {
     if (f2_range(off, size)) {
-        int scaled = (size >= 4) ? off / 4 : (size == 2) ? off / 2 : off;
         fprintf(out, "    %s %s, %d\n",
-                load_f2(size, is_signed), regname(rd), scaled);
+                load_f2(size, is_signed), regname(rd), f_scaled(off, size));
         return;
     }
     int adj  = off % 4;
@@ -241,8 +263,8 @@ static void emit_bp_load(FILE *out, int rd, int off, int size, int is_signed) {
 // `tmp` is used only in the fallback and must differ from `rv`.
 static void emit_bp_store(FILE *out, int rv, int tmp, int off, int size) {
     if (f2_range(off, size)) {
-        int scaled = (size >= 4) ? off / 4 : (size == 2) ? off / 2 : off;
-        fprintf(out, "    %s %s, %d\n", store_f2(size), regname(rv), scaled);
+        fprintf(out, "    %s %s, %d\n",
+                store_f2(size), regname(rv), f_scaled(off, size));
         return;
     }
     int adj  = off % 4;
@@ -366,6 +388,56 @@ static int resolve_const(Value *v, int *out) {
     return 0;
 }
 
+// ------------------------------------------------------------
+// Peephole fire predicates — shared by emit_inst (which emits the compact
+// form) and mark_dead_consts (which kills the now-unneeded IK_CONST).
+// emit_inst is the source of truth: whenever a predicate says "fires",
+// emit_inst must not materialize the constant operand.
+// ------------------------------------------------------------
+
+// P7: fold OP(a, b) at emit time.  Returns 1 and sets *result when the
+// fold fires; 0 for kinds that fall through (DIV/MOD/float) and need
+// their operands in registers.  Whether the fold fires depends only on
+// the operation kind, never on the operand values.
+static int p7_fold(InstKind kind, int32_t a, int32_t b, int32_t *result) {
+    uint32_t ua = (uint32_t)a, ub = (uint32_t)b;
+    switch (kind) {
+    case IK_ADD:  *result = a + b;  return 1;
+    case IK_SUB:  *result = a - b;  return 1;
+    case IK_MUL:  *result = a * b;  return 1;
+    case IK_AND:  *result = a & b;  return 1;
+    case IK_OR:   *result = a | b;  return 1;
+    case IK_XOR:  *result = a ^ b;  return 1;
+    case IK_SHL:  *result = (int32_t)(ua << (ub & 31)); return 1;
+    case IK_SHR:  *result = (int32_t)(ua >> (ub & 31)); return 1;
+    case IK_USHR: *result = (int32_t)(ua >> (ub & 31)); return 1;
+    case IK_EQ:   *result = (a == b); return 1;
+    case IK_NE:   *result = (a != b); return 1;
+    case IK_LT:   *result = (a < b);  return 1;
+    case IK_ULT:  *result = (ua < ub); return 1;
+    case IK_LE:   *result = (a <= b);  return 1;
+    case IK_ULE:  *result = (ua <= ub); return 1;
+    default:      return 0;
+    }
+}
+
+// P8/P14: AND(x, kv) with a single constant operand — zxb/zxw for
+// 0xFF/0xFFFF (P8), andi/andli for 0..255 (P14).
+static int p8_p14_and_fires(int kv) {
+    return (kv >= 0 && kv <= IMM9_MAX) || kv == 0xffff;
+}
+
+// P11/P13: SHL/SHR/USHR(x, k) with a resolvable constant shift amount
+// always fires: P11 emits shli/shlli; P13 emits shrsi/shrsli when the
+// value is sign-safe and shrli (logical) otherwise.  Returns the masked
+// shift amount via *k_out.
+static int p11_p13_shift_fires(Inst *inst, int *k_out) {
+    int shift_k;
+    if (inst->nops < 2 || !resolve_const(inst->ops[1], &shift_k)) return 0;
+    if (k_out) *k_out = shift_k & 31;
+    return 1;
+}
+
 // P15 helper: compute a bitmask of possibly-set bits for a value.
 // Returns a non-negative mask, or -1 if unknown.
 // Used to eliminate redundant AND(x, mask) when x's bits are already within mask.
@@ -424,8 +496,7 @@ static void emit_inst(Inst *inst, FILE *out) {
     case IK_COPY: {
         if (!dst || inst->nops < 1) break;
         int rs = get_val_reg(out, inst->ops[0], rd);
-        if (rs != rd)
-            fprintf(out, "    or %s, %s, %s\n", regname(rd), regname(rs), regname(rs));
+        emit_mov(out, rd, rs);
         break;
     }
 
@@ -437,8 +508,7 @@ static void emit_inst(Inst *inst, FILE *out) {
         if (!dst) break;
         int pidx = inst->param_idx;
         if (pidx > 7) pidx = 7;
-        if (rd != pidx)
-            fprintf(out, "    or %s, %s, %s\n", regname(rd), regname(pidx), regname(pidx));
+        emit_mov(out, rd, pidx);
         break;
     }
 
@@ -471,6 +541,27 @@ static void emit_inst(Inst *inst, FILE *out) {
         int p0 = c0 ? -1 : (op0 ? preg(op0) : rd);
         int p1 = c1 ? -1 : (op1 ? preg(op1) : rd);
 
+        // Single-constant-operand extraction, shared by the peepholes below.
+        // kv/kreg/ksrc: valid when exactly one operand is a compile-time
+        //   constant including IK_CONST-defined values (k0 ^ k1) — used by
+        //   P8/P14/P15.  kv is the constant, kreg the other operand's
+        //   register, ksrc the other operand's Value.
+        // cv/creg: the VAL_CONST-only subset (c0 ^ c1) — used by
+        //   P2-P4/P18/P19, which fire only on raw constants.
+        int kv = 0, kreg = -1;
+        Value *ksrc = NULL;
+        if (k0 ^ k1) {
+            kv   = k1 ? (c1 ? op1->iconst : op1->def->imm)
+                      : (c0 ? op0->iconst : op0->def->imm);
+            kreg = k1 ? p0 : p1;
+            ksrc = k1 ? op0 : op1;
+        }
+        int cv = 0, creg = -1;
+        if (c0 ^ c1) {
+            cv   = c1 ? op1->iconst : op0->iconst;
+            creg = c1 ? p0 : p1;
+        }
+
         // P7: Both operands are compile-time constants — fold at emit time.
         // Handles both VAL_CONST operands and VAL_INST from IK_CONST instructions
         // (e.g. AND(mask, const) from legalize Pass D TRUNC/ZEXT lowering).
@@ -478,29 +569,11 @@ static void emit_inst(Inst *inst, FILE *out) {
         if (k0 && k1) {
             int32_t a = c0 ? op0->iconst : op0->def->imm;
             int32_t b = c1 ? op1->iconst : op1->def->imm;
-            uint32_t ua = (uint32_t)a, ub = (uint32_t)b;
             int32_t result;
-            switch (inst->kind) {
-            case IK_ADD:  result = a + b;  break;
-            case IK_SUB:  result = a - b;  break;
-            case IK_MUL:  result = a * b;  break;
-            case IK_AND:  result = a & b;  break;
-            case IK_OR:   result = a | b;  break;
-            case IK_XOR:  result = a ^ b;  break;
-            case IK_SHL:  result = (int32_t)(ua << (ub & 31)); break;
-            case IK_SHR:  result = (int32_t)(ua >> (ub & 31)); break;
-            case IK_USHR: result = (int32_t)(ua >> (ub & 31)); break;
-            case IK_EQ:   result = (a == b); break;
-            case IK_NE:   result = (a != b); break;
-            case IK_LT:   result = (a < b);  break;
-            case IK_ULT:  result = (ua < ub); break;
-            case IK_LE:   result = (a <= b);  break;
-            case IK_ULE:  result = (ua <= ub); break;
-            default: goto p7_no_fold;
+            if (p7_fold(inst->kind, a, b, &result)) {
+                emit_imm(out, rd, result);
+                break;
             }
-            emit_imm(out, rd, result);
-            break;
-            p7_no_fold:;
         }
 
         // P16: bitex fusion — AND(SHR(x, k_shift), k_mask) → bitex rd, src, imm9
@@ -516,189 +589,142 @@ static void emit_inst(Inst *inst, FILE *out) {
         // AND(x, mask) is a no-op when all bits of x are already within mask.
         // Common pattern: AND(XOR(AND(a,1),AND(b,1)), 0xFF) — the XOR of two
         // 1-bit values is 1-bit, so the outer AND with 0xFF is redundant.
-        if (inst->kind == IK_AND && (k0 ^ k1)) {
-            int kv = k1 ? (c1 ? op1->iconst : op1->def->imm)
-                        : (c0 ? op0->iconst : op0->def->imm);
-            Value *src = k1 ? op0 : op1;
-            int ps = k1 ? p0 : p1;
-            if (kv > 0) {
-                int src_mask = known_bits_mask(src, 4);
-                if (src_mask >= 0 && (src_mask & ~kv) == 0) {
-                    // AND is redundant — just move source to dest
-                    if (ps != rd)
-                        fprintf(out, "    or %s, %s, %s\n", regname(rd), regname(ps), regname(ps));
-                    break;
-                }
+        if (inst->kind == IK_AND && (k0 ^ k1) && kv > 0) {
+            int src_mask = known_bits_mask(ksrc, 4);
+            if (src_mask >= 0 && (src_mask & ~kv) == 0) {
+                // AND is redundant — just move source to dest
+                emit_mov(out, rd, kreg);
+                break;
             }
         }
 
-        // P8: AND(x, 0xFF) → zxb; AND(x, 0xFFFF) → zxw
-        // In-place (rd == preg(x)): zxb/zxw rd (2 bytes).
-        // Cross-register 0xFF: andli rd, ps, 255 (F0b, 3 bytes).
-        // Cross-register 0xFFFF: zxwor rd, ps, ps (F1a, 2 bytes) — degenerate form of zxwor.
-        if (inst->kind == IK_AND && (k0 ^ k1)) {
-            int kv = k1 ? (c1 ? op1->iconst : op1->def->imm)
-                        : (c0 ? op0->iconst : op0->def->imm);
-            int ps = k1 ? p0 : p1;
+        // P8:  AND(x, 0xFF) → zxb (in-place) / andli (cross-reg, F0b 3 bytes);
+        //      AND(x, 0xFFFF) → zxw (in-place) / zxwor rd, ps, ps (F1a 2 bytes,
+        //      degenerate form of zxwor).
+        // P14: AND(x, k) k in 0..127 in-place → andi (F2, 2 bytes);
+        //      otherwise k in 0..255 → andli (F0b, 3 bytes vs 5 for immw+and).
+        if (inst->kind == IK_AND && (k0 ^ k1) && p8_p14_and_fires(kv)) {
             if (kv == 0xff) {
-                if (ps == rd)
+                if (kreg == rd)
                     fprintf(out, "    zxb %s\n", regname(rd));
                 else
-                    fprintf(out, "    andli %s, %s, 255\n", regname(rd), regname(ps));
-                break;
-            }
-            if (kv == 0xffff) {
-                if (ps == rd)
+                    fprintf(out, "    andli %s, %s, 255\n", regname(rd), regname(kreg));
+            } else if (kv == 0xffff) {
+                if (kreg == rd)
                     fprintf(out, "    zxw %s\n", regname(rd));
                 else
-                    fprintf(out, "    zxwor %s, %s, %s\n", regname(rd), regname(ps), regname(ps));
-                break;
-            }
-        }
-
-        // P14: AND(x, k) where k in 0..255
-        // In-place (rd == preg(x), k in 0..127): andi (F2, 2 bytes)
-        // Cross-register or k in 128..255: andli (F0b, 3 bytes vs 5 for immw+and)
-        if (inst->kind == IK_AND && (k0 ^ k1)) {
-            int kv = k1 ? (c1 ? op1->iconst : op1->def->imm)
-                        : (c0 ? op0->iconst : op0->def->imm);
-            int ps = k1 ? p0 : p1;
-            if (kv >= 0 && kv <= 127 && ps == rd) {
+                    fprintf(out, "    zxwor %s, %s, %s\n", regname(rd), regname(kreg), regname(kreg));
+            } else if (kv <= ANDI_MAX && kreg == rd) {
                 fprintf(out, "    andi %s, %d\n", regname(rd), kv);
-                break;
+            } else {
+                fprintf(out, "    andli %s, %s, %d\n", regname(rd), regname(kreg), kv);
             }
-            if (kv >= 0 && kv <= 255) {
-                fprintf(out, "    andli %s, %s, %d\n", regname(rd), regname(ps), kv);
-                break;
-            }
+            break;
         }
 
         // P2/P3/P4: compact encoding for ADD/SUB with exactly one const operand
         if ((inst->kind == IK_ADD || inst->kind == IK_SUB) && (c0 ^ c1)) {
-            int k = 0, ps = -1, ok = 1;
-            if (inst->kind == IK_ADD) {
-                // ADD is commutative: either operand can be the constant
-                k  = c1 ? op1->iconst : op0->iconst;
-                ps = c1 ? p0 : p1;
-            } else {
-                // IK_SUB: only optimise when ops[1] is the constant
-                // rd = p0 - k  →  rd = p0 + (-k), use addli rd, p0, -k
-                if (!c1) { ok = 0; }
-                else { k = -op1->iconst; ps = p0; }
-            }
+            // ADD is commutative: either operand can be the constant.
+            // IK_SUB: only optimise when ops[1] is the constant —
+            // rd = p0 - k  →  rd = p0 + (-k), use addli rd, p0, -k
+            int k  = (inst->kind == IK_SUB) ? -cv : cv;
+            int ok = (inst->kind == IK_ADD) || c1;
             if (ok) {
-                if (k == 1 && ps == rd)
+                if (k == 1 && creg == rd)
                     { fprintf(out, "    inc %s\n", regname(rd)); break; }
-                if (k == -1 && ps == rd)
+                if (k == -1 && creg == rd)
                     { fprintf(out, "    dec %s\n", regname(rd)); break; }
-                if (k >= -64 && k <= 63 && ps == rd)
+                if (k >= IMM7_MIN && k <= IMM7_MAX && creg == rd)
                     { fprintf(out, "    addi %s, %d\n", regname(rd), k); break; }
-                if (k >= -256 && k <= 255)
-                    { fprintf(out, "    addli %s, %s, %d\n", regname(rd), regname(ps), k); break; }
+                if (k >= IMM9_MIN && k <= IMM9_MAX)
+                    { fprintf(out, "    addli %s, %s, %d\n", regname(rd), regname(creg), k); break; }
             }
         }
 
         // P18: MUL(x, k) where k fits sext9 → mulli (F0b, 3 bytes vs 5 for immw+mul)
-        if (inst->kind == IK_MUL && (c0 ^ c1)) {
-            int kv = c1 ? op1->iconst : op0->iconst;
-            int ps = c1 ? p0 : p1;
-            if (kv >= -256 && kv <= 255)
-                { fprintf(out, "    mulli %s, %s, %d\n", regname(rd), regname(ps), kv); break; }
+        if (inst->kind == IK_MUL && (c0 ^ c1) &&
+            cv >= IMM9_MIN && cv <= IMM9_MAX) {
+            fprintf(out, "    mulli %s, %s, %d\n", regname(rd), regname(creg), cv);
+            break;
         }
 
         // P11: SHL with constant shift amount
         // In-place: shli rd, k (F2, 2 bytes)
-        // Cross-reg: shlli rd, ps, k (F0b, 3 bytes vs 4 for or+shli)
-        if (inst->kind == IK_SHL && !k0) {
-            int shift_k;
-            if (resolve_const(op1, &shift_k)) {
-                int k = shift_k & 31;
-                if (k >= 0 && k <= 63) {
-                    if (p0 == rd)
-                        fprintf(out, "    shli %s, %d\n", regname(rd), k);
-                    else
-                        fprintf(out, "    shlli %s, %s, %d\n", regname(rd), regname(p0), k);
-                    break;
-                }
+        // Cross-reg: shlli rd, p0, k (F0b, 3 bytes vs 4 for or+shli)
+        {
+            int k;
+            if (inst->kind == IK_SHL && !k0 && p11_p13_shift_fires(inst, &k)) {
+                if (p0 == rd)
+                    fprintf(out, "    shli %s, %d\n", regname(rd), k);
+                else
+                    fprintf(out, "    shlli %s, %s, %d\n", regname(rd), regname(p0), k);
+                break;
             }
-        }
 
-        // P13: Right shift with constant amount
-        // Signed: shrsi (F2 in-place, 2 bytes) or shrsli (F0b cross-reg, 3 bytes)
-        // Unsigned: shrsi safe when ≤16 bits; else shrli (F0b, 3 bytes, logical)
-        if ((inst->kind == IK_SHR || inst->kind == IK_USHR) && !k0) {
-            int shift_k;
-            if (resolve_const(op1, &shift_k)) {
-                int k = shift_k & 31;
-                int safe = is_signed;
-                if (!safe && inst->dst) {
-                    ValType dvt = inst->dst->vtype;
-                    safe = (dvt != VT_U32 && dvt != VT_I32);
-                }
-                if (safe && k >= 0 && k <= 63) {
-                    if (p0 == rd)
-                        fprintf(out, "    shrsi %s, %d\n", regname(rd), k);
-                    else
-                        fprintf(out, "    shrsli %s, %s, %d\n", regname(rd), regname(p0), k);
-                    break;
-                }
-                if (!safe && k >= 0 && k <= 31) {
+            // P13: Right shift with constant amount
+            // Signed: shrsi (F2 in-place, 2 bytes) or shrsli (F0b cross-reg, 3 bytes)
+            // Unsigned: shrsi safe when ≤16 bits; else shrli (F0b, 3 bytes, logical)
+            if ((inst->kind == IK_SHR || inst->kind == IK_USHR) && !k0 &&
+                p11_p13_shift_fires(inst, &k)) {
+                ValType dvt = dst->vtype;
+                int safe = is_signed || (dvt != VT_U32 && dvt != VT_I32);
+                if (safe && p0 == rd)
+                    fprintf(out, "    shrsi %s, %d\n", regname(rd), k);
+                else if (safe)
+                    fprintf(out, "    shrsli %s, %s, %d\n", regname(rd), regname(p0), k);
+                else
                     // Unsigned 32-bit: use shrli (F0b, logical right shift)
                     fprintf(out, "    shrli %s, %s, %d\n", regname(rd), regname(p0), k);
-                    break;
-                }
+                break;
             }
         }
 
         // P19: F0b immediate ALU (3 bytes vs 5 for immw+alu)
         // Covers comparisons, div/mod, or/xor, reverse-sub not handled by P2-P18.
-        if ((c0 ^ c1)) {
-            int kv = c1 ? op1->iconst : op0->iconst;
-            if (kv >= -256 && kv <= 255) {
-                const char *mnem = NULL;
-                int ps = c1 ? p0 : p1;
-                switch (inst->kind) {
-                // Comparisons: EQ/NE are commutative
-                case IK_EQ:   mnem = "eqli"; break;
-                case IK_NE:   mnem = "neli"; break;
-                // LE with const on right → lesli/leli
-                // LE with const on left → a > const-1 → gtsli/gtli
-                case IK_LE:
-                    if (c1) { mnem = is_signed ? "lesli" : "leli"; }
-                    else if (kv > (is_signed ? -256 : 0))
-                        { mnem = is_signed ? "gtsli" : "gtli"; kv--; }
-                    break;
-                case IK_ULE:
-                    if (c1) { mnem = "leli"; }
-                    else if (kv > 0) { mnem = "gtli"; kv--; }
-                    break;
-                // LT with const on left → a > const → gtsli/gtli
-                // LT with const on right → a <= const-1 → lesli/leli
-                case IK_LT:
-                    if (c0) { mnem = is_signed ? "gtsli" : "gtli"; }
-                    else if (kv > (is_signed ? -256 : 0))
-                        { mnem = is_signed ? "lesli" : "leli"; kv--; }
-                    break;
-                case IK_ULT:
-                    if (c0) { mnem = "gtli"; }
-                    else if (kv > 0) { mnem = "leli"; kv--; }
-                    break;
-                // SUB with const on left → rsubli (SUB(a,const) handled by P4)
-                case IK_SUB:  if (c0) mnem = "rsubli"; break;
-                // Division and modulo
-                case IK_DIV:  mnem = c1 ? "divsli" : "rdivsli"; break;
-                case IK_UDIV: mnem = c1 ? "divli"  : "rdivli";  break;
-                case IK_MOD:  if (c1) mnem = "modsli"; break;
-                case IK_UMOD: mnem = c1 ? "modli"  : "rmodli";  break;
-                // Commutative bitwise ops
-                case IK_OR:   mnem = "orli"; break;
-                case IK_XOR:  mnem = "xorli"; break;
-                default: break;
-                }
-                if (mnem) {
-                    fprintf(out, "    %s %s, %s, %d\n", mnem, regname(rd), regname(ps), kv);
-                    break;
-                }
+        if ((c0 ^ c1) && cv >= IMM9_MIN && cv <= IMM9_MAX) {
+            const char *mnem = NULL;
+            int k = cv;
+            switch (inst->kind) {
+            // Comparisons: EQ/NE are commutative
+            case IK_EQ:   mnem = "eqli"; break;
+            case IK_NE:   mnem = "neli"; break;
+            // LE with const on right → lesli/leli
+            // LE with const on left → a > const-1 → gtsli/gtli
+            case IK_LE:
+                if (c1) { mnem = is_signed ? "lesli" : "leli"; }
+                else if (k > (is_signed ? IMM9_MIN : 0))
+                    { mnem = is_signed ? "gtsli" : "gtli"; k--; }
+                break;
+            case IK_ULE:
+                if (c1) { mnem = "leli"; }
+                else if (k > 0) { mnem = "gtli"; k--; }
+                break;
+            // LT with const on left → a > const → gtsli/gtli
+            // LT with const on right → a <= const-1 → lesli/leli
+            case IK_LT:
+                if (c0) { mnem = is_signed ? "gtsli" : "gtli"; }
+                else if (k > (is_signed ? IMM9_MIN : 0))
+                    { mnem = is_signed ? "lesli" : "leli"; k--; }
+                break;
+            case IK_ULT:
+                if (c0) { mnem = "gtli"; }
+                else if (k > 0) { mnem = "leli"; k--; }
+                break;
+            // SUB with const on left → rsubli (SUB(a,const) handled by P4)
+            case IK_SUB:  if (c0) mnem = "rsubli"; break;
+            // Division and modulo
+            case IK_DIV:  mnem = c1 ? "divsli" : "rdivsli"; break;
+            case IK_UDIV: mnem = c1 ? "divli"  : "rdivli";  break;
+            case IK_MOD:  if (c1) mnem = "modsli"; break;
+            case IK_UMOD: mnem = c1 ? "modli"  : "rmodli";  break;
+            // Commutative bitwise ops
+            case IK_OR:   mnem = "orli"; break;
+            case IK_XOR:  mnem = "xorli"; break;
+            default: break;
+            }
+            if (mnem) {
+                fprintf(out, "    %s %s, %s, %d\n", mnem, regname(rd), regname(creg), k);
+                break;
             }
         }
 
@@ -740,7 +766,7 @@ static void emit_inst(Inst *inst, FILE *out) {
     case IK_ITOF: {
         if (!dst || inst->nops < 1) break;
         int r1 = get_val_reg(out, inst->ops[0], rd);
-        if (r1 != rd) fprintf(out, "    or %s, %s, %s\n", regname(rd), regname(r1), regname(r1));
+        emit_mov(out, rd, r1);
         // Sign-extend only for sub-32-bit integer operands; 32-bit values need no sign-extension.
         {
             ValType ovt = inst->ops[0] ? inst->ops[0]->vtype : VT_I16;
@@ -754,7 +780,7 @@ static void emit_inst(Inst *inst, FILE *out) {
     case IK_FTOI: {
         if (!dst || inst->nops < 1) break;
         int r1 = get_val_reg(out, inst->ops[0], rd);
-        if (r1 != rd) fprintf(out, "    or %s, %s, %s\n", regname(rd), regname(r1), regname(r1));
+        emit_mov(out, rd, r1);
         fprintf(out, "    ftoi %s\n", regname(rd));
         break;
     }
@@ -764,7 +790,7 @@ static void emit_inst(Inst *inst, FILE *out) {
         if (sv && sv->kind == VAL_CONST) {
             int v = (int8_t)(sv->iconst & 0xff);
             emit_imm(out, rd, v);
-        } else if (sv && sv->kind == VAL_INST && sv->def && sv->def->kind == IK_CONST && !sv->def->fname) {
+        } else if (is_ik_const(sv)) {
             int v = (int8_t)(sv->def->imm & 0xff);
             emit_imm(out, rd, v);
         } else if (sv && sv->kind == VAL_INST && sv->def &&
@@ -772,10 +798,10 @@ static void emit_inst(Inst *inst, FILE *out) {
                    vtype_signed(sv->vtype)) {
             // P10: load already used lbx (sign-extending); sxb is redundant
             int r1 = get_val_reg(out, inst->ops[0], rd);
-            if (r1 != rd) fprintf(out, "    or %s, %s, %s\n", regname(rd), regname(r1), regname(r1));
+            emit_mov(out, rd, r1);
         } else {
             int r1 = get_val_reg(out, inst->ops[0], rd);
-            if (r1 != rd) fprintf(out, "    or %s, %s, %s\n", regname(rd), regname(r1), regname(r1));
+            emit_mov(out, rd, r1);
             fprintf(out, "    sxb %s\n", regname(rd));
         }
         break;
@@ -786,7 +812,7 @@ static void emit_inst(Inst *inst, FILE *out) {
         if (sv && sv->kind == VAL_CONST) {
             int v = (int16_t)(sv->iconst & 0xffff);
             emit_imm(out, rd, v);
-        } else if (sv && sv->kind == VAL_INST && sv->def && sv->def->kind == IK_CONST && !sv->def->fname) {
+        } else if (is_ik_const(sv)) {
             int v = (int16_t)(sv->def->imm & 0xffff);
             emit_imm(out, rd, v);
         } else if (sv && sv->kind == VAL_INST && sv->def &&
@@ -794,7 +820,7 @@ static void emit_inst(Inst *inst, FILE *out) {
                    vtype_signed(sv->vtype)) {
             // P10: load already used lwx/llwx (sign-extending); sxw is redundant
             int r1 = get_val_reg(out, inst->ops[0], rd);
-            if (r1 != rd) fprintf(out, "    or %s, %s, %s\n", regname(rd), regname(r1), regname(r1));
+            emit_mov(out, rd, r1);
         } else {
             int r1 = get_val_reg(out, inst->ops[0], rd);
             if (r1 == rd)
@@ -811,7 +837,7 @@ static void emit_inst(Inst *inst, FILE *out) {
         // is the mask_size >= 4 case (no masking needed — just copy).
         if (!dst || inst->nops < 1) break;
         int r1 = get_val_reg(out, inst->ops[0], rd);
-        if (r1 != rd) fprintf(out, "    or %s, %s, %s\n", regname(rd), regname(r1), regname(r1));
+        emit_mov(out, rd, r1);
         break;
     }
 
@@ -836,9 +862,9 @@ static void emit_inst(Inst *inst, FILE *out) {
                 fprintf(out, "    %s %s, %s, 0\n", load_f3c(size, is_s), regname(rd), regname(tmp));
             } else {
                 // F3c: mnem rx, ry, scaled_imm10
-                int scaled = (size >= 4) ? off / 4 : (size == 2) ? off / 2 : off;
                 fprintf(out, "    %s %s, %s, %d\n",
-                        load_f3c(size, is_s), regname(rd), regname(rb), scaled);
+                        load_f3c(size, is_s), regname(rd), regname(rb),
+                        f_scaled(off, size));
             }
         }
         break;
@@ -873,9 +899,9 @@ static void emit_inst(Inst *inst, FILE *out) {
             emit_bp_store(out, rv, tmp, off, size);
         } else {
             // F3c: mnem rv, ry, scaled_imm10
-            int scaled = (size >= 4) ? off / 4 : (size == 2) ? off / 2 : off;
             fprintf(out, "    %s %s, %s, %d\n",
-                    store_f3c(size), regname(rv), regname(rb), scaled);
+                    store_f3c(size), regname(rv), regname(rb),
+                    f_scaled(off, size));
         }
         break;
     }
@@ -943,7 +969,7 @@ static void emit_inst(Inst *inst, FILE *out) {
             for (int ai = inst->nops - 1; ai >= 0; ai--) {
                 Value *av = val_resolve(inst->ops[ai]);
                 if (av && av->kind == VAL_CONST) {
-                    int sc = pick_scratch(0, arg_regs);
+                    int sc = pick_scratch(arg_regs);
                     emit_const_into(out, av, sc);
                     fprintf(out, "    pushr %s\n", regname(sc));
                 } else {
@@ -970,7 +996,7 @@ static void emit_inst(Inst *inst, FILE *out) {
             for (int ai = inst->nops - 1; ai >= nreg; ai--) {
                 Value *av = val_resolve(inst->ops[ai]);
                 if (av && av->kind == VAL_CONST) {
-                    int sc = pick_scratch(0, extra_avoid);
+                    int sc = pick_scratch(extra_avoid);
                     emit_const_into(out, av, sc);
                     fprintf(out, "    pushr %s\n", regname(sc));
                 } else {
@@ -981,8 +1007,7 @@ static void emit_inst(Inst *inst, FILE *out) {
             fprintf(out, "    jl %s\n", inst->fname);
             if (nextra > 0) fprintf(out, "    adjw %d\n", nextra * 4);
         }
-        if (dst && preg(dst) != 0)
-            fprintf(out, "    or %s, r0, r0\n", regname(preg(dst)));
+        if (dst) emit_mov(out, preg(dst), 0);
         break;
     }
 
@@ -1004,7 +1029,7 @@ static void emit_inst(Inst *inst, FILE *out) {
         for (int ai = inst->nops - 1; ai > nreg; ai--) {
             Value *av = val_resolve(inst->ops[ai]);
             if (av && av->kind == VAL_CONST) {
-                int sc = pick_scratch(0, extra_avoid);
+                int sc = pick_scratch(extra_avoid);
                 emit_const_into(out, av, sc);
                 fprintf(out, "    pushr %s\n", regname(sc));
             } else {
@@ -1015,8 +1040,7 @@ static void emit_inst(Inst *inst, FILE *out) {
         // fp is in r0 (pre-colored by IK_COPY from legalize_function() Pass B)
         fprintf(out, "    jlr r0\n");
         if (nextra > 0) fprintf(out, "    adjw %d\n", nextra * 4);
-        if (dst && preg(dst) != 0)
-            fprintf(out, "    or %s, r0, r0\n", regname(preg(dst)));
+        if (dst) emit_mov(out, preg(dst), 0);
         break;
     }
 
@@ -1048,7 +1072,7 @@ static void emit_inst(Inst *inst, FILE *out) {
         // Return value in r0
         if (inst->nops > 0) {
             int rv = get_val_reg(out, inst->ops[0], 0);
-            if (rv != 0) fprintf(out, "    or r0, %s, %s\n", regname(rv), regname(rv));
+            emit_mov(out, 0, rv);
         }
         fprintf(out, "    ret\n");
         break;
@@ -1083,7 +1107,6 @@ typedef struct {
 //
 // Processed in reverse order so copy chains resolve naturally.
 static void remap_single_use_values(Function *f) {
-    int debug_remap = getenv("DEBUG_REMAP") != NULL;
     for (int bi = 0; bi < f->nblocks; bi++) {
         Block *b = f->blocks[bi];
 
@@ -1108,12 +1131,7 @@ static void remap_single_use_values(Function *f) {
         for (Inst *inst = b->tail; inst; inst = inst->prev) {
             if (inst->is_dead || !inst->dst) continue;
             Value *v = inst->dst;
-            if (v->use_count != 1 || v->phys_reg < 0) {
-                if (debug_remap && inst->kind == IK_CONST && v->phys_reg >= 0)
-                    fprintf(stderr, "remap skip: %s v%d r%d use_count=%d\n",
-                            f->name, v->id, v->phys_reg, v->use_count);
-                continue;
-            }
+            if (v->use_count != 1 || v->phys_reg < 0) continue;
             // Don't remap call results (must be r0) or params
             if (inst->kind == IK_CALL || inst->kind == IK_ICALL ||
                 inst->kind == IK_PARAM || inst->kind == IK_PUTCHAR)
@@ -1446,62 +1464,41 @@ static void mark_dead_consts(Function *f) {
             int is_k0 = (o0 && o0->kind == VAL_CONST) || ik0;
             int is_k1 = (o1 && o1->kind == VAL_CONST) || ik1;
 
-            // P7: both operands constant — fold eliminates entire ALU op.
-            // Only mark IK_CONST dead for operations P7 actually folds;
-            // DIV/MOD/float ops fall through and need registers.
+            // P7: both operands constant — the fold eliminates the entire
+            // ALU op, so neither IK_CONST is needed.  p7_fold ignores its
+            // operand values when deciding whether it fires; DIV/MOD/float
+            // ops fall through and need registers.
             if (is_k0 && is_k1) {
-                switch (inst->kind) {
-                case IK_ADD: case IK_SUB: case IK_MUL:
-                case IK_AND: case IK_OR:  case IK_XOR:
-                case IK_SHL: case IK_SHR: case IK_USHR:
-                case IK_EQ:  case IK_NE:
-                case IK_LT:  case IK_ULT:
-                case IK_LE:  case IK_ULE:
+                int32_t dummy;
+                if (p7_fold(inst->kind, 0, 0, &dummy)) {
                     if (ik0 && o0->use_count <= 1) o0->def->is_dead = 1;
                     if (ik1 && o1->use_count <= 1) o1->def->is_dead = 1;
-                    break;
-                default:
-                    break;
                 }
                 continue;
             }
-            // P8/P14: AND(x, k) → zxb/zxw/andi; mask IK_CONST is not needed
-            // P8 fires for k == 0xFF/0xFFFF; P14 fires for k in [0,127].
+            // P8/P14: AND(x, k) → zxb/zxw/andi/andli; mask IK_CONST not needed
             if (inst->kind == IK_AND && (is_k0 ^ is_k1)) {
                 Value *kv = is_k1 ? o1 : o0;
                 int mask = (kv->kind == VAL_CONST) ? kv->iconst : kv->def->imm;
                 int is_ik = is_k1 ? ik1 : ik0;
-                if (is_ik && kv->use_count <= 1 &&
-                    ((mask >= 0 && mask <= 255) || mask == 0xffff))
+                if (is_ik && kv->use_count <= 1 && p8_p14_and_fires(mask))
                     kv->def->is_dead = 1;
             }
-            // P11/P13: SHL/SHR/USHR with constant shift amount → shli/shrsi;
-            // the IK_CONST (or AND chain) holding the shift amount is not needed.
-            if ((inst->kind == IK_SHL || inst->kind == IK_SHR || inst->kind == IK_USHR) && !is_k0) {
-                int shift_k;
-                if (resolve_const(o1, &shift_k)) {
-                    int k = shift_k & 31;
-                    int will_fire = 0;
-                    if (inst->kind == IK_SHL && k >= 0 && k <= 63) {
-                        will_fire = 1;
-                    } else if (k >= 0 && k <= 63) {
-                        ValType dvt = inst->dst ? inst->dst->vtype : VT_I16;
-                        int safe = (dvt == VT_I8 || dvt == VT_I16 || dvt == VT_I32);
-                        if (!safe) safe = (dvt != VT_U32 && dvt != VT_I32);
-                        will_fire = safe;
-                    }
-                    if (will_fire && o1 && o1->kind == VAL_INST && o1->def && o1->use_count <= 1) {
-                        Inst *d = o1->def;
-                        if (d->kind == IK_CONST && !d->fname)
-                            d->is_dead = 1;
-                        else if (d->kind == IK_AND && d->nops >= 2) {
-                            d->is_dead = 1;
-                            for (int j2 = 0; j2 < d->nops; j2++) {
-                                Value *a = d->ops[j2] ? val_resolve(d->ops[j2]) : NULL;
-                                if (is_ik_const(a) && a->use_count <= 1)
-                                    a->def->is_dead = 1;
-                            }
-                        }
+            // P11/P13: SHL/SHR/USHR with constant shift amount →
+            // shli/shrsi/shrli; the IK_CONST (or AND chain) holding the
+            // shift amount is not needed.
+            if ((inst->kind == IK_SHL || inst->kind == IK_SHR || inst->kind == IK_USHR) &&
+                !is_k0 && p11_p13_shift_fires(inst, NULL) &&
+                o1 && o1->kind == VAL_INST && o1->def && o1->use_count <= 1) {
+                Inst *d = o1->def;
+                if (d->kind == IK_CONST && !d->fname)
+                    d->is_dead = 1;
+                else if (d->kind == IK_AND && d->nops >= 2) {
+                    d->is_dead = 1;
+                    for (int j2 = 0; j2 < d->nops; j2++) {
+                        Value *a = d->ops[j2] ? val_resolve(d->ops[j2]) : NULL;
+                        if (is_ik_const(a) && a->use_count <= 1)
+                            a->def->is_dead = 1;
                     }
                 }
             }
@@ -1789,7 +1786,7 @@ static int detect_branch_fusions(Function *f, BranchFuse *fuse,
         Inst *def = NULL;
         Value *seek = cond;
         for (Inst *scan = term->prev; scan; scan = scan->prev) {
-            if (scan->dst != seek) { if (!scan->is_dead) continue; else continue; }
+            if (scan->dst != seek) continue;
             if (scan->is_dead && scan->kind == IK_COPY && scan->nops >= 1) {
                 Value *src = val_resolve(scan->ops[0]);
                 if (src && src->kind == VAL_INST) { seek = src; continue; }
@@ -1891,9 +1888,9 @@ static int detect_branch_fusions(Function *f, BranchFuse *fuse,
                 for (Inst *ii = f->blocks[k]->head; ii; ii = ii->next)
                     if (!ii->is_dead) est_bytes += 3;
         }
-        // F3c displacement is ±511 bytes (10-bit signed, PC-relative from
-        // end of branch instruction). Use 500 when measured, 450 for the
-        // conservative heuristic fallback.
+        // F3c displacement is ±BR_DISP_RANGE bytes (10-bit signed,
+        // PC-relative from end of branch instruction). Use 500 when
+        // measured, 450 for the conservative heuristic fallback.
         int p5_cap = block_size ? 500 : 450;
         int in_range = (est_bytes <= p5_cap);
 
@@ -1935,10 +1932,10 @@ static int detect_branch_fusions(Function *f, BranchFuse *fuse,
             Value *cb_reg = NULL;
             int cb_k = 0, tmp = 0;
             if (dop0 && dop0->kind == VAL_INST && dop0->phys_reg >= 0 &&
-                resolve_const(dop1, &tmp) && tmp >= 0 && tmp <= 127)
+                resolve_const(dop1, &tmp) && tmp >= 0 && tmp <= CB_CONST_MAX)
                 { cb_reg = dop0; cb_k = tmp; }
             else if (dop1 && dop1->kind == VAL_INST && dop1->phys_reg >= 0 &&
-                     resolve_const(dop0, &tmp) && tmp >= 0 && tmp <= 127)
+                     resolve_const(dop0, &tmp) && tmp >= 0 && tmp <= CB_CONST_MAX)
                 { cb_reg = dop1; cb_k = tmp; }
             if (cb_reg) {
                 // Determine which target we'll actually branch to
@@ -1959,10 +1956,10 @@ static int detect_branch_fusions(Function *f, BranchFuse *fuse,
                             for (Inst *ii = f->blocks[k]->head; ii; ii = ii->next)
                                 if (!ii->is_dead) cb_est += 3;
                     }
-                    // F0c displacement is ±511 bytes (10-bit signed,
-                    // PC-relative). 500 when measured, 500 for the
-                    // conservative heuristic fallback.
-                    int p17_cap = block_size ? 500 : 500;
+                    // F0c displacement is ±BR_DISP_RANGE bytes (10-bit
+                    // signed, PC-relative). 500 when measured, 450 for the
+                    // conservative heuristic fallback (same margins as P5).
+                    int p17_cap = block_size ? 500 : 450;
                     if (cb_est <= p17_cap) {
                         def->is_dead        = 1;
                         fuse[fbi].fused     = 4;
@@ -2036,6 +2033,44 @@ static int detect_branch_fusions(Function *f, BranchFuse *fuse,
     return committed;
 }
 
+// Emit the branch instruction for an IK_BR according to its BranchFuse
+// entry (P5/P5+/P6/P17; fused == 0 emits a plain jz/jnz on cond_reg).
+// `invert` flips the branch sense — used when branching to the false
+// target so the trailing `j` can be dropped.  Callers only invert the
+// single-register forms (fused 0/3/4); P5/P5+ have no inverted mnemonic.
+static void emit_fused_branch(FILE *out, const BranchFuse *bf, int cond_reg,
+                              int invert, const char *fname, int target_id) {
+    switch (bf->fused) {
+    case 1:  // P5: two-register compare+branch
+        fprintf(out, "    %s %s, %s, _%s_B%d\n", bf->mnem,
+                regname(bf->p0), regname(bf->p1), fname, target_id);
+        break;
+    case 2:  // P5+: materialize const into scratch (p1), then compare+branch
+        emit_imm(out, bf->p1, bf->const_val);
+        if (bf->swap)
+            fprintf(out, "    %s %s, %s, _%s_B%d\n", bf->mnem,
+                    regname(bf->p1), regname(bf->p0), fname, target_id);
+        else
+            fprintf(out, "    %s %s, %s, _%s_B%d\n", bf->mnem,
+                    regname(bf->p0), regname(bf->p1), fname, target_id);
+        break;
+    case 3:  // P6: zero-test → jz/jnz
+        fprintf(out, "    %s %s, _%s_B%d\n",
+                (bf->is_eq ^ invert) ? "jz" : "jnz",
+                regname(bf->p0), fname, target_id);
+        break;
+    case 4:  // P17: cbeq/cbne with 7-bit constant
+        fprintf(out, "    %s %s, %d, _%s_B%d\n",
+                (bf->is_eq ^ invert) ? "cbeq" : "cbne",
+                regname(bf->p0), bf->const_val, fname, target_id);
+        break;
+    default: // unfused: plain jnz/jz on the condition register
+        fprintf(out, "    %s %s, _%s_B%d\n", invert ? "jz" : "jnz",
+                regname(cond_reg), fname, target_id);
+        break;
+    }
+}
+
 // Emit a rotated branch (P12): duplicate header's IK_BR at the end of a latch block.
 //
 // `block_start` (may be NULL) carries the dry-run measured starting offset of
@@ -2096,54 +2131,24 @@ static int emit_rotated_branch(Function *f, FILE *out, Inst *inst,
         // Branch is encoded as (rel-to-end-of-instruction). The fused form
         // is 3 bytes; its end is at cur_offset + 3.
         int disp = tgt_off - (cur_offset + 3);
-        if (disp > 511 || disp < -512) {
+        if (disp > BR_DISP_RANGE || disp < -(BR_DISP_RANGE + 1)) {
             // Out of F3c/F0c reach — sticky decision so we don't oscillate.
             if (no_rotate) no_rotate[bi] = 1;
             return 0;
         }
     }
 
-    int rotated = 0;
-    if (fuse[hbi].fused == 0) {
-        if (hdr_br->target)
-            fprintf(out, "    jnz %s, _%s_B%d\n",
-                    regname(cond->phys_reg), f->name, hdr_br->target->id);
-        rotated = 1;
-    } else if (fuse[hbi].fused == 1) {
-        if (hdr_br->target)
-            fprintf(out, "    %s %s, %s, _%s_B%d\n",
-                    fuse[hbi].mnem,
-                    regname(fuse[hbi].p0), regname(fuse[hbi].p1),
-                    f->name, hdr_br->target->id);
-        rotated = 1;
-    } else if (fuse[hbi].fused == 2) {
-        emit_imm(out, fuse[hbi].p1, fuse[hbi].const_val);
-        if (hdr_br->target) {
-            if (fuse[hbi].swap)
-                fprintf(out, "    %s %s, %s, _%s_B%d\n",
-                        fuse[hbi].mnem,
-                        regname(fuse[hbi].p1), regname(fuse[hbi].p0),
-                        f->name, hdr_br->target->id);
-            else
-                fprintf(out, "    %s %s, %s, _%s_B%d\n",
-                        fuse[hbi].mnem,
-                        regname(fuse[hbi].p0), regname(fuse[hbi].p1),
-                        f->name, hdr_br->target->id);
-        }
-        rotated = 1;
-    } else if (fuse[hbi].fused == 3) {
-        if (hdr_br->target)
-            fprintf(out, "    %s %s, _%s_B%d\n",
-                    fuse[hbi].is_eq ? "jz" : "jnz",
-                    regname(fuse[hbi].p0),
-                    f->name, hdr_br->target->id);
-        rotated = 1;
-    }
-    if (rotated) {
-        if (hdr_br->target2 && hdr_br->target2 != next_blk)
-            fprintf(out, "    j _%s_B%d\n", f->name, hdr_br->target2->id);
-    }
-    return rotated;
+    // P17 (fused == 4) is never rotated (no rotated cbeq/cbne emission);
+    // it still goes through the range check above so the sticky no_rotate
+    // decision stays consistent across dry-runs.
+    if (fuse[hbi].fused == 4) return 0;
+
+    if (hdr_br->target)
+        emit_fused_branch(out, &fuse[hbi], cond->phys_reg, /*invert=*/0,
+                          f->name, hdr_br->target->id);
+    if (hdr_br->target2 && hdr_br->target2 != next_blk)
+        fprintf(out, "    j _%s_B%d\n", f->name, hdr_br->target2->id);
+    return 1;
 }
 
 // ============================================================
@@ -2219,9 +2224,8 @@ static void emit_function_body(Function *f, FILE *out, BranchFuse *fuse,
                     Value *rv = val_resolve(inst->ops[0]);
                     if (rv && rv->kind == VAL_CONST) {
                         emit_imm(out, 0, rv->iconst);
-                    } else if (rv && rv->phys_reg >= 0 && rv->phys_reg != 0) {
-                        fprintf(out, "    or r0, %s, %s\n",
-                                regname(rv->phys_reg), regname(rv->phys_reg));
+                    } else if (rv && rv->phys_reg >= 0) {
+                        emit_mov(out, 0, rv->phys_reg);
                     }
                 }
                 int tmp_frame = 0;
@@ -2248,64 +2252,21 @@ static void emit_function_body(Function *f, FILE *out, BranchFuse *fuse,
                 fprintf(out, "    ret\n");
             } else if (inst->kind == IK_BR && !inst->is_dead && inst->nops >= 1) {
                 Block *next_blk = (bi + 1 < f->nblocks) ? f->blocks[bi + 1] : NULL;
-                int inverted = 0;
-                if (fuse[bi].fused == 1) {
-                    if (inst->target)
-                        fprintf(out, "    %s %s, %s, _%s_B%d\n",
-                                fuse[bi].mnem,
-                                regname(fuse[bi].p0), regname(fuse[bi].p1),
-                                f->name, inst->target->id);
-                } else if (fuse[bi].fused == 2) {
-                    emit_imm(out, fuse[bi].p1, fuse[bi].const_val);
-                    if (inst->target) {
-                        if (fuse[bi].swap)
-                            fprintf(out, "    %s %s, %s, _%s_B%d\n",
-                                    fuse[bi].mnem,
-                                    regname(fuse[bi].p1), regname(fuse[bi].p0),
-                                    f->name, inst->target->id);
-                        else
-                            fprintf(out, "    %s %s, %s, _%s_B%d\n",
-                                    fuse[bi].mnem,
-                                    regname(fuse[bi].p0), regname(fuse[bi].p1),
-                                    f->name, inst->target->id);
-                    }
-                } else if (fuse[bi].fused == 3) {
-                    if (inst->target == next_blk && inst->target2) {
-                        fprintf(out, "    %s %s, _%s_B%d\n",
-                                fuse[bi].is_eq ? "jnz" : "jz",
-                                regname(fuse[bi].p0),
-                                f->name, inst->target2->id);
-                        inverted = 1;
-                    } else if (inst->target) {
-                        fprintf(out, "    %s %s, _%s_B%d\n",
-                                fuse[bi].is_eq ? "jz" : "jnz",
-                                regname(fuse[bi].p0),
-                                f->name, inst->target->id);
-                    }
-                } else if (fuse[bi].fused == 4) {
-                    if (inst->target == next_blk && inst->target2) {
-                        fprintf(out, "    %s %s, %d, _%s_B%d\n",
-                                fuse[bi].is_eq ? "cbne" : "cbeq",
-                                regname(fuse[bi].p0), fuse[bi].const_val,
-                                f->name, inst->target2->id);
-                        inverted = 1;
-                    } else if (inst->target) {
-                        fprintf(out, "    %s %s, %d, _%s_B%d\n",
-                                fuse[bi].is_eq ? "cbeq" : "cbne",
-                                regname(fuse[bi].p0), fuse[bi].const_val,
-                                f->name, inst->target->id);
-                    }
-                } else {
-                    int r1 = get_val_reg(out, inst->ops[0], 0);
-                    if (inst->target == next_blk && inst->target2) {
-                        fprintf(out, "    jz %s, _%s_B%d\n",
-                                regname(r1), f->name, inst->target2->id);
-                        inverted = 1;
-                    } else if (inst->target) {
-                        fprintf(out, "    jnz %s, _%s_B%d\n",
-                                regname(r1), f->name, inst->target->id);
-                    }
-                }
+                int fz = fuse[bi].fused;
+                // Materialize an unfused condition before deciding the target.
+                int cond_reg = -1;
+                if (fz == 0) cond_reg = get_val_reg(out, inst->ops[0], 0);
+                // Branch inversion: when the true target is the fall-through
+                // block, branch on the inverted condition to the false target
+                // and drop the trailing j.  Only the single-register forms
+                // (unfused / P6 / P17) have an inverted mnemonic.
+                int can_invert = (fz == 0 || fz == 3 || fz == 4);
+                int inverted = can_invert && inst->target == next_blk &&
+                               inst->target2;
+                Block *tgt = inverted ? inst->target2 : inst->target;
+                if (tgt)
+                    emit_fused_branch(out, &fuse[bi], cond_reg, inverted,
+                                      f->name, tgt->id);
                 if (!inverted && inst->target2 && inst->target2 != next_blk)
                     fprintf(out, "    j _%s_B%d\n", f->name, inst->target2->id);
             } else if (inst->kind == IK_JMP && inst->target &&
