@@ -17,6 +17,7 @@ make smallcc        # Build the compiler
 make test           # Run all pytest test cases (quiet)
 make test_v         # Run all pytest test cases (verbose)
 make test_p         # Run pytest cases in parallel (requires pytest-xdist)
+make test_irsim     # Run the corpus through the IR interpreter (-runoos/-runirc)
 make clean          # Remove binaries and temp files
 ```
 
@@ -33,7 +34,7 @@ echo 'int main(){return 5+3;}' > t.c
 DUMP_IR=1 ./smallcc -arch cpu4 -o out.s t.c                    # dump post-OOS and post-IRC IR to stderr
 ```
 
-Tests use `sim_c` (the C simulator) to execute generated assembly and check the value left in register `r0`. On test failure, verbose output is written to `error.log`. The test harness is in `test.sh`; individual suites are in `tests/`.
+Tests are pytest-collected `.c` files under `tests/cases/` with `EXPECT_R0`/`EXPECT_STDOUT`/`EXPECT_COMPILE_FAIL` magic comments (harness: `tests/conftest.py`). `make test` runs them against `sim_c`; `make test_irsim` runs the same corpus through the in-process IR interpreter (`-runoos` and `-runirc`), giving a three-way differential oracle that localizes bugs to legalize/IRC vs emission. Tests under `tests/cases/hw/` exercise sim_c's MMIO device model and are skipped in irsim mode.
 
 ### Simulators
 
@@ -41,7 +42,7 @@ Tests use `sim_c` (the C simulator) to execute generated assembly and check the 
 
 **`sim_c` usage:**
 ```
-./sim_c [-v] [-arch cpu4] [-maxsteps N] file.s
+./sim_c [-trace FILE] [-arch cpu4] [-maxsteps N] file.s
 ```
 
 **`sim_c` debug facilities:**
@@ -49,7 +50,7 @@ Tests use `sim_c` (the C simulator) to execute generated assembly and check the 
 | Feature | Description |
 |---|---|
 | Register dump | Always printed on halt: `r0:xxxxxxxx sp:xxxx bp:xxxx lr:xxxx pc:xxxx H:x cycles:N` |
-| `-v` (verbose) | Prints every instruction as it executes: `[pc] op=xx r0=xxxxxxxx sp=xxxx bp=xxxx` |
+| `-trace FILE` | Writes every instruction as it executes: `[pc] op=xx r0=xxxxxxxx sp=xxxx bp=xxxx` |
 | Write watchpoints | Writes to addresses below `0x5000` print to stderr: `WRITE8/16/32 to addr = val  at pc=... sp=... bp=... r0=...`; useful for catching stray stores into the code/data area |
 | Crash trace | On unknown opcode, dumps the last 32 executed instructions (pc, opcode, r0, sp, bp) to help locate the crash |
 | MMIO cycle counter | A 32-bit read-only cycle counter at address `0xFF00` incremented once per instruction; used by `core_portme.c` for timing |
@@ -137,7 +138,7 @@ Per-TU loop [smallcc.c] (lib TUs first, then user TUs):
 | `tokeniser.c` | Lexer — produces a `Token` linked list |
 | `parser.c` | Recursive-descent parser — builds AST; `resolve_symbols`, `derive_types`, `insert_coercions` |
 | `types.c` | Type table, symbol table, struct layout, `add_types_and_symbols`, `reset_types_state`, `insert_extern_sym` |
-| `sx.h` / `sx.c` | Sexp AST: `Sx` cons-cell tree with `SX_PAIR/SX_SYM/SX_STR/SX_INT` kinds; constructors; printer (used for data-section globals only) |
+| `sx.h` / `sx.c` | Sexp AST: `Sx` cons-cell tree with `SX_PAIR/SX_SYM/SX_STR/SX_INT` kinds; constructors + accessors (data-section interchange only) |
 | `lower.h` / `lower.c` | Global lowering: Node* → Sexp `gvar`/`strlit` nodes for the data section; function bodies compiled directly by braun.c |
 | `ssa.h` / `ssa.c` | SSA IR types (`Value`, `Inst`, `Block`, `Function`); `InstKind` opcodes; constructors; IR printer (`print_function`) |
 | `braun.h` / `braun.c` | Braun SSA construction directly from Node* AST; Symbol*-keyed variable maps; derives ValType/CallDesc from Node*.type; handles all statement/expression kinds; accumulates function-body string literals and static locals |
@@ -166,18 +167,16 @@ Per-TU loop [smallcc.c] (lib TUs first, then user TUs):
 - **ILP32 type model.** `char` is 1 byte, `short` is 2 bytes, `int`/`long`/`float`/`double`/pointer are all **4 bytes**. Stack and code addresses still live in the low 64 KB (`sp`, `bp`, `pc` are 16-bit), but pointers are stored as 4-byte values so user code can address the 32 MB SDRAM behind the pbus through ordinary C pointers. The high half of compiler-emitted addresses is zero; `lea` masks its result to 16 bits to guarantee that.
 - `new_node()` initializes `node->type = t_void` (not NULL) — type-propagation guards use `== t_void`
 - Type singletons (`t_int`, `t_void`, etc.) are interned — use pointer equality for comparison
-- Stack starts at `sp = 0x1000`; grows downward; `enter N` saves `(lr<<16)|bp` into one 4-byte slot and allocates N bytes; the first stack-passed param is at `bp+4` (not `bp+8`).
-- `adj imm8` (opcode 0x41) adjusts `sp` by a signed 8-bit value (−128..127); `adjw imm16` (opcode 0x89) adjusts by a signed 16-bit value — used by the backend for locals larger than 127 bytes
+- Stack starts at `sp = 0xF000`; grows downward; `enter N` saves `(lr<<16)|bp` into one 4-byte slot and allocates N bytes; the first stack-passed param is at `bp+4` (not `bp+8`).
+- `adjw imm14` (F3b, opcode 0xc4) adjusts `sp` by a signed 4-byte-scaled amount — used by the backend to pop stack arguments after calls with more than 3 parameters
 
 ---
 
 ## Detailed Reference
 
 - @docs/architecture.md — tokeniser, parser (grammar, AST nodes), type system, per-TU compilation
-- @docs/backend.md — stack IR, CPU3 backend, CPU3 peephole optimisations
 - @docs/compiler-pipeline.md — CPU4 nanopass pipeline: lowering, Braun SSA, IRC, emission
 - @docs/optimization-passes.md — pass catalog, bitmask system, LICM/CSE tuning constants, emission peepholes
-- @docs/isa/cpu3.md — CPU3 registers, instruction set, assembly syntax
 - @docs/isa/cpu4.md — CPU4 registers, instruction set, assembly syntax
 - @docs/abi.md — calling convention, frame layout, type sizes, symbol naming, MMIO map (the contract between compiler and hardware)
 - @docs/c89-status.md — compliance tables, deliberate deviations, what's implemented/missing

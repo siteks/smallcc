@@ -143,6 +143,6 @@ The compiler now uses the **ILP32** type model: `char` 1, `short` 2, `int`/`long
 
 **Partially working**: `const`/`volatile` (stored, not enforced), `auto`/`register` (parsed, ignored).
 
-**Not yet implemented**: bit fields (deliberate), `sizeof` on non-trivial expressions, predefined macros (`__FILE__`, `__LINE__`, `__DATE__`, `__TIME__`, `__STDC__`), `#error` directive (silently ignored instead of halting compilation), `va_arg` with struct type (use `struct P *` instead).
+**Not yet implemented**: bit fields (deliberate), `sizeof` on non-trivial expressions, predefined macros (`__FILE__`, `__LINE__`, `__DATE__`, `__TIME__`, `__STDC__`), `#` / `##` preprocessor operators, `va_arg` with struct type (use `struct P *` instead). `#error` halts compilation with the message; other unknown directives are silently ignored.
 
 **Extensions beyond C89**: `//` line comments; declarations anywhere in a block (C99); `for`-init declarations (C99).

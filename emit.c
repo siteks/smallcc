@@ -326,7 +326,7 @@ static void emit_alu_const(FILE *out, Inst *inst, int is_signed, int rd,
     if (spilled) fprintf(out, "    popr %s\n", regname(sc));
 }
 
-// Map fuseable comparison kind to F3b branch mnemonic (P5 compare+branch fusion)
+// Map fuseable comparison kind to F3c branch mnemonic (P5 compare+branch fusion)
 static const char *fused_branch_mnemonic(InstKind kind) {
     switch (kind) {
     case IK_EQ:  return "beq";
@@ -1065,7 +1065,7 @@ static void emit_inst(Inst *inst, FILE *out) {
 
 typedef struct {
     int         fused;     // 0=none, 1=P5 two-reg, 2=P5+ const-operand, 3=P6 zero-test, 4=P17 cbeq/cbne
-    const char *mnem;      // F3b branch mnemonic (beq/bne/blt/ble/blts/bles)
+    const char *mnem;      // F3c branch mnemonic (beq/bne/blt/ble/blts/bles)
     int         p0, p1;    // physical registers of the comparison operands
     int         const_val; // P5+: the constant operand's value
     int         swap;      // P5+: 1 if constant is the first (lhs) operand
@@ -1766,7 +1766,7 @@ static int block_size_from_offsets(Function *f, int bi,
     return end > start ? end - start : 0;
 }
 
-// Detect comparison+branch pairs that can be fused into F3b branches.
+// Detect comparison+branch pairs that can be fused into F3c branches.
 // block_size[] (may be NULL) gives exact byte sizes indexed by layout
 // position (f->blocks[bi]). When non-NULL it replaces the coarse
 // "3 bytes × instruction count" heuristic with measured bytes.
@@ -1875,7 +1875,7 @@ static int detect_branch_fusions(Function *f, BranchFuse *fuse,
 
         Value *dop0 = def->ops[0] ? val_resolve(def->ops[0]) : NULL;
         Value *dop1 = def->ops[1] ? val_resolve(def->ops[1]) : NULL;
-        // Estimate byte distance to true target; skip if out of F3b range.
+        // Estimate byte distance to true target; skip if out of F3c range.
         int target_bi = -1;
         for (int k = 0; k < f->nblocks; k++) {
             if (f->blocks[k] == term->target) { target_bi = k; break; }

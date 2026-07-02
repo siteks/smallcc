@@ -210,9 +210,9 @@ static Block *split_one_critical_edge(Function *f, Block *pred, Block *succ) {
     inst_append(mid, jmp);
 
     // Update pred's terminator: replace references to succ with mid.
-    // The phi for v47 (or any late-added incomplete phi) may be placed AFTER the
-    // branch instruction via inst_append when the block was unsealed.  Walk back
-    // from the tail to find the actual terminator (IK_BR / IK_JMP / IK_RET).
+    // A late-added incomplete phi may be placed AFTER the branch instruction
+    // via inst_append when the block was unsealed.  Walk back from the tail
+    // to find the actual terminator (IK_BR / IK_JMP / IK_RET / IK_SWITCH).
     Inst *term = pred->tail;
     while (term && term->kind != IK_BR && term->kind != IK_JMP && term->kind != IK_RET && term->kind != IK_SWITCH)
         term = term->prev;

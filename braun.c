@@ -494,11 +494,6 @@ static int vparam_off(BraunCtx *ctx, Symbol *sym) {
 }
 
 // ============================================================
-// Helper: assembly label for a symbol
-// ============================================================
-
-
-// ============================================================
 // scan_addr_taken — pre-scan function body
 // ============================================================
 
@@ -2175,13 +2170,13 @@ static Block *cg_stmt(BraunCtx *ctx, Block *b, Node *n) {
             // Infinite loop: cond_blk unconditionally jumps to body_blk.
             // Wire the cond_blk→body_blk edge BEFORE sealing body_blk so it
             // sees its real 1-pred state. Sealing a 0-pred block sends
-            // read_var down the "npreds == 0" path which writes a const 0
-            // into the defs map (line 619-622); after that, every read of
+            // read_var down read_var_recursive's "npreds == 0" path which
+            // writes a const 0 into the defs map; after that, every read of
             // any loop-carried variable in the body returns cached 0,
             // collapsing the SSA into trivial constants. cond_blk is the
             // back-edge target and must stay unsealed until the body has
-            // wired its step_blk→cond_blk edge — natural seal at line 2147
-            // covers that.
+            // wired its step_blk→cond_blk edge — the natural seal after the
+            // loop body covers that.
             Inst *j = arena_alloc(sizeof(Inst));
             j->kind = IK_JMP; j->target = body_blk; j->block = cond_blk;
             inst_append(cond_blk, j); cond_blk->filled = 1;

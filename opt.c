@@ -27,17 +27,17 @@ int opt_stat_bd_change  = 0;
  * R2E  opt_cse():            Hash-based common subexpression elimination.
  *      Walk blocks in dominator-tree pre-order; for each pure instruction,
  *      look up its (kind, operands, imm, fname) in a fixed hash table.  If an
- *      equivalent instruction already exists in the SAME block, alias the
- *      current dst to that earlier result and mark it dead.  Recounts
- *      use_count afterward.  Pure = ALU, comparisons, type conversions, GADDR.
- *      Loads, stores, calls, and control flow are never CSE'd.
- *      Cross-block CSE is deliberately disabled: in the post-OOS IR, values
- *      can be redefined by OOS copy insertions (phi-variable copies), so SSA
- *      dominance does not guarantee semantic equality across blocks.  More
- *      practically, cross-block CSE in loop-heavy functions extends canonical
- *      value live ranges through parallel-branch loops (loops not on the idom
- *      path but still on CFG paths), causing IRC register pressure to exceed
- *      K=8 and producing miscoloured or uncoloured values.
+ *      equivalent instruction already exists in an eligible earlier block,
+ *      alias the current dst to that earlier result and mark it dead.
+ *      Recounts use_count afterward.  Pure = ALU, comparisons, type
+ *      conversions, GADDR.  Loads, stores, calls, and control flow are
+ *      never CSE'd.  Cross-block policy differs by regime (see gvn_walk):
+ *      pre-OOS (true SSA) matches against any dominating block at the same
+ *      or shallower loop depth; post-OOS it is restricted to the DIRECT
+ *      dominating predecessor only — post-OOS values can be redefined by
+ *      OOS copy insertions, and wider policies extend canonical live
+ *      ranges through loop-heavy CFGs until IRC pressure exceeds K=8
+ *      (it also defeats P12 loop rotation).
  *
  * R2D  opt_copy_prop():        Collapse IK_COPY chains post-OOS, before IRC.
  *      Sets Value.alias for each copy destination so val_resolve() chains
@@ -1362,7 +1362,7 @@ void opt_licm_const(Function *f) {
     recount_uses(f);
 }
 
-// ── R2K: General LICM (loop-invariant code motion) ──────────────────────
+// ── R2F: General LICM (loop-invariant code motion) ──────────────────────
 //
 // Move pure loop-invariant instructions from loop bodies to pre-headers.
 // A pure instruction is loop-invariant if all its operands are either

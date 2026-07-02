@@ -494,11 +494,9 @@ Each `.c` argument is one user translation unit, compiled in argument order afte
 
 ### Per-TU State Reset
 
-At the start of each TU, four reset functions are called:
+At the start of each TU, `reset_tu()` calls three reset functions:
 
 ```c
-reset_codegen()        // clears strlit_count, loop_depth, label_table_size
-                       // does NOT reset 'labels' — monotonically increasing across TUs
 reset_parser()         // clears current_function
                        // does NOT reset anon_index — monotonically increasing across TUs
 reset_types_state()    // carries SYM_EXTERN symbols from previous TU's global scope into
@@ -509,13 +507,17 @@ reset_types_state()    // carries SYM_EXTERN symbols from previous TU's global s
 reset_preprocessor()   // clears macro table; resets include-depth counter
 ```
 
+String-literal IDs (`_lN`) are kept monotonically increasing across TUs via
+the `cpu4_strlit_id` counter threaded through `lower_globals` and
+`braun_function`.
+
 After reset, `make_basic_types()` re-populates the basic type singletons (found in the existing `types` list and reused, not duplicated).
 
 ### Cross-TU Global Propagation
 
 There is no separate `ExternSym[]` array. The mechanism is simpler:
 
-**`harvest_globals()`** (called after `backend_emit_asm`): walks the just-compiled TU's global `symbol_table->symbols` and calls `insert_extern_sym()` for each `NS_IDENT` symbol that is not `SYM_STATIC_GLOBAL`, `SYM_STATIC_LOCAL`, `SYM_EXTERN`, or `SYM_BUILTIN`.
+**`harvest_globals()`** (called after each TU's functions are compiled): walks the just-compiled TU's global `symbol_table->symbols` and calls `insert_extern_sym()` for each `NS_IDENT` symbol that is not `SYM_STATIC_GLOBAL`, `SYM_STATIC_LOCAL`, `SYM_EXTERN`, or `SYM_BUILTIN`.
 
 **`insert_extern_sym()`** (in `types.c`): marks the symbol `SYM_EXTERN` in the current global scope (or inserts a new `SYM_EXTERN` entry if not already present).
 
@@ -570,15 +572,20 @@ The compiler supports C89-style variadic functions using `...` in the parameter 
 
 ### Stack Layout for Variadic Calls
 
-Arguments are pushed right-to-left by the caller. Named parameters are accessed at fixed `bp+offset` locations. Variadic arguments are accessed through the `ap` pointer which iterates forward through the argument stack area.
+Arguments are pushed right-to-left by the caller in 4-byte slots. Named
+parameters follow the normal convention (first three in r1–r3, the rest on
+the stack); the variadic portion is **always** passed on the stack, starting
+immediately after the named-parameter stack region. Variadic arguments are
+accessed through the `ap` pointer which iterates forward through that area.
 
 ```
-bp+8+2*(n-1)   param n (first variadic, accessed via *ap)
+bp+4+4*n       first variadic arg (accessed via *ap)
     ...
-bp+8           param 0 (last named, accessed via bp+offset)
-bp+4           return address (lr)
-bp+0           saved bp
+bp+4           first stack-passed named param (if any)
+bp+0           saved (lr<<16)|bp   ← packed by enter
 ```
+
+See `docs/abi.md` §4.2 for the full variadic convention.
 
 ### Usage Example
 

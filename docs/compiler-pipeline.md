@@ -264,7 +264,7 @@ and attached to `Inst.calldesc` at each call site.
 | `ND_WHILESTMT` | header (unsealed) → body → seal; `IK_JMP` back-edge |
 | `ND_FORSTMT` | entry; cond_blk (unsealed); body; step; seal |
 | `ND_DOWHILESTMT` | body_blk; cond; `IK_BR` back-edge / exit |
-| `ND_SWITCHSTMT` | comparison chain with `IK_BR`/`IK_JMP` (native, no desugaring) |
+| `ND_SWITCHSTMT` | comparison chain with `IK_BR`/`IK_JMP`; dense switches (≥ 12 cases, value range ≤ 256, ≥ 50% density) emit `IK_SWITCH` instead — a jump-table dispatch that emission lowers to a range check + `shli` + table load + `jr` with a per-function `word` label table |
 | `ND_RETURNSTMT` | `IK_RET cg_expr(expr)` |
 | `ND_BREAKSTMT` | `IK_JMP brk_target` |
 | `ND_CONTINUESTMT` | `IK_JMP cont_target` |
@@ -285,6 +285,15 @@ slot via `IK_ADDR + IK_STORE`; subsequent reads come from memory, not an SSA val
 
 **String literals and static locals** in function bodies are accumulated into internal
 lists and flushed to the data section via `braun_emit_strlits(out)` after each function.
+
+**Inlining:** After each function is compiled, `braun_register_inline_candidate`
+qualifies it as an inline candidate if it is small (≤ 80 body nodes, ≤ 10
+straight-line prefix statements plus a final return), non-recursive, takes no
+addresses of locals/params, and contains no control-flow statements. Calls to
+registered candidates from later functions are expanded inline during Braun
+construction instead of emitting `IK_CALL`. Definition order matters: a callee
+is only inlinable into functions compiled after it (lib TUs compile first, so
+lib helpers qualify everywhere).
 
 ### R2C — Algebraic simplification (in `emit_binop`)
 
@@ -388,7 +397,7 @@ overview above and `optimization-passes.md` for details.
 | Conversions | `IK_ITOF IK_FTOI IK_SEXT8 IK_SEXT16 IK_ZEXT IK_TRUNC` |
 | Memory | `IK_LOAD IK_STORE IK_ADDR IK_GADDR IK_MEMCPY` |
 | Calls | `IK_CALL IK_ICALL IK_PUTCHAR` |
-| Control flow | `IK_BR IK_JMP IK_RET` |
+| Control flow | `IK_BR IK_JMP IK_SWITCH IK_RET` |
 
 `IK_LT` / `IK_LE` are signed; `IK_ULT` / `IK_ULE` are unsigned. Emission chooses
 `lts`/`les` vs `lt`/`le` by inspecting `Value.vtype` of the operands.
@@ -848,8 +857,13 @@ most impactful cases.
 
 **`setjmp`/`longjmp`.** Requires special stack frame treatment. Not implemented.
 
-**Jump tables for switch.** Switch is currently lowered to comparison chains.
-Jump table optimisation is future work.
+**Tail/sibling calls.** Blocked at the ISA level: nothing can write `lr`
+except `jl`/`jlr`, so a sibling's `ret` cannot return to the original caller
+without an ISA change.
+
+(Jump tables for switch are **implemented** — see `IK_SWITCH` above; sparse
+switches still lower to comparison chains, which P17 `cbeq`/`cbne` fusion
+keeps at 3 bytes per link.)
 
 ---
 
@@ -859,7 +873,7 @@ Jump table optimisation is future work.
 
 | File | Role |
 |------|------|
-| `sx.h` / `sx.c` | Sexp AST types + constructors + printer (data section only) |
+| `sx.h` / `sx.c` | Sexp AST types + constructors (data-section interchange only) |
 | `lower.h` / `lower.c` | Global lowering: Node* → `gvar`/`strlit` sexp for data section |
 | `ssa.h` / `ssa.c` | SSA IR types + constructors + printer |
 | `braun.h` / `braun.c` | Braun SSA construction directly from Node* AST |
