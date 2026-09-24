@@ -64,10 +64,13 @@ class CTestFile(pytest.File):
             yield CTestItem.from_parent(self, name=self.path.stem,
                                         path=self.path, arch='cpu4')
         else:
-            if irsim and (meta.get('TARGET') == 'hw' or self.path.parent.name == 'hw'):
+            if irsim and (meta.get('TARGET') == 'hw'
+                          or self.path.parent.name in ('hw', 'multicore')
+                          or 'SIM_ARGS' in meta):
                 # Hardware/MMIO device-model tests (framebuffer, SDRAM keyhole,
-                # DISP_MODE, ...) exercise sim_c's device model; the IR
-                # interpreter has no devices, so they cannot run under irsim.
+                # DISP_MODE, ...) and tests needing extra sim_c flags (e.g.
+                # SIM_ARGS: -cores 4) exercise sim_c itself; the IR
+                # interpreter has no devices/cores, so they cannot run there.
                 return
             modes = IRSIM_MODES if irsim else ARCHES
             for arch in modes:
@@ -142,9 +145,12 @@ class CTestItem(pytest.Item):
                 f"compile failed (exit {proc.returncode}):\n{proc.stderr}"
 
             # Simulate with sim_c -arch cpu4; for hw target, request framebuffer dump.
+            # SIM_ARGS passes extra flags verbatim (e.g. // SIM_ARGS: -cores 4).
             sim_cmd = [str(root / 'sim_c'), '-arch', 'cpu4']
             if target == 'hw':
                 sim_cmd.append('-dumpfb')
+            if 'SIM_ARGS' in meta:
+                sim_cmd += meta['SIM_ARGS'].split()
             sim_cmd.append(asm)
 
             sim = subprocess.run(sim_cmd, capture_output=True, text=True)

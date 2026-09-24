@@ -32,8 +32,47 @@
  * check_align16/check_align32).
  */
 
-static uint8_t  mem[65536];                    /* 64 KB BRAM */
+static uint8_t  mem[65536];                    /* 64 KB BRAM (assembler image) */
 static uint8_t *sdram = NULL;                  /* 32 MB, lazy allocated */
+
+/* ── Multi-core support (-cores N) ──────────────────────────────────
+ * N cores, each with its own registers and a private copy of the 64 KB
+ * BRAM image (SPMD: every core boots the same program at pc=0 and
+ * branches on CORE_ID, MMIO 0xFF24). SDRAM, the display, and the SDRAM
+ * keyhole are shared. Scheduling is deterministic round-robin: one
+ * instruction per live core per tick; g_cycles counts ticks (for
+ * -cores 1 that is identical to the historical instructions count).
+ * `mem` above stays the pristine assembler image; execution runs
+ * against the current core's BRAM via g_bram. */
+#define SIM_MAX_CORES 1024
+typedef struct {
+    uint32_t r[8];
+    uint16_t sp, bp, lr, pc;
+    int      H;
+    uint32_t insns;            /* instructions executed by this core */
+    uint8_t *bram;             /* private BRAM (code + data + stack); shared by a tile's contexts in -soc */
+} Core;
+static Core    *g_cores  = NULL;
+static int      g_ncores = 1;
+static int      g_curcore = 0;     /* index of the core executing now */
+static uint8_t *g_bram   = mem;    /* BRAM the router reads/writes */
+
+/* ── -soc: the KU5P cpu4_socN model (2026-09-15) ─────────────────────
+ * Each of the N cores is a barrel TILE of SOC_NCTX hardware contexts that
+ * share the tile's 64 KB BRAM (one Core entry per context; g_cores has
+ * N*SOC_NCTX entries, contexts 1..7 start parked = halted). The SoC's MMIO
+ * replaces the legacy core-id words:
+ *   0xFF24 LAUNCH_PCSP  w: {sp[15:0], pc[15:0]}   r: the same word
+ *   0xFF28 LAUNCH_CTRL  w: {bit8 kill, [2:0] ctx} starts (or parks) that
+ *                          context at the last LAUNCH_PCSP; r: bit0 busy (0)
+ *   0xFF2C CORE_ID      r: {NCORES[15:8], id[7:0]}
+ * Without -soc the historical map (CORE_ID 0xFF24 / NCORES 0xFF28) stands. */
+#define SOC_NCTX 8
+static int      g_soc    = 0;
+static int      g_nunits = 1;      /* schedulable Core entries (= g_ncores, or g_ncores*SOC_NCTX) */
+static int      g_live   = 0;      /* non-halted units */
+typedef struct { uint16_t launch_pc, launch_sp; } Tile;
+static Tile    *g_tiles  = NULL;
 
 #define MMIO_BASE 0xFF00u
 #define SDRAM_SIZE (32u * 1024u * 1024u)       /* 0x0200_0000 */
@@ -246,6 +285,15 @@ static uint16_t g_write_threshold = 0x5000;
 static uint32_t mmio_read32(uint32_t a) {
     if (a == 0xFF00)                              return g_cycles;
     if (a == 0xFF1C)                              return g_disp_mode;
+    if (g_soc) {
+        int tile = g_curcore / SOC_NCTX;
+        if (a == 0xFF24) return ((uint32_t)g_tiles[tile].launch_sp << 16) | g_tiles[tile].launch_pc;
+        if (a == 0xFF28) return 0;                                   /* launch never busy */
+        if (a == 0xFF2C) return ((uint32_t)g_ncores << 8) | (uint32_t)tile;
+    } else {
+        if (a == 0xFF24)                          return (uint32_t)g_curcore;
+        if (a == 0xFF28)                          return (uint32_t)g_ncores;
+    }
     if (a >= 0xFF40 && a < 0xFF80 && (a & 3) == 0) return g_perfcnt[(a - 0xFF40) >> 2];
     if (a == 0xFFA0)                              return g_sdram_addr_w;
     if (a == 0xFFA4)                              return g_sdram_wdata;
@@ -257,6 +305,24 @@ static uint32_t mmio_read32(uint32_t a) {
 
 static void mmio_write32(uint32_t a, uint32_t v) {
     if (a == 0xFF1C) { g_disp_mode = v;                                       return; }
+    if (g_soc && a == 0xFF24) {
+        Tile *t = &g_tiles[g_curcore / SOC_NCTX];
+        t->launch_pc = (uint16_t)(v & 0xffffu); t->launch_sp = (uint16_t)(v >> 16);
+        return;
+    }
+    if (g_soc && a == 0xFF28) {
+        int tile = g_curcore / SOC_NCTX, k = (int)(v & 7u);
+        Core *c = &g_cores[tile * SOC_NCTX + k];
+        if (v & 0x100u) {                       /* kill: park the context */
+            if (!c->H) { c->H = 1; g_live--; }
+        } else {                                /* launch at LAUNCH_PCSP, fresh registers */
+            Tile *t = &g_tiles[tile];
+            if (c->H) g_live++;
+            memset(c->r, 0, sizeof(c->r));
+            c->pc = t->launch_pc; c->sp = t->launch_sp; c->bp = t->launch_sp; c->lr = 0; c->H = 0;
+        }
+        return;
+    }
     if (a == 0xFF20) { g_disp_lut[(v >> 24) & 0xFF] = v & 0xFFFFFFu;          return; }
     if (a == 0xFF80) { for (int i = 0; i < 16; i++) g_perfcnt[i] = 0;          return; }
     if (a == 0xFFA0) { g_sdram_addr_w = v & 0x7FFFFFu;                         return; }
@@ -309,7 +375,7 @@ static void write8_inner (uint32_t a, uint8_t  v) {
         if (g_assembler_done && a < g_write_threshold)
             fprintf(stderr, "  WRITE8 to %04x = %02x  at pc=%04x sp=%04x bp=%04x r0=%08x\n",
                     (unsigned)a, v, g_watch_pc, g_watch_sp, g_watch_bp, g_watch_r0);
-        mem[a] = v;
+        g_bram[a] = v;
         return;
     }
     if (addr_is_mmio(a)) {
@@ -340,7 +406,7 @@ static void write32_inner(uint32_t a, uint32_t v) {
 #define write32 write32_inner
 
 static uint8_t read8(uint32_t a) {
-    if (addr_is_bram(a))   return mem[a];
+    if (addr_is_bram(a))   return g_bram[a];
     if (addr_is_mmio(a))   return mmio_read8(a);
     if (addr_is_sdram(a))  { ensure_sdram(); return sdram[sdram_chip_byte(a)]; }
     return 0;
@@ -1333,16 +1399,33 @@ static FILE *g_trace_out = NULL;
 
 static void run_cpu4(void)
 {
-    uint32_t r[8] = {0};
-    uint16_t sp = 0, bp = 0, lr = 0, pc = 0;
-    int H = 0;
     g_cycles = 0;
 
     enum { TRACE_N4 = 32 };
-    struct { uint16_t pc; uint8_t op; uint32_t r0; uint16_t sp, bp; } trace[TRACE_N4];
+    struct { uint16_t t_pc; uint8_t t_op; uint32_t t_r0; uint16_t t_sp, t_bp; int t_core; } trace[TRACE_N4];
+    memset(trace, 0, sizeof(trace));
     int trace_idx = 0;
 
-    for (int step = 0; step < g_max_steps && !H; step++, g_cycles++) {
+    g_live = 0;
+    for (int i = 0; i < g_nunits; i++) if (!g_cores[i].H) g_live++;
+
+/* The executor body below reads/writes core state through these
+ * aliases; `cc` is the core being stepped this iteration. The macros
+ * are #undef'd right after the loop. */
+#define r  (cc->r)
+#define sp (cc->sp)
+#define bp (cc->bp)
+#define lr (cc->lr)
+#define pc (cc->pc)
+#define H  (cc->H)
+
+    for (int step = 0; step < g_max_steps && g_live > 0; step++, g_cycles++) {
+      for (int ci = 0; ci < g_nunits; ci++) {
+        Core *cc = &g_cores[ci];
+        if (H) continue;
+        g_curcore = ci;
+        g_bram    = cc->bram;
+
         uint8_t  b0 = read8(pc);
         uint16_t oldpc = pc;
         pc++;
@@ -1434,8 +1517,9 @@ static void run_cpu4(void)
         }
 
         g_watch_pc = oldpc; g_watch_r0 = r[0]; g_watch_sp = sp; g_watch_bp = bp;
-        trace[trace_idx].pc = oldpc; trace[trace_idx].op = b0;
-        trace[trace_idx].r0 = r[0]; trace[trace_idx].sp = sp; trace[trace_idx].bp = bp;
+        trace[trace_idx].t_pc = oldpc; trace[trace_idx].t_op = b0;
+        trace[trace_idx].t_r0 = r[0]; trace[trace_idx].t_sp = sp; trace[trace_idx].t_bp = bp;
+        trace[trace_idx].t_core = ci;
         trace_idx = (trace_idx + 1) % TRACE_N4;
 
         if (g_trace_out) {
@@ -1447,6 +1531,7 @@ static void run_cpu4(void)
             for (int i = 0; i < ilen; i++)
                 p += snprintf(ins_buf + p, sizeof(ins_buf) - p,
                               "%02x", read8((uint16_t)(oldpc + i)));
+            if (g_ncores > 1) fprintf(g_trace_out, "c%d ", ci);
             fprintf(g_trace_out,
                 "pc=%04x ins=%-6s r0=%08x r1=%08x r2=%08x r3=%08x "
                 "r4=%08x r5=%08x r6=%08x r7=%08x sp=%04x bp=%04x lr=%04x\n",
@@ -1638,13 +1723,13 @@ static void run_cpu4(void)
         case 0xf0: if(!r[rd]) pc=(uint16_t)imm; break;                               /* jz   */
         case 0xf8: if( r[rd]) pc=(uint16_t)imm; break;                               /* jnz  */
         default:
-            fprintf(stderr, "cpu4: unknown opcode 0x%02x at pc=%04x\n", b0, oldpc);
+            fprintf(stderr, "cpu4: unknown opcode 0x%02x at pc=%04x (core %d)\n", b0, oldpc, ci);
             fprintf(stderr, "Last %d instructions:\n", TRACE_N4);
             for (int _ti = 0; _ti < TRACE_N4; _ti++) {
                 int _idx = (trace_idx + _ti) % TRACE_N4;
-                fprintf(stderr, "  [%04x] op=%02x r0=%08x sp=%04x bp=%04x\n",
-                        trace[_idx].pc, trace[_idx].op, trace[_idx].r0,
-                        trace[_idx].sp, trace[_idx].bp);
+                fprintf(stderr, "  c%d [%04x] op=%02x r0=%08x sp=%04x bp=%04x\n",
+                        trace[_idx].t_core, trace[_idx].t_pc, trace[_idx].t_op,
+                        trace[_idx].t_r0, trace[_idx].t_sp, trace[_idx].t_bp);
             }
             H = 1;
             break;
@@ -1662,10 +1747,35 @@ static void run_cpu4(void)
             fprintf(stderr, "CPU4 alignment error: BP misaligned 0x%04x at pc=0x%04x\n", bp, oldpc);
             H = 1;
         }
+
+        cc->insns++;
+        if (H) g_live--;
+      }
     }
 
-    printf("r0:%08x r1:%08x r2:%08x r3:%08x r4:%08x r5:%08x r6:%08x r7:%08x sp:%04x bp:%04x lr:%04x pc:%04x H:%x cycles:%u\n",
-           r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], sp, bp, lr, pc, H, g_cycles);
+#undef r
+#undef sp
+#undef bp
+#undef lr
+#undef pc
+#undef H
+
+    /* Single-core output stays byte-compatible with the historical
+     * format (test harnesses parse it). Multi-core prints one line per
+     * core (cycles: = that core's executed instructions) plus a
+     * summary tick count. */
+    for (int ci = 0; ci < g_nunits; ci++) {
+        Core *c = &g_cores[ci];
+        if (g_soc) { if (ci % SOC_NCTX && c->H && c->insns == 0) continue;   /* never-launched context */
+                     printf("core%d.ctx%d ", ci / SOC_NCTX, ci % SOC_NCTX); }
+        else if (g_ncores > 1) printf("core%d ", ci);
+        printf("r0:%08x r1:%08x r2:%08x r3:%08x r4:%08x r5:%08x r6:%08x r7:%08x sp:%04x bp:%04x lr:%04x pc:%04x H:%x cycles:%u\n",
+               c->r[0], c->r[1], c->r[2], c->r[3], c->r[4], c->r[5], c->r[6], c->r[7],
+               c->sp, c->bp, c->lr, c->pc, c->H,
+               g_ncores > 1 ? c->insns : g_cycles);
+    }
+    if (g_ncores > 1)
+        printf("ticks:%u\n", g_cycles);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1699,7 +1809,7 @@ static void dump_framebuffer(void)
     for (int row = 0; row < 30; row++) {
         char line[81];
         for (int col = 0; col < 80; col++) {
-            uint8_t b = mem[0xF000 + row * 80 + col];
+            uint8_t b = g_cores[0].bram[0xF000 + row * 80 + col];
             line[col] = (b >= 32 && b < 127) ? (char)b : ' ';
         }
         int end = 80;
@@ -1773,6 +1883,17 @@ static const char *usage_text =
 "  -trace FILE        Write a per-instruction execution trace to FILE\n"
 "  -arch cpu4         Target architecture (only cpu4 is supported)\n"
 "  -maxsteps N        Override the default instruction-step cap\n"
+"                     (with -cores: N is ticks; each live core runs one\n"
+"                     instruction per tick)\n"
+"  -cores N           Simulate N CPU4 cores (default 1, max 1024). Every\n"
+"                     core boots the same image at pc=0 with a private\n"
+"                     64 KB BRAM; SDRAM and the display are shared.\n"
+"                     Software reads CORE_ID at MMIO 0xFF24 (NCORES at\n"
+"                     0xFF28) and branches. Deterministic round-robin.\n"
+"  -soc               Model the KU5P cpu4_socN tile: each core is a barrel of 8\n"
+"                     contexts sharing its BRAM (context launch via 0xFF24/0xFF28,\n"
+"                     CORE_ID = {NCORES, id} at 0xFF2C) instead of the legacy\n"
+"                     CORE_ID/NCORES words. Contexts 1..7 start parked.\n"
 "  -dump FILE         Assemble and write a bytecode dump; do not execute\n"
 "  -dumpfb            After running, dump the legacy 80x30 text framebuffer at 0xF000\n"
 "  -fb FILE           After running, dump the bitmap framebuffer to FILE.ppm\n"
@@ -1813,6 +1934,14 @@ int main(int argc, char **argv)
         else if (strcmp(argv[i], "-maxsteps") == 0 && i+1 < argc) {
             maxsteps_override = atoi(argv[++i]);
         }
+        else if (strcmp(argv[i], "-soc") == 0) { g_soc = 1; }
+        else if (strcmp(argv[i], "-cores") == 0 && i+1 < argc) {
+            g_ncores = atoi(argv[++i]);
+            if (g_ncores < 1 || g_ncores > SIM_MAX_CORES) {
+                fprintf(stderr, "sim_c: -cores must be 1..%d\n", SIM_MAX_CORES);
+                return 1;
+            }
+        }
         else if (strcmp(argv[i], "-linemap") == 0 && i+1 < argc) {
             g_linemap_out = argv[++i];
         }
@@ -1848,6 +1977,21 @@ int main(int argc, char **argv)
         g_trace_out = fopen(trace_path, "w");
         if (!g_trace_out) { perror(trace_path); return 1; }
     }
+    g_nunits = g_soc ? g_ncores * SOC_NCTX : g_ncores;
+    g_cores = calloc((size_t)g_nunits, sizeof(Core));
+    g_tiles = calloc((size_t)g_ncores, sizeof(Tile));
+    if (!g_cores || !g_tiles) { fprintf(stderr, "sim_c: out of memory for %d cores\n", g_ncores); return 1; }
+    for (int i = 0; i < g_ncores; i++) {
+        uint8_t *b = malloc(sizeof(mem));
+        if (!b) { fprintf(stderr, "sim_c: out of memory for core %d BRAM\n", i); return 1; }
+        memcpy(b, mem, sizeof(mem));
+        if (g_soc) {
+            for (int k = 0; k < SOC_NCTX; k++) { g_cores[i * SOC_NCTX + k].bram = b; g_cores[i * SOC_NCTX + k].H = (k != 0); }
+        } else {
+            g_cores[i].bram = b;
+        }
+    }
+    g_bram = g_cores[0].bram;
     run_cpu4();
     if (g_trace_out) fclose(g_trace_out);
     if (dumpfb) dump_framebuffer();
