@@ -953,15 +953,23 @@ static void emit_inst(Inst *inst, FILE *out) {
     }
 
     case IK_MEMCPY: {
-        // memcpy(ops[0], ops[1], imm bytes)
-        // Emit as a simple byte loop via inline expansion (small copies) or libcall
-        // For now: call a memcpy helper (not available yet) or expand inline
-        // Simple inline: assume imm is small and compile to word/byte moves
+        // memcpy(ops[0], ops[1], imm bytes) — inline word/byte move loop.
+        // Data scratch = the IRC-allocated dst attached by legalize Pass B2;
+        // it interferes with both pointer operands and everything live
+        // through the copy. Fallback (const-materialized pointer landed in
+        // the scratch's register, or no dst): borrow a register and save
+        // it around the loop — we have no liveness here, so assume live.
         if (inst->nops < 2) break;
         int rdst = get_val_reg(out, inst->ops[0], 0);
         int rsrc = get_val_reg(out, inst->ops[1], 1);
         int bytes = inst->imm;
-        int tmp   = 2;
+        int tmp   = (dst && rd >= 0) ? rd : -1;
+        int saved = 0;
+        if (tmp < 0 || tmp == rdst || tmp == rsrc) {
+            tmp = pick_scratch((1u << rdst) | (1u << rsrc));
+            saved = 1;
+            fprintf(out, "    pushr %s\n", regname(tmp));
+        }
         for (int off2 = 0; off2 < bytes; off2 += 2) {
             int rem = bytes - off2;
             if (rem >= 2) {
@@ -972,6 +980,7 @@ static void emit_inst(Inst *inst, FILE *out) {
                 fprintf(out, "    slb %s, %s, %d\n", regname(tmp), regname(rdst), off2);
             }
         }
+        if (saved) fprintf(out, "    popr %s\n", regname(tmp));
         break;
     }
 

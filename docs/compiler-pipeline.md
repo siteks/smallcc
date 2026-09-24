@@ -82,6 +82,7 @@ Node* parse tree  (output of resolve_symbols / derive_types / insert_coercions)
       ├─ legalize_function() legalize.c  ISA/ABI lowering + post-OOS folding (see Legalize section)
       │   ├─ Pass A: pre-color IK_PARAM landing values (r1/r2/r3)
       │   ├─ Pass B: insert pre-colored IK_COPY for call args (r1/r2/r3) and IK_ICALL fp (r0)
+      │   ├─ Pass B2: attach IRC-allocated scratch def to IK_MEMCPY
       │   ├─ Pass C: lower IK_NEG/IK_NOT → IK_SUB(0,src)/IK_EQ(src,0) + explicit IK_CONST(0)
       │   ├─ Pass D: lower IK_ZEXT/IK_TRUNC → IK_CONST(mask) + IK_AND
       │   │           fast-path: TRUNC(VAL_CONST(k)) → IK_CONST(k & 0xff) for 8-bit truncation
@@ -177,7 +178,7 @@ typedef struct {
     int      nparams;
     Type   **param_types;
     bool     is_variadic;
-    bool     hidden_sret;  // struct-return: caller allocates buffer + passes pointer
+    bool     hidden_sret;  // struct-return flag (set but unused — see abi.md §4.4)
 } CallDesc;
 ```
 
@@ -208,10 +209,17 @@ String literals that appear inside function bodies are accumulated separately by
 
 ### Struct-returning functions
 
-Functions returning struct types use a hidden first parameter (sret pointer):
-- Callee receives the sret param as its first argument; writes the return value through it
-- Callsite allocates a stack temp, passes its address as the first arg
-- `CallDesc.hidden_sret = true` records this for emission
+Functions returning struct types do **not** use a hidden sret parameter
+(see `docs/abi.md` §4.4 for the full convention):
+- The callee builds the value in a slot in its own frame and returns that
+  slot's address in r0; declared args occupy the normal slots.
+- The returned pointer refers to the callee's dead frame, so every consumer
+  copies/reads through it immediately after the call, before any other call
+  or push: struct assignment memcpys right away; struct arguments memcpy
+  into the caller-owned §4.3 temp (`copy_struct_arg`); member access loads
+  directly.
+- `CallDesc.hidden_sret` is still set by `make_calldesc` but no pipeline
+  stage consumes it (vestige of an earlier design).
 
 ---
 
@@ -490,6 +498,16 @@ For each non-variadic `IK_CALL` or `IK_ICALL`:
   pointer, emitted **after** the argument copies so the fp value stays live through them.
 
 This replaces the `emit_reg_arg_copies` helper that used to live in `braun.c`.
+
+### Pass B2 — Attach a scratch def to IK_MEMCPY
+
+emit.c expands `IK_MEMCPY` as an inline load/store loop and needs a data
+register. Pass B2 gives each `IK_MEMCPY` a fresh dst value so IRC allocates
+that scratch; `build_interference_graph` adds explicit dst↔operand edges
+(the scratch is written between reads of the pointer operands, so it must
+not share their registers even though their live ranges may end at the
+memcpy). Historically the scratch was hardcoded to r2, which corrupted the
+second struct parameter's incoming pointer.
 
 ### Pass C — Lower IK_NEG / IK_NOT
 

@@ -401,6 +401,20 @@ static IGraph *build_interference_graph(Function *f) {
                     }
                 }
                 bv_clear(live, d);
+
+                // IK_MEMCPY's dst is the scratch for the inline copy loop
+                // (attached by legalize Pass B2). It is written between
+                // reads of the pointer operands, so it must not share a
+                // register with them even though their live ranges may
+                // end at this instruction.
+                if (inst->kind == IK_MEMCPY) {
+                    for (int oi = 0; oi < inst->nops; oi++) {
+                        Value *ov = val_resolve(inst->ops[oi]);
+                        if (ov && ov->kind == VAL_INST &&
+                            ov->id >= 0 && ov->id < nv && ov->id != d)
+                            ig_add_edge(g, d, ov->id);
+                    }
+                }
             }
 
             // Call-site interference: values that survive a call must not

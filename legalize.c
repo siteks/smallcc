@@ -65,6 +65,23 @@ void legalize_function(Function *f) {
         }
     }
 
+    // ── Pass B2: Attach a scratch def to IK_MEMCPY ──────────────────────
+    // emit.c expands IK_MEMCPY as an inline load/store loop and needs a
+    // data register. A hardcoded scratch clobbers whatever lives there
+    // (historically r2 — the second struct parameter's incoming pointer).
+    // Give the memcpy a dst value so IRC allocates the scratch;
+    // build_interference_graph adds explicit dst↔operand edges since the
+    // scratch is written between reads of the pointer operands.
+    for (int bi = 0; bi < f->nblocks; bi++) {
+        Block *b = f->blocks[bi];
+        for (Inst *inst = b->head; inst; inst = inst->next) {
+            if (inst->kind != IK_MEMCPY || inst->dst) continue;
+            Value *scratch = new_value(f, VAL_INST, VT_I32);
+            scratch->def = inst;
+            inst->dst = scratch;
+        }
+    }
+
     // ── Pass C: Lower IK_NEG (float) / IK_NOT ──────────────────────────
     // Integer IK_NEG is kept as-is: emit.c emits the native `neg rd` F1b
     // instruction (2 bytes) which does not need a zero register.

@@ -1236,9 +1236,54 @@ static CallDesc *make_calldesc(Type *fn_type) {
 // Helper: emit args list (Node* linked via ->next) into call inst
 // ============================================================
 
+// ABI §4.3: struct arguments are passed as a pointer to a caller-owned
+// copy. Allocate a fresh frame temp per struct argument and memcpy the
+// struct into it immediately after evaluating the argument, so that
+// (a) callee writes through its parameter never alias the caller's
+// variable, and (b) a struct produced by a nested call is secured from
+// the callee's dead frame before any later call's `enter` reuses that
+// stack area.
+static Value *copy_struct_arg(BraunCtx *ctx, Block **cur, Type *ty, Value *src) {
+    Function *f = ctx->f;
+    int size = ty->size;
+    f->frame_size = (f->frame_size + 3) & ~3;   // struct members may be 4-byte
+    f->frame_size += (size + 3) & ~3;
+    int off = -f->frame_size;
+    Block *b = *cur;
+    Value *tmp = emit_frame_addr(ctx, b, off);
+    Inst *mc = bi(ctx, b, IK_MEMCPY, NULL);
+    mc->imm  = size;
+    mc->size = size;
+    inst_add_op(mc, tmp);
+    inst_add_op(mc, src);
+    inst_append(b, mc);
+    return tmp;
+}
+
+// Effective value type of an argument expression. Struct-returning call
+// nodes deliberately keep the function (or fn-pointer) type in
+// derive_types; unwrap to the return type so struct-ness is visible.
+static Type *arg_value_type(Node *a) {
+    Type *t = a->type;
+    int is_call =
+        (a->kind == ND_IDENT   && a->u.ident.is_function) ||
+        (a->kind == ND_UNARYOP && a->u.unaryop.is_function) ||
+        (a->kind == ND_MEMBER  && a->u.member.is_function);
+    if (is_call && t) {
+        if (t->base == TB_POINTER && t->u.ptr.pointee &&
+            t->u.ptr.pointee->base == TB_FUNCTION)
+            t = t->u.ptr.pointee;
+        if (t->base == TB_FUNCTION) t = t->u.fn.ret;
+    }
+    return t;
+}
+
 static void cg_call_args(BraunCtx *ctx, Block **cur, Inst *call, Node *args_head) {
     for (Node *a = args_head; a; a = a->next) {
         Value *av = cg_expr(ctx, cur, a);
+        Type *aty = arg_value_type(a);
+        if (aty && aty->base == TB_STRUCT)
+            av = copy_struct_arg(ctx, cur, aty, av);
         inst_add_op(call, av);
     }
 }
@@ -1353,11 +1398,17 @@ static Value *braun_try_inline(BraunCtx *ctx, Block **cur, Symbol *fsym,
 
     Block *b = *cur;
 
-    // Evaluate arguments and write to callee's param symbols
+    // Evaluate arguments and write to callee's param symbols.
+    // Struct args get the same caller-owned copy as real calls (ABI §4.3):
+    // the inlined body reads/writes the copy, never the caller's variable,
+    // and a nested call's dead-frame result is secured immediately.
     Node *arg = args_head;
     for (int i = 0; i < ic->nparams; i++) {
         if (!arg) break;
         Value *av = cg_expr(ctx, cur, arg);
+        Type *aty = arg_value_type(arg);
+        if (aty && aty->base == TB_STRUCT)
+            av = copy_struct_arg(ctx, cur, aty, av);
         b = *cur;
         write_var(b, ic->param_syms[i], av);
         arg = arg->next;
@@ -1678,10 +1729,14 @@ static Value *cg_expr(BraunCtx *ctx, Block **cur, Node *n) {
 
     // ----------------------------------------------------------
     case ND_ASSIGN: {
-        // Struct assignment: memcpy
+        // Struct assignment: memcpy. The destination address is computed
+        // first: if the RHS is a struct-returning call, its result lives
+        // in the callee's dead frame and must be copied out before any
+        // other call (e.g. inside the LHS address expression) reuses
+        // that stack area.
         if (n->ch[0]->type && n->ch[0]->type->base == TB_STRUCT) {
-            Value *src = cg_expr(ctx, cur, n->ch[1]); b = *cur;
             Value *dst_v = cg_addr(ctx, cur, n->ch[0]); b = *cur;
+            Value *src = cg_expr(ctx, cur, n->ch[1]); b = *cur;
             Inst *mc = bi(ctx, b, IK_MEMCPY, NULL);
             mc->imm  = n->ch[0]->type->size;
             mc->size = n->ch[0]->type->size;

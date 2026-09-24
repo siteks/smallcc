@@ -70,6 +70,7 @@ compute_dominators()         recompute after CFG changes
 legalize_function()
   Pass A: pre-color params              always on (ABI correctness)
   Pass B: pre-color call args           always on (ABI correctness)
+  Pass B2: IK_MEMCPY scratch def        always on (correctness: emit.c copy-loop scratch)
   Pass C: lower NEG/NOT                 always on (emit.c has no fallback)
   Pass D: lower ZEXT/TRUNC             always on (emit.c has no fallback)
   Pass E: AND-chain fold       LEG_E   OPT_LEG_E

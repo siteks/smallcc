@@ -227,29 +227,52 @@ convention:
 Structs of any size are passed by reference, with the caller making a copy.
 The compiler:
 
-1. Allocates a stack temporary the size of the struct.
-2. Copies the struct argument into the temporary.
+1. Allocates a temporary in its own frame, the size of the struct (rounded
+   up to 4-byte alignment).
+2. Copies the struct argument into the temporary **immediately after
+   evaluating that argument** (before evaluating any later argument). This
+   matters when the argument is itself a struct-returning call — see §4.4:
+   the copy secures the value before any subsequent call reuses the stack.
 3. Passes the address of the temporary as a 4-byte pointer through the normal
    register/stack slot.
 
-The callee receives a pointer and dereferences as needed. There is no
+The callee receives a pointer and dereferences as needed. Because the copy is
+caller-owned and per-call-site, the callee may freely write through its
+parameter without affecting the caller's variable. There is no
 struct-by-value tail-call optimisation.
 
 ### 4.4 Struct return values
 
-Functions returning a struct use a hidden first parameter:
+Functions returning a struct do **not** use a hidden sret parameter. The
+convention is:
 
-1. The caller allocates a stack buffer the size of the return type.
-2. The caller passes the buffer's address as a hidden 0th argument in `r1`,
-   shifting the user's 1st argument to `r2`, etc.
-3. The callee writes the return value through the hidden pointer.
-4. The callee returns normally; `r0` is unused for the value.
+1. Declared arguments occupy the normal slots (r1–r3, then stack) — the same
+   layout as a scalar-returning function with the same parameter list.
+2. The callee builds the return value in a slot in its **own frame** and
+   returns that slot's address in `r0`.
+3. `ret` releases the callee's frame, so the returned pointer refers to
+   stack memory below the caller's `sp`. The pointed-to bytes remain valid
+   only until the next stack write below `sp` — i.e. until the next call
+   (`enter`) or push (`pushr`).
+4. The caller must therefore consume the result **immediately** after the
+   call, before emitting any other call or push. The compiler does this at
+   every consumption site: assignment (`s = f();`) emits the copy-out memcpy
+   directly after the call; use as an argument (`g(f(), …)`) copies into the
+   §4.3 caller-owned temporary directly after the inner call; member access
+   (`f().x`) loads through the pointer directly.
 
-The compiler signals this in the `CallDesc.hidden_sret` flag; both caller and
-callee must agree based on the function signature.
+This is deterministic on this target because nothing writes below `sp`
+asynchronously (no interrupts; neither `sim_c` nor the RTL touches stack
+memory spontaneously). Hand-written assembly or a foreign-language caller
+invoking a struct-returning function must follow the same rule: copy the
+result out of the dead frame before the next call or push.
 
-In practice, with 3 user arguments + 1 hidden sret pointer, only the first 2
-user arguments stay in registers (r2, r3); the 3rd spills to the stack.
+**Vestiges of an earlier hidden-sret design** exist in the compiler but are
+inert: `make_calldesc` sets `CallDesc.hidden_sret` (no CPU4 pipeline stage
+consumes it), and the parser shifts `SYM_PARAM` offsets up by 4 for
+struct-returning definitions (`shift_param_offsets_for_struct_ret`) — but
+`braun.c` assigns parameter slots positionally (`bp+4 + 4×slot` for stack
+params), ignoring those offsets, so the visible layout is unaffected.
 
 ### 4.5 Function pointers
 
@@ -368,9 +391,10 @@ compiler enforces each rule:
 | Args 1–3 → pre-colored copies | `legalize.c` Pass B |
 | Stack arg layout (bp+4, +8, …) | `braun.c` (`cg_call_args` push side; param-load side) |
 | Variadic stack-only convention | `braun.c` `is_variadic` branch in param setup |
-| Hidden sret pointer | `braun.c` `make_calldesc` + parser's `shift_param_offsets_for_struct_ret` |
+| Struct return: callee-local + immediate caller copy-out (§4.4) | `braun.c` (return of local's address; copy-out at each consumption site) |
 | r4–r7 callee-save | `alloc.c` `insert_callee_saves` (prologue stores, epilogue loads) |
-| Struct argument copy-and-pass | `braun.c` argument lowering |
+| Struct argument copy-and-pass (§4.3) | `braun.c` `copy_struct_arg` (used by `cg_call_args` and inline arg binding) |
+| Memcpy data scratch never clobbers live registers | `legalize.c` Pass B2 + `alloc.c` dst↔operand edges for `IK_MEMCPY` |
 | Local alignment | `types.c` `do_align` in `insert_local_ident`; `braun.c` for spill homes |
 | Spill-slot alignment | `alloc.c` `rewrite_spills` (round-up before reservation) |
 | `enter`/`ret` packing | `emit.c` prologue/epilogue emission |
@@ -387,4 +411,10 @@ There is no formal version number yet. Significant changes to date:
 
 - **(historical)** LP32 model: `int` and pointer were 2 bytes. Stack args at
   bp+8 (CPU3-era 8-byte enter overhead). Migrated to ILP32 in 2026.
+- **2026-07:** struct-by-value argument copies (§4.3) actually implemented
+  (previously the callee received the caller's variable address directly);
+  §4.4 rewritten to document the implemented struct-return convention
+  (callee-local slot returned in r0 + immediate caller copy-out) — the
+  hidden-sret scheme this section previously described was never
+  implemented.
 - **Current:** ILP32, packed-`enter` 4-byte overhead, stack args at bp+4.
