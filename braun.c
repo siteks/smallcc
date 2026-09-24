@@ -94,6 +94,28 @@ static void static_locals_push(int id, Symbol *sym, Node *init) {
     g_nsl++;
 }
 
+// Evaluate a scalar/element initializer that is a compile-time integer
+// literal, looking through the ND_CAST wrappers insert_coercions adds
+// (int literal -> short/char/unsigned/long) and a leading unary minus.
+// Returns 1 and stores the value in *out if the node is such a literal,
+// 0 otherwise. Shared by the BSS classifier, the assembly emitter and
+// the irsim byte renderer so the three cannot disagree (a previous
+// version checked init->kind == ND_LITERAL directly and so silently
+// zeroed `static short s = 0x1234;` and `static int n = -1;`).
+static int static_init_literal(Node *n, int *out) {
+    int neg = 1;
+    while (n && n->kind == ND_CAST) n = n->ch[1];
+    if (n && n->kind == ND_UNARYOP && n->op_kind == TK_MINUS) { neg = -1; n = n->ch[0]; }
+    while (n && n->kind == ND_CAST) n = n->ch[1];
+    if (!n || n->kind != ND_LITERAL || n->u.literal.strval) return 0;
+    *out = (int)n->u.literal.ival * neg;
+    return 1;
+}
+
+static int static_local_is_scalar(Type *ty) {
+    return ty && !istype_array(ty) && ty->base != TB_STRUCT;
+}
+
 // Returns 1 if the static local has no initializer or a zero scalar literal.
 static int static_local_is_bss(BStaticLocal *sl) {
     Node *init = sl->init_node;
@@ -108,9 +130,9 @@ static int static_local_is_bss(BStaticLocal *sl) {
      * bringing up NanoJPEG's static lookup tables under -target sim.) */
     if (ty && istype_array(ty) && init->kind == ND_INITLIST)
         return 0;
-    if (!istype_array(ty) && ty && ty->base != TB_STRUCT && init->kind == ND_LITERAL) {
-        if (init->u.literal.ival == 0) return 1;
-        return 0;
+    if (static_local_is_scalar(ty)) {
+        int v;
+        if (static_init_literal(init, &v)) return v == 0;
     }
     return 1;
 }
@@ -122,6 +144,13 @@ static void emit_static_local_data(FILE *out, BStaticLocal *sl) {
     Type   *ty   = sym->type;
     int     size = ty ? ty->size : 2;
 
+    // Same rule as the global emitter (emit.c gvar path): any multi-byte
+    // static must start on a 4-byte boundary. Without this, a static
+    // int/short/array following odd-length data (a string literal, a
+    // char array, a 2-byte static) lands at a 2- or 3-mod-4 address and
+    // the hardware word load silently returns the aligned neighbour
+    // (docs/issues/0001).
+    if (size >= 2) fprintf(out, "    align\n");
     fprintf(out, "_ls%d:", sl->id);
 
     // String-literal initializer for a char array (e.g. static char s[] = "hello")
@@ -134,12 +163,17 @@ static void emit_static_local_data(FILE *out, BStaticLocal *sl) {
         return;
     }
 
-    // Scalar integer initializer
-    if (!istype_array(ty) && ty && ty->base != TB_STRUCT && init && init->kind == ND_LITERAL) {
-        if (size <= 2)
-            fprintf(out, "\n    word %d\n", (int)init->u.literal.ival & 0xffff);
+    // Scalar integer initializer (literal, possibly behind coercion casts
+    // or a unary minus). Directive width follows the declared size so a
+    // 1-byte static never writes a 2-byte word.
+    int sv;
+    if (static_local_is_scalar(ty) && init && static_init_literal(init, &sv)) {
+        if (size == 1)
+            fprintf(out, "\n    byte %d\n", sv & 0xff);
+        else if (size == 2)
+            fprintf(out, "\n    word %d\n", sv & 0xffff);
         else
-            fprintf(out, "\n    long %d\n", (int)init->u.literal.ival);
+            fprintf(out, "\n    long %d\n", sv);
         return;
     }
 
@@ -153,12 +187,8 @@ static void emit_static_local_data(FILE *out, BStaticLocal *sl) {
         int   emitted = 0;
         fprintf(out, "\n");
         for (Node *el = init->ch[0]; el; el = el->next) {
-            Node *r = el;
-            int   neg = 1;
-            while (r && r->kind == ND_CAST) r = r->ch[1];
-            if (r && r->kind == ND_UNARYOP && r->op_kind == TK_MINUS) { neg = -1; r = r->ch[0]; }
-            while (r && r->kind == ND_CAST) r = r->ch[1];
-            int v = (r && r->kind == ND_LITERAL) ? (int)r->u.literal.ival * neg : 0;
+            int v = 0;
+            static_init_literal(el, &v);
             if      (esize == 1) fprintf(out, "    byte %d\n", v & 0xff);
             else if (esize == 2) fprintf(out, "    word %d\n", v & 0xffff);
             else if (esize == 4) fprintf(out, "    long %d\n", v);
@@ -209,10 +239,10 @@ unsigned char *braun_render_static_local(int i, char label_buf[32], int *len_out
         memcpy(buf, init->u.literal.strval, (size_t)init->u.literal.strval_len);
         return buf;  // trailing NUL from calloc
     }
-    if (!istype_array(ty) && ty && ty->base != TB_STRUCT && init && init->kind == ND_LITERAL) {
-        long long v = init->u.literal.ival;
+    int sv;
+    if (static_local_is_scalar(ty) && init && static_init_literal(init, &sv)) {
         for (int j = 0; j < size && j < 4; j++)
-            buf[j] = (unsigned char)((v >> (j * 8)) & 0xff);
+            buf[j] = (unsigned char)(((unsigned)sv >> (j * 8)) & 0xff);
         return buf;
     }
     if (ty && istype_array(ty) && init && init->kind == ND_INITLIST) {
@@ -220,12 +250,8 @@ unsigned char *braun_render_static_local(int i, char label_buf[32], int *len_out
         int   esize = etype ? etype->size : 1;
         int   off = 0;
         for (Node *el = init->ch[0]; el && off + esize <= cap; el = el->next) {
-            Node *r = el;
-            int   neg = 1;
-            while (r && r->kind == ND_CAST) r = r->ch[1];
-            if (r && r->kind == ND_UNARYOP && r->op_kind == TK_MINUS) { neg = -1; r = r->ch[0]; }
-            while (r && r->kind == ND_CAST) r = r->ch[1];
-            int v = (r && r->kind == ND_LITERAL) ? (int)r->u.literal.ival * neg : 0;
+            int v = 0;
+            static_init_literal(el, &v);
             for (int j = 0; j < esize && j < 4; j++)
                 buf[off + j] = (unsigned char)(((unsigned)v >> (j * 8)) & 0xff);
             off += esize;

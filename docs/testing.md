@@ -70,6 +70,7 @@ All values are hex. `H:1` means halted normally. `putchar` output goes to
 | Write watchpoints | Writes to addresses below `0x5000` print to stderr — useful for catching stray stores into the code/data area |
 | Crash trace | On unknown opcode, dumps the last 32 executed instructions |
 | Immediate range checks | The assembler rejects out-of-range immediates (e.g. F2 imm7) instead of silently masking them |
+| Data alignment checks | The assembler rejects a `long` directive at a non-4-aligned address or a `word` directive at an odd address, naming the preceding label (docs/issues/0001) |
 | MMIO cycle counter | 32-bit read-only counter at `0xFF00`, incremented once per instruction |
 
 ### Memory model

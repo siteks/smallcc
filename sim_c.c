@@ -600,6 +600,7 @@ static void assemble_cpu4(const char *src)
     for (int pass = 1; pass <= 2; pass++) {
         int cur = 0;
         int lineno = 0;
+        char last_label[MAX_NAME] = "<none>";  /* named in alignment errors */
         char *p = buf;
         while (*p) {
             char *eol = strchr(p, '\n');
@@ -669,6 +670,8 @@ static void assemble_cpu4(const char *src)
                     for (char *c = lname; *c; c++)
                         if (isspace((unsigned char)*c)) { *c = '\0'; break; }
                     if (pass == 1) add_sym(lname, (uint16_t)cur);
+                    strncpy(last_label, lname, MAX_NAME-1);
+                    last_label[MAX_NAME-1] = '\0';
                     lp = colon + 1;
                     while (*lp && isspace((unsigned char)*lp)) lp++;
                     if (*lp == '\0') continue;
@@ -714,6 +717,11 @@ static void assemble_cpu4(const char *src)
                 continue;
             }
             if (strcmp(mnem, "word") == 0) {
+                if (pass == 2 && (cur & 1)) {
+                    fprintf(stderr, "asm error (line %d): word directive at unaligned address 0x%04x (after label %s); insert 'align' before the label (docs/issues/0001)\n",
+                            cur_lineno+1, (unsigned)cur, last_label);
+                    exit(1);
+                }
                 for (int i = 0; i < nops; i++) {
                     if (pass == 2) write16((uint16_t)cur, (uint16_t)parse_tok(ops[i], pass));
                     cur += 2;
@@ -721,6 +729,11 @@ static void assemble_cpu4(const char *src)
                 continue;
             }
             if (strcmp(mnem, "long") == 0) {
+                if (pass == 2 && (cur & 3)) {
+                    fprintf(stderr, "asm error (line %d): long directive at unaligned address 0x%04x (after label %s); insert 'align' before the label (docs/issues/0001)\n",
+                            cur_lineno+1, (unsigned)cur, last_label);
+                    exit(1);
+                }
                 for (int i = 0; i < nops; i++) {
                     if (pass == 2) write32((uint16_t)cur, parse_tok(ops[i], pass));
                     cur += 4;
