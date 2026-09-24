@@ -80,7 +80,7 @@ def gen_md():
 def expected_label(d):
     """The case-label value decode.v uses for this instruction, per format."""
     op, sub, f = d['op'], d['subop'], d['fmt']
-    return {'F0a': op & 0xf, 'F0b': (op - 0x10) * 2 + sub, 'F0c': (op >> 4) & 1, 'F1a': (op - 0x40) >> 1,
+    return {'F0a': op & 0xf, 'F0b': (op - 0x10) * 2 + sub, 'F0c': (op >> 4) & 1, 'F1a': op >> 1,   # decode.v cases on byte0[7:1]
             'F1b': sub, 'F2': (op >> 2) & 0xf, 'F3a': op & 3, 'F3b': (op >> 1) & 1, 'F3c': op & 0xf,
             'F3d': sub, 'F3e': (op >> 3) & 3}[f]
 
