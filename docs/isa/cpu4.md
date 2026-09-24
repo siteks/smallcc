@@ -33,6 +33,14 @@ Memory is 65536 bytes. Data is little-endian. The stack starts at `sp = 0xF000` 
 
 ## Instruction Encoding
 
+**Source of truth:** `cpu4/isa.py` defines every mnemonic's format, opcode
+bits, operands and immediate shape. `cpu4/gen_isa.py` generates `sim_c`'s
+table, `cpu.py`'s table and the assembler's pseudo-ops, and the per-format
+tables in [cpu4-encoding.md](cpu4-encoding.md); `make isa` regenerates,
+`make isa-check` (part of `make test`) fails if a generated copy is stale, and
+the hardware repo's `make isa-check` compares `decode.v`'s case labels with
+it. Add or change an instruction there first.
+
 Eleven formats with variable widths (1, 2, or 3 bytes). The format is determined by the top
 bits of the first byte:
 

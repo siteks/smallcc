@@ -38,23 +38,12 @@ class Item:
         return s
 
 
-# Pseudo-ops: name -> (real_mnemonic, lambda(operands) -> new_operands)
-PSEUDOS = {
-    'mov':  ('or',   lambda ops: [ops[0], ops[1], ops[1]]),
-    'gt':   ('lt',   lambda ops: [ops[0], ops[2], ops[1]]),
-    'ge':   ('le',   lambda ops: [ops[0], ops[2], ops[1]]),
-    'gts':  ('lts',  lambda ops: [ops[0], ops[2], ops[1]]),
-    'ges':  ('les',  lambda ops: [ops[0], ops[2], ops[1]]),
-    'fgt':  ('flt',  lambda ops: [ops[0], ops[2], ops[1]]),
-    'fge':  ('fle',  lambda ops: [ops[0], ops[2], ops[1]]),
-    'bgt':  ('blt',  lambda ops: [ops[1], ops[0], ops[2]]),
-    'bge':  ('ble',  lambda ops: [ops[1], ops[0], ops[2]]),
-    'bgts': ('blts', lambda ops: [ops[1], ops[0], ops[2]]),
-    'bges': ('bles', lambda ops: [ops[1], ops[0], ops[2]]),
-}
-
-# F3b branch mnemonics use PC-relative imm10
-BRANCHES = {'beq', 'bne', 'blt', 'ble', 'blts', 'bles'}
+# Pseudo-ops and PC-relative branch set come from the encoding source of
+# truth (cpu4/isa.py via the generated isa_table.py).
+from isa_table import PSEUDOS as _ISA_PSEUDOS, PCREL_BRANCHES
+PSEUDOS = {n: (real, (lambda p: (lambda ops: [ops[k] for k in p]))(perm))
+           for n, (real, perm) in _ISA_PSEUDOS.items()}
+BRANCHES = {n for n in PCREL_BRANCHES if n in ('beq', 'bne', 'blt', 'ble', 'blts', 'bles')}
 
 
 def is_reg(s):

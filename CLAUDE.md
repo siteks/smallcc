@@ -169,7 +169,7 @@ Per-TU loop [smallcc.c] (lib TUs first, then user TUs):
 - @docs/architecture.md — tokeniser, parser (grammar, AST nodes), type system, per-TU compilation
 - @docs/compiler-pipeline.md — CPU4 nanopass pipeline: lowering, Braun SSA, IRC, emission
 - @docs/optimization-passes.md — pass catalog, bitmask system, LICM/CSE tuning constants, emission peepholes
-- @docs/isa/cpu4.md — CPU4 registers, instruction set, assembly syntax
+- @docs/isa/cpu4.md — CPU4 registers, instruction set, assembly syntax (encoding tables generated from `cpu4/isa.py`, the source of truth: edit it, run `make isa`)
 - @docs/abi.md — calling convention, frame layout, type sizes, symbol naming, MMIO map (the contract between compiler and hardware)
 - @docs/c89-status.md — compliance tables, deliberate deviations, what's implemented/missing
 - @docs/testing.md — test systems and debugging tips

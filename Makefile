@@ -6,10 +6,19 @@ SRCS_NEW    = sx.c lower.c ssa.c braun.c dom.c oos.c opt.c legalize.c alloc.c em
 
 smallcc: $(SRCS_COMMON) $(SRCS_NEW) cpu4/fpu_model.h cpu4/fpu_roms.h
 	$(CC) $(CFLAGS) -o smallcc $(SRCS_COMMON) $(SRCS_NEW) -lm
-sim_c: sim_c.c cpu4/fpu_model.h cpu4/fpu_roms.h
+sim_c: sim_c.c cpu4/fpu_model.h cpu4/fpu_roms.h cpu4/isa_table_c.h
 	$(CC) $(CFLAGS) -O2 -o sim_c sim_c.c -lm
 
-test: smallcc sim_c
+isa:
+	python3 cpu4/gen_isa.py
+
+isa-check:
+	python3 cpu4/gen_isa.py --check
+
+cpu4/isa_table_c.h cpu4/isa_table.py: cpu4/isa.py cpu4/gen_isa.py
+	python3 cpu4/gen_isa.py
+
+test: smallcc sim_c isa-check
 	python3 -m pytest tests/cases/ -q
 	python3 -m pytest tests/cases/ -q --irsim
 
@@ -52,4 +61,4 @@ help:
 	@echo "Misc"
 	@echo "  clean      Remove compiler, simulator, and temp files"
 
-.PHONY: test test_v test_p test_irsim test_irsim_v test_irsim_p clean help
+.PHONY: isa isa-check test test_v test_p test_irsim test_irsim_v test_irsim_p clean help

@@ -23,9 +23,11 @@ sea-of-processors project. This file is the contract between the two.
 ## The ISA/ABI change rule
 
 An ISA or ABI change is **one commit in smallcc** that touches, together:
-`docs/isa/cpu4.md` (or `docs/abi.md`), `sim_c.c`, `cpu4/cpu.py`, the compiler
-(emit/legalize/assembler tables) and at least one corpus test that exercises
-the change. It is followed by **one commit downstream** that updates the RTL
+`cpu4/isa.py` (the encoding source of truth; `make isa` regenerates the
+simulator and assembler tables and `docs/isa/cpu4-encoding.md`),
+`docs/isa/cpu4.md` (or `docs/abi.md`) for the semantics, `sim_c.c` and
+`cpu4/cpu.py` for the execution, the compiler (emit/legalize) and at least
+one corpus test that exercises the change. It is followed by **one commit downstream** that updates the RTL
 and bumps the submodule pointer. There is never a downstream-only change to
 ISA semantics, and never a "temporary" local copy of the RTL or the spec.
 

@@ -4,6 +4,7 @@
 import re
 import struct
 import numpy as np
+from isa_table import PTABLE
 
 import sys
 
@@ -120,6 +121,9 @@ import sys
 #   jlr     lr = pc; pc = rd & 0xffff
 #   jr      pc = rd & 0xffff
 #   ssp     sp = rd & 0xffff
+#   neg     rd = -rd
+#   frecip  rd = 1 / rd
+#   frsqrt  rd = 1 / sqrt(rd)
 #   __putchar   rd
 #   
 #   Format 2 - one op + imm7; stack frame access (16 slots)
@@ -166,6 +170,10 @@ import sys
 #   beqz    pc = rx==0 ? (pc + sxt(imm10)) : pc
 #   bnez    pc = rx!=0 ? (pc + sxt(imm10)) : pc
 #   dbnz    pc = --rx!=0 ? (pc + sxt(imm10)) : pc
+#   bltz    pc = rx<0 ? (pc + sxt(imm10)) : pc
+#   bgez    pc = rx>=0 ? (pc + sxt(imm10)) : pc
+#   bgtz    pc = rx>0 ? (pc + sxt(imm10)) : pc
+#   blez    pc = rx<=0 ? (pc + sxt(imm10)) : pc
 #
 #   Format 3e - one op + imm16 (4 slots)
 #   immw    rd = imm16
@@ -309,145 +317,8 @@ class G:
         'align':    1,
     }
 
-    # Fields are a) first byte b) num extra bytes c) subformat d) subopcode
-    ptable = {
-        # format 0a - zero op, 8 bits   0000oooo
-        # This space will be used for hot code ops after analysis
-        'halt'  :   (0x00, 0, 0, 0),
-        'ret'   :   (0x01, 0, 0, 0),
-        'zero0' :   (0x02, 0, 0, 0),
-        'zero1' :   (0x03, 0, 0, 0),
-        'zero2' :   (0x04, 0, 0, 0),
-        'zero3' :   (0x05, 0, 0, 0),
-        'zero4' :   (0x06, 0, 0, 0),
-        'zero5' :   (0x07, 0, 0, 0),
-        'zero6' :   (0x08, 0, 0, 0),
-        'zero7' :   (0x09, 0, 0, 0),
-        # format 0b - two op + imm9     0001ooooodddxxxiiiiiiiii
-        'addli' :   (0x10, 2, 1, 0),
-        'subli' :   (0x10, 2, 1, 1),
-        'mulli' :   (0x11, 2, 1, 0),
-        'divli' :   (0x11, 2, 1, 1),
-        'modli' :   (0x12, 2, 1, 0),
-        'shlli' :   (0x12, 2, 1, 1),
-        'shrli' :   (0x13, 2, 1, 0),
-        'leli'  :   (0x13, 2, 1, 1),
-        'gtli'  :   (0x14, 2, 1, 0),
-        'eqli'  :   (0x14, 2, 1, 1),
-        'neli'  :   (0x15, 2, 1, 0),
-        'andli' :   (0x15, 2, 1, 1),
-        'orli'  :   (0x16, 2, 1, 0),
-        'xorli' :   (0x16, 2, 1, 1),
-        'lesli' :   (0x17, 2, 1, 0),
-        'gtsli' :   (0x17, 2, 1, 1),
-        'divsli':   (0x18, 2, 1, 0),
-        'modsli':   (0x18, 2, 1, 1),
-        'shrsli':   (0x19, 2, 1, 0),
-        'bitex' :   (0x19, 2, 1, 1),
-        'rsubli':   (0x1a, 2, 1, 0),
-        'rdivli':   (0x1a, 2, 1, 1),
-        'rmodli':   (0x1b, 2, 1, 0),
-        'rdivsli':  (0x1b, 2, 1, 1),
-        # format 0c - one op + imm17    001odddiiiiiiiiiiiiiiiii
-        'cbeq'  :   (0x20, 2, 2, 0),
-        'cbne'  :   (0x30, 2, 2, 0),
-        # format 1a - three op, 16 bits 01ooooodddxxxyyy
-        'add'   :   (0x40, 1, 0, 0),
-        'sub'   :   (0x42, 1, 0, 0),
-        'mul'   :   (0x44, 1, 0, 0),
-        'div'   :   (0x46, 1, 0, 0),
-        'mod'   :   (0x48, 1, 0, 0),
-        'shl'   :   (0x4a, 1, 0, 0),
-        'shr'   :   (0x4c, 1, 0, 0),
-        'lt'    :   (0x4e, 1, 0, 0),
-        'le'    :   (0x50, 1, 0, 0),
-        'eq'    :   (0x52, 1, 0, 0),
-        'ne'    :   (0x54, 1, 0, 0),
-        'and'   :   (0x56, 1, 0, 0),
-        'or'    :   (0x58, 1, 0, 0),
-        'xor'   :   (0x5a, 1, 0, 0),
-        'lts'   :   (0x5c, 1, 0, 0),
-        'les'   :   (0x5e, 1, 0, 0),
-        'divs'  :   (0x60, 1, 0, 0),
-        'mods'  :   (0x62, 1, 0, 0),
-        'shrs'  :   (0x64, 1, 0, 0),
-        'fadd'  :   (0x66, 1, 0, 0),
-        'fsub'  :   (0x68, 1, 0, 0),
-        'fmul'  :   (0x6a, 1, 0, 0),
-        'fdiv'  :   (0x6c, 1, 0, 0),
-        'flt'   :   (0x6e, 1, 0, 0),
-        'fle'   :   (0x70, 1, 0, 0),
-        'zxwor' :   (0x72, 1, 0, 0),
-        'sxwor' :   (0x74, 1, 0, 0),
-        # format 1b - one op, 16 bits   0111111dddoooooo
-        # this format escapes to give large space for single op no imm
-        'sxb'   :   (0x7e, 1, 1, 0x00),
-        'sxw'   :   (0x7e, 1, 1, 0x01),
-        'inc'   :   (0x7e, 1, 1, 0x02),
-        'dec'   :   (0x7e, 1, 1, 0x03),
-        'pushr' :   (0x7e, 1, 1, 0x04),
-        'popr'  :   (0x7e, 1, 1, 0x05),
-        'zxb'   :   (0x7e, 1, 1, 0x06),
-        'zxw'   :   (0x7e, 1, 1, 0x07),
-        'itof'  :   (0x7e, 1, 1, 0x08),
-        'ftoi'  :   (0x7e, 1, 1, 0x09),
-        'jlr'   :   (0x7e, 1, 1, 0x0a),
-        'jr'    :   (0x7e, 1, 1, 0x0b),
-        'ssp'   :   (0x7e, 1, 1, 0x0c),
-        'neg'   :   (0x7e, 1, 1, 0x0d),
-        'frecip':   (0x7e, 1, 1, 0x0e),
-        'frsqrt':   (0x7e, 1, 1, 0x0f),
-        'putchar':  (0x7e, 1, 1, 0x3f),
-        # format 2 - one op + imm7      10ooooxxxiiiiiii
-        'lb'    :   (0x80, 1, 0, 0),
-        'lw'    :   (0x84, 1, 0, 0),
-        'll'    :   (0x88, 1, 0, 0),
-        'sb'    :   (0x8c, 1, 0, 0),
-        'sw'    :   (0x90, 1, 0, 0),
-        'sl'    :   (0x94, 1, 0, 0),
-        'lbx'   :   (0x98, 1, 0, 0),
-        'lwx'   :   (0x9c, 1, 0, 0),
-        'addi'  :   (0xa0, 1, 0, 0),
-        'shli'  :   (0xa4, 1, 0, 0),
-        'andi'  :   (0xa8, 1, 0, 0),
-        'shrsi' :   (0xac, 1, 0, 0),
-        'imms'  :   (0xb0, 1, 0, 0),
-        # format 3a - zero op + imm16   110000ooiiiiiiiiiiiiiiii
-        'j'     :   (0xc0, 2, 0, 0),
-        'jl'    :   (0xc1, 2, 0, 0),
-        'enter' :   (0xc2, 2, 0, 0),
-        # format 3b - one op + imm14    110001odddiiiiiiiiiiiiii
-        'adjw'  :   (0xc4, 2, 1, 0),
-        'lea'   :   (0xc6, 2, 1, 0),
-        # format 3c - two op + imm10    1101ooooxxxyyyiiiiiiiiii
-        'llb'   :   (0xd0, 2, 2, 0),
-        'llw'   :   (0xd1, 2, 2, 0),
-        'lll'   :   (0xd2, 2, 2, 0),
-        'slb'   :   (0xd3, 2, 2, 0),
-        'slw'   :   (0xd4, 2, 2, 0),
-        'sll'   :   (0xd5, 2, 2, 0),
-        'llbx'  :   (0xd6, 2, 2, 0),
-        'llwx'  :   (0xd7, 2, 2, 0),
-        'beq'   :   (0xd8, 2, 2, 0),
-        'bne'   :   (0xd9, 2, 2, 0),
-        'blt'   :   (0xda, 2, 2, 0),
-        'ble'   :   (0xdb, 2, 2, 0),
-        'blts'  :   (0xdc, 2, 2, 0),
-        'bles'  :   (0xdd, 2, 2, 0),
-        # format 3d - one op + imm10    11011111xxxoooiiiiiiiiii
-        'beqz'  :   (0xdf, 2, 3, 0x00),
-        'bnez'  :   (0xdf, 2, 3, 0x01),
-        'dbnz'  :   (0xdf, 2, 3, 0x02),
-        'bltz'  :   (0xdf, 2, 3, 0x03),
-        'bgez'  :   (0xdf, 2, 3, 0x04),
-        'bgtz'  :   (0xdf, 2, 3, 0x05),
-        'blez'  :   (0xdf, 2, 3, 0x06),
-        # format 3e - one op + imm16    111ooxxxiiiiiiiiiiiiiiii
-        'immw'  :   (0xe0, 2, 4, 0),
-        'immwh' :   (0xe8, 2, 4, 0),
-        'jz'    :   (0xf0, 2, 4, 0),
-        'jnz'   :   (0xf8, 2, 4, 0),
-    }
+    # Encoding table generated from cpu4/isa.py (see isa_table.py); edit isa.py, run `make isa`.
+    ptable = PTABLE
 
     # The key becomes (first byte, subop). the value is (instr, length, subfmt, subopcode)
     rptable = {(v[0], v[3]) : (k, v[1], v[2]) for k, v in ptable.items()}
