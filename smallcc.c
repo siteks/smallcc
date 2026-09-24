@@ -517,6 +517,7 @@ int main(int argc, char **argv)
                     {"leg_f",          OPT_LEG_F},
                     {"leg_g",          OPT_LEG_G},
                     {"leg_h",          OPT_LEG_H},
+                    {"fmadd",          OPT_FMADD},
                     {NULL, 0}
                 };
                 int found = 0;

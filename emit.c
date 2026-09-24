@@ -793,6 +793,36 @@ static void emit_inst(Inst *inst, FILE *out) {
         fprintf(out, "    itof %s\n", regname(rd));
         break;
     }
+    case IK_FRECIP: case IK_FRSQRT: {
+        if (!dst || inst->nops < 1) break;
+        int r1 = get_val_reg(out, inst->ops[0], rd);
+        emit_mov(out, rd, r1);
+        fprintf(out, "    %s %s\n", inst->kind == IK_FRECIP ? "frecip" : "frsqrt", regname(rd));
+        break;
+    }
+    case IK_FMADD: case IK_FMSUB: {
+        // Two-address: rd = fadd/fsub(rd, fmul(ra, rb)).  IRC tries to give the
+        // accumulator rd's register (coalesce_copies treats the pair as
+        // move-related); otherwise move it first, unless the move would
+        // clobber a multiply operand, in which case fall back to the
+        // two-instruction sequence through rd.
+        if (!dst || inst->nops < 3) break;
+        int racc = get_val_reg(out, inst->ops[0], rd);
+        int ra   = get_val_reg(out, inst->ops[1], rd == racc ? 0 : rd);
+        int rb   = get_val_reg(out, inst->ops[2], rd == racc ? 1 : rd);
+        const char *mn = inst->kind == IK_FMADD ? "fmadd" : "fmsub";
+        if (racc == rd) {
+            fprintf(out, "    %s %s, %s, %s\n", mn, regname(rd), regname(ra), regname(rb));
+        } else if (ra != rd && rb != rd) {
+            emit_mov(out, rd, racc);
+            fprintf(out, "    %s %s, %s, %s\n", mn, regname(rd), regname(ra), regname(rb));
+        } else {
+            fprintf(out, "    fmul %s, %s, %s\n", regname(rd), regname(ra), regname(rb));
+            fprintf(out, "    %s %s, %s, %s\n", inst->kind == IK_FMADD ? "fadd" : "fsub",
+                    regname(rd), regname(racc), regname(rd));
+        }
+        break;
+    }
     case IK_FTOI: {
         if (!dst || inst->nops < 1) break;
         int r1 = get_val_reg(out, inst->ops[0], rd);
@@ -1118,7 +1148,8 @@ static void emit_inst(Inst *inst, FILE *out) {
 // ============================================================
 
 typedef struct {
-    int         fused;     // 0=none, 1=P5 two-reg, 2=P5+ const-operand, 3=P6 zero-test, 4=P17 cbeq/cbne
+    int         fused;     // 0=none, 1=P5 two-reg, 2=P5+ const-operand, 3=P6 zero-test, 4=P17 cbeq/cbne, 5=P21 signed zero-compare (bltz family)
+    const char *imnem;     // P21: mnemonic with the branch sense inverted
     const char *mnem;      // F3c branch mnemonic (beq/bne/blt/ble/blts/bles)
     int         p0, p1;    // physical registers of the comparison operands
     int         const_val; // P5+: the constant operand's value
@@ -1882,7 +1913,10 @@ static int detect_branch_fusions(Function *f, BranchFuse *fuse,
             }
         }
         const char *mnem = fused_branch_mnemonic(def->kind);
-        if (!mnem) continue;
+        // Float compares have no F3c branch form, but a float compare against
+        // zero has the F3d form (P21 below); let those through.
+        int is_fcmp = (def->kind == IK_FLT || def->kind == IK_FLE);
+        if (!mnem && !is_fcmp) continue;
 
         // Fusion correctness invariant: every value that will be marked
         // is_dead by the paths below (P6 / P5 / P17 / P5+) must have no
@@ -1959,6 +1993,37 @@ static int detect_branch_fusions(Function *f, BranchFuse *fuse,
                 continue;
             }
         }
+
+        // P21: signed compare against zero → one F3d instruction
+        // (bltz/bgez/bgtz/blez).  Covers int `x < 0` etc. and float compares
+        // against 0.0f on the bit pattern under the ISA's signed-zero/NaN
+        // deviation policy (docs/isa/cpu4.md, F3d).  Same ±511-byte reach as
+        // the F3c forms, so it shares `in_range`.
+        if (in_range && def->nops >= 2 &&
+            (def->kind == IK_LT || def->kind == IK_LE || def->kind == IK_FLT || def->kind == IK_FLE)) {
+            int z0 = is_known_zero(dop0), z1 = is_known_zero(dop1);
+            int is_le = (def->kind == IK_LE || def->kind == IK_FLE);
+            Value *tv = NULL; const char *mn = NULL, *imn = NULL;
+            if (z1 && dop0 && dop0->kind == VAL_INST && dop0->phys_reg >= 0) {        // x < 0, x <= 0
+                tv = dop0; mn = is_le ? "blez" : "bltz"; imn = is_le ? "bgtz" : "bgez";
+            } else if (z0 && dop1 && dop1->kind == VAL_INST && dop1->phys_reg >= 0) { // 0 < x, 0 <= x
+                tv = dop1; mn = is_le ? "bgez" : "bgtz"; imn = is_le ? "bltz" : "blez";
+            }
+            if (tv) {
+                def->is_dead = 1;
+                Value *zero_v = (tv == dop0) ? dop1 : dop0;
+                if (zero_v && zero_v->kind == VAL_INST && zero_v->def && zero_v->use_count <= 1)
+                    zero_v->def->is_dead = 1;
+                fuse[fbi].fused = 5;
+                fuse[fbi].mnem  = mn;
+                fuse[fbi].imnem = imn;
+                fuse[fbi].p0    = tv->phys_reg;
+                committed++;
+                continue;
+            }
+        }
+
+        if (!mnem) continue;   // float compare not against zero: unfused
 
         // P17: cbeq/cbne — EQ/NE with 7-bit unsigned const, short-range.
         // Checked before P5 because when a constant has been materialised to
@@ -2101,6 +2166,10 @@ static void emit_fused_branch(FILE *out, const BranchFuse *bf, int cond_reg,
         fprintf(out, "    %s %s, %d, _%s_B%d\n",
                 (bf->is_eq ^ invert) ? "cbeq" : "cbne",
                 regname(bf->p0), bf->const_val, fname, target_id);
+        break;
+    case 5:  // P21: signed compare against zero (F3d)
+        fprintf(out, "    %s %s, _%s_B%d\n",
+                invert ? bf->imnem : bf->mnem, regname(bf->p0), fname, target_id);
         break;
     default: // unfused: plain jnz/jz on the condition register
         fprintf(out, "    %s %s, _%s_B%d\n", invert ? "jz" : "jnz",
@@ -2252,7 +2321,7 @@ static int emit_rotated_branch(Function *f, FILE *out, Inst *inst,
     // path emits an unfused jnz/jz (F3e, 16-bit absolute) which has no range
     // limit; the fused == 3 path also emits jz/jnz (F3e). We only need to
     // guard the F3c/F0c forms.
-    if ((fuse[hbi].fused == 1 || fuse[hbi].fused == 2 || fuse[hbi].fused == 4)
+    if ((fuse[hbi].fused == 1 || fuse[hbi].fused == 2 || fuse[hbi].fused == 4 || fuse[hbi].fused == 5)
         && block_start && hdr_br->target) {
         int tgt_id = hdr_br->target->id;
         int tgt_off = block_start[tgt_id];
@@ -2394,7 +2463,7 @@ static void emit_function_body(Function *f, FILE *out, BranchFuse *fuse,
                 // block, branch on the inverted condition to the false target
                 // and drop the trailing j.  Only the single-register forms
                 // (unfused / P6 / P17) have an inverted mnemonic.
-                int can_invert = (fz == 0 || fz == 3 || fz == 4);
+                int can_invert = (fz == 0 || fz == 3 || fz == 4 || fz == 5);
                 int inverted = can_invert && inst->target == next_blk &&
                                inst->target2;
                 Block *tgt = inverted ? inst->target2 : inst->target;

@@ -158,7 +158,7 @@ static const char *instname(InstKind k) {
         "shl","shr","ushr","and","or","xor","neg","not",
         "lt","ult","le","ule","eq","ne",
         "fadd","fsub","fmul","fdiv","flt","fle","feq","fne",
-        "itof","ftoi","sext8","sext16","zext","trunc",
+        "itof","frecip","frsqrt","fmadd","fmsub","ftoi","sext8","sext16","zext","trunc",
         "load","store","addr","gaddr","memcpy",
         "call","icall","putchar",
         "br","jmp","ret","switch",

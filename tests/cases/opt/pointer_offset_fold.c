@@ -1,4 +1,5 @@
 // EXPECT_R0: 73
+// TIMEOUT: 4000000
 // Loads/stores through p + k fold the constant into the access offset when
 // it fits the register-relative encoding, including negative offsets and
 // offsets at the edge of the imm10*size range; larger ones stay as adds.

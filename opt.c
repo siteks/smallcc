@@ -448,7 +448,7 @@ static int is_cse_pure(InstKind k) {
     case IK_EQ:   case IK_NE:
     case IK_FADD: case IK_FSUB: case IK_FMUL: case IK_FDIV:
     case IK_FLT:  case IK_FLE:  case IK_FEQ:  case IK_FNE:
-    case IK_ITOF: case IK_FTOI:
+    case IK_ITOF: case IK_FTOI: case IK_FRECIP: case IK_FRSQRT: case IK_FMADD: case IK_FMSUB:
     case IK_SEXT8: case IK_SEXT16: case IK_ZEXT: case IK_TRUNC:
     case IK_GADDR: case IK_CONST:
         return 1;

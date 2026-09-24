@@ -26,6 +26,23 @@
 #include <stdio.h>
 #include <math.h>
 
+#include "cpu4/fpu_roms.h"
+/* Same definitions as sim_c (the executable spec); see cpu4/gen_fpu_roms.py. */
+static uint32_t irsim_frecip_seed(uint32_t x) {
+    uint32_t sign = x & 0x80000000u, e = (x >> 23) & 0xff, i = (x >> 13) & 0x3ff;
+    if (e == 0 && (x & 0x7fffff) == 0) return 0;
+    uint32_t ee = (i == 0) ? (254 - e) : (253 - e);
+    return sign | ((ee & 0xff) << 23) | ((uint32_t)FRECIP_ROM[i] << 7);
+}
+static uint32_t irsim_frsqrt_seed(uint32_t x) {
+    uint32_t e = (x >> 23) & 0xff, m = x & 0x7fffff;
+    if (e == 0)   return 0x7f800000u;
+    if (e == 255) return 0;
+    uint32_t p = (~e) & 1, i = (p << 9) | (m >> 14);
+    uint32_t ee = (e & 1) ? (379 - e) / 2 : (380 - e) / 2;
+    return ((ee & 0xff) << 23) | ((uint32_t)FRSQRT_ROM[i] << 7);
+}
+
 /* =========================================================================
  * IrSim struct
  * ========================================================================= */
@@ -454,6 +471,23 @@ static Block *execute_block(IrSim *sim, Block *b, SimFrame *frame)
             float fv = (float)iv;
             uint32_t rv; memcpy(&rv, &fv, 4);
             set_val(vreg, dst, rv);
+            break;
+        }
+        case IK_FRECIP: case IK_FRSQRT: {
+            if (!dst || inst->nops < 1) break;
+            uint32_t x = get_val(vreg, inst->ops[0]);
+            set_val(vreg, dst, inst->kind == IK_FRECIP ? irsim_frecip_seed(x) : irsim_frsqrt_seed(x));
+            break;
+        }
+        case IK_FMADD: case IK_FMSUB: {
+            if (!dst || inst->nops < 3) break;
+            float acc, a, b, prod, r;
+            uint32_t ba = get_val(vreg, inst->ops[0]), bb = get_val(vreg, inst->ops[1]), bc = get_val(vreg, inst->ops[2]);
+            memcpy(&acc, &ba, 4); memcpy(&a, &bb, 4); memcpy(&b, &bc, 4);
+            prod = a * b;                                   /* fmul then fadd/fsub, as the ISA defines it */
+            r = (inst->kind == IK_FMADD) ? acc + prod : acc - prod;
+            uint32_t rb; memcpy(&rb, &r, 4);
+            set_val(vreg, dst, rb);
             break;
         }
         case IK_FTOI: {

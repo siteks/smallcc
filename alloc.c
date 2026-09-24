@@ -310,21 +310,26 @@ static void coalesce_copies(IGraph *g, Function *f, int K) {
         for (int bi = 0; bi < f->nblocks; bi++) {
             Block *b = f->blocks[bi];
             for (Inst *inst = b->head; inst; inst = inst->next) {
-                if (inst->kind != IK_COPY || inst->is_dead || inst->nops < 1) continue;
+                // IK_FMADD/IK_FMSUB are two-address (dst wants ops[0]'s register):
+                // treat (dst, ops[0]) as move-related; on success nothing is
+                // deleted, emission just sees the registers coincide.
+                int is_copy = (inst->kind == IK_COPY);
+                int is_acc  = (inst->kind == IK_FMADD || inst->kind == IK_FMSUB);
+                if ((!is_copy && !is_acc) || inst->is_dead || inst->nops < 1) continue;
                 Value *vdst = val_resolve(inst->dst);
                 Value *vsrc = val_resolve(inst->ops[0]);
-                if (!vdst || !vsrc || vdst == vsrc) { inst->is_dead = 1; changed = 1; continue; }
+                if (!vdst || !vsrc || vdst == vsrc) { if (is_copy) { inst->is_dead = 1; changed = 1; } continue; }
                 if (vdst->kind != VAL_INST || vsrc->kind != VAL_INST) continue;
                 if (vdst->id < 0 || vsrc->id < 0 ||
                     vdst->id >= g->nv || vsrc->id >= g->nv) continue;
 
                 int u = ig_find(g, vdst->id);
                 int v = ig_find(g, vsrc->id);
-                if (u == v) { inst->is_dead = 1; changed = 1; continue; }
+                if (u == v) { if (is_copy) { inst->is_dead = 1; changed = 1; } continue; }
 
                 // Both precolored: only coalesce if same forced register
                 if (g->precolored[u] >= 0 && g->precolored[v] >= 0) {
-                    if (g->precolored[u] == g->precolored[v])
+                    if (g->precolored[u] == g->precolored[v] && is_copy)
                         { inst->is_dead = 1; changed = 1; }
                     continue;
                 }
@@ -341,7 +346,7 @@ static void coalesce_copies(IGraph *g, Function *f, int K) {
 
                 if (can_coalesce_george(g, u, v, K)) {
                     ig_merge(g, u, v);
-                    inst->is_dead = 1;
+                    if (is_copy) inst->is_dead = 1;
                     changed = 1;
                 }
             }

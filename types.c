@@ -592,6 +592,12 @@ void make_basic_types()
     Param *p = arena_alloc(sizeof(Param));
     p->type  = t_int;
     insert_builtin("__putchar", get_function_type(t_int, p, false));
+    {
+        Param *fp = arena_alloc(sizeof(Param));
+        fp->type = t_float; fp->next = NULL;
+        insert_builtin("__builtin_frsqrt", get_function_type(t_float, fp, false));
+        insert_builtin("__builtin_frecip", get_function_type(t_float, fp, false));
+    }
 
     // Register va_list as a typedef for int so the normal typedef path handles it.
     Symbol *va = arena_alloc(sizeof(Symbol));

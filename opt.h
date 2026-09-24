@@ -29,6 +29,7 @@
 #define OPT_LEG_F          (1u << 10)  // materialize large VAL_CONST operands
 #define OPT_LEG_G          (1u << 11)  // frame-slot IK_ADDR + load/store → bp-relative F2 form
 #define OPT_LEG_H          (1u << 12)  // frame-slot store→load forwarding + dead private stores
+#define OPT_FMADD          (1u << 13)  // form fmadd/fmsub (opt-in until the RTL has them: -Opass=fmadd)
 
 // Presets
 #define OPT_ALL            0x1FFFu     // all 13 bits

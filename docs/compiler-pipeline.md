@@ -574,6 +574,16 @@ forwarded directly — keeping one live past its working copy collides with the
 next pre-coloured value in the same register, which IRC cannot repair. Such a
 value is forwarded through a fresh `IK_COPY` placed after its definition.
 
+### Pass I — fmadd/fmsub formation (opt-in, `OPT_FMADD`)
+
+`FADD(x, FMUL(a,b))`, `FADD(FMUL(a,b), x)` and `FSUB(x, FMUL(a,b))` become
+`IK_FMADD`/`IK_FMSUB (x, a, b)` when the product has no other use. The ISA
+defines `fmadd` as the same two roundings, so this is exact. The op is
+two-address (`rd` is the accumulator): IRC's `coalesce_copies` treats
+`(dst, ops[0])` as move-related, and emission falls back to `mov` + `fmadd`,
+or `fmul` + `fadd` through `rd` when the move would clobber a multiply
+operand. Off by default until the RTL implements the op (`-Opass=fmadd`).
+
 ### Pass E — AND-chain constant folding
 
 Folds `AND(AND(x, c1), c2) → AND(x, c1 & c2)` when both c1 and c2 are compile-time
@@ -733,6 +743,8 @@ used callee-saved register (r4–r7). Callee saves are stored **below** the spil
 | `IK_STORE [ra+0], rb` (other) | `slw/slb/sll rb, [ra+0]` |
 | `IK_COPY rd, rs` | `or rd, rs, rs` (mov pseudo) |
 | `IK_MEMCPY dst, src, n` | inlined word/byte moves (always; no libcall) |
+| `IK_FRECIP` / `IK_FRSQRT` (`__builtin_frecip/frsqrt`) | `frecip rd` / `frsqrt rd` (F1b seeds) |
+| `IK_FMADD rd, acc, a, b` | `fmadd rd, a, b` when `rd` is `acc`'s register |
 | `IK_CALL "fname"` | `jl fname` |
 | `IK_ICALL fp` | `jlr` (fp in r0) |
 | `IK_BR cond, T, F` | `jnz rx, T_label`; `j F_label` (both branches explicit) |
@@ -843,6 +855,14 @@ After:  cbeq r6, 44, _f_B7                  (3 bytes, 1 instruction)
 Supports branch inversion: when the true target is the fall-through block, emits the
 inverted instruction (`cbeq` ↔ `cbne`) branching to the false target, eliminating the
 trailing `j` instruction.
+
+**P21 — Signed compare against zero → F3d branch**
+
+`IK_LT`/`IK_LE` (signed) or `IK_FLT`/`IK_FLE` with one operand a known zero,
+feeding an `IK_BR`, emit one of `bltz`/`bgez`/`bgtz`/`blez` (F3d, ±511 bytes,
+inverted mnemonic available for the fall-through case). Float compares use
+the operand's bit pattern, which matches IEEE except for −0.0 and NaN, per
+the ISA's stated deviation policy. Checked after P6 and before P17.
 
 **P18 — MUL(x, const) → mulli**
 

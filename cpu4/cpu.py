@@ -174,6 +174,31 @@ import sys
 #   jnz     pc = rd!=0 ? imm16 : pc
 
 
+_ROM_DIR = __import__('os').path.dirname(__import__('os').path.abspath(__file__))
+def _load_rom(name):
+    with open(__import__('os').path.join(_ROM_DIR, name)) as fh:
+        return [int(l, 16) for l in fh.read().split()]
+FRECIP_ROM = _load_rom('frecip_rom.hex')
+FRSQRT_ROM = _load_rom('frsqrt_rom.hex')
+
+def frecip_seed(x):
+    """ISA frecip: reciprocal seed from the 1024-entry ROM (see gen_fpu_roms.py)."""
+    x &= 0xffffffff
+    sign = x & 0x80000000; e = (x >> 23) & 0xff; i = (x >> 13) & 0x3ff
+    if e == 0 and (x & 0x7fffff) == 0: return 0
+    ee = (254 - e) if i == 0 else (253 - e)
+    return sign | ((ee & 0xff) << 23) | (FRECIP_ROM[i] << 7)
+
+def frsqrt_seed(x):
+    """ISA frsqrt: reciprocal-square-root seed (sign ignored)."""
+    x &= 0xffffffff
+    e = (x >> 23) & 0xff; m = x & 0x7fffff
+    if e == 0: return 0x7f800000
+    if e == 255: return 0
+    p = (~e) & 1; i = (p << 9) | (m >> 14)
+    ee = (379 - e) // 2 if (e & 1) else (380 - e) // 2
+    return ((ee & 0xff) << 23) | (FRSQRT_ROM[i] << 7)
+
 def f2b(f):
     """Convert Python float to 32-bit IEEE 754 bit pattern (unsigned int)."""
     return struct.unpack('<I', struct.pack('<f', float(f)))[0]
@@ -265,6 +290,8 @@ class G:
         'fle'   :   (0x70, 1, 0, 0),
         'zxwor' :   (0x72, 1, 0, 0),
         'sxwor' :   (0x74, 1, 0, 0),
+        'fmadd' :   (0x76, 1, 0, 0),
+        'fmsub' :   (0x78, 1, 0, 0),
         # format 1b - one op, 16 bits   0111111dddoooooo
         # this format escapes to give large space for single op no imm
         'sxb'   :   (0x7e, 1, 1, 0x00),
@@ -281,6 +308,8 @@ class G:
         'jr'    :   (0x7e, 1, 1, 0x0b),
         'ssp'   :   (0x7e, 1, 1, 0x0c),
         'neg'   :   (0x7e, 1, 1, 0x0d),
+        'frecip':   (0x7e, 1, 1, 0x0e),
+        'frsqrt':   (0x7e, 1, 1, 0x0f),
         'putchar':  (0x7e, 1, 1, 0x3f),
         # format 2 - one op + imm7      10ooooxxxiiiiiii
         'lb'    :   (0x80, 1, 0, 0),
@@ -322,6 +351,10 @@ class G:
         'beqz'  :   (0xdf, 2, 3, 0x00),
         'bnez'  :   (0xdf, 2, 3, 0x01),
         'dbnz'  :   (0xdf, 2, 3, 0x02),
+        'bltz'  :   (0xdf, 2, 3, 0x03),
+        'bgez'  :   (0xdf, 2, 3, 0x04),
+        'bgtz'  :   (0xdf, 2, 3, 0x05),
+        'blez'  :   (0xdf, 2, 3, 0x06),
         # format 3e - one op + imm16    111ooxxxiiiiiiiiiiiiiiii
         'immw'  :   (0xe0, 2, 4, 0),
         'immwh' :   (0xe8, 2, 4, 0),
@@ -623,6 +656,8 @@ class CPU:
         elif    i == 'fadd':    s.r[dst] = f2b(b2f(s.r[src0]) + b2f(s.r[src1]))
         elif    i == 'fsub':    s.r[dst] = f2b(b2f(s.r[src0]) - b2f(s.r[src1]))
         elif    i == 'fmul':    s.r[dst] = f2b(b2f(s.r[src0]) * b2f(s.r[src1]))
+        elif    i == 'fmadd':   s.r[dst] = f2b(b2f(s.r[dst]) + b2f(f2b(b2f(s.r[src0]) * b2f(s.r[src1]))))
+        elif    i == 'fmsub':   s.r[dst] = f2b(b2f(s.r[dst]) - b2f(f2b(b2f(s.r[src0]) * b2f(s.r[src1]))))
         elif    i == 'fdiv':    s.r[dst] = f2b(b2f(s.r[src0]) / b2f(s.r[src1]))
         elif    i == 'flt':     s.r[dst] = b2f(s.r[src0]) < b2f(s.r[src1])
         elif    i == 'fle':     s.r[dst] = b2f(s.r[src0]) <= b2f(s.r[src1])
@@ -643,6 +678,8 @@ class CPU:
         elif    i == 'jr':      s.pc = s.r[src0]
         elif    i == 'ssp':     s.sp = s.r[src0]
         elif    i == 'neg':     s.r[dst] = -sext(s.r[src0], 32)
+        elif    i == 'frecip':  s.r[dst] = frecip_seed(s.r[src0])
+        elif    i == 'frsqrt':  s.r[dst] = frsqrt_seed(s.r[src0])
         elif    i == 'putchar': sys.stderr.write(chr(s.r[src0] & 0xff)); sys.stderr.flush()
         # f2
         elif    i == 'lb':      s.r[dst] = m.read8(s.bp + sext(imm, 7))
@@ -683,6 +720,10 @@ class CPU:
         # f3d
         elif    i == 'beqz':    s.pc = s.pc + sext(imm, 10) if s.r[src0] == 0 else s.pc
         elif    i == 'bnez':    s.pc = s.pc + sext(imm, 10) if s.r[src0] != 0 else s.pc
+        elif    i == 'bltz':    s.pc = s.pc + sext(imm, 10) if sext(s.r[src0], 32) <  0 else s.pc
+        elif    i == 'bgez':    s.pc = s.pc + sext(imm, 10) if sext(s.r[src0], 32) >= 0 else s.pc
+        elif    i == 'bgtz':    s.pc = s.pc + sext(imm, 10) if sext(s.r[src0], 32) >  0 else s.pc
+        elif    i == 'blez':    s.pc = s.pc + sext(imm, 10) if sext(s.r[src0], 32) <= 0 else s.pc
         elif    i == 'dbnz':    s.r[src0] -= 1; s.pc = s.pc + sext(imm, 10) if s.r[src0] != 0 else s.pc
         # f3e
         elif    i == 'immw':    s.r[dst] = imm

@@ -100,7 +100,10 @@ class CTestItem(pytest.Item):
             # IR interpreter: smallcc -arch cpu4 -runoos/-runirc prints r0 to stdout,
             # putchar output to stderr — no separate simulator step needed.
             run_cmd = [str(root / 'smallcc'), '-arch', 'cpu4',
-                       f'-{self.arch}'] + files
+                       f'-{self.arch}']
+            if 'CFLAGS' in meta:
+                run_cmd += meta['CFLAGS'].split()
+            run_cmd += files
             sim = subprocess.run(run_cmd, capture_output=True, text=True)
 
             assert sim.returncode == 0, \
@@ -132,7 +135,10 @@ class CTestItem(pytest.Item):
 
             # Compile with -arch cpu4 -target <target>
             compile_cmd = [str(root / 'smallcc'), '-arch', 'cpu4',
-                           '-target', target, '-o', asm] + files
+                           '-target', target, '-o', asm]
+            if 'CFLAGS' in meta:                      # // CFLAGS: -Opass=fmadd  (verbatim compiler flags)
+                compile_cmd += meta['CFLAGS'].split()
+            compile_cmd += files
 
             proc = subprocess.run(compile_cmd, capture_output=True, text=True)
 

@@ -1526,6 +1526,17 @@ static Value *cg_expr(BraunCtx *ctx, Block **cur, Node *n) {
                 return new_const(ctx->f, 0, VT_I16);
             }
 
+            // Builtin float seeds: __builtin_frsqrt(x), __builtin_frecip(x)
+            if (sym->kind == SYM_BUILTIN &&
+                (strcmp(sym->name, "__builtin_frsqrt") == 0 || strcmp(sym->name, "__builtin_frecip") == 0)) {
+                Value *arg = cg_expr(ctx, cur, args_head); b = *cur;
+                Value *dst = new_value(ctx->f, VAL_INST, VT_F32);
+                Inst *inst = bi(ctx, b, strcmp(sym->name, "__builtin_frsqrt") == 0 ? IK_FRSQRT : IK_FRECIP, dst);
+                inst_add_op(inst, arg);
+                inst_append(b, inst);
+                return dst;
+            }
+
             if (istype_function(sym->type)) {
                 // Try inlining first
                 Value *inlined = braun_try_inline(ctx, cur, sym, args_head, call_vt);
