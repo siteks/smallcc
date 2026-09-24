@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Cross-Repo Coordination
 
-CPU4 spans three repos with their own Claude Code contexts: this one (`smallcc`, the compiler + reference simulator + ISA/ABI specs), `../cpu4_hardware` (the RTL implementation), and `../coremark_single_file` (the benchmark). Read **@coordination.md** before making changes that touch the ISA, the ABI, or anything visible across the repo boundary. Short version: read freely from any repo, write only to your own, route ISA/ABI changes through the human, file cross-repo bugs as test-corpus entries.
+smallcc is a self-contained repo: the C compiler, the reference simulators (`sim_c`, `irsim`, `cpu4/cpu.py`), the CPU4 ISA and ABI specs, the test corpus, the fuzzer and the CoreMark bench all live here and work with no hardware. It is also consumed as a git submodule (`toolchain/smallcc`) by the CPU4 sea-of-processors project, whose RTL, boards, runtime libraries and applications live in the parent monorepo when this checkout is that submodule (`../..` from here). Read **@coordination.md** before making changes that touch the ISA, the ABI, or anything visible across that boundary. Short version: the spec and `sim_c` are canonical and live here; an ISA/ABI change is one commit here that updates spec, simulators, compiler and a corpus test together, followed by a downstream commit that updates the RTL and bumps the submodule.
 
 ## Debugging Rule
 
@@ -58,13 +58,12 @@ Tests are pytest-collected `.c` files under `tests/cases/` with `EXPECT_R0`/`EXP
 
 ### CoreMark Benchmark
 
-Use `../coremark_single_file` for testing — it is a single-file CoreMark with 1 iteration
-and performance-run seeds, suitable for quick validation and profiling:
+`bench/coremark/coremark_single.c` is a single-file CoreMark (1 iteration,
+performance-run seeds) suitable for quick validation and profiling:
 
 ```bash
-cd ../coremark_single_file
-../smallcc/smallcc -arch cpu4 -o coremark.s coremark_single.c
-../smallcc/sim_c -arch cpu4 -maxsteps 4000000 coremark.s
+./smallcc -arch cpu4 -o bench/coremark/coremark.s bench/coremark/coremark_single.c
+./sim_c -arch cpu4 -maxsteps 4000000 bench/coremark/coremark.s
 # Expect: "Errors detected" — this is ONLY the 10-second minimum-runtime
 # check failing on a 1-iteration run and is immaterial for compiler work.
 # The real correctness signal is the CRC set: seedcrc 0xe9f5,
@@ -73,22 +72,11 @@ cd ../coremark_single_file
 
 To generate an execution profile:
 ```bash
-cd ../coremark_single_file
-../smallcc/smallcc -arch cpu4 -o coremark_single.s coremark_single.c
-../smallcc/sim_c -arch cpu4 -maxsteps 4000000 -profile coremark_single.s > profile.s
+./sim_c -arch cpu4 -maxsteps 4000000 -profile bench/coremark/coremark.s > bench/coremark/profile.s
 ```
 
-The multi-file CoreMark in `../coremark` can also be used for multi-iteration runs:
-```bash
-cd ../coremark
-../smallcc/smallcc -Icpu3 -I. -arch cpu4 \
-  -DFLAGS_STR=\""-DPERFORMANCE_RUN=1  "\" \
-  -DITERATIONS=10 -DPERFORMANCE_RUN=1 \
-  -o ./coremark4.s \
-  core_list_join.c core_main.c core_matrix.c core_state.c core_util.c cpu3/core_portme.c
-../smallcc/sim_c -arch cpu4 -maxsteps 20000000 coremark4.s
-# Expect: "Correct operation validated" (needs ITERATIONS>=10 to pass min runtime check)
-```
+See `bench/coremark/README.md` for provenance and licence. The multi-file
+EEMBC tree is not vendored; the single-file port is a faithful concatenation.
 
 ---
 

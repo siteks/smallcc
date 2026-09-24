@@ -1,83 +1,41 @@
 # Cross-Repo Coordination
 
-CPU4 spans three closely-coupled but independently-versioned repos:
+smallcc is a standalone repo and also the toolchain submodule of the CPU4
+sea-of-processors project. This file is the contract between the two.
 
-| Repo | Owns | Lives at |
-|---|---|---|
-| `smallcc` | Compiler, reference simulator (`sim_c`, `cpu4/cpu.py`), ISA spec, ABI spec, test corpus | this repo |
-| `cpu4_hardware` | RTL implementation of the ISA, FPGA build, hardware tests | `../cpu4_hardware` |
-| `coremark_single_file` | Benchmark sources tuned for this target | `../coremark_single_file` |
-
-Each repo has its own Claude Code context. This file is the contract for how
-those contexts coordinate without stepping on each other.
-
-## Read freely, write your own column
-
-Each Claude **may read** any of the other repos at will. Reading is
-zero-cost and avoids round-tripping facts through the human. The hardware
-Claude consulting `sim_c.c` to confirm semantics, or the compiler Claude
-checking RTL timing, is exactly the right thing.
-
-Each Claude **must only write** to its own repo. No cross-repo edits — even
-"obvious" fixes — without the human ratifying first. This keeps version
-ownership clear and prevents two contexts from racing on the same source of
-truth.
+| Where | Owns |
+|---|---|
+| `smallcc` (this repo) | Compiler, `sim_c` / `irsim` / `cpu4/cpu.py`, **ISA spec** (`docs/isa/cpu4.md`), **ABI spec** (`docs/abi.md`), the test corpus (`tests/cases/`), fuzzer, CoreMark bench, compiler intrinsics and the simulator's device models (MMIO, multi-core `-cores`, SoC tile `-soc`) |
+| processor monorepo (`../..` when this checkout is its `toolchain/smallcc` submodule) | RTL and FPGA boards (`hw/`), host tools, runtime libraries (CSP channels, BIOS), applications (ray tracer), hardware-only tests, system-level docs |
 
 ## Canonical artifacts
 
-Three documents are the contract between repos. They live in `smallcc`
-because that's where the compiler keeps its references; the hardware repo
-should symlink (or git-submodule) them, not copy:
+- **`docs/isa/cpu4.md`** wins all ties. **`sim_c.c`** is the executable spec:
+  when the doc is ambiguous, what `sim_c` does is what the compiler targets and
+  what the hardware must match. A doc/`sim_c` discrepancy is a spec bug to fix
+  here.
+- **`docs/abi.md`** is the software contract; hardware sees it only through the
+  instructions the compiler emits.
+- **`tests/cases/`** is the single corpus. Downstream runs these same files
+  through the submodule path; it never keeps a copy. Hardware-only cases
+  (device model, SoC) live downstream.
 
-- **`docs/isa/cpu4.md`** — the ISA spec. Encoding, semantics, mnemonics.
-  When the spec changes, both compiler and hardware update against it. The
-  spec wins all ties.
-- **`docs/abi.md`** — the ABI. Calling convention, frame layout, types.
-  Visible to hardware mainly for tooling (debuggers, profilers); compiler
-  enforces it.
-- **`tests/cases/`** — the test corpus. Each `.c` file with `EXPECT_R0`
-  metadata is a reproducible behavioural check. Adding to the corpus is the
-  primary way bugs get pinned down across repos: the discovering Claude
-  writes a test, the responsible Claude makes it pass.
+## The ISA/ABI change rule
 
-  **The smallcc copy is canonical.** The hardware repo should consume the
-  same files (symlink or submodule), not maintain a parallel copy — historical
-  duplication has already drifted (smallcc has 3 files the hardware copy
-  doesn't, e.g. `tests/cases/multifile/main.c`). When either Claude writes a
-  new reproducer it lands in `smallcc/tests/cases/`; the hardware test runner
-  picks it up via the symlink. New tests follow the existing subdirectory
-  convention (`coremark/`, `array/`, etc.).
+An ISA or ABI change is **one commit in smallcc** that touches, together:
+`docs/isa/cpu4.md` (or `docs/abi.md`), `sim_c.c`, `cpu4/cpu.py`, the compiler
+(emit/legalize/assembler tables) and at least one corpus test that exercises
+the change. It is followed by **one commit downstream** that updates the RTL
+and bumps the submodule pointer. There is never a downstream-only change to
+ISA semantics, and never a "temporary" local copy of the RTL or the spec.
 
-`sim_c` is the de-facto executable spec — when the ISA doc is ambiguous,
-`sim_c.c` is what the compiler targets and what the hardware should match.
-Discrepancies between the doc and `sim_c` are spec bugs to be filed.
+Submodule discipline: commit and push here before bumping the pointer
+downstream, so the recorded commit is always resolvable.
 
-## When to involve the human
+## Proposals
 
-- **ISA changes** (new instruction, encoding tweak, semantics change). The
-  proposing Claude writes a short delta doc covering opcode, encoding,
-  semantics, motivation, expected impact. Human ratifies; both Claudes then
-  implement against the amended spec.
-- **ABI changes** (calling convention, struct layout, type sizes). Same
-  workflow as ISA changes — the changes are visible across the boundary.
-- **Cross-repo bug investigations.** Once the discovering Claude has a
-  minimal reproducer, the human relays it to the right side. The reproducer
-  belongs in the test corpus.
-
-## What not to do
-
-- **Don't sync MEMORY.md across Claudes.** Each session's memory is local
-  context. Anything that should outlive the session goes in a checked-in doc.
-- **Don't have one Claude run another's tooling indirectly.** If the
-  hardware Claude needs a smallcc-compiled assembly, it asks the human (or
-  reads a checked-in `.s` from the test corpus). Avoids version-skew.
-- **Don't duplicate ISA / ABI text into each repo.** Symlink or submodule.
-  Two physical copies will drift.
-
-## Lightweight handoff format
-
-When a finding does need to cross repos, a one-paragraph spec-delta note is
-the format:
+Anyone (either side, either Claude session) can propose a change with a short
+spec-delta note:
 
 > **Subject:** widen F0c imm7 → imm8 for cbeq/cbne
 > **Why:** profile shows 8% of dynamic loads have constants in [128, 255],
@@ -87,5 +45,17 @@ the format:
 > **Compiler impact:** P17 cap goes from 127 to 255; range from ±511 to ±255.
 > **Hardware impact:** decoder bit-slice change.
 
-Either Claude can write that. Larger changes graduate to a `docs/proposals/`
-document. The human ratifies and both implement.
+Larger proposals are documents under `docs/proposals/` in the monorepo. When
+a proposal is accepted the ISA-facing part lands here with the change, per the
+rule above. `docs/handoffs/` holds the historical cross-repo handoffs from
+when the hardware was a separate repo; new ones are not needed.
+
+## Working across the boundary
+
+- A Claude Code session at the monorepo root may edit both trees; the commits
+  are still two, in the order above.
+- Cross-boundary bugs are pinned down as corpus entries: the discovering side
+  writes a minimal `.c` reproducer under `tests/cases/`, the responsible side
+  makes it pass.
+- Don't rely on session memory to carry facts across sessions or repos.
+  Anything that should outlive a session goes in a checked-in doc.

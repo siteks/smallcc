@@ -324,16 +324,13 @@ for bit in $(seq 0 10); do
     name=$(echo "fold_br dead_blocks copy_prop cse redundant_bool \
         narrow_loads licm jump_thread unroll \
         leg_e leg_f" | awk "{print \$$((bit+1))}")
-    cd ../coremark_single_file
-    ../smallcc/smallcc -Omask=$mask -arch cpu4 -o coremark.s coremark_single.c 2>/dev/null
-    cycles=$(../smallcc/sim_c -arch cpu4 -maxsteps 4000000 coremark.s 2>&1 | grep -o 'cycles:[0-9]*' | cut -d: -f2)
+    ./smallcc -Omask=$mask -arch cpu4 -o bench/coremark/coremark.s bench/coremark/coremark_single.c 2>/dev/null
+    cycles=$(./sim_c -arch cpu4 -maxsteps 4000000 bench/coremark/coremark.s 2>&1 | grep -o 'cycles:[0-9]*' | cut -d: -f2)
     echo "without $name (mask=$mask): $cycles cycles"
-    cd ../smallcc
 done
 echo "all on (mask=0x7FF):"
-cd ../coremark_single_file
-../smallcc/smallcc -arch cpu4 -o coremark.s coremark_single.c 2>/dev/null
-../smallcc/sim_c -arch cpu4 -maxsteps 4000000 coremark.s 2>&1 | grep -o 'cycles:[0-9]*'
+./smallcc -arch cpu4 -o bench/coremark/coremark.s bench/coremark/coremark_single.c 2>/dev/null
+./sim_c -arch cpu4 -maxsteps 4000000 bench/coremark/coremark.s 2>&1 | grep -o 'cycles:[0-9]*'
 ```
 
 ---

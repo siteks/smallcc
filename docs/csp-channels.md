@@ -7,7 +7,7 @@ open questions.
 
 ## Problem statement
 
-The CPU4 hardware (`../cpu4_hardware`) is an 8-context barrel processor:
+The CPU4 hardware (`hw/` in the processor monorepo) is an 8-context barrel processor:
 8 hardware threads share an 8-stage pipeline with one context per stage.
 Each context already has its own PC, SP, BP, LR, halt flag, and 8 GPRs;
 contexts are functionally independent processes that happen to share BRAM
@@ -267,7 +267,7 @@ auxiliary mask register written via a control-register move).
 
 ## Hardware sketch
 
-A new `chan_unit.v` module in `../cpu4_hardware/rtl/`:
+A new `chan_unit.v` module in the monorepo's `hw/rtl/`:
 
 ```
 chan_unit

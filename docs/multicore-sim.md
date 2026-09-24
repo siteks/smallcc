@@ -1,7 +1,7 @@
 # sim_c multi-core mode (`-cores N`)
 
 Added 2026-07-12 to support the sea-of-processors ray-tracer demo
-(`../ray_tracer`); designed to be the behavioural reference for the future
+(`sw/raytracer` in the processor monorepo); designed to be the behavioural reference for the future
 multi-core RTL. Single-core behaviour (`-cores 1`, the default) is exactly
 the historical simulator — same state line, same cycle counts, byte-identical
 outputs; the whole existing test corpus passes unchanged.

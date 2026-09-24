@@ -28,7 +28,7 @@ landing diverged from the original plan:
 
 ## Motivation
 
-The CPU4 hardware target (`../cpu4_hardware`) has a 32 MB SDRAM available
+The CPU4 hardware target (`hw/` in the processor monorepo) has a 32 MB SDRAM available
 behind the pbus, while CPU code and stack live in 64 KB of BRAM. The CPU's
 register width is already 32 bits, and the load/store instructions whose base
 operand is a register (`llb`/`llw`/`lll` and stores in F3c) already accept a
