@@ -61,8 +61,6 @@ typedef enum {
     IK_ITOF,
     IK_FRECIP,  // dst = frecip seed of ops[0]
     IK_FRSQRT,  // dst = frsqrt seed of ops[0]
-    IK_FMADD,   // dst = fadd(ops[0], fmul(ops[1], ops[2]))  (two-address: dst wants ops[0]'s register)
-    IK_FMSUB,   // dst = fsub(ops[0], fmul(ops[1], ops[2]))
     IK_FTOI,
     IK_SEXT8,
     IK_SEXT16,

@@ -26,22 +26,7 @@
 #include <stdio.h>
 #include <math.h>
 
-#include "cpu4/fpu_roms.h"
-/* Same definitions as sim_c (the executable spec); see cpu4/gen_fpu_roms.py. */
-static uint32_t irsim_frecip_seed(uint32_t x) {
-    uint32_t sign = x & 0x80000000u, e = (x >> 23) & 0xff, i = (x >> 13) & 0x3ff;
-    if (e == 0 && (x & 0x7fffff) == 0) return 0;
-    uint32_t ee = (i == 0) ? (254 - e) : (253 - e);
-    return sign | ((ee & 0xff) << 23) | ((uint32_t)FRECIP_ROM[i] << 7);
-}
-static uint32_t irsim_frsqrt_seed(uint32_t x) {
-    uint32_t e = (x >> 23) & 0xff, m = x & 0x7fffff;
-    if (e == 0)   return 0x7f800000u;
-    if (e == 255) return 0;
-    uint32_t p = (~e) & 1, i = (p << 9) | (m >> 14);
-    uint32_t ee = (e & 1) ? (379 - e) / 2 : (380 - e) / 2;
-    return ((ee & 0xff) << 23) | ((uint32_t)FRSQRT_ROM[i] << 7);
-}
+#include "cpu4/fpu_model.h"
 
 /* =========================================================================
  * IrSim struct
@@ -429,35 +414,24 @@ static Block *execute_block(IrSim *sim, Block *b, SimFrame *frame)
         /* ---- Float ALU ---- */
         case IK_FADD: case IK_FSUB: case IK_FMUL: case IK_FDIV: {
             if (!dst || inst->nops < 2) break;
-            uint32_t av = get_val(vreg, inst->ops[0]);
-            uint32_t bv = get_val(vreg, inst->ops[1]);
-            float a, b;
-            memcpy(&a, &av, 4); memcpy(&b, &bv, 4);
-            float r;
+            uint32_t a = get_val(vreg, inst->ops[0]), b = get_val(vreg, inst->ops[1]), r;
             switch (inst->kind) {
-            case IK_FADD: r = a + b; break;
-            case IK_FSUB: r = a - b; break;
-            case IK_FMUL: r = a * b; break;
-            default:       r = b != 0.0f ? a / b : 0.0f; break;
+            case IK_FADD: r = cpu4_fadd(a, b); break;
+            case IK_FSUB: r = cpu4_fsub(a, b); break;
+            case IK_FMUL: r = cpu4_fmul(a, b); break;
+            default:      r = cpu4_fdiv(a, b); break;
             }
-            uint32_t rv; memcpy(&rv, &r, 4);
-            set_val(vreg, dst, rv);
+            set_val(vreg, dst, r);
             break;
         }
-
-        /* ---- Float comparisons ---- */
         case IK_FLT: case IK_FLE: case IK_FEQ: case IK_FNE: {
             if (!dst || inst->nops < 2) break;
-            uint32_t av = get_val(vreg, inst->ops[0]);
-            uint32_t bv = get_val(vreg, inst->ops[1]);
-            float a, b;
-            memcpy(&a, &av, 4); memcpy(&b, &bv, 4);
-            uint32_t r;
+            uint32_t a = get_val(vreg, inst->ops[0]), b = get_val(vreg, inst->ops[1]), r;
             switch (inst->kind) {
-            case IK_FLT: r = (a < b) ? 1u : 0u; break;
-            case IK_FLE: r = (a <= b) ? 1u : 0u; break;
-            case IK_FEQ: r = (a == b) ? 1u : 0u; break;
-            default:     r = (a != b) ? 1u : 0u; break;
+            case IK_FLT: r = cpu4_flt(a, b); break;
+            case IK_FLE: r = cpu4_fle(a, b); break;
+            case IK_FEQ: r = (a == b); break;
+            default:     r = (a != b); break;
             }
             set_val(vreg, dst, r);
             break;
@@ -467,34 +441,18 @@ static Block *execute_block(IrSim *sim, Block *b, SimFrame *frame)
         case IK_ITOF: {
             if (!dst || inst->nops < 1) break;
             /* Sign-extend before converting */
-            int32_t iv = (int32_t)get_val(vreg, inst->ops[0]);
-            float fv = (float)iv;
-            uint32_t rv; memcpy(&rv, &fv, 4);
-            set_val(vreg, dst, rv);
+            set_val(vreg, dst, cpu4_itof(get_val(vreg, inst->ops[0])));
             break;
         }
         case IK_FRECIP: case IK_FRSQRT: {
             if (!dst || inst->nops < 1) break;
             uint32_t x = get_val(vreg, inst->ops[0]);
-            set_val(vreg, dst, inst->kind == IK_FRECIP ? irsim_frecip_seed(x) : irsim_frsqrt_seed(x));
-            break;
-        }
-        case IK_FMADD: case IK_FMSUB: {
-            if (!dst || inst->nops < 3) break;
-            float acc, a, b, prod, r;
-            uint32_t ba = get_val(vreg, inst->ops[0]), bb = get_val(vreg, inst->ops[1]), bc = get_val(vreg, inst->ops[2]);
-            memcpy(&acc, &ba, 4); memcpy(&a, &bb, 4); memcpy(&b, &bc, 4);
-            prod = a * b;                                   /* fmul then fadd/fsub, as the ISA defines it */
-            r = (inst->kind == IK_FMADD) ? acc + prod : acc - prod;
-            uint32_t rb; memcpy(&rb, &r, 4);
-            set_val(vreg, dst, rb);
+            set_val(vreg, dst, inst->kind == IK_FRECIP ? cpu4_frecip(x) : cpu4_frsqrt(x));
             break;
         }
         case IK_FTOI: {
             if (!dst || inst->nops < 1) break;
-            uint32_t bits = get_val(vreg, inst->ops[0]);
-            float fv; memcpy(&fv, &bits, 4);
-            set_val(vreg, dst, (uint32_t)(int32_t)fv);
+            set_val(vreg, dst, cpu4_ftoi(get_val(vreg, inst->ops[0])));
             break;
         }
         case IK_SEXT8: {

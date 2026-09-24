@@ -316,8 +316,9 @@ lib helpers qualify everywhere).
 
 - **Const-const folding:** `IK_ADD/SUB/MUL/DIV/…(VAL_CONST, VAL_CONST)` → `VAL_CONST`
   via `fold_binop`. No instruction is emitted. Float binops and compares fold too
-  (`fold_fbinop`, host single-precision on the IEEE-754 bit patterns), so
-  `1.0f/240.0f` and `-1.0f` (lowered as `0.0f - 1.0f`) are constants.
+  (`fold_fbinop`, using the target's own arithmetic from `cpu4/fpu_model.h`:
+  RNE with flush-to-zero, `fdiv` as the seed multiply), so `1.0f/240.0f` and
+  `-1.0f` (lowered as `0.0f - 1.0f`) are constants with exactly the run-time bits.
 - **Identity/zero rules (rhs-const):**
   - `x + 0`, `x - 0`, `x << 0`, `x >> 0`, `x | 0`, `x ^ 0` → `x`
   - `x * 0` → `0`; `x * 1` → `x`
@@ -574,16 +575,6 @@ forwarded directly — keeping one live past its working copy collides with the
 next pre-coloured value in the same register, which IRC cannot repair. Such a
 value is forwarded through a fresh `IK_COPY` placed after its definition.
 
-### Pass I — fmadd/fmsub formation (opt-in, `OPT_FMADD`)
-
-`FADD(x, FMUL(a,b))`, `FADD(FMUL(a,b), x)` and `FSUB(x, FMUL(a,b))` become
-`IK_FMADD`/`IK_FMSUB (x, a, b)` when the product has no other use. The ISA
-defines `fmadd` as the same two roundings, so this is exact. The op is
-two-address (`rd` is the accumulator): IRC's `coalesce_copies` treats
-`(dst, ops[0])` as move-related, and emission falls back to `mov` + `fmadd`,
-or `fmul` + `fadd` through `rd` when the move would clobber a multiply
-operand. Off by default until the RTL implements the op (`-Opass=fmadd`).
-
 ### Pass E — AND-chain constant folding
 
 Folds `AND(AND(x, c1), c2) → AND(x, c1 & c2)` when both c1 and c2 are compile-time
@@ -744,7 +735,6 @@ used callee-saved register (r4–r7). Callee saves are stored **below** the spil
 | `IK_COPY rd, rs` | `or rd, rs, rs` (mov pseudo) |
 | `IK_MEMCPY dst, src, n` | inlined word/byte moves (always; no libcall) |
 | `IK_FRECIP` / `IK_FRSQRT` (`__builtin_frecip/frsqrt`) | `frecip rd` / `frsqrt rd` (F1b seeds) |
-| `IK_FMADD rd, acc, a, b` | `fmadd rd, a, b` when `rd` is `acc`'s register |
 | `IK_CALL "fname"` | `jl fname` |
 | `IK_ICALL fp` | `jlr` (fp in r0) |
 | `IK_BR cond, T, F` | `jnz rx, T_label`; `j F_label` (both branches explicit) |

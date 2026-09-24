@@ -310,12 +310,8 @@ static void coalesce_copies(IGraph *g, Function *f, int K) {
         for (int bi = 0; bi < f->nblocks; bi++) {
             Block *b = f->blocks[bi];
             for (Inst *inst = b->head; inst; inst = inst->next) {
-                // IK_FMADD/IK_FMSUB are two-address (dst wants ops[0]'s register):
-                // treat (dst, ops[0]) as move-related; on success nothing is
-                // deleted, emission just sees the registers coincide.
-                int is_copy = (inst->kind == IK_COPY);
-                int is_acc  = (inst->kind == IK_FMADD || inst->kind == IK_FMSUB);
-                if ((!is_copy && !is_acc) || inst->is_dead || inst->nops < 1) continue;
+                if (inst->kind != IK_COPY || inst->is_dead || inst->nops < 1) continue;
+                const int is_copy = 1;   // (a two-address accumulate op once shared this path)
                 Value *vdst = val_resolve(inst->dst);
                 Value *vsrc = val_resolve(inst->ops[0]);
                 if (!vdst || !vsrc || vdst == vsrc) { if (is_copy) { inst->is_dead = 1; changed = 1; } continue; }

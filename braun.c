@@ -13,6 +13,7 @@
 #include "ssa.h"
 #include "sx.h"
 #include "smallcc.h"
+#include "cpu4/fpu_model.h"
 
 // ============================================================
 // Cross-TU string literal dedup table: (data,len) → assigned _lN id.
@@ -816,21 +817,21 @@ static bool can_fold_binop(InstKind kind) {
 // extended precision on the host targets we build on); x/0 gives inf as it
 // does on the target.
 static int32_t fold_fbinop(InstKind kind, int32_t a, int32_t b) {
-    float fa, fb, r; int32_t bits;
-    memcpy(&fa, &a, 4); memcpy(&fb, &b, 4);
+    // The target's own arithmetic (cpu4/fpu_model.h), not the host's: RNE
+    // with flush-to-zero, fdiv as the seed multiply, sign-magnitude compares,
+    // eq/ne as the bit patterns (that is how they are emitted).
+    uint32_t ua = (uint32_t)a, ub = (uint32_t)b;
     switch (kind) {
-    case IK_FADD: r = fa + fb; break;
-    case IK_FSUB: r = fa - fb; break;
-    case IK_FMUL: r = fa * fb; break;
-    case IK_FDIV: r = fa / fb; break;
-    case IK_FLT:  return fa <  fb ? 1 : 0;
-    case IK_FLE:  return fa <= fb ? 1 : 0;
-    case IK_FEQ:  return fa == fb ? 1 : 0;
-    case IK_FNE:  return fa != fb ? 1 : 0;
+    case IK_FADD: return (int32_t)cpu4_fadd(ua, ub);
+    case IK_FSUB: return (int32_t)cpu4_fsub(ua, ub);
+    case IK_FMUL: return (int32_t)cpu4_fmul(ua, ub);
+    case IK_FDIV: return (int32_t)cpu4_fdiv(ua, ub);
+    case IK_FLT:  return (int32_t)cpu4_flt(ua, ub);
+    case IK_FLE:  return (int32_t)cpu4_fle(ua, ub);
+    case IK_FEQ:  return ua == ub ? 1 : 0;
+    case IK_FNE:  return ua != ub ? 1 : 0;
     default: return 0;
     }
-    memcpy(&bits, &r, 4);
-    return bits;
 }
 
 static int32_t fold_binop(InstKind kind, int32_t a, int32_t b) {

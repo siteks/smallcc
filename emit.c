@@ -800,29 +800,6 @@ static void emit_inst(Inst *inst, FILE *out) {
         fprintf(out, "    %s %s\n", inst->kind == IK_FRECIP ? "frecip" : "frsqrt", regname(rd));
         break;
     }
-    case IK_FMADD: case IK_FMSUB: {
-        // Two-address: rd = fadd/fsub(rd, fmul(ra, rb)).  IRC tries to give the
-        // accumulator rd's register (coalesce_copies treats the pair as
-        // move-related); otherwise move it first, unless the move would
-        // clobber a multiply operand, in which case fall back to the
-        // two-instruction sequence through rd.
-        if (!dst || inst->nops < 3) break;
-        int racc = get_val_reg(out, inst->ops[0], rd);
-        int ra   = get_val_reg(out, inst->ops[1], rd == racc ? 0 : rd);
-        int rb   = get_val_reg(out, inst->ops[2], rd == racc ? 1 : rd);
-        const char *mn = inst->kind == IK_FMADD ? "fmadd" : "fmsub";
-        if (racc == rd) {
-            fprintf(out, "    %s %s, %s, %s\n", mn, regname(rd), regname(ra), regname(rb));
-        } else if (ra != rd && rb != rd) {
-            emit_mov(out, rd, racc);
-            fprintf(out, "    %s %s, %s, %s\n", mn, regname(rd), regname(ra), regname(rb));
-        } else {
-            fprintf(out, "    fmul %s, %s, %s\n", regname(rd), regname(ra), regname(rb));
-            fprintf(out, "    %s %s, %s, %s\n", inst->kind == IK_FMADD ? "fadd" : "fsub",
-                    regname(rd), regname(racc), regname(rd));
-        }
-        break;
-    }
     case IK_FTOI: {
         if (!dst || inst->nops < 1) break;
         int r1 = get_val_reg(out, inst->ops[0], rd);

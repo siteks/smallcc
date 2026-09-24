@@ -1,6 +1,6 @@
 # 0003 — FPU results differ between sim_c and the RTL (rounding, fdiv)
 
-Status: OPEN, decision needed (found 2026-09-24 while writing proposal 0003).
+Status: **RESOLVED 2026-09-24**, option (c): the RTL rounds `fadd`/`fsub`/`fmul` to nearest-even (guard/round/sticky in X2–W), `fdiv` is *defined* as `fmul(a, frecip(b))`, and `cpu4/fpu_model.h` is the bit-exact spec used by every simulator and the constant folder; `tests/cases/floats/fpu_vectors.c` holds the RTL to it. Original report follows.
 
 `sim_c`, `cpu4/cpu.py` and `irsim` compute `fadd`/`fsub`/`fmul` with host
 IEEE-754 single precision (round-to-nearest-even) and `fdiv` as exact
@@ -22,9 +22,8 @@ Options and recommendation are in the monorepo's
 and the simulators model it bit-exactly; (c) RNE for add/sub/mul in the RTL,
 `fdiv` defined as the seed multiply. Recommended: (c).
 
-Until decided, `frecip`/`frsqrt` (table lookups) and `fmadd` (defined as
-the `fmul`-then-`fadd` sequence) are specified so that they are exact
-under any of the three outcomes.
+(`fmadd`/`fmsub`, mentioned in the original report, were withdrawn with the
+decision.)
 
 To reproduce: compile any float program with `-ann`, run on `sim_c` and on
 the RTL bench (`make -C hw test-sim` with a case that returns float bits),

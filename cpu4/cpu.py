@@ -181,16 +181,26 @@ def _load_rom(name):
 FRECIP_ROM = _load_rom('frecip_rom.hex')
 FRSQRT_ROM = _load_rom('frsqrt_rom.hex')
 
-def frecip_seed(x):
-    """ISA frecip: reciprocal seed from the 1024-entry ROM (see gen_fpu_roms.py)."""
+def _fpack(sign, exp9, mant24):
+    if exp9 <= 0: return 0
+    if exp9 >= 255: return sign | 0x7f800000
+    return sign | (exp9 << 23) | (mant24 & 0x7fffff)
+
+def _rne(mant24, guard, sticky, exp9):
+    rnd = guard & (sticky | (mant24 & 1))
+    m = mant24 + rnd
+    if m & 0x1000000: m >>= 1; exp9 += 1
+    return m, exp9
+
+def cpu4_frecip(x):
     x &= 0xffffffff
     sign = x & 0x80000000; e = (x >> 23) & 0xff; i = (x >> 13) & 0x3ff
-    if e == 0 and (x & 0x7fffff) == 0: return 0
+    if e == 0: return sign
     ee = (254 - e) if i == 0 else (253 - e)
-    return sign | ((ee & 0xff) << 23) | (FRECIP_ROM[i] << 7)
+    if ee <= 0: return sign
+    return sign | (ee << 23) | (FRECIP_ROM[i] << 7)
 
-def frsqrt_seed(x):
-    """ISA frsqrt: reciprocal-square-root seed (sign ignored)."""
+def cpu4_frsqrt(x):
     x &= 0xffffffff
     e = (x >> 23) & 0xff; m = x & 0x7fffff
     if e == 0: return 0x7f800000
@@ -198,6 +208,85 @@ def frsqrt_seed(x):
     p = (~e) & 1; i = (p << 9) | (m >> 14)
     ee = (379 - e) // 2 if (e & 1) else (380 - e) // 2
     return ((ee & 0xff) << 23) | (FRSQRT_ROM[i] << 7)
+
+def cpu4_fmul(a, b):
+    a &= 0xffffffff; b &= 0xffffffff
+    sign = (a ^ b) & 0x80000000
+    ea = (a >> 23) & 0xff; eb = (b >> 23) & 0xff
+    if ea == 0 or eb == 0: return sign
+    p = (0x800000 | (a & 0x7fffff)) * (0x800000 | (b & 0x7fffff))
+    norm = (p >> 47) & 1
+    if norm: mant = (p >> 24) & 0xffffff; guard = (p >> 23) & 1; sticky = int((p & 0x7fffff) != 0)
+    else:    mant = (p >> 23) & 0xffffff; guard = (p >> 22) & 1; sticky = int((p & 0x3fffff) != 0)
+    mant, exp9 = _rne(mant, guard, sticky, ea + eb - 127 + norm)
+    return _fpack(sign, exp9, mant)
+
+def cpu4_fadd(a, b):
+    a &= 0xffffffff; b &= 0xffffffff
+    sa = a >> 31; sb = b >> 31
+    ea = (a >> 23) & 0xff; eb = (b >> 23) & 0xff
+    ma = a & 0x7fffff; mb = b & 0x7fffff
+    fa = (0x800000 | ma) if ea else 0; fb = (0x800000 | mb) if eb else 0
+    a_bigger = (ea > eb) or (ea == eb and ma >= mb)
+    big, small = (fa, fb) if a_bigger else (fb, fa)
+    bexp = ea if a_bigger else eb
+    d = (ea - eb) if a_bigger else (eb - ea)
+    sign = sa if a_bigger else sb
+    sub = (sa ^ sb) != 0
+    ext_small = small << 3
+    if d >= 27: aligned = 0; sticky = int(small != 0)
+    else: aligned = ext_small >> d; sticky = int((ext_small & ((1 << d) - 1)) != 0)
+    aligned |= sticky
+    bigx = big << 3
+    sum_ = (bigx - aligned) if sub else (bigx + aligned)
+    if sum_ == 0: return 0
+    if sum_ & 0x8000000:
+        mant = (sum_ >> 4) & 0xffffff; guard = (sum_ >> 3) & 1; st = int((sum_ & 7) != 0); exp9 = bexp + 1
+    else:
+        lzc = 0; v = sum_ & 0x7ffffff
+        while not (v & 0x4000000): v <<= 1; lzc += 1
+        mant = (v >> 3) & 0xffffff; guard = (v >> 2) & 1; st = int((v & 3) != 0); exp9 = bexp - lzc
+    mant, exp9 = _rne(mant, guard, st, exp9)
+    return _fpack(sign << 31, exp9, mant)
+
+def cpu4_fsub(a, b): return cpu4_fadd(a, b ^ 0x80000000)
+def cpu4_fdiv(a, b): return cpu4_fmul(a, cpu4_frecip(b))
+
+def cpu4_flt(a, b):
+    a &= 0xffffffff; b &= 0xffffffff
+    sa = a >> 31; sb = b >> 31; aa = a & 0x7fffffff; ab = b & 0x7fffffff
+    if aa == 0 and ab == 0: return 0
+    if sa and not sb: return 1
+    if not sa and sb: return 0
+    return int(aa > ab) if sa else int(aa < ab)
+
+def cpu4_fle(a, b):
+    a &= 0xffffffff; b &= 0xffffffff
+    sa = a >> 31; sb = b >> 31; aa = a & 0x7fffffff; ab = b & 0x7fffffff
+    if aa == 0 and ab == 0: return 1
+    if sa and not sb: return 1
+    if not sa and sb: return 0
+    return int(aa >= ab) if sa else int(aa <= ab)
+
+def cpu4_itof(i):
+    i &= 0xffffffff
+    if i == 0: return 0
+    sign = i & 0x80000000
+    ab = ((-i) & 0xffffffff) if sign else i
+    pos = ab.bit_length() - 1
+    mant = (ab >> (pos - 23)) if pos > 23 else (ab << (23 - pos))
+    return sign | ((127 + pos) << 23) | (mant & 0x7fffff)
+
+def cpu4_ftoi(x):
+    x &= 0xffffffff
+    sign = x >> 31; e = (x >> 23) & 0xff
+    if e == 0: return 0
+    full = 0x800000 | (x & 0x7fffff)
+    if e < 127: ab = 0
+    elif e >= 150:
+        sh = e - 150; ab = 0 if sh >= 32 else ((full << sh) & 0xffffffff)
+    else: ab = full >> (150 - e)
+    return ((-ab) & 0xffffffff) if sign else ab
 
 def f2b(f):
     """Convert Python float to 32-bit IEEE 754 bit pattern (unsigned int)."""
@@ -290,8 +379,6 @@ class G:
         'fle'   :   (0x70, 1, 0, 0),
         'zxwor' :   (0x72, 1, 0, 0),
         'sxwor' :   (0x74, 1, 0, 0),
-        'fmadd' :   (0x76, 1, 0, 0),
-        'fmsub' :   (0x78, 1, 0, 0),
         # format 1b - one op, 16 bits   0111111dddoooooo
         # this format escapes to give large space for single op no imm
         'sxb'   :   (0x7e, 1, 1, 0x00),
@@ -653,14 +740,12 @@ class CPU:
         elif    i == 'divs':    s.r[dst] = int(sext(s.r[src0], 32) / sext(s.r[src1], 32)) if s.r[src1] != 0 else 0
         elif    i == 'mods':    s.r[dst] = sext(s.r[src0], 32) % sext(s.r[src1], 32) if s.r[src1] != 0 else 0
         elif    i == 'shrs':    s.r[dst] = sext(s.r[src0], 32) >> (s.r[src1] & 31)
-        elif    i == 'fadd':    s.r[dst] = f2b(b2f(s.r[src0]) + b2f(s.r[src1]))
-        elif    i == 'fsub':    s.r[dst] = f2b(b2f(s.r[src0]) - b2f(s.r[src1]))
-        elif    i == 'fmul':    s.r[dst] = f2b(b2f(s.r[src0]) * b2f(s.r[src1]))
-        elif    i == 'fmadd':   s.r[dst] = f2b(b2f(s.r[dst]) + b2f(f2b(b2f(s.r[src0]) * b2f(s.r[src1]))))
-        elif    i == 'fmsub':   s.r[dst] = f2b(b2f(s.r[dst]) - b2f(f2b(b2f(s.r[src0]) * b2f(s.r[src1]))))
-        elif    i == 'fdiv':    s.r[dst] = f2b(b2f(s.r[src0]) / b2f(s.r[src1]))
-        elif    i == 'flt':     s.r[dst] = b2f(s.r[src0]) < b2f(s.r[src1])
-        elif    i == 'fle':     s.r[dst] = b2f(s.r[src0]) <= b2f(s.r[src1])
+        elif    i == 'fadd':    s.r[dst] = cpu4_fadd(s.r[src0], s.r[src1])
+        elif    i == 'fsub':    s.r[dst] = cpu4_fsub(s.r[src0], s.r[src1])
+        elif    i == 'fmul':    s.r[dst] = cpu4_fmul(s.r[src0], s.r[src1])
+        elif    i == 'fdiv':    s.r[dst] = cpu4_fdiv(s.r[src0], s.r[src1])
+        elif    i == 'flt':     s.r[dst] = cpu4_flt(s.r[src0], s.r[src1])
+        elif    i == 'fle':     s.r[dst] = cpu4_fle(s.r[src0], s.r[src1])
         elif    i == 'zxwor':   s.r[dst] = (s.r[src0] | s.r[src1]) & 0xffff
         elif    i == 'sxwor':   v = (s.r[src0] | s.r[src1]) & 0xffff; s.r[dst] = 0xffff0000 | v if v & 0x8000 else v
         # f1b
@@ -672,14 +757,14 @@ class CPU:
         elif    i == 'popr':    s.r[dst] = m.read32(s.sp); s.sp += 4
         elif    i == 'zxb':     s.r[dst] = s.r[src0] & 0xff
         elif    i == 'zxw':     s.r[dst] = s.r[src0] & 0xffff
-        elif    i == 'itof':    iv = s.r[src0] if s.r[src0] < 0x80000000 else s.r[src0] - 0x100000000; s.r[dst] = f2b(float(iv))
-        elif    i == 'ftoi':    s.r[dst] = int(b2f(s.r[src0])) & 0xffffffff
+        elif    i == 'itof':    s.r[dst] = cpu4_itof(s.r[src0])
+        elif    i == 'ftoi':    s.r[dst] = cpu4_ftoi(s.r[src0])
         elif    i == 'jlr':     s.pc, s.lr = s.r[src0], s.pc
         elif    i == 'jr':      s.pc = s.r[src0]
         elif    i == 'ssp':     s.sp = s.r[src0]
         elif    i == 'neg':     s.r[dst] = -sext(s.r[src0], 32)
-        elif    i == 'frecip':  s.r[dst] = frecip_seed(s.r[src0])
-        elif    i == 'frsqrt':  s.r[dst] = frsqrt_seed(s.r[src0])
+        elif    i == 'frecip':  s.r[dst] = cpu4_frecip(s.r[src0])
+        elif    i == 'frsqrt':  s.r[dst] = cpu4_frsqrt(s.r[src0])
         elif    i == 'putchar': sys.stderr.write(chr(s.r[src0] & 0xff)); sys.stderr.flush()
         # f2
         elif    i == 'lb':      s.r[dst] = m.read8(s.bp + sext(imm, 7))

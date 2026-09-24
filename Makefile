@@ -4,8 +4,9 @@ CFLAGS=-std=c11 -g
 SRCS_COMMON = smallcc.c tokeniser.c parser.c types.c preprocess.c
 SRCS_NEW    = sx.c lower.c ssa.c braun.c dom.c oos.c opt.c legalize.c alloc.c emit.c irsim.c verify.c
 
-smallcc: $(SRCS_COMMON) $(SRCS_NEW)
-sim_c: sim_c.c
+smallcc: $(SRCS_COMMON) $(SRCS_NEW) cpu4/fpu_model.h cpu4/fpu_roms.h
+	$(CC) $(CFLAGS) -o smallcc $(SRCS_COMMON) $(SRCS_NEW) -lm
+sim_c: sim_c.c cpu4/fpu_model.h cpu4/fpu_roms.h
 	$(CC) $(CFLAGS) -O2 -o sim_c sim_c.c -lm
 
 test: smallcc sim_c

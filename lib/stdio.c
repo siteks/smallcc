@@ -32,9 +32,14 @@ static void _print_str(const char *s)
         _emit(*s++);
 }
 
+static void _print_ulong(unsigned long n);
 static void _print_int(int n)
 {
-    if (n < 0) { _emit('-'); n = -n; }
+    if (n < 0) {
+        _emit('-');
+        if (n == -2147483647 - 1) { _print_ulong(2147483648u); return; }   /* -n would overflow */
+        n = -n;
+    }
     if (n > 9) _print_int(n / 10);
     _emit('0' + n % 10);
 }

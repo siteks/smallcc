@@ -613,36 +613,6 @@ void legalize_function(Function *f) {
             legalize_slot_forward(f);
     }
 
-    // ── Pass I: fmadd/fmsub formation (opt-in) ─────────────────────────────
-    // FADD(x, FMUL(a,b)) / FADD(FMUL(a,b), x) → FMADD(x, a, b);
-    // FSUB(x, FMUL(a,b)) → FMSUB(x, a, b), when the product has no other use.
-    // The ISA defines fmadd as the same two roundings, so this is exact.
-    if (opt_flags & OPT_FMADD) {
-        for (int bi = 0; bi < f->nblocks; bi++) {
-            Block *b = f->blocks[bi];
-            for (Inst *inst = b->head; inst; inst = inst->next) {
-                if (inst->is_dead || inst->nops != 2 || !inst->dst) continue;
-                if (inst->kind != IK_FADD && inst->kind != IK_FSUB) continue;
-                Value *x = val_resolve(inst->ops[0]), *y = val_resolve(inst->ops[1]);
-                Value *acc = NULL, *prod = NULL;
-                if (y && y->kind == VAL_INST && y->def && y->def->kind == IK_FMUL && !y->def->is_dead && y->use_count == 1)
-                    { acc = x; prod = y; }
-                else if (inst->kind == IK_FADD && x && x->kind == VAL_INST && x->def && x->def->kind == IK_FMUL &&
-                         !x->def->is_dead && x->use_count == 1)
-                    { acc = y; prod = x; }
-                if (!acc || !prod || acc->kind != VAL_INST) continue;
-                Inst *mul = prod->def;
-                if (mul->nops != 2) continue;
-                Value *a = val_resolve(mul->ops[0]), *bb = val_resolve(mul->ops[1]);
-                if (!a || !bb || a->kind != VAL_INST || bb->kind != VAL_INST) continue;
-                inst->kind   = (inst->kind == IK_FADD) ? IK_FMADD : IK_FMSUB;
-                inst->ops[0] = acc; inst->ops[1] = a; inst->nops = 2;
-                inst_add_op(inst, bb);                    // ops = (acc, a, b)
-                prod->use_count = 0;                      // the product's only use is gone
-                unlink_inst(mul->block, mul);             // a, b keep their use counts (moved, not added)
-            }
-        }
-    }
 }
 
 // Materialize VAL_CONST operands that no compact emit-time encoding can

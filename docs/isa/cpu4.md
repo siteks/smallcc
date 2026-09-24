@@ -188,10 +188,8 @@ Result written to `rd`; `rx` and `ry` are read-only. Opcode `11111` (0x7e) is th
 | 0x70 | `fle rd, rx, ry` | rd = (float(rx) <= float(ry)) ? 1 : 0 |
 | 0x72 | `zxwor rd, rx, ry` | rd = (rx \| ry) & 0xffff |
 | 0x74 | `sxwor rd, rx, ry` | rd = sign_extend_16((rx \| ry) & 0xffff) |
-| 0x76 | `fmadd rd, rx, ry` | rd = fadd(rd, fmul(rx, ry)) — two-address multiply-accumulate; defined as the two-instruction sequence (same rounding as `fmul` then `fadd`) |
-| 0x78 | `fmsub rd, rx, ry` | rd = fsub(rd, fmul(rx, ry)) |
 
-*(2 slots available: 0x7a, 0x7c.)*
+*(4 slots available: 0x76, 0x78, 0x7a, 0x7c.)*
 
 `zxwor`/`sxwor` fuse a bitwise OR with 16-bit zero/sign extension. When `rx == ry` they
 degenerate to a pure cross-register 16-bit zero/sign extend (`rd = zx/sx(rx)`), used by the
@@ -258,7 +256,9 @@ exponent and `m` the 23-bit mantissa of the operand:
 
 - `frecip`: `i = m[22:13]`; `rom[i] = round((2/(1 + i/1024) − 1)·65536)`, `rom[0] = 0`.
   Result exponent `254 − e` when `i = 0`, else `253 − e`; result
-  `{sign, exp, rom[i], 7'b0}`. A zero operand gives 0. Relative error ≤ 2⁻¹⁰.
+  `{sign, exp, rom[i], 7'b0}`. A zero or denormal operand, or one whose
+  reciprocal would underflow (exponent ≥ 254), gives a zero with the
+  operand's sign. Relative error ≤ 2⁻¹⁰.
 - `frsqrt`: `p = ~e[0]`; `i = {p, m[22:14]}`; the table holds the normalised
   reciprocal square root at the interval midpoint,
   `rom[i] = round((2/sqrt((1 + ((i & 511) + 0.5)/512)·(p ? 2 : 1)) − 1)·65536)`.
@@ -267,10 +267,33 @@ exponent and `m` the 23-bit mantissa of the operand:
   (`0x7f800000`), exponent 255 gives 0. Relative error ≤ 2⁻¹¹; one Newton
   step `y·(1.5 − 0.5·x·y·y)` gives about 22 bits.
 
-`fdiv` in the RTL is `fmul(a, frecip(b))` with no refinement; `sim_c` divides
-exactly. Resolving that (and the RTL's truncating `fmul`/`fadd`) is proposal
-0003's prerequisite decision; until then float results may differ in the low
-bits between the simulator and the hardware.
+## Floating-point semantics
+
+Decided 2026-09-24 (proposal 0003, option c). The bit-exact definition is
+`cpu4/fpu_model.h`; `sim_c`, `irsim`, the compiler's constant folder and
+`cpu4/cpu.py` use it, and `tests/cases/floats/fpu_vectors.c` checks the RTL
+against it on hardware-hostile operand pairs.
+
+- **Formats.** IEEE-754 single. An operand with exponent field 0 is ±0
+  (denormals flush to zero). An operand with exponent field 255 is treated
+  as a finite number of that magnitude; a result whose exponent reaches 255
+  saturates to ±inf. The machine never produces NaN.
+- **`fadd`, `fsub`, `fmul`** are correctly rounded (round-to-nearest, ties
+  to even) on the values above. A zero or underflowing result is +0.
+  `fmul` with a zero operand gives a zero with the XOR of the signs.
+  `fsub a, b` ≡ `fadd a, −b`.
+- **`fdiv a, b`** = `fmul(a, frecip(b))`: the reciprocal seed times `a`,
+  relative error about 2⁻¹⁶, one slot, no divider. Code that needs an
+  exact quotient refines the seed (two Newton steps) in software.
+- **`flt`, `fle`** compare sign and magnitude: −0 and +0 are equal, and
+  exponent-255 patterns order by magnitude. `feq`/`fne` are the integer
+  `eq`/`ne` on the bit patterns (so −0 ≠ +0). The F3d zero branches test
+  the sign bit and are consistent with `flt`/`fle` against 0.0 except for
+  −0.0 (`bltz` taken, `bgez` not).
+- **`itof`** truncates toward zero when |i| > 2²⁴. **`ftoi`** truncates
+  toward zero; |x| < 1 gives 0; magnitudes that do not fit are shifted out
+  (wrap), exponent-255 inputs give 0.
+- **`frecip`, `frsqrt`** are the table seeds defined above.
 
 `neg rd` replaces the 3-instruction `immw tmp, 0; sub rd, tmp, rd` sequence (5 bytes) or
 the 2-instruction `zero rd; sub rd, rd, src` sequence with a single in-place 2-byte
