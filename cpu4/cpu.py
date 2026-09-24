@@ -1,5 +1,12 @@
- 
+"""CPU4 Python model.
 
+Decoding uses the table generated from cpu4/isa.py (isa_table.py; edit
+isa.py and run `make isa`). Execution is hand-written in CPU.step(): one
+`elif i == 'mnemonic':` branch per instruction, which must be added by hand
+for every new instruction (sim_c.c run_cpu4() is the executable spec it must
+match). Float arithmetic is a line-for-line port of cpu4/fpu_model.h.
+See "Where an instruction is defined" in docs/isa/cpu4.md.
+"""
 
 import re
 import struct

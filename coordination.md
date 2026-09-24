@@ -23,13 +23,22 @@ sea-of-processors project. This file is the contract between the two.
 ## The ISA/ABI change rule
 
 An ISA or ABI change is **one commit in smallcc** that touches, together:
-`cpu4/isa.py` (the encoding source of truth; `make isa` regenerates the
-simulator and assembler tables and `docs/isa/cpu4-encoding.md`),
-`docs/isa/cpu4.md` (or `docs/abi.md`) for the semantics, `sim_c.c` and
-`cpu4/cpu.py` for the execution, the compiler (emit/legalize) and at least
-one corpus test that exercises the change. It is followed by **one commit downstream** that updates the RTL
-and bumps the submodule pointer. There is never a downstream-only change to
-ISA semantics, and never a "temporary" local copy of the RTL or the spec.
+
+- `cpu4/isa.py` — the encoding, plus the files `make isa` regenerates from
+  it (`cpu4/isa_table_c.h`, `cpu4/isa_table.py`, `docs/isa/cpu4-encoding.md`);
+- `docs/isa/cpu4.md` (or `docs/abi.md`) — the semantics in prose, and
+  `cpu4/fpu_model.h` for a float op;
+- `sim_c.c` `run_cpu4()` and `cpu4/cpu.py` `CPU.step()` — the semantics,
+  executable, hand-written in each (the generated tables only decode);
+- the compiler (`emit.c`, `legalize.c`, `braun.c` for a builtin);
+- at least one corpus test that executes the change.
+
+The ordered checklist is "Where an instruction is defined" in
+`docs/isa/cpu4.md`. It is followed by **one commit downstream** that updates
+the RTL (decode case labels tagged `// mnemonic` so `make -C hw isa-check`
+finds them) and bumps the submodule pointer. There is never a downstream-only
+change to ISA semantics, and never a "temporary" local copy of the RTL or the
+spec.
 
 Submodule discipline: commit and push here before bumping the pointer
 downstream, so the recorded commit is always resolvable.

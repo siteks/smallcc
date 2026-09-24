@@ -39,7 +39,9 @@ Tests are pytest-collected `.c` files under `tests/cases/` with `EXPECT_R0`/`EXP
 
 ### Simulators
 
-`sim_c` (`sim_c.c`) is the primary simulator — a self-contained C program that assembles and executes CPU4 assembly. Build with `make sim_c`.
+`sim_c` (`sim_c.c`) is the primary simulator and the executable ISA spec — a self-contained C program that assembles and executes CPU4 assembly. Build with `make sim_c`. `cpu4/cpu.py` is the independent Python model (`python3 cpu4/sim.py --maxsteps N file.s`); it decodes through the same generated table as `sim_c`'s assembler but executes through its own hand-written `step()`.
+
+**Instruction definition flow:** encoding in `cpu4/isa.py` (generated into `sim_c`, `cpu.py`, the assembler and `docs/isa/cpu4-encoding.md` by `make isa`); semantics written by hand in `docs/isa/cpu4.md`, `sim_c.c` `run_cpu4()` and `cpu4/cpu.py` `step()`; float arithmetic in `cpu4/fpu_model.h`. The full checklist is "Where an instruction is defined" in `docs/isa/cpu4.md`.
 
 **`sim_c` usage:**
 ```

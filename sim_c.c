@@ -490,7 +490,11 @@ typedef struct {
     int         subop;   /* F1b: subopcode in byte1[5:0] */
 } Instr4;
 
-#include "cpu4/isa_table_c.h"   /* generated from cpu4/isa.py: the encoding source of truth */
+#include "cpu4/isa_table_c.h"   /* generated from cpu4/isa.py: the encoding source of truth.
+                                  * The table only assembles/disassembles; what an instruction
+                                  * DOES is the hand-written switch in run_cpu4() below, which is
+                                  * the executable ISA spec (docs/isa/cpu4.md, "Where an
+                                  * instruction is defined"). */
 
 static const Instr4 *find_instr4(const char *n)
 {
