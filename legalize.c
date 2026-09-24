@@ -1,8 +1,292 @@
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "legalize.h"
 #include "opt.h"     // opt_flags, OPT_LEG_*
 #include "dom.h"     // dominates, compute_dominators
 #include "alloc.h"   // IRC_CALLER_REGS
+
+
+// ── Pass H support: frame-slot store→load forwarding ──────────────────────
+static int is_pure_kind(Inst *inst);
+static unsigned char *mark_live_values(Function *f);
+typedef struct { int off, size; Value *v; } SlotEnt;
+#define SLOT_MAX 48
+typedef struct { SlotEnt e[SLOT_MAX]; int n; } SlotMap;
+
+static int ranges_overlap(int a, int as, int b, int bs) { return a < b + bs && b < a + as; }
+
+static void slotmap_invalidate(SlotMap *m, int off, int size) {
+    int w = 0;
+    for (int i = 0; i < m->n; i++)
+        if (!ranges_overlap(m->e[i].off, m->e[i].size, off, size)) m->e[w++] = m->e[i];
+    m->n = w;
+}
+static void slotmap_set(SlotMap *m, int off, int size, Value *v) {
+    slotmap_invalidate(m, off, size);
+    if (!v) return;
+    if (m->n == SLOT_MAX) { memmove(&m->e[0], &m->e[1], (SLOT_MAX - 1) * sizeof(SlotEnt)); m->n--; }
+    m->e[m->n].off = off; m->e[m->n].size = size; m->e[m->n].v = v; m->n++;
+}
+static Value *slotmap_get(SlotMap *m, int off, int size) {
+    for (int i = m->n - 1; i >= 0; i--)
+        if (m->e[i].off == off && m->e[i].size == size) return m->e[i].v;
+    return NULL;
+}
+
+static void unlink_inst(Block *b, Inst *inst) {
+    if (inst->prev) inst->prev->next = inst->next; else b->head = inst->next;
+    if (inst->next) inst->next->prev = inst->prev; else b->tail = inst->prev;
+    inst->is_dead = 1;
+}
+
+static int load_size(Inst *inst) {
+    if (inst->size) return inst->size;
+    return inst->dst ? vtype_size(inst->dst->vtype) : 4;
+}
+static int store_size(Inst *inst) {
+    if (inst->size) return inst->size;
+    Value *v = val_resolve(inst->ops[inst->nops - 1]);
+    return v ? vtype_size(v->vtype) : 4;
+}
+static int is_slot_load(Inst *inst)  { return inst->kind == IK_LOAD  && inst->nops >= 1 && !inst->ops[0] && inst->dst; }
+static int is_slot_store(Inst *inst) { return inst->kind == IK_STORE && inst->nops == 1; }
+
+// Escaped frame ranges: every IK_ADDR that still has a use after Pass G is a
+// frame address that reaches memory-unaware code (a call argument, a memcpy,
+// a pointer store).  Its extent is unknown, so it is taken to run up to the
+// next IK_ADDR base above it (locals are laid out contiguously and every
+// addressed local has its own base), or to bp / the top of the param area.
+typedef struct { int lo, hi; } Range;
+
+static int cmp_int(const void *a, const void *b) { return *(const int *)a - *(const int *)b; }
+
+static int collect_escapes(Function *f, Range **out) {
+    int nb = 0, cap = 16;
+    int *bases = malloc(cap * sizeof(int));
+    for (int bi = 0; bi < f->nblocks; bi++)
+        for (Inst *inst = f->blocks[bi]->head; inst; inst = inst->next)
+            if (!inst->is_dead && inst->kind == IK_ADDR) {
+                if (nb == cap) { cap *= 2; bases = realloc(bases, cap * sizeof(int)); }
+                bases[nb++] = inst->imm;
+            }
+    qsort(bases, nb, sizeof(int), cmp_int);
+    // Which IK_ADDR values are used by *live* instructions.  Pass G leaves
+    // the folded address arithmetic behind for IRC's dead-code pass to
+    // remove; a mark-and-sweep from the impure instructions (nothing is
+    // unlinked here — that was measured to perturb IRC's spill choices)
+    // tells us which uses will survive.
+    unsigned char *live = mark_live_values(f);
+    unsigned char *used = calloc(f->nvalues + 1, 1);
+    for (int bi = 0; bi < f->nblocks; bi++)
+        for (Inst *inst = f->blocks[bi]->head; inst; inst = inst->next) {
+            if (inst->is_dead) continue;
+            if (is_pure_kind(inst) && !(inst->dst->id < f->nvalues && live[inst->dst->id])) continue;
+            for (int j = 0; j < inst->nops; j++) {
+                Value *v = val_resolve(inst->ops[j]);
+                if (v && v->kind == VAL_INST && v->def && v->def->kind == IK_ADDR && v->id < f->nvalues) {
+                    used[v->id] = 1;
+                    if (getenv("LEG_DEBUG")) fprintf(stderr, "  [H] %s: addr v%d (bp%+d) used by kind %d nops %d\n", f->name, v->id, v->def->imm, inst->kind, inst->nops);
+                }
+            }
+        }
+    free(live);
+    Range *r = malloc((nb + 1) * sizeof(Range)); int nr = 0;
+    for (int bi = 0; bi < f->nblocks; bi++)
+        for (Inst *inst = f->blocks[bi]->head; inst; inst = inst->next) {
+            if (inst->is_dead || inst->kind != IK_ADDR || !inst->dst) continue;
+            if (inst->dst->id >= f->nvalues || !used[inst->dst->id]) continue;
+            int lo = inst->imm, hi = (lo < 0) ? 0 : 0x7fff;
+            for (int k = 0; k < nb; k++) if (bases[k] > lo) { hi = bases[k]; break; }
+            if (lo >= 0 && hi < 0) hi = 0x7fff;
+            r[nr].lo = lo; r[nr].hi = hi; nr++;
+        }
+    if (getenv("LEG_DEBUG"))
+        for (int i = 0; i < nr; i++) fprintf(stderr, "  [H] %s: escaped range [%d,%d)\n", f->name, r[i].lo, r[i].hi);
+    free(bases); free(used);
+    *out = r;
+    return nr;
+}
+
+static int escaped(Range *r, int nr, int off, int size) {
+    for (int i = 0; i < nr; i++)
+        if (ranges_overlap(r[i].lo, r[i].hi - r[i].lo, off, size)) return 1;
+    return 0;
+}
+
+// Which values have a live definition: mark-and-sweep from the impure
+// instructions (stores, calls, control flow) through operand defs.  Values
+// pre-coloured to a register count as live (IRC keeps their defs).
+static int is_pure_kind(Inst *inst) {
+    switch (inst->kind) {
+    case IK_STORE: case IK_CALL: case IK_ICALL: case IK_BR: case IK_JMP:
+    case IK_RET: case IK_SWITCH: case IK_PUTCHAR: case IK_MEMCPY:
+        return 0;
+    default:
+        return inst->dst != NULL;
+    }
+}
+static unsigned char *mark_live_values(Function *f) {
+    unsigned char *live = calloc(f->nvalues + 1, 1);
+    Value **work = malloc((f->nvalues + 1) * sizeof(Value *)); int nw = 0;
+    for (int bi = 0; bi < f->nblocks; bi++)
+        for (Inst *inst = f->blocks[bi]->head; inst; inst = inst->next) {
+            if (inst->is_dead) continue;
+            int root = !is_pure_kind(inst) || (inst->dst && inst->dst->phys_reg >= 0);
+            if (!root) continue;
+            if (inst->dst && inst->dst->id < f->nvalues) live[inst->dst->id] = 1;
+            for (int j = 0; j < inst->nops; j++) {
+                Value *v = val_resolve(inst->ops[j]);
+                if (v && v->kind == VAL_INST && v->id < f->nvalues && !live[v->id]) { live[v->id] = 1; work[nw++] = v; }
+            }
+        }
+    while (nw > 0) {
+        Value *v = work[--nw];
+        if (!v->def) continue;
+        for (int j = 0; j < v->def->nops; j++) {
+            Value *o = val_resolve(v->def->ops[j]);
+            if (o && o->kind == VAL_INST && o->id < f->nvalues && !live[o->id]) { live[o->id] = 1; work[nw++] = o; }
+        }
+    }
+    free(work);
+    return live;
+}
+
+// A value pre-coloured to a physical register (a param landing in r1-r3, a
+// call result in r0) must die at its immediate working copy: keeping it live
+// would collide with the next pre-coloured value in the same register, which
+// IRC cannot repair.  Forwarding therefore goes through a fresh working copy
+// placed right after the definition, made once per value.
+static Value *forwardable(Function *f, Value *v, Value ***cache, int *cache_n) {
+    if (!v || v->kind != VAL_INST || v->phys_reg < 0 || !v->def) return v;
+    if (v->id < *cache_n && (*cache)[v->id]) return (*cache)[v->id];
+    Value *w = new_value(f, VAL_INST, v->vtype);
+    Inst  *cp = new_inst(f, v->def->block, IK_COPY, w);
+    cp->line = v->def->line;
+    inst_insert_after(v->def, cp);
+    inst_add_op(cp, v);
+    v->use_count++;
+    if (v->id >= *cache_n) {
+        int nn = v->id + 64;
+        *cache = realloc(*cache, nn * sizeof(Value *));
+        memset(*cache + *cache_n, 0, (nn - *cache_n) * sizeof(Value *));
+        *cache_n = nn;
+    }
+    (*cache)[v->id] = w;
+    return w;
+}
+
+// Pass H body.  Blocks are visited in reverse post-order; a block with a
+// single predecessor inherits that predecessor's exit state.
+static void legalize_slot_forward(Function *f) {
+    Range *esc; int nesc = collect_escapes(f, &esc);
+    Value **wcache = NULL; int wcache_n = 0;
+
+    int nb = f->nblocks;
+    Block **order = malloc(nb * sizeof(Block *));
+    int no = 0;
+    for (int bi = 0; bi < nb; bi++) if (f->blocks[bi]->rpo_index >= 0) order[no++] = f->blocks[bi];
+    for (int i = 1; i < no; i++) {              // insertion sort by rpo_index (nb is small)
+        Block *b = order[i]; int j = i - 1;
+        while (j >= 0 && order[j]->rpo_index > b->rpo_index) { order[j + 1] = order[j]; j--; }
+        order[j + 1] = b;
+    }
+    SlotMap *exit = calloc(nb, sizeof(SlotMap));
+    unsigned char *done = calloc(nb, 1);
+    SlotMap m;
+
+    for (int oi = 0; oi < no; oi++) {
+        Block *b = order[oi];
+        int bidx = -1;
+        for (int k = 0; k < nb; k++) if (f->blocks[k] == b) { bidx = k; break; }
+        m.n = 0;
+        if (b->npreds == 1) {
+            for (int k = 0; k < nb; k++)
+                if (f->blocks[k] == b->preds[0] && done[k]) { m = exit[k]; break; }
+        }
+        for (Inst *inst = b->head; inst; inst = inst->next) {
+            if (inst->is_dead) continue;
+            switch (inst->kind) {
+            case IK_LOAD:
+                if (!is_slot_load(inst)) break;
+                if (load_size(inst) == 4) {
+                    Value *v = slotmap_get(&m, inst->imm, 4);
+                    if (v) {
+                        if (getenv("LEG_DEBUG")) fprintf(stderr, "  [H] %s: load [bp%+d]:4 forwarded from v%d (%s)\n", f->name, inst->imm, v->id, v->vtype == inst->dst->vtype ? "alias" : "copy");
+                        if (v->vtype == inst->dst->vtype) {
+                            // Same type: the load simply *is* the stored value.
+                            v->use_count += inst->dst->use_count;
+                            inst->dst->alias = v;
+                            unlink_inst(b, inst);
+                        } else {
+                            // Same bits, different C type (the union pun): a
+                            // type-preserving IK_COPY keeps the load's vtype for
+                            // emission's signedness decisions; IRC coalesces it.
+                            inst->kind = IK_COPY; inst->ops[0] = v; inst->nops = 1;
+                            inst->imm = 0; inst->size = 0;
+                            v->use_count++;
+                        }
+                    } else {
+                        slotmap_set(&m, inst->imm, 4, inst->dst);
+                    }
+                }
+                break;
+            case IK_STORE:
+                if (is_slot_store(inst)) {
+                    int sz = store_size(inst);
+                    Value *v = val_resolve(inst->ops[0]);
+                    if (sz == 4 && v && v->kind == VAL_INST) v = forwardable(f, v, &wcache, &wcache_n);
+                    slotmap_set(&m, inst->imm, sz, (sz == 4 && v && v->kind == VAL_INST) ? v : NULL);
+                } else {
+                    // pointer store: may hit any escaped slot
+                    int w = 0;
+                    for (int i = 0; i < m.n; i++)
+                        if (!escaped(esc, nesc, m.e[i].off, m.e[i].size)) m.e[w++] = m.e[i];
+                    m.n = w;
+                }
+                break;
+            case IK_MEMCPY: case IK_CALL: case IK_ICALL: {
+                int w = 0;
+                for (int i = 0; i < m.n; i++)
+                    if (!escaped(esc, nesc, m.e[i].off, m.e[i].size)) m.e[w++] = m.e[i];
+                m.n = w;
+                break;
+            }
+            default: break;
+            }
+        }
+        if (bidx >= 0) { exit[bidx] = m; done[bidx] = 1; }
+    }
+
+    // Dead-store elimination for private slots: a store whose range no
+    // remaining (live) slot load overlaps, and which no escaped address can reach.
+    unsigned char *live = mark_live_values(f);
+    for (int bi = 0; bi < nb; bi++) {
+        Block *b = f->blocks[bi];
+        Inst *inst = b->head;
+        while (inst) {
+            Inst *next = inst->next;
+            if (!inst->is_dead && is_slot_store(inst)) {
+                int sz = store_size(inst);
+                if (!escaped(esc, nesc, inst->imm, sz)) {
+                    int read = 0;
+                    for (int bj = 0; bj < nb && !read; bj++)
+                        for (Inst *q = f->blocks[bj]->head; q; q = q->next)
+                            if (!q->is_dead && is_slot_load(q) && q->dst->id < f->nvalues && live[q->dst->id] &&
+                                ranges_overlap(q->imm, load_size(q), inst->imm, sz)) { read = 1; break; }
+                    if (getenv("LEG_DEBUG")) fprintf(stderr, "  [H] %s: store [bp%+d]:%d %s\n", f->name, inst->imm, sz, read ? "kept (loaded)" : "dead");
+                    if (!read) {
+                        Value *sv = val_resolve(inst->ops[0]);
+                        if (sv && sv->kind == VAL_INST && sv->use_count > 0) sv->use_count--;
+                        unlink_inst(b, inst);
+                    }
+                }
+            }
+            inst = next;
+        }
+    }
+    free(order); free(exit); free(done); free(esc); free(wcache); free(live);
+}
 
 void legalize_function(Function *f) {
     if (!f || f->nblocks == 0) return;
@@ -252,6 +536,89 @@ void legalize_function(Function *f) {
     }
 
     // ── Pass F: Materialize large VAL_CONST binary ALU operands ────────────
+    // Also run early (start of the post-OOS pipeline) so CSE and LICM see the
+    // materialised IK_CONSTs; this call catches anything created since.
+    legalize_materialize_consts(f);
+
+    // ── Pass G: fold IK_ADDR(bp+slot) bases into bp-relative loads/stores ──
+    // A frame-slot access written as `IK_ADDR a, slot; IK_LOAD d, [a+off]`
+    // costs a lea plus an F3c load.  The bp-relative form (NULL base,
+    // imm = slot+off) is the single F2 instruction the spill code already
+    // uses, and emit_bp_load/store fall back to lea+F3c when the combined
+    // offset is out of F2 range, so the rewrite is always safe.  The IK_ADDR
+    // survives for any other use (an escaping pointer) and is otherwise
+    // removed by IRC's dead-code elimination.
+    if (opt_flags & OPT_LEG_G) {
+        for (int bi = 0; bi < f->nblocks; bi++) {
+            Block *b = f->blocks[bi];
+            for (Inst *inst = b->head; inst; inst = inst->next) {
+                if (inst->is_dead) continue;
+                if (inst->kind != IK_LOAD && inst->kind != IK_STORE) continue;
+                if (inst->kind == IK_LOAD  && inst->nops < 1) continue;
+                if (inst->kind == IK_STORE && inst->nops != 2) continue;
+                if (!inst->ops[0]) continue;
+                Value *base = val_resolve(inst->ops[0]);
+                if (!base || base->kind != VAL_INST || !base->def || base->def->is_dead) continue;
+                int size = (inst->kind == IK_LOAD) ? load_size(inst) : store_size(inst);
+                // Look through one `base = p + k` (field / element offset): the
+                // constant folds into the access's own offset.  For a plain
+                // pointer p the folded offset must stay within the F3c scaled
+                // imm10 (±511 elements); for a frame address any offset works.
+                int k = 0;
+                if (base->def->kind == IK_ADD && base->def->nops == 2) {
+                    Value *a0 = val_resolve(base->def->ops[0]);
+                    Value *a1 = val_resolve(base->def->ops[1]);
+                    int k0, k1;
+                    Value *p = NULL;
+                    if (a1 && get_iconst(a1, &k1) && a0 && !get_iconst(a0, &k0))      { p = a0; k = k1; }
+                    else if (a0 && get_iconst(a0, &k0) && a1 && !get_iconst(a1, &k1)) { p = a1; k = k0; }
+                    if (!p || p->kind != VAL_INST || !p->def) continue;
+                    int noff = inst->imm + k;
+                    if (p->def->kind == IK_ADDR && !p->def->is_dead) {
+                        // fall into the frame case below (base keeps its use until then)
+                    } else {
+                        if (noff % size != 0 || noff / size < -511 || noff / size > 511) continue;
+                        inst->imm    = noff;
+                        inst->ops[0] = p;
+                        if (base->use_count > 0) base->use_count--;
+                        p->use_count++;
+                        continue;
+                    }
+                    base = p;
+                }
+                if (base->def->kind != IK_ADDR) continue;
+                Value *old = val_resolve(inst->ops[0]);
+                if (old && old->use_count > 0) old->use_count--;
+                inst->imm += base->def->imm + k;
+                if (inst->kind == IK_LOAD) {
+                    inst->ops[0] = NULL;
+                } else {
+                    inst->ops[0] = inst->ops[1];
+                    inst->ops[1] = NULL;
+                    inst->nops   = 1;
+                }
+            }
+        }
+    }
+
+    // ── Pass H: forward frame-slot stores to later loads, drop dead private stores ──
+    // After Pass G a local that never escapes is just a set of bp offsets; a
+    // store followed (on every path) by a same-sized load of the same offset
+    // becomes a register copy, and a store nothing ever loads is deleted.
+    // This is what makes an inlined out-param vector live in registers and
+    // makes a union type-pun free.
+    if (opt_flags & OPT_LEG_H) {
+        const char *only = getenv("LEG_H_ONLY");          // debugging aid: restrict Pass H to one function
+        if (!only || (f->name && strstr(f->name, only)))
+            legalize_slot_forward(f);
+    }
+}
+
+// Materialize VAL_CONST operands that no compact emit-time encoding can
+// absorb, as explicit IK_CONST instructions.  Called at the start of the
+// post-OOS pipeline (so CSE dedupes and LICM hoists them) and again from
+// legalize_function for anything created later.  Idempotent.
+void legalize_materialize_consts(Function *f) {
     // When a binary ALU or comparison instruction has a VAL_CONST operand
     // whose value cannot be handled by any compact emit-time encoding,
     // insert an explicit IK_CONST before it.  This lets IRC allocate a
@@ -275,6 +642,11 @@ void legalize_function(Function *f) {
                 case IK_MOD: case IK_UMOD:
                 case IK_SHL: case IK_SHR: case IK_USHR:
                 case IK_FADD: case IK_FSUB: case IK_FMUL: case IK_FDIV:
+                case IK_FLT:  case IK_FLE:  case IK_FEQ:  case IK_FNE:
+                    // Float compares: FEQ/FNE emit as integer eq/ne (P17/P19 take
+                    // |k| ≤ 255); FLT/FLE have no immediate form, but a zero
+                    // operand is a 1-byte zeroN, so only larger values are worth
+                    // a register.
                     // F0b immediate handles |k| ≤ 255 (P18 mulli, P19 general);
                     // P11/P13 handle SHL/SHR/USHR shifts via resolve_const.
                     // Only materialize constants outside those ranges.
@@ -283,7 +655,9 @@ void legalize_function(Function *f) {
                         if (!v || v->kind != VAL_CONST) continue;
                         int k = v->iconst;
                         if (k >= -256 && k <= 255) continue;  // F0b immediate range
-                        Value *cv = new_value(f, VAL_INST, inst->dst->vtype);
+                        int is_cmp = inst->kind == IK_FLT || inst->kind == IK_FLE ||
+                                     inst->kind == IK_FEQ || inst->kind == IK_FNE;
+                        Value *cv = new_value(f, VAL_INST, is_cmp ? v->vtype : inst->dst->vtype);
                         Inst  *ci = new_inst(f, b, IK_CONST, cv);
                         ci->imm  = v->iconst;
                         ci->line = inst->line;

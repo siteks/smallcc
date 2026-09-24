@@ -15,7 +15,10 @@
  *      (replaces emit_reg_arg_copies that used to live in braun.c)
  *   C. IK_ZEXT / IK_TRUNC with mask < 4 bytes
  *      → IK_CONST(mask) + IK_AND  (removes PUSH_SCRATCH from emit.c)
+ *   F. large VAL_CONST operands → IK_CONST (legalize_materialize_consts)
+ *   G. IK_ADDR(bp slot) + load/store → bp-relative load/store (F2 form)
  */
 void legalize_function(Function *f);
+void legalize_materialize_consts(Function *f);   // Pass F, also run early in the post-OOS pipeline
 
 #endif // LEGALIZE_H

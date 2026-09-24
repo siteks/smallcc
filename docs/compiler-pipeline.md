@@ -88,7 +88,9 @@ Node* parse tree  (output of resolve_symbols / derive_types / insert_coercions)
       │   │           fast-path: TRUNC(VAL_CONST(k)) → IK_CONST(k & 0xff) for 8-bit truncation
       │   ├─ Pass E: AND-chain constant folding — AND(AND(x,c1),c2) → AND(x,c1&c2);
       │   │           also looks through type-coercing IK_COPY chains
-      │   └─ Pass F: materialize VAL_CONST operands outside F0b range (|k| > 255)
+      │   ├─ Pass F: materialize VAL_CONST operands outside F0b range (|k| > 255); also run first in the post-OOS pipeline
+      │   ├─ Pass G: frame-slot and pointer-offset access folding (lea+lll → F2 ll; p+k → F3c offset)
+      │   └─ Pass H: frame-slot store→load forwarding, dead private stores
       │
       ├─ irc_allocate()     alloc.c      IRC register allocation (Appel & George 1996)
       │                                  vregs → physical r0–r7; spills if needed
@@ -297,8 +299,12 @@ lists and flushed to the data section via `braun_emit_strlits(out)` after each f
 
 **Inlining:** After each function is compiled, `braun_register_inline_candidate`
 qualifies it as an inline candidate if it is small (≤ 80 body nodes, ≤ 10
-straight-line prefix statements plus a final return), non-recursive, takes no
-addresses of locals/params, and contains no control-flow statements. Calls to
+straight-line statements plus, for a non-void function, a final `return expr;`),
+has at most 6 parameters (they bind by `write_var`, so the 3-register ABI limit
+does not apply), is non-recursive, takes no addresses of locals/params, and
+contains no control-flow statements. Void functions qualify (an optional bare
+`return;` may end the body) and inline as a statement sequence with no result;
+this is what makes out-param vector helpers free. Calls to
 registered candidates from later functions are expanded inline during Braun
 construction instead of emitting `IK_CALL`. Definition order matters: a callee
 is only inlinable into functions compiled after it (lib TUs compile first, so
@@ -309,7 +315,9 @@ lib helpers qualify everywhere).
 `emit_binop` folds both const+const and one-const cases during SSA construction:
 
 - **Const-const folding:** `IK_ADD/SUB/MUL/DIV/…(VAL_CONST, VAL_CONST)` → `VAL_CONST`
-  via `fold_binop`. No instruction is emitted.
+  via `fold_binop`. No instruction is emitted. Float binops and compares fold too
+  (`fold_fbinop`, host single-precision on the IEEE-754 bit patterns), so
+  `1.0f/240.0f` and `-1.0f` (lowered as `0.0f - 1.0f`) are constants.
 - **Identity/zero rules (rhs-const):**
   - `x + 0`, `x - 0`, `x << 0`, `x >> 0`, `x | 0`, `x ^ 0` → `x`
   - `x * 0` → `0`; `x * 1` → `x`
@@ -532,6 +540,40 @@ directly to `IK_CONST(k & mask)` without creating a mask value. Covers both 8-bi
 (`mask = 0xff`) and 16-bit (`mask = 0xffff`) cases. This avoids adding a register to the
 interference graph for a constant known at compile time.
 
+### Pass G — frame-slot and pointer-offset access folding
+
+A load or store whose base is `IK_ADDR(slot)`, or `IK_ADD(IK_ADDR(slot), k)`,
+becomes the bp-relative form the spill code already uses (NULL base,
+`imm = slot + k + off`), which emits as one F2 instruction (`ll rd, imm7`)
+instead of `lea` + `lll`; `emit_bp_load/store` fall back to `lea`+F3c when
+the combined offset is out of F2 range, so any offset is legal. A base of
+`IK_ADD(p, k)` for a plain pointer folds `k` into the access offset when the
+result stays within the F3c scaled imm10 (±511 elements, aligned). The
+address arithmetic left behind is removed by IRC's dead-code pass.
+
+### Pass H — frame-slot store→load forwarding
+
+After Pass G a local that never escapes is just a set of bp offsets. Pass H
+walks blocks in reverse post-order (a single-predecessor block inherits its
+predecessor's exit state) with a map from `(offset, size)` to the value last
+stored or loaded; a later same-sized (4-byte) load of the same offset becomes
+that value — an alias when the types match, a type-preserving `IK_COPY`
+otherwise (the union type-pun case), so emission's signedness decisions are
+unchanged. Stores to slots that nothing loads are deleted.
+
+Escape analysis: every `IK_ADDR` still used by a *live* instruction (a call
+argument, `IK_MEMCPY`, a pointer store, `IK_RET`) marks its object as
+escaped, with the extent taken to run up to the next frame base (bases are
+contiguous). Calls and pointer stores invalidate map entries in escaped
+ranges; dead-store elimination skips them. Liveness is a mark-and-sweep from
+the impure instructions; nothing is unlinked for it (unlinking dead
+instructions before IRC was measured to perturb its spill choices).
+
+Values pre-coloured to a register (param landings, call results) are never
+forwarded directly — keeping one live past its working copy collides with the
+next pre-coloured value in the same register, which IRC cannot repair. Such a
+value is forwarded through a fresh `IK_COPY` placed after its definition.
+
 ### Pass E — AND-chain constant folding
 
 Folds `AND(AND(x, c1), c2) → AND(x, c1 & c2)` when both c1 and c2 are compile-time
@@ -585,7 +627,11 @@ repeat until no spills (max 20 iterations):
 **Call-site ABI constraints** are encoded directly in the interference graph via phantom
 nodes (indices `nvalues..nvalues+K-1`) that are permanently pre-colored to r0–r7. At each
 `IK_CALL`/`IK_ICALL`, every value live through the call receives an interference edge to the
-phantom nodes for r0–r3, forcing such values to callee-saved registers or spill.
+phantom nodes for the registers the callee clobbers (its recorded caller-saved
+usage, r0–r3 at most; unknown callees and `IK_ICALL` count as all four), forcing
+such values to callee-saved registers or spill. Only r0–r3 are ever clobbers: a
+callee that uses r4–r7 saves and restores them, so the caller may keep values
+there across the call.
 
 **Coalescing:** `coalesce_copies` runs to fixpoint over all `IK_COPY` instructions.
 For each copy `dst ← src`, after resolving canonical nodes via `ig_find`:

@@ -309,6 +309,9 @@ static int collect_runtime_files(const char *runtime_dir,
 // calls opt_remove_dead_blocks when it changes anything, so any jump-threaded
 // orphans are still cleaned up.
 static void run_post_oos_pipeline(Function *f) {
+    // Materialise large constants first so CSE dedupes and LICM hoists them
+    // (legalize used to do this last, after both had run).
+    if (opt_flags & OPT_LEG_F)          legalize_materialize_consts(f);
     if (opt_flags & OPT_COPY_PROP)      STAT("post3", opt_stat_copy_alias, opt_copy_prop(f));
     verify_function(f, "copy_prop", VERIFY_POST_OOS);
     if (opt_flags & OPT_CSE)            { compute_dominators(f);
@@ -324,6 +327,7 @@ static void run_post_oos_pipeline(Function *f) {
     compute_dominators(f);
     legalize_function(f);
     verify_function(f, "legalize", VERIFY_POST_OOS);
+    if (getenv("DUMP_PRE_IRC")) { fprintf(stderr, "=== PRE-IRC: %s ===\n", f->name); print_function(f, stderr); }
     irc_allocate(f);
     verify_function(f, "irc", VERIFY_POST_IRC);
 }
@@ -511,6 +515,8 @@ int main(int argc, char **argv)
                     {"unroll",         OPT_UNROLL},
                     {"leg_e",          OPT_LEG_E},
                     {"leg_f",          OPT_LEG_F},
+                    {"leg_g",          OPT_LEG_G},
+                    {"leg_h",          OPT_LEG_H},
                     {NULL, 0}
                 };
                 int found = 0;

@@ -63,7 +63,12 @@ static void record_function_clobbers(Function *f) {
     for (int bi = 0; bi < f->nblocks; bi++) {
         for (Inst *inst = f->blocks[bi]->head; inst; inst = inst->next) {
             if (inst->is_dead) continue;
-            if (inst->dst && inst->dst->phys_reg >= 0 && inst->dst->phys_reg < IRC_K)
+            // Only caller-saved registers are clobbers: r4-r7 are saved and
+            // restored by the callee's own prologue/epilogue, so a value the
+            // caller keeps there survives the call.  Recording them here made
+            // callers spill everything live across a call to any callee that
+            // happened to use all four.
+            if (inst->dst && inst->dst->phys_reg >= 0 && inst->dst->phys_reg < IRC_CALLER_REGS)
                 mask |= (1u << inst->dst->phys_reg);
             if (inst->kind == IK_CALL && inst->fname)
                 mask |= lookup_clobbers(inst->fname);
@@ -71,6 +76,7 @@ static void record_function_clobbers(Function *f) {
                 mask |= 0x0F;  // unknown target: assume all caller-saved
         }
     }
+    if (getenv("DBG_IRC")) fprintf(stderr, "IRC clobbers %s = 0x%02x\n", f->name, mask);
     record_clobbers(f->name, mask);
 }
 
@@ -428,7 +434,7 @@ static IGraph *build_interference_graph(Function *f) {
                 else if (inst->kind == IK_ICALL)
                     cmask = 0x0F;  // unknown target: all caller-saved
                 else
-                    cmask = lookup_clobbers(inst->fname);
+                    cmask = lookup_clobbers(inst->fname) & 0x0F;   // caller-saved only
                 for (int w = 0; w < nw; w++) {
                     uint32_t word = live[w];
                     while (word) {

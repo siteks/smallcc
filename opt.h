@@ -27,9 +27,11 @@
 // requirements and always run — emit.c has no fallback for un-lowered instructions.
 #define OPT_LEG_E          (1u << 9)   // AND-chain constant folding
 #define OPT_LEG_F          (1u << 10)  // materialize large VAL_CONST operands
+#define OPT_LEG_G          (1u << 11)  // frame-slot IK_ADDR + load/store → bp-relative F2 form
+#define OPT_LEG_H          (1u << 12)  // frame-slot store→load forwarding + dead private stores
 
 // Presets
-#define OPT_ALL            0x7FFu      // all 11 bits
+#define OPT_ALL            0x1FFFu     // all 13 bits
 #define OPT_NONE           0u
 #define OPT_SAFE           (OPT_FOLD_BR | OPT_DEAD_BLOCKS | OPT_COPY_PROP)
 

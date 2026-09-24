@@ -55,6 +55,8 @@ out_of_ssa()                 phi elimination (Boissinot 2009)
 
 ── Post-OOS passes (run_post_oos_pipeline, profile-parameterised) ─
 
+legalize_materialize_consts() LEG_F OPT_LEG_F   (early: large VAL_CONSTs become IK_CONST so
+                                                  CSE dedupes and LICM hoists them)
 opt_copy_prop()              R2D   OPT_COPY_PROP          (1st call)
 compute_dominators()                                       (for CSE)
 opt_cse()                    R2E   OPT_CSE
@@ -74,7 +76,11 @@ legalize_function()
   Pass C: lower NEG/NOT                 always on (emit.c has no fallback)
   Pass D: lower ZEXT/TRUNC             always on (emit.c has no fallback)
   Pass E: AND-chain fold       LEG_E   OPT_LEG_E
-  Pass F: materialize consts   LEG_F   OPT_LEG_F
+  Pass F: materialize consts   LEG_F   OPT_LEG_F   (second run; catches anything created since)
+  Pass G: frame-slot access    LEG_G   OPT_LEG_G   (IK_ADDR[+k] + load/store → bp-relative F2 form;
+                                                   p+k + load/store → register-relative offset)
+  Pass H: slot forwarding      LEG_H   OPT_LEG_H   (store→load forwarding on private frame slots,
+                                                   dead private stores removed)
 
 ── Register allocation + emission ─────────────────────────────────
 
@@ -145,7 +151,7 @@ encapsulated in `run_post_oos_pipeline()`.
 | ID | Bit | Function | What | Depends on |
 |----|-----|----------|------|------------|
 | R2D | `OPT_COPY_PROP` | `opt_copy_prop` | Collapse single-def copy chains | — |
-| R2E | `OPT_CSE` | `opt_cse` | Dominator-tree scoped GVN | dominators (block ordering) |
+| R2E | `OPT_CSE` | `opt_cse` | Dominator-tree scoped GVN; `IK_CONST` is CSE-pure, so constants materialised by the early Pass F run dedupe | dominators (block ordering) |
 | R2F | `OPT_LICM` | `opt_licm_const` | Hoist `VAL_CONST` out of loops | dominators, loop depth |
 | R2F | `OPT_LICM` | `opt_licm` | Hoist loop-invariant pure instructions | dominators, loop depth |
 | R2I | `OPT_JUMP_THREAD` | `opt_jump_thread` | Thread jumps through thin blocks | R2D (copy targets resolved) |
@@ -176,7 +182,9 @@ R2J ──→ R2D(2nd)      (unroll creates copies that need propagation)
 | Pass C | — | `IK_NEG` → `IK_SUB(0,x)`, `IK_NOT` → `IK_EQ(x,0)` | **Correctness** (emit.c has no fallback) |
 | Pass D | — | `IK_ZEXT/TRUNC` → `IK_AND(x, mask)` | **Correctness** (emit.c has no fallback) |
 | Pass E | `OPT_LEG_E` | `AND(AND(x,c1),c2)` → `AND(x,c1&c2)` | Optimization (reduces register pressure) |
-| Pass F | `OPT_LEG_F` | Materialize large `VAL_CONST` operands | Optimization (avoids pushr/popr scratch) |
+| Pass F | `OPT_LEG_F` | Materialize large `VAL_CONST` operands (ALU ops and float compares); also run at the start of the post-OOS pipeline | Optimization (avoids pushr/popr scratch; lets CSE/LICM see constants) |
+| Pass G | `OPT_LEG_G` | `IK_ADDR(slot) [+ k]` as a load/store base → bp-relative form (`lea`+`lll` → one F2 `ll`); `p + k` base → folded into the F3c offset when within ±511 elements | Optimization (one instruction per frame-slot access) |
+| Pass H | `OPT_LEG_H` | Forward a frame-slot store to later same-sized loads (same block, or single-predecessor chain); delete stores to private slots nothing loads. Escape analysis: a slot reachable from a live `IK_ADDR` (call arg, memcpy, pointer store) is invalidated by calls and pointer stores. Pre-coloured values are forwarded through a working copy | Optimization (out-param vectors and union puns live in registers) |
 
 Passes A–D are correctness requirements — they must always run. emit.c has no
 fallback for un-lowered `IK_NEG`/`IK_NOT`/`IK_ZEXT`/`IK_TRUNC` instructions.
@@ -187,6 +195,8 @@ Passes E–F are optimizations that reduce register pressure.
 ```
 Pass D ──→ Pass E     (E folds mask constants created by D)
 Pass F after E        (F should see folded AND chains from E)
+Pass G after F        (G needs the constant operands of address adds)
+Pass H after G        (H only sees slots that G exposed as bp offsets)
 ```
 
 ### Emission Peepholes (emit.c)
@@ -269,9 +279,11 @@ the inlined constants above.
 // Legalization passes E-F (C and D are always-on correctness passes)
 #define OPT_LEG_E          (1u << 9)   // AND-chain fold
 #define OPT_LEG_F          (1u << 10)  // Materialize large consts
+#define OPT_LEG_G          (1u << 11)  // Frame-slot / pointer-offset access folding
+#define OPT_LEG_H          (1u << 12)  // Frame-slot store→load forwarding + dead private stores
 
 // Presets
-#define OPT_ALL            0x7FFu      // all 11 bits
+#define OPT_ALL            0x1FFFu     // all 13 bits
 #define OPT_NONE           0u
 #define OPT_SAFE           (OPT_FOLD_BR | OPT_DEAD_BLOCKS | OPT_COPY_PROP)
 ```
@@ -284,7 +296,7 @@ the inlined constants above.
 -O2                   OPT_ALL  — all passes (default)
 -Opass=NAME           enable single pass by name (additive)
 -Ono-pass=NAME        disable single pass by name (subtractive from default)
--Omask=0x7FF          set exact bitmask (hex)
+-Omask=0x1FFF         set exact bitmask (hex)
 ```
 
 Examples:
@@ -310,6 +322,8 @@ Examples:
 | `unroll` | 8 | R2J |
 | `leg_e` | 9 | Legalize E |
 | `leg_f` | 10 | Legalize F |
+| `leg_g` | 11 | Legalize G |
+| `leg_h` | 12 | Legalize H |
 
 ### Exploration Script
 
@@ -318,17 +332,17 @@ To measure pass effectiveness systematically:
 ```bash
 #!/bin/bash
 # measure_passes.sh — test each pass's contribution to CoreMark
-BASE=0x7FF   # all on
-for bit in $(seq 0 10); do
+BASE=0x1FFF  # all on
+for bit in $(seq 0 12); do
     mask=$(printf "0x%04x" $((BASE & ~(1 << bit))))
     name=$(echo "fold_br dead_blocks copy_prop cse redundant_bool \
         narrow_loads licm jump_thread unroll \
-        leg_e leg_f" | awk "{print \$$((bit+1))}")
+        leg_e leg_f leg_g leg_h" | awk "{print \$$((bit+1))}")
     ./smallcc -Omask=$mask -arch cpu4 -o bench/coremark/coremark.s bench/coremark/coremark_single.c 2>/dev/null
     cycles=$(./sim_c -arch cpu4 -maxsteps 4000000 bench/coremark/coremark.s 2>&1 | grep -o 'cycles:[0-9]*' | cut -d: -f2)
     echo "without $name (mask=$mask): $cycles cycles"
 done
-echo "all on (mask=0x7FF):"
+echo "all on (mask=0x1FFF):"
 ./smallcc -arch cpu4 -o bench/coremark/coremark.s bench/coremark/coremark_single.c 2>/dev/null
 ./sim_c -arch cpu4 -maxsteps 4000000 bench/coremark/coremark.s 2>&1 | grep -o 'cycles:[0-9]*'
 ```

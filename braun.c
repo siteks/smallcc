@@ -298,6 +298,7 @@ typedef struct {
 #define MAX_INLINE        256
 #define INLINE_MAX_NODES   80   // total body node count cap
 #define INLINE_MAX_STMTS   10   // prefix-statement count cap (excludes final return)
+#define INLINE_MAX_PARAMS   6   // params bind by write_var, so the 3-register ABI limit does not apply
 static InlineCandidate g_inline[MAX_INLINE];
 static int g_ninline;
 
@@ -359,11 +360,12 @@ static Node *inline_qualify(Node *func_decl) {
             if (s->kind == SYM_PARAM && s->ns == NS_IDENT)
                 nparams++;
     }
-    if (nparams > 3) return NULL;
+    if (nparams > INLINE_MAX_PARAMS) return NULL;
 
-    // Void return type — skip (no return value to substitute)
+    // Void functions inline as a statement sequence with no result; the
+    // sentinel return value is the body node itself (never a valid expr).
     Type *ret_type = ftype->u.fn.ret;
-    if (ret_type && ret_type->base == TB_VOID) return NULL;
+    int is_void = ret_type && ret_type->base == TB_VOID;
 
     // Struct return — skip (hidden sret pointer)
     if (ret_type && ret_type->base == TB_STRUCT) return NULL;
@@ -372,21 +374,24 @@ static Node *inline_qualify(Node *func_decl) {
     Node *stmt = body->ch[0];
     if (!stmt) return NULL;
 
-    // Walk statements: all non-final must be scalar ND_DECLARATION or ND_EXPRSTMT;
-    // the final statement must be ND_RETURNSTMT with a non-null expression.
+    // Walk statements: all non-final must be scalar ND_DECLARATION or ND_EXPRSTMT.
+    // Non-void: the final statement must be ND_RETURNSTMT with an expression.
+    // Void: no return expression anywhere; a bare `return;` is allowed only as
+    // the final statement (an early return would need control flow).
     Node *ret_stmt = NULL;
     int   nstmts   = 0;
     for (Node *s = stmt; s; s = s->next) {
         Node *u = s;
         while (u && u->kind == ND_STMT) u = u->ch[0];
 
-        if (!s->next) {
-            // Last statement must be the return
-            if (!u || u->kind != ND_RETURNSTMT) return NULL;
+        if (u && u->kind == ND_RETURNSTMT) {
+            if (s->next) return NULL;            // return must be last
+            if (is_void) { if (u->ch[0]) return NULL; break; }
             if (!u->ch[0]) return NULL;
             ret_stmt = u;
             break;
         }
+        if (!s->next && !is_void) return NULL;   // non-void: last must be the return
         if (!u || u->kind == ND_EMPTY) continue;
 
         if (++nstmts > INLINE_MAX_STMTS) return NULL;
@@ -410,13 +415,13 @@ static Node *inline_qualify(Node *func_decl) {
         if (u->kind == ND_EXPRSTMT) continue;
         return NULL;
     }
-    if (!ret_stmt) return NULL;
+    if (!is_void && !ret_stmt) return NULL;
 
     // Whole-body walk for size cap, address-taken rejection, self-recursion rejection.
     int count = 0;
     if (!walk_inline_check(body, fsym, &count)) return NULL;
 
-    return ret_stmt->ch[0];
+    return is_void ? body : ret_stmt->ch[0];
 }
 
 void braun_register_inline_candidate(Node *func_decl, int tu_index) {
@@ -432,10 +437,10 @@ void braun_register_inline_candidate(Node *func_decl, int tu_index) {
     const char *label = sym_label(fsym);
 
     // Collect param symbols sorted by offset
-    Symbol *psyms[4]; int np = 0;
+    Symbol *psyms[INLINE_MAX_PARAMS]; int np = 0;
     if (body->symtable) {
         for (Symbol *s = body->symtable->symbols; s; s = s->next)
-            if (s->kind == SYM_PARAM && s->ns == NS_IDENT && np < 4)
+            if (s->kind == SYM_PARAM && s->ns == NS_IDENT && np < INLINE_MAX_PARAMS)
                 psyms[np++] = s;
         for (int i = 0; i < np - 1; i++)
             for (int j = i + 1; j < np; j++)
@@ -449,7 +454,7 @@ void braun_register_inline_candidate(Node *func_decl, int tu_index) {
     ic->func_decl = func_decl;
     ic->nparams = np;
     ic->body = body;
-    ic->ret_expr = ret_expr;
+    ic->ret_expr = (ret_expr == body) ? NULL : ret_expr;   // NULL: void function
     if (np > 0) {
         ic->param_syms = arena_alloc(np * sizeof(Symbol *));
         memcpy(ic->param_syms, psyms, np * sizeof(Symbol *));
@@ -799,14 +804,41 @@ static bool can_fold_binop(InstKind kind) {
     case IK_EQ:  case IK_NE:
     case IK_LT:  case IK_ULT:
     case IK_LE:  case IK_ULE:
+    case IK_FADD: case IK_FSUB: case IK_FMUL: case IK_FDIV:
+    case IK_FLT:  case IK_FLE:  case IK_FEQ:  case IK_FNE:
         return true;
     default: return false;
     }
 }
 
+// Fold a float binop on IEEE-754 bit patterns.  Host single-precision
+// arithmetic is what sim_c and the RTL compute (round-to-nearest, no
+// extended precision on the host targets we build on); x/0 gives inf as it
+// does on the target.
+static int32_t fold_fbinop(InstKind kind, int32_t a, int32_t b) {
+    float fa, fb, r; int32_t bits;
+    memcpy(&fa, &a, 4); memcpy(&fb, &b, 4);
+    switch (kind) {
+    case IK_FADD: r = fa + fb; break;
+    case IK_FSUB: r = fa - fb; break;
+    case IK_FMUL: r = fa * fb; break;
+    case IK_FDIV: r = fa / fb; break;
+    case IK_FLT:  return fa <  fb ? 1 : 0;
+    case IK_FLE:  return fa <= fb ? 1 : 0;
+    case IK_FEQ:  return fa == fb ? 1 : 0;
+    case IK_FNE:  return fa != fb ? 1 : 0;
+    default: return 0;
+    }
+    memcpy(&bits, &r, 4);
+    return bits;
+}
+
 static int32_t fold_binop(InstKind kind, int32_t a, int32_t b) {
     uint32_t ua = (uint32_t)a, ub = (uint32_t)b;
     switch (kind) {
+    case IK_FADD: case IK_FSUB: case IK_FMUL: case IK_FDIV:
+    case IK_FLT:  case IK_FLE:  case IK_FEQ:  case IK_FNE:
+        return fold_fbinop(kind, a, b);
     case IK_ADD:  return a + b;
     case IK_SUB:  return a - b;
     case IK_MUL:  return a * b;
@@ -1419,13 +1451,17 @@ static Value *braun_try_inline(BraunCtx *ctx, Block **cur, Symbol *fsym,
     // in the caller's Braun variable map via write_var (locals are pure SSA since
     // we rejected &local/&param in qualify).
     Node *body_stmts = ic->body ? ic->body->ch[0] : NULL;
-    for (Node *s = body_stmts; s && s->next; s = s->next) {
+    for (Node *s = body_stmts; s; s = s->next) {
         Node *u = s;
         while (u && u->kind == ND_STMT) u = u->ch[0];
         if (!u || u->kind == ND_EMPTY) continue;
+        if (u->kind == ND_RETURNSTMT) break;     // final return: handled below (or bare, void)
         b = cg_stmt(ctx, b, u);
         *cur = b;
     }
+
+    // Void: no result; the call site discards the value (statement context).
+    if (!ic->ret_expr) return new_const(ctx->f, 0, VT_I16);
 
     // Final statement is the return — evaluate its expression as the inline result.
     return cg_expr(ctx, cur, ic->ret_expr);
