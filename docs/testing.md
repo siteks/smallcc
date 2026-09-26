@@ -261,6 +261,10 @@ containing `FILES` needs `EXPECT_*` keys.
 | `EXPECT_STDOUT` | string | Exact string expected from `putchar` calls |
 | `FILES` | space-separated filenames | Multi-TU: compile all listed files (relative to this file's directory) |
 | `TARGET` | `sim` (default) or `hw` | Selects the crt0 variant; `hw` tests are skipped in irsim mode |
+| `CFLAGS` | verbatim compiler flags | Appended to the `smallcc` command line (e.g. `-O0`, `-Ono-pass=licm`) |
+| `SIM_ARGS` | verbatim `sim_c` flags | Appended to the `sim_c` command line (e.g. `-cores 4`, `-maxsteps 200000`); such a case is skipped in irsim mode and on the RTL bench |
+| `XFAIL` | `issue NNNN (reason)` | The case reproduces a known bug in `docs/issues/NNNN-*.md` and is expected to fail. Strict in sim_c mode: when the fix lands the case passes, pytest reports XPASS as a failure, and the tag is removed in the same commit. Not strict in irsim mode, which cannot observe every bug (no alignment checks, no devices) |
+| `TIMEOUT` | simulation time units | Read by the hardware harness only (`hw/test/conftest.py`); `sim_c`'s step cap is set with `SIM_ARGS: -maxsteps N` |
 
 Multiple keys can appear in any order. All that are present are checked.
 

@@ -84,6 +84,14 @@ class CTestItem(pytest.Item):
         self.src_path = path
         self.arch = arch
         self.meta = parse_meta(path)
+        if 'XFAIL' in self.meta:
+            # A reproducer for a known bug (// XFAIL: issue NNNN ...). Strict in sim_c
+            # mode: once the bug is fixed the case passes, pytest reports XPASS as a
+            # failure, and the XFAIL line must be removed with the fix. Not strict in
+            # irsim mode, which is the weaker oracle (no alignment checks, no devices)
+            # and may not observe the bug at all.
+            self.add_marker(pytest.mark.xfail(reason=str(self.meta['XFAIL']),
+                                              strict=arch not in IRSIM_MODES))
 
     def runtest(self):
         meta = self.meta
