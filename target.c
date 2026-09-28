@@ -1,4 +1,6 @@
 /* target.c — the Target descriptions and the encoding queries (target.h). */
+#include <stddef.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "target.h"
@@ -16,6 +18,13 @@ const Target target_cpu4 = {
     .ret_reg      = 0,
     .n_arg_regs   = 3,
     .arg_regs     = {1, 2, 3},
+    // Tuned by tools/tune.py (2026-09-28): corpus -0.70%, CoreMark -0.61%,
+    // ray tracer -0.83%, JPEG -0.52% cycles against the hand-set values
+    // (2 5 16 2 4 1 4 4 10 6 4).
+    .tune         = { .lc_reserve = 6, .lc_reserve_large = 6, .lc_large_body = 16,
+                      .lc_cap_reserve = 5, .lc_max_hoist = 4, .lc_min_uses = 1,
+                      .licm_reserve = 5, .licm_max = 4, .licm_dense_hi = 30,
+                      .licm_dense_lo = 6, .lsr_reserve = 7 },
 };
 
 // CPU5 (proposal 0004): 16 registers. The minimal ABI change from CPU4:
@@ -31,6 +40,14 @@ const Target target_cpu5 = {
     .ret_reg      = 0,
     .n_arg_regs   = 3,
     .arg_regs     = {1, 2, 3},
+    // Tuned by tools/tune.py (2026-09-28): corpus -0.75%, CoreMark -2.65%,
+    // ray tracer -2.09%, JPEG +0.27% against CPU4's hand-set values. With
+    // CPU5's 16-bit immediates a hoisted constant mostly replaces a free
+    // immediate operand, so constant hoisting is sparing and LSR is off.
+    .tune         = { .lc_reserve = 14, .lc_reserve_large = 14, .lc_large_body = 64,
+                      .lc_cap_reserve = 10, .lc_max_hoist = 2, .lc_min_uses = 3,
+                      .licm_reserve = 4, .licm_max = 5, .licm_dense_hi = 1000,
+                      .licm_dense_lo = 14, .lsr_reserve = 15 },
 };
 
 const Target *g_target = &target_cpu4;
@@ -51,6 +68,36 @@ const char *target_names(void) {
         strncat(buf, all_targets[i]->name, sizeof buf - strlen(buf) - 1);
     }
     return buf;
+}
+
+// ---- optimiser budgets ------------------------------------------------
+
+Tune g_tune;
+
+static const struct { const char *name; size_t off; } tune_fields[] = {
+#define TF(n) { #n, offsetof(Tune, n) }
+    TF(lc_reserve), TF(lc_reserve_large), TF(lc_large_body), TF(lc_cap_reserve),
+    TF(lc_max_hoist), TF(lc_min_uses), TF(licm_reserve), TF(licm_max),
+    TF(licm_dense_hi), TF(licm_dense_lo), TF(lsr_reserve),
+#undef TF
+};
+
+int tune_set(const char *nv) {
+    const char *eq = strchr(nv, '=');
+    if (!eq) return 0;
+    for (size_t i = 0; i < sizeof tune_fields / sizeof tune_fields[0]; i++)
+        if (strlen(tune_fields[i].name) == (size_t)(eq - nv) &&
+            !strncmp(tune_fields[i].name, nv, eq - nv)) {
+            *(int *)((char *)&g_tune + tune_fields[i].off) = atoi(eq + 1);
+            return 1;
+        }
+    return 0;
+}
+
+void tune_list(void) {
+    for (size_t i = 0; i < sizeof tune_fields / sizeof tune_fields[0]; i++)
+        fprintf(stderr, "%s=%d\n", tune_fields[i].name,
+                *(int *)((char *)&g_tune + tune_fields[i].off));
 }
 
 // ---- encoding queries -------------------------------------------------

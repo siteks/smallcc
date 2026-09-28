@@ -1661,16 +1661,17 @@ void opt_licm_const(Function *f) {
                 if (!inst->is_dead) body_insts++;
         }
 
-        // Budgets relative to the register count (CPU4, K=8: 3 and 6).
+        // Budgets relative to the register count (g_tune; CPU4: 3 and 6).
         int K = g_target->nregs;
-        int budget = (body_insts > 16) ? K - 5 : K - 2;
+        int budget = (body_insts > g_tune.lc_large_body) ? K - g_tune.lc_reserve_large
+                                                         : K - g_tune.lc_reserve;
         if (nlive + 1 > budget) {
             // Budget exceeded for general hoisting.  Still try to hoist the
             // loop-bound constant (VAL_CONST operand of the header's
             // terminator comparison).  P12 (emit_rotated_branch) duplicates
             // the comparison in the latch, so the constant is materialized
             // twice per iteration.  Allow one hoist with a relaxed cap.
-            if (nlive + 1 > K - 2) continue;
+            if (nlive + 1 > K - g_tune.lc_cap_reserve) continue;
             Inst *hdr_term = h->tail;
             if (!hdr_term || hdr_term->kind != IK_BR || hdr_term->nops < 1)
                 continue;
@@ -1706,7 +1707,7 @@ void opt_licm_const(Function *f) {
             continue;
         }
 
-        int max_hoist = 4;
+        int max_hoist = g_tune.lc_max_hoist;
 
         // Step 4: Count VAL_CONST operand uses inside the loop body.
         LicmCand cands[LICM_MAX_CANDS];
@@ -1746,7 +1747,7 @@ void opt_licm_const(Function *f) {
         // balanced against two saved immw per iteration).
         int nhoisted = 0;
         for (int pass = 0; pass < max_hoist; pass++) {
-            int best = -1, best_uses = 1;   // hoist when uses > 1 (i.e. >= 2)
+            int best = -1, best_uses = g_tune.lc_min_uses;   // hoist when uses > lc_min_uses
             for (int k = 0; k < ncands; k++) {
                 if (!cands[k].hoisted && cands[k].uses > best_uses) {
                     best = k;
@@ -1864,13 +1865,13 @@ void opt_licm(Function *f) {
         // temporaries (address computations, intermediate values), and each
         // hoist adds 1 to the cross-loop pressure.  Cap budget when loop-
         // internal definitions are high (tight loops with many values).
-        int budget = g_target->nregs - 4 - nlive;   // reserve 4 regs for in-body temps
+        int budget = g_target->nregs - g_tune.licm_reserve - nlive;   // reserve regs for in-body temps
         if (budget <= 0) continue;
-        if (nloop_defs > 10)
+        if (nloop_defs > g_tune.licm_dense_hi)
             budget = budget < 1 ? 0 : 1;
-        else if (nloop_defs > 6)
+        else if (nloop_defs > g_tune.licm_dense_lo)
             budget = budget < 2 ? budget : 2;
-        if (budget > 4) budget = 4;
+        if (budget > g_tune.licm_max) budget = g_tune.licm_max;
 
         // Build def-count per value inside the loop.
         int nv = f->nvalues;
@@ -2816,7 +2817,7 @@ void opt_lsr(Function *f) {
             // Count external values used inside the loop
             nlive = count_loop_liveins(f, &loops[li], live_ids, nlive, live_cap);
         }
-        int lsr_budget = g_target->nregs - 4 - nlive;  // K - scratch - existing cross-loop values
+        int lsr_budget = g_target->nregs - g_tune.lsr_reserve - nlive;  // K - scratch - existing cross-loop values
         if (lsr_budget <= 0) continue;
 
         // Step 2: Detect basic induction variables in header phis.

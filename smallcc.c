@@ -338,6 +338,7 @@ int main(int argc, char **argv)
     // Parse flags: -o outfile, -stats, -DNAME[=VALUE]
     FILE *out = stdout;
     int file_start = 1;
+    const char *tune_args[32]; int n_tune_args = 0;
     bool show_stats = false;
     bool preprocess_only = false;
     FILE *ssa_out = NULL;  // -ssa file: write Braun SSA IR to this file after braun_function
@@ -390,6 +391,7 @@ int main(int argc, char **argv)
                 "  -Opass=NAME        Enable single pass (additive)\n"
                 "  -Ono-pass=NAME     Disable single pass (subtractive)\n"
                 "  -Omask=0xNNNN      Set exact pass bitmask (hex)\n"
+                "  -Oparam=NAME=N     Override an optimiser budget (-Oparam=list shows them)\n"
                 "\n"
                 "Diagnostics:\n"
                 "  -stats             Print per-TU arena usage to stderr\n"
@@ -502,6 +504,10 @@ int main(int argc, char **argv)
                 opt_flags = OPT_ALL;
             else if (strncmp(arg, "mask=", 5) == 0)
                 opt_flags = (unsigned)strtoul(arg + 5, NULL, 0);
+            else if (strncmp(arg, "param=", 6) == 0) {
+                // applied once the target is known (below)
+                if (n_tune_args < 32) tune_args[n_tune_args++] = arg + 6;
+            }
             else if (strncmp(arg, "pass=", 5) == 0 || strncmp(arg, "no-pass=", 8) == 0) {
                 int negate = (arg[0] == 'n');
                 const char *name = negate ? arg + 8 : arg + 5;
@@ -552,6 +558,18 @@ int main(int argc, char **argv)
     // Determine compiler binary directory for include/ and lib/ resolution
     char compiler_dir[4096];
     get_compiler_dir(argv[0], compiler_dir, sizeof(compiler_dir));
+
+    // Optimiser budgets: the target's, then -Oparam=NAME=VALUE overrides
+    // (-Oparam=list prints them).
+    g_tune = g_target->tune;
+    for (int i = 0; i < n_tune_args; i++) {
+        if (!strcmp(tune_args[i], "list")) { tune_list(); return 0; }
+        if (!tune_set(tune_args[i])) {
+            fprintf(stderr, "smallcc: unknown -Oparam %s; known:\n", tune_args[i]);
+            tune_list();
+            return 1;
+        }
+    }
 
     // Set system include directory
     char include_dir[4096];

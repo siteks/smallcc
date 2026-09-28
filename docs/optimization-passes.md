@@ -238,21 +238,45 @@ with EQ/NE only; const 0 is handled by P6 with `jz`/`jnz` at unlimited range).
 
 ## LICM / CSE Heuristics
 
-The register-pressure-sensitive LICM and CSE passes use hardcoded tuning constants
-(inlined at each site in `opt.c`):
+The loop passes work on each loop's natural body (`find_loops`: the header
+and every block that reaches a back edge without passing through it), not on
+everything the header dominates.
 
-| Pass | Parameter | Value | Meaning |
-|------|-----------|-------|---------|
-| `opt_licm_const` | body budget (small/large) | 6 / 3 | Hoist budget when body_insts ≤ 16 / > 16 |
-| `opt_licm_const` | hard cap | 6 | Max `nlive+1` for loop-bound const hoist |
-| `opt_licm_const` | max hoists | 4 | Cap on constants hoisted per loop |
-| `opt_licm_const` | use threshold | 2 | Hoist only when `uses > 2` (i.e. ≥ 3) |
-| `opt_licm` | reserve | 4 | Registers reserved for in-body temps (`8 − 4 − nlive = budget`) |
-| `opt_licm` | max hoists | 4 | Cap on invariant hoists per loop |
-| `opt_licm` | dense-hi | 10 | `nloop_defs` threshold that forces budget ≤ 1 |
-| `opt_licm` | dense-lo | 6 | `nloop_defs` threshold that caps budget at 2 |
-| `opt_cse` post-OOS | cross-block | direct pred only | Wider policies defeat P12 loop rotation |
-| `opt_copy_prop` | type-coercing copies | not propagated | Same P12 interaction |
+The register-pressure budgets are per target (`Tune` in `target.h`, values
+in `target.c`) and can be overridden with `-Oparam=NAME=VALUE`
+(`-Oparam=list` prints them). K is the target's register count; a reserve
+is subtracted from K. The values were chosen by `tools/tune.py`, a
+coordinate-descent sweep that compiles and runs the corpus, CoreMark, the ray
+tracer and the NanoJPEG decode for each setting, checks every result, and
+keeps a change only if no workload loses more than 0.5% of its cycles.
+Rerun it after a change to the ISA or to these passes.
+
+| Parameter | Pass | Meaning | CPU4 | CPU5 |
+|---|---|---|---|---|
+| `lc_reserve` | `opt_licm_const` | budget K - this for a small body | 6 | 14 |
+| `lc_reserve_large` | `opt_licm_const` | budget K - this when the body exceeds `lc_large_body` | 6 | 14 |
+| `lc_large_body` | `opt_licm_const` | instructions | 16 | 64 |
+| `lc_cap_reserve` | `opt_licm_const` | hard cap K - this, also for the loop-bound constant | 5 | 10 |
+| `lc_max_hoist` | `opt_licm_const` | constants hoisted per loop | 4 | 2 |
+| `lc_min_uses` | `opt_licm_const` | hoist a constant used more than this many times | 1 | 3 |
+| `licm_reserve` | `opt_licm` | budget K - this - live-ins | 5 | 4 |
+| `licm_max` | `opt_licm` | hoists per loop | 4 | 5 |
+| `licm_dense_hi` | `opt_licm` | more loop-defined values than this: at most 1 hoist | 30 | 1000 (off) |
+| `licm_dense_lo` | `opt_licm` | more than this: at most 2 | 6 | 14 |
+| `lsr_reserve` | `opt_lsr` | reductions K - this - live-ins | 7 | 15 (LSR effectively off) |
+
+Both targets settle on less aggressive constant hoisting and strength
+reduction than the old hand-set values (2, 5, 16, 2, 4, 1, 4, 4, 10, 6, 4):
+on CPU4 a hoisted constant or reduced multiply competes for 8 registers,
+and on CPU5 most constants fit a 16-bit immediate, so hoisting one replaces a
+free operand with a register.
+
+Two policies are fixed rather than tuned:
+
+| Pass | Policy | Why |
+|------|--------|-----|
+| `opt_cse` post-OOS | cross-block: direct predecessor only | Wider policies defeat P12 loop rotation |
+| `opt_copy_prop` | type-coercing copies not propagated | Same P12 interaction |
 
 An earlier version of the compiler carried an `OptProfile` struct and a
 `-speculative` mode that tried a conservative + aggressive variant per function
