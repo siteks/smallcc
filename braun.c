@@ -154,6 +154,9 @@ typedef struct {
     int         nparams;
     Node       *body;       // ND_COMPSTMT body (for straight-line prefix walk)
     Node       *ret_expr;   // the return expression node (ch[0] of final ND_RETURNSTMT)
+    int         has_cf;     // body has control flow: expanded through cg_stmt with
+                            // returns jumping to a continuation block
+    Type       *ret_type;   // has_cf: the return type (NULL: void)
 } InlineCandidate;
 
 #define MAX_INLINE        256
@@ -285,11 +288,75 @@ static Node *inline_qualify(Node *func_decl) {
     return is_void ? body : ret_stmt->ch[0];
 }
 
+// Bodies with control flow (g_tune.inline_cf_nodes > 0): anything but goto
+// and labels (they would collide with the caller's), static locals (one
+// object, not one per call site), variadic access and &param. Locals that
+// live in memory get a frame slot in each caller (local_bpoff).
+static int cf_walk(Node *n, Symbol *self, int *count) {
+    for (; n; n = n->next) {
+        if (++(*count) > g_tune.inline_cf_nodes) return 0;
+        switch (n->kind) {
+        case ND_GOTOSTMT: case ND_LABELSTMT:
+        case ND_VA_START: case ND_VA_ARG: case ND_VA_END:
+            return 0;
+        default: break;
+        }
+        if (n->kind == ND_UNARYOP && n->op_kind == TK_AMPERSAND && n->ch[0] &&
+            n->ch[0]->kind == ND_IDENT && n->ch[0]->symbol &&
+            n->ch[0]->symbol->kind == SYM_PARAM)
+            return 0;
+        if (n->kind == ND_IDENT && n->u.ident.is_function && n->symbol == self) return 0;
+        if (n->kind == ND_DECLARATOR && n->symbol && n->symbol->kind == SYM_STATIC_LOCAL) return 0;
+        for (int i = 0; i < 4; i++)
+            if (n->ch[i] && !cf_walk(n->ch[i], self, count)) return 0;
+    }
+    return 1;
+}
+
+static void mark_inlined_locals(Node *n) {
+    for (; n; n = n->next) {
+        if (n->kind == ND_DECLARATOR && n->symbol && n->symbol->kind == SYM_LOCAL)
+            n->symbol->inlined = true;
+        for (int i = 0; i < 4; i++) mark_inlined_locals(n->ch[i]);
+    }
+}
+
+static int cf_qualify(Node *func_decl) {
+    if (g_tune.inline_cf_nodes <= 0) return 0;
+    if (!func_decl || func_decl->kind != ND_DECLARATION || !func_decl->u.declaration.is_func_defn) return 0;
+    Node *declarator = func_decl->ch[1], *body = func_decl->ch[2];
+    if (!declarator || !body || body->kind != ND_COMPSTMT) return 0;
+    Symbol *fsym = declarator->symbol;
+    if (!fsym || !fsym->type || fsym->type->base != TB_FUNCTION) return 0;
+    if (fsym->type->u.fn.is_variadic) return 0;
+    Type *rt = fsym->type->u.fn.ret;
+    if (rt && rt->base == TB_STRUCT) return 0;
+    int np = 0;
+    if (body->symtable)
+        for (Symbol *s = body->symtable->symbols; s; s = s->next)
+            if (s->kind == SYM_PARAM && s->ns == NS_IDENT) np++;
+    if (np > INLINE_MAX_PARAMS) return 0;
+    int count = 0;
+    Node *next = body->next; body->next = NULL;
+    int ok = cf_walk(body, fsym, &count);
+    body->next = next;
+    return ok;
+}
+
 void braun_register_inline_candidate(Node *func_decl, int tu_index) {
     if (g_ninline >= MAX_INLINE) return;
 
     Node *ret_expr = inline_qualify(func_decl);
-    if (!ret_expr) return;
+    int has_cf = 0;
+    if (!ret_expr) {
+        if (!cf_qualify(func_decl)) return;
+        has_cf = 1;
+        ret_expr = func_decl->ch[2];              // unused for has_cf
+        Node *body = func_decl->ch[2];
+        Node *next = body->next; body->next = NULL;
+        mark_inlined_locals(body);
+        body->next = next;
+    }
 
     Node *declarator = func_decl->ch[1];
     Node *body = func_decl->ch[2];
@@ -316,6 +383,8 @@ void braun_register_inline_candidate(Node *func_decl, int tu_index) {
     ic->nparams = np;
     ic->body = body;
     ic->ret_expr = (ret_expr == body) ? NULL : ret_expr;   // NULL: void function
+    ic->has_cf = has_cf;
+    ic->ret_type = fsym->type->u.fn.ret && fsym->type->u.fn.ret->base != TB_VOID ? fsym->type->u.fn.ret : NULL;
     if (np > 0) {
         ic->param_syms = arena_alloc(np * sizeof(Symbol *));
         memcpy(ic->param_syms, psyms, np * sizeof(Symbol *));
@@ -379,6 +448,16 @@ typedef struct {
     LvnEntry  lvn[LVN_SIZE];
     Block    *lvn_block;
     int       lvn_count;
+
+    // Inlining a body with control flow: `return` writes inl_ret_sym and
+    // jumps to inl_ret (NULL outside such a body).
+    Block    *inl_ret;
+    Symbol   *inl_ret_sym;
+    // Frame slots in this function for inlined callees' locals that live
+    // in memory (arrays, structs, address-taken scalars).
+    Symbol  **inl_slot_syms;
+    int      *inl_slot_offs;
+    int       n_inl_slots, inl_slot_cap;
 } BraunCtx;
 
 // Create an instruction and stamp the current source line on it.
@@ -407,6 +486,30 @@ static bool is_addr_taken(BraunCtx *ctx, Symbol *sym) {
     for (int i = 0; i < ctx->n_addr_taken; i++)
         if (ctx->addr_taken[i] == sym) return true;
     return false;
+}
+
+// bp offset of a local's frame slot: its own (-offset), or, for a local of
+// an inlined callee, a slot allocated in this function's frame the first
+// time it is needed (callee offsets belong to the callee's frame).
+static int local_bpoff(BraunCtx *ctx, Symbol *sym) {
+    if (!sym->inlined) return -(sym->offset);
+    for (int i = 0; i < ctx->n_inl_slots; i++)
+        if (ctx->inl_slot_syms[i] == sym) return ctx->inl_slot_offs[i];
+    if (ctx->n_inl_slots >= ctx->inl_slot_cap) {
+        int nc = ctx->inl_slot_cap ? ctx->inl_slot_cap * 2 : 8;
+        Symbol **ns = arena_alloc(nc * sizeof(Symbol *));
+        int *no = arena_alloc(nc * sizeof(int));
+        memcpy(ns, ctx->inl_slot_syms, ctx->n_inl_slots * sizeof(Symbol *));
+        memcpy(no, ctx->inl_slot_offs, ctx->n_inl_slots * sizeof(int));
+        ctx->inl_slot_syms = ns; ctx->inl_slot_offs = no; ctx->inl_slot_cap = nc;
+    }
+    Function *f = ctx->f;
+    int size = sym->type ? sym->type->size : 4;
+    f->frame_size = (f->frame_size + 3) & ~3;
+    f->frame_size += (size + 3) & ~3;
+    ctx->inl_slot_syms[ctx->n_inl_slots] = sym;
+    ctx->inl_slot_offs[ctx->n_inl_slots] = -f->frame_size;
+    return ctx->inl_slot_offs[ctx->n_inl_slots++];
 }
 
 // ============================================================
@@ -1349,7 +1452,7 @@ static Value *cg_addr(BraunCtx *ctx, Block **cur, Node *n) {
         }
 
         // Local: IK_ADDR at negative bp offset
-        return emit_frame_addr(ctx, b, -(sym->offset));
+        return emit_frame_addr(ctx, b, local_bpoff(ctx, sym));
     }
 
     if (n->kind == ND_UNARYOP) {
@@ -1410,6 +1513,29 @@ static Value *braun_try_inline(BraunCtx *ctx, Block **cur, Symbol *fsym,
         b = *cur;
         write_var(b, ic->param_syms[i], av);
         arg = arg->next;
+    }
+
+    if (ic->has_cf) {
+        // The whole body through cg_stmt; `return` writes the result
+        // variable and jumps to the continuation block (ND_RETURNSTMT).
+        Block *saved_ret = ctx->inl_ret; Symbol *saved_sym = ctx->inl_ret_sym;
+        Block *ret_blk = new_block(ctx->f);
+        Symbol *rs = NULL;
+        if (ic->ret_type) {
+            rs = arena_alloc(sizeof(Symbol));
+            memset(rs, 0, sizeof *rs);
+            rs->name = "$inline_ret"; rs->type = ic->ret_type; rs->kind = SYM_LOCAL; rs->ns = NS_IDENT;
+            write_var(b, rs, new_value(ctx->f, VAL_UNDEF, vt_of(ic->ret_type)));
+        }
+        scan_addr_taken(ctx, ic->body->ch[0]);   // the callee's &local
+        ctx->inl_ret = ret_blk; ctx->inl_ret_sym = rs;
+        b = cg_stmt(ctx, b, ic->body);
+        if (b && !b->filled) emit_jmp(b, ret_blk);
+        ctx->inl_ret = saved_ret; ctx->inl_ret_sym = saved_sym;
+        seal_block(ctx, ret_blk);
+        *cur = ret_blk;
+        if (!rs) return new_const(ctx->f, 0, VT_I16);
+        return read_var(ctx, ret_blk, rs);
     }
 
     // Walk the straight-line prefix. Each declaration or expression statement is
@@ -1552,7 +1678,7 @@ static Value *cg_expr(BraunCtx *ctx, Block **cur, Node *n) {
                 int voff = vparam_off(ctx, sym);
                 bpoff = (voff >= 0) ? voff : param_home_off(ctx, sym);
             } else {
-                bpoff = -(sym->offset);
+                bpoff = local_bpoff(ctx, sym);
             }
             Value *addr = emit_frame_addr(ctx, b, bpoff);
             int sz = sym->type ? sym->type->size : 2;
@@ -2137,7 +2263,7 @@ static void cg_decl_init(BraunCtx *ctx, Block **cur, Symbol *sym, Node *init) {
     if (!istype_array(ty) && ty && ty->base != TB_STRUCT) {
         Value *v = cg_expr(ctx, cur, init); b = *cur;
         if (is_addr_taken(ctx, sym)) {
-            int bpoff = -(sym->offset);
+            int bpoff = local_bpoff(ctx, sym);
             if (sym->kind == SYM_PARAM) bpoff = param_home_off(ctx, sym);
             Value *addr = emit_frame_addr(ctx, b, bpoff);
             emit_store(ctx, b, addr, v, ty->size, 0);
@@ -2149,7 +2275,7 @@ static void cg_decl_init(BraunCtx *ctx, Block **cur, Symbol *sym, Node *init) {
 
     // char array from string literal: byte-by-byte stores
     if (istype_array(ty) && init->kind == ND_LITERAL && init->u.literal.strval) {
-        Value *base_addr = emit_frame_addr(ctx, b, -(sym->offset));
+        Value *base_addr = emit_frame_addr(ctx, b, local_bpoff(ctx, sym));
         const char *str = init->u.literal.strval;
         int slen = init->u.literal.strval_len;
         for (int i = 0; i <= slen; i++) {
@@ -2162,7 +2288,7 @@ static void cg_decl_init(BraunCtx *ctx, Block **cur, Symbol *sym, Node *init) {
 
     // Array with initializer list: zero-fill then write non-zero elements
     if (istype_array(ty) && init->kind == ND_INITLIST) {
-        Value *base_addr = emit_frame_addr(ctx, b, -(sym->offset));
+        Value *base_addr = emit_frame_addr(ctx, b, local_bpoff(ctx, sym));
         // Zero-fill entire array
         Type *leaf = array_elem_type(ty);
         int lsz = (leaf && leaf->size > 0) ? leaf->size : 2;
@@ -2180,7 +2306,7 @@ static void cg_decl_init(BraunCtx *ctx, Block **cur, Symbol *sym, Node *init) {
     // Struct with initializer list: handled as memcpy from a temp
     // (for simplicity: zero addr then store each field is complex; use memcpy approach)
     if (ty && ty->base == TB_STRUCT) {
-        Value *dst_addr = emit_frame_addr(ctx, b, -(sym->offset));
+        Value *dst_addr = emit_frame_addr(ctx, b, local_bpoff(ctx, sym));
 
         if (init->kind == ND_INITLIST) {
             // Zero what the fields below leave (holes, padding, members
@@ -2405,6 +2531,17 @@ static Block *cg_stmt(BraunCtx *ctx, Block *b, Node *n) {
     }
 
     case ND_RETURNSTMT: {
+        if (ctx->inl_ret) {                       // inside an inlined body with control flow
+            if (n->ch[0]) {
+                Block *cur = b;
+                Value *v = cg_expr(ctx, &cur, n->ch[0]);
+                b = cur;
+                if (ctx->inl_ret_sym) write_var(b, ctx->inl_ret_sym, v);
+            }
+            emit_jmp(b, ctx->inl_ret);
+            b->filled = 1;
+            return b;
+        }
         Inst *ret = arena_alloc(sizeof(Inst));
         ret->kind  = IK_RET;
         ret->block = b;

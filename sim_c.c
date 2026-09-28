@@ -456,17 +456,26 @@ static void check_align32(uint32_t addr, uint16_t pc) {
 /* Symbol table                                                         */
 /* ------------------------------------------------------------------ */
 
-#define MAX_SYMS 2048
+#define MAX_SYMS 16384      /* inlining multiplies block labels */
 #define MAX_NAME 128
+#define SYM_HASH 32768      /* open-addressed index into syms[], power of 2 */
 
 typedef struct { char name[MAX_NAME]; uint16_t addr; } Sym;
 static Sym syms[MAX_SYMS];
 static int nsyms = 0;
+static int sym_hash[SYM_HASH];   /* syms index + 1; 0 = empty */
+
+static unsigned sym_hash_of(const char *n)
+{
+    unsigned h = 2166136261u;
+    while (*n) { h ^= (unsigned char)*n++; h *= 16777619u; }
+    return h;
+}
 
 static int find_sym(const char *n)
 {
-    for (int i = 0; i < nsyms; i++)
-        if (strcmp(syms[i].name, n) == 0) return i;
+    for (unsigned i = sym_hash_of(n) & (SYM_HASH - 1); sym_hash[i]; i = (i + 1) & (SYM_HASH - 1))
+        if (strcmp(syms[sym_hash[i] - 1].name, n) == 0) return sym_hash[i] - 1;
     return -1;
 }
 
@@ -478,6 +487,9 @@ static void add_sym(const char *n, uint16_t addr)
     strncpy(syms[nsyms].name, n, MAX_NAME-1);
     syms[nsyms].name[MAX_NAME-1] = '\0';
     syms[nsyms].addr = addr;
+    unsigned h = sym_hash_of(syms[nsyms].name) & (SYM_HASH - 1);
+    while (sym_hash[h]) h = (h + 1) & (SYM_HASH - 1);
+    sym_hash[h] = nsyms + 1;
     nsyms++;
 }
 

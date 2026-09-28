@@ -34,6 +34,7 @@ typedef struct Tune {
     int lsr_reserve;       // LSR: K - this - live-ins reductions
     int ipra;              // 1: qualifying static functions save no registers (irc_is_internal) ...
     int ipra_reserve;      //   ... if they leave at least this many registers unwritten for callers
+    int inline_cf_nodes;   // inline functions with control flow up to this many AST nodes (0: off)
 } Tune;
 extern Tune g_tune;        // the target's, then -Oparam overrides
 int tune_set(const char *name_eq_value);   // 0 if the name is unknown

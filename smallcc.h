@@ -315,6 +315,7 @@ struct Symbol
     SymbolKind kind;
     Namespace  ns;          // NS_IDENT | NS_TAG | NS_TYPEDEF
     int     tu_index;       // TU that defined a static (SYM_STATIC_GLOBAL / SYM_STATIC_LOCAL)
+    bool    inlined;        // a local of a function being inlined (braun: gets a frame slot of its own)
     Symbol  *next;
 };
 

@@ -310,6 +310,11 @@ registered candidates from later functions are expanded inline during Braun
 construction instead of emitting `IK_CALL`. Definition order matters: a callee
 is only inlinable into functions compiled after it (lib TUs compile first, so
 lib helpers qualify everywhere).
+With `-Oparam=inline_cf_nodes=N` (the CPU5 default is 160) functions with
+control flow up to N AST nodes are also candidates; they are expanded by
+running the whole body through `cg_stmt` with `return` redirected to a
+continuation block, and their memory-resident locals get frame slots in the
+caller (`local_bpoff`). See docs/optimization-passes.md.
 
 ### R2C — Algebraic simplification (in `emit_binop`)
 

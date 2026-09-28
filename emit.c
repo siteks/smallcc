@@ -1984,10 +1984,16 @@ static int detect_branch_fusions(Function *f, BranchFuse *fuse,
 
         Value *dop0 = def->ops[0] ? val_resolve(def->ops[0]) : NULL;
         Value *dop1 = def->ops[1] ? val_resolve(def->ops[1]) : NULL;
-        // Estimate byte distance to true target; skip if out of F3c range.
+        // Estimate the byte distance to the block the fused branch will
+        // jump to: the true target, or the false one when the true target
+        // is the next block and emission inverts the branch (the estimate
+        // used to be to the true target only, so an inverted branch could
+        // be out of reach in a large function).
+        Block *next_blk = (fbi + 1 < f->nblocks) ? f->blocks[fbi + 1] : NULL;
+        Block *br_tgt = (term->target == next_blk && term->target2) ? term->target2 : term->target;
         int target_bi = -1;
         for (int k = 0; k < f->nblocks; k++) {
-            if (f->blocks[k] == term->target) { target_bi = k; break; }
+            if (f->blocks[k] == br_tgt) { target_bi = k; break; }
         }
         if (target_bi < 0) continue;
         int lo = (fbi < target_bi) ? fbi + 1 : target_bi;

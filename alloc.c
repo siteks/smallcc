@@ -531,7 +531,7 @@ static int is_rematerializable(Value *v);   /* forward decl: defined below */
 // behaviour, EXHAUST 500) or like immediate successes before rewrite
 // inserted their per-use clones (the alternative also-broken).
 static int assign_colors(IGraph *g, Function *f, int K, int pessimistic,
-                          const uint8_t *persist_spill, int persist_cap) {
+                          const uint8_t *persist_spill, int persist_cap, int short_first) {
     // Simplification order: build a stack using degree < K heuristic
     int nv = g->nv;
     int *stack    = arena_alloc(nv * sizeof(int));
@@ -763,10 +763,22 @@ static int assign_colors(IGraph *g, Function *f, int K, int pessimistic,
         }
     }
 
-    // Assign colors from stack (pop order)
+    // Assign colors from stack (pop order). Values that already have a
+    // spill slot go first: rewrite_spills cut them to [def, spill store],
+    // and that one-instruction range still needs a register (there is no
+    // further spilling it). Coloring them first puts the pressure on long
+    // ranges, which can spill. (Left uncolored, such a value used to be
+    // accepted as "already spilled" and emitted into r0 over a live value.)
+    for (int pass = 0; pass < 2; pass++)
     for (int i = stack_top - 1; i >= 0; i--) {
         int v = stack[i];
-        if (g->spilled[v]) continue;
+        int short_range = v < f->nvalues && f->values[v]->spill_slot != -1 &&
+                          !is_rematerializable(f->values[v]);
+        if (pass == 0 && (!short_first || !short_range)) continue;
+        if (pass == 1 && !short_first) short_range = 0;   // normal order: one pass over everything
+        if (pass == 1 && (short_range || g->color[v] >= 0)) continue;
+        if (g->spilled[v] && !(pass == 0 && short_range)) continue;
+        if (pass == 0) g->spilled[v] = 0;
 
         // Collect forbidden colors from all colored neighbors.
         // Phantom nodes (indices nv..nv+K-1) are included since uid < g->nv,
@@ -855,6 +867,11 @@ static int assign_colors(IGraph *g, Function *f, int K, int pessimistic,
             int already_persistent = (persist_spill && i < persist_cap && persist_spill[i]);
             if (!already_persistent && v->spill_slot == -1)
                 return 0;  // new spill — need another round
+            // A value with a slot that is still defined by a live
+            // instruction needs a register for [def, spill store].
+            if (i < f->nvalues && v->spill_slot != -1 && !is_rematerializable(v) &&
+                v->def && !v->def->is_dead)
+                return short_first ? 0 : 2;   // 2: retry this round, short ranges first
         }
     }
     return 1;
@@ -1205,6 +1222,7 @@ void irc_allocate(Function *f) {
 
     int K = IRC_K;
     int max_iter = 500;
+    int short_first = 0;   // see assign_colors: set once a short spill range fails to color
     // Persistent spill set for Tier 3: once a value is spilled, it stays
     // spilled.  Dynamically grown as rewrite_spills adds new values.
     int persist_cap = f->nvalues + 64;  // initial capacity with headroom
@@ -1250,9 +1268,22 @@ void irc_allocate(Function *f) {
 
         // Tier 3 (iter >= 8): pessimistic spilling to break cascade
         int pessimistic = (iter >= 8);
+        uint8_t *spilled0 = arena_alloc(g->nv);
+        memcpy(spilled0, g->spilled, g->nv);
         int ok = assign_colors(g, f, K, pessimistic,
                                iter >= 8 ? persist_spill : NULL,
-                               iter >= 8 ? persist_cap : 0);
+                               iter >= 8 ? persist_cap : 0, short_first);
+        if (ok == 2) {
+            // A value cut to [def, spill store] got no register: color such
+            // values first, this round and (so the spill choices do not
+            // oscillate between the two orders) every later one.
+            short_first = 1;
+            memcpy(g->spilled, spilled0, g->nv);
+            for (int i = 0; i < g->nv; i++) if (g->precolored[i] < 0) g->color[i] = -1;
+            ok = assign_colors(g, f, K, pessimistic,
+                               iter >= 8 ? persist_spill : NULL,
+                               iter >= 8 ? persist_cap : 0, 1);
+        }
 
         if (ok) {
             // Apply colors to values

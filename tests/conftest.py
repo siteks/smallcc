@@ -113,6 +113,7 @@ class CTestItem(pytest.Item):
             # putchar output to stderr — no separate simulator step needed.
             run_cmd = [str(root / 'smallcc'), '-arch', self.isa,
                        f'-{self.arch}']
+            run_cmd += os.environ.get('SMALLCC_FLAGS', '').split()   # e.g. -Oparam=... for a whole run
             if 'CFLAGS' in meta:
                 run_cmd += meta['CFLAGS'].split()
             run_cmd += files
@@ -148,6 +149,7 @@ class CTestItem(pytest.Item):
             # Compile with -arch cpu4 -target <target>
             compile_cmd = [str(root / 'smallcc'), '-arch', self.isa,
                            '-target', target, '-o', asm]
+            compile_cmd += os.environ.get('SMALLCC_FLAGS', '').split()   # e.g. -Oparam=... for a whole run
             if 'CFLAGS' in meta:                      # // CFLAGS: -Opass=fmadd  (verbatim compiler flags)
                 compile_cmd += meta['CFLAGS'].split()
             compile_cmd += files

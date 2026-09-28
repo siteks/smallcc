@@ -266,6 +266,7 @@ Rerun it after a change to the ISA or to these passes.
 | `lsr_reserve` | `opt_lsr` | reductions K - this - live-ins | 7 | 15 (LSR effectively off) |
 | `ipra` | allocator, emission | qualifying static functions take their own convention | 1 | 1 |
 | `ipra_reserve` | allocator | ... only if they leave this many registers unwritten | 2 | 0 |
+| `inline_cf_nodes` | braun inliner | inline functions with control flow up to this many AST nodes (0: only straight-line bodies) | 0 | 160 |
 
 Both targets settle on less aggressive constant hoisting and strength
 reduction than the old hand-set values (2, 5, 16, 2, 4, 1, 4, 4, 10, 6, 4):
@@ -279,6 +280,17 @@ saves no callee-saved registers and its callers avoid every register it
 writes, provided it leaves at least `ipra_reserve` registers unwritten.
 CPU4 uses 1 and 2 (8 registers: a callee that writes almost all of them
 pushes spills into its callers), CPU5 1 and 0.
+
+`inline_cf_nodes` lets braun inline functions with control flow (loops,
+early returns, switches): a `return` writes a result variable and jumps to a
+continuation block, and the callee's locals that live in memory get a frame
+slot in each caller. Excluded: goto and labels, static locals, variadic
+access and taking a parameter's address. On CPU4 it stays off: 8 registers
+do not hold the merged live ranges, and the allocator's spill rewriting can
+fail to converge (it then refuses to emit code). Legalize Pass F also turns
+a constant stored to memory into an `IK_CONST` so LICM can hoist it: a store
+has no immediate form, and inlining a fill loop with a constant value
+otherwise materialised it on every iteration.
 
 Two policies are fixed rather than tuned:
 

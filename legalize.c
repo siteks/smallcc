@@ -678,6 +678,25 @@ void legalize_materialize_consts(Function *f) {
         for (int bi = 0; bi < f->nblocks; bi++) {
             Block *b = f->blocks[bi];
             for (Inst *inst = b->head; inst; inst = inst->next) {
+                // A store has no immediate form for its value: emission
+                // materialises a constant value at every execution. As an
+                // IK_CONST it is the same instruction, but LICM can hoist it
+                // out of a loop (a fill loop stored `zero4` per iteration).
+                if (!inst->is_dead && inst->kind == IK_STORE && inst->nops >= 1) {
+                    int vi = inst->nops - 1;
+                    Value *v = inst->ops[vi] ? val_resolve(inst->ops[vi]) : NULL;
+                    if (v && v->kind == VAL_CONST) {
+                        ValType vt = v->vtype != VT_VOID ? v->vtype : VT_I32;
+                        Value *cv = new_value(f, VAL_INST, vt);
+                        Inst  *ci = new_inst(f, b, IK_CONST, cv);
+                        ci->imm  = v->iconst;
+                        ci->line = inst->line;
+                        inst_insert_before(inst, ci);
+                        inst->ops[vi] = cv;
+                        cv->use_count++;
+                    }
+                    continue;
+                }
                 if (inst->is_dead || inst->nops < 2 || !inst->dst) continue;
                 // Only binary ALU and bitwise (not comparisons — P5+ handles those)
                 switch (inst->kind) {
