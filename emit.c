@@ -3,6 +3,7 @@
 #include <string.h>
 #include <ctype.h>
 #include "smallcc.h"
+#include "target.h"
 #include "emit.h"
 #include "alloc.h"   // irc_add_clobbers
 
@@ -86,13 +87,15 @@ static void emit_src_comment(int line, FILE *out)
 #define BR_DISP_RANGE  511   // F3c/F0c/F3d 10-bit signed branch displacement
 
 static const char *regname(int r) {
-    static const char *names[] = {"r0","r1","r2","r3","r4","r5","r6","r7"};
-    if (r >= 0 && r < 8) return names[r];
+    static const char *names[MAX_GPR] = {
+        "r0","r1","r2","r3","r4","r5","r6","r7","r8","r9","r10","r11","r12","r13","r14","r15",
+        "r16","r17","r18","r19","r20","r21","r22","r23","r24","r25","r26","r27","r28","r29","r30","r31"};
+    if (r >= 0 && r < g_target->nregs) return names[r];
     return "??";
 }
 
 static const char *g_cur_func_name = "";
-static uint8_t     g_blk_live_out_regs = 0xff; // conservative default: all busy
+static regmask_t   g_blk_live_out_regs = 0xffffffffu; // conservative default: all busy
 
 // Emit a register move (mov pseudo-op: or rd, rs, rs), skipped when the
 // value is already in the destination register.
@@ -108,7 +111,7 @@ static void emit_mov(FILE *out, int rd, int rs) {
 // don't keep live values in a register the callee silently writes.
 // (Found by tools/fuzz.py seed 9199: a caller kept a value in r2 across a
 // call whose callee borrowed r2 for an unmaterialized large constant.)
-static uint8_t g_scratch_borrows;
+static regmask_t g_scratch_borrows;
 
 // Find a caller-saved scratch register (r0-r3) that is genuinely dead at `inst`.
 // `exclude` is a bitmask of registers that must not be chosen (operands of inst).
@@ -128,14 +131,16 @@ static int find_free_scratch(Inst *inst, int exclude) {
     for (Inst *p = inst->next; p; p = p->next) {
         for (int i = 0; i < p->nops; i++) {
             Value *v = val_resolve(p->ops[i]);
-            if (v && v->kind == VAL_INST && v->phys_reg >= 0 && v->phys_reg < 8)
+            if (v && v->kind == VAL_INST && v->phys_reg >= 0 && v->phys_reg < g_target->nregs)
                 busy |= (1u << v->phys_reg);
         }
     }
 
     // Pick first free caller-saved register
-    for (int r = 0; r <= 3; r++)
-        if (!(busy & (1u << r))) { g_scratch_borrows |= (uint8_t)(1u << r); return r; }
+    for (int r = 0; r < g_target->nregs; r++)
+        if (reg_in(g_target->caller_saved, r) && !(busy & (1u << r))) {
+            g_scratch_borrows |= 1u << r; return r;
+        }
     return -1;
 }
 
@@ -148,9 +153,9 @@ static int find_free_scratch(Inst *inst, int exclude) {
 static int pick_scratch(unsigned forbidden) {
     // Caller-saved only: a borrowed r4-r7 would bypass the callee-save
     // prologue (computed from IR-assigned registers before emission).
-    for (int r = 0; r < 4; r++) {
-        if (!(forbidden & (1u << r))) {
-            g_scratch_borrows |= (uint8_t)(1u << r);
+    for (int r = 0; r < g_target->nregs; r++) {
+        if (reg_in(g_target->caller_saved, r) && !(forbidden & (1u << r))) {
+            g_scratch_borrows |= 1u << r;
             return r;
         }
     }
@@ -169,7 +174,7 @@ static int preg(Value *v) {
 // Emit an immediate into a register (uses immw + immwh for large values)
 static void emit_imm(FILE *out, int rd, int val) {
     unsigned uval = (unsigned)val;
-    if (val == 0 && rd >= 0 && rd <= 7) {
+    if (val == 0 && rd >= 0 && rd < g_target->nregs) {
         fprintf(out, "    zero%d\n", rd);
     } else if (val >= -64 && val <= 63) {
         fprintf(out, "    imms %s, %d\n", regname(rd), val);
@@ -914,13 +919,13 @@ static void emit_inst(Inst *inst, FILE *out) {
             // Unallocated (spill-rewritten) value: by convention it is in
             // the default scratch already; nothing to materialise.
             int sc = (rb == 0) ? 1 : 0;
-            g_scratch_borrows |= (uint8_t)(1u << sc);
+            g_scratch_borrows |= (1u << sc);
             rv = get_val_reg(out, val, sc);
         } else if (val && (val->kind == VAL_CONST || val->kind == VAL_UNDEF)) {
             int sc = find_free_scratch(inst, (int)used);
             if (sc < 0) {
                 sc = (rb == 0) ? 1 : 0;
-                g_scratch_borrows |= (uint8_t)(1u << sc);
+                g_scratch_borrows |= (1u << sc);
                 fprintf(out, "    pushr %s\n", regname(sc));
                 saved[nsaved++] = sc;
             }
@@ -935,7 +940,7 @@ static void emit_inst(Inst *inst, FILE *out) {
             if (sc < 0) {
                 sc = 0;
                 while (used & (1u << sc)) sc++;
-                g_scratch_borrows |= (uint8_t)(1u << sc);
+                g_scratch_borrows |= (1u << sc);
                 fprintf(out, "    pushr %s\n", regname(sc));
                 saved[nsaved++] = sc;
             }
@@ -952,7 +957,7 @@ static void emit_inst(Inst *inst, FILE *out) {
                 if (tmp < 0) {
                     tmp = 0;
                     while (used & (1u << tmp)) tmp++;
-                    g_scratch_borrows |= (uint8_t)(1u << tmp);
+                    g_scratch_borrows |= (1u << tmp);
                     fprintf(out, "    pushr %s\n", regname(tmp));
                     saved[nsaved++] = tmp;
                 }
@@ -1054,10 +1059,11 @@ static void emit_inst(Inst *inst, FILE *out) {
             // Non-variadic: register args (ops[0..nreg-1]) are pre-colored to r1..r3
             // by IK_COPY instructions inserted by legalize_function() (Pass B).
             // IRC's interference analysis guarantees sequential emission is cycle-free.
-            int nreg   = inst->nops < 3 ? inst->nops : 3;
-            int nextra = inst->nops > 3 ? inst->nops - 3 : 0;
-            // Compute mask of all registers holding extra (stack) args, plus r1/r2/r3.
-            unsigned extra_avoid = 0x0e; // r1|r2|r3 always off-limits for scratch
+            int na     = g_target->n_arg_regs;
+            int nreg   = inst->nops < na ? inst->nops : na;
+            int nextra = inst->nops > na ? inst->nops - na : 0;
+            // Compute mask of all registers holding extra (stack) args, plus the arg registers.
+            unsigned extra_avoid = target_arg_mask(); // arg registers always off-limits for scratch
             for (int ai = nreg; ai < inst->nops; ai++) {
                 Value *av = val_resolve(inst->ops[ai]);
                 if (av && av->kind == VAL_INST && av->phys_reg >= 0)
@@ -1087,10 +1093,11 @@ static void emit_inst(Inst *inst, FILE *out) {
         // ops[1..nreg] = pre-colored reg args (r1..r3)
         // ops[nreg+1..] = extra stack args
         if (inst->nops < 1) break;
-        int nreg   = (inst->nops - 1) < 3 ? (inst->nops - 1) : 3;
-        int nextra = (inst->nops - 1) > 3 ? (inst->nops - 1) - 3 : 0;
-        // Compute mask of registers holding extra args, plus r0/r1/r2/r3.
-        unsigned extra_avoid = 0x0f; // r0|r1|r2|r3 always off-limits for scratch
+        int na     = g_target->n_arg_regs;
+        int nreg   = (inst->nops - 1) < na ? (inst->nops - 1) : na;
+        int nextra = (inst->nops - 1) > na ? (inst->nops - 1) - na : 0;
+        // Compute mask of registers holding extra args, plus the fp and arg registers.
+        unsigned extra_avoid = target_arg_mask() | (1u << g_target->ret_reg); // always off-limits for scratch
         for (int ai = nreg + 1; ai < inst->nops; ai++) {
             Value *av = val_resolve(inst->ops[ai]);
             if (av && av->kind == VAL_INST && av->phys_reg >= 0)
@@ -1109,7 +1116,7 @@ static void emit_inst(Inst *inst, FILE *out) {
             }
         }
         // fp is in r0 (pre-colored by IK_COPY from legalize_function() Pass B)
-        fprintf(out, "    jlr r0\n");
+        fprintf(out, "    jlr %s\n", regname(g_target->ret_reg));
         if (nextra > 0) fprintf(out, "    adjw %d\n", nextra * 4);
         if (dst) emit_mov(out, preg(dst), 0);
         break;
@@ -1183,7 +1190,7 @@ static void remap_single_use_values(Function *f) {
         Block *b = f->blocks[bi];
 
         // Physical register live_in mask
-        uint8_t live_in_regs = 0;
+        regmask_t live_in_regs = 0;
         if (b->live_in) {
             for (int w = 0; w < b->nwords; w++) {
                 uint32_t bits = b->live_in[w];
@@ -1192,7 +1199,7 @@ static void remap_single_use_values(Function *f) {
                     int vid = w * 32 + bit;
                     if (vid < f->nvalues) {
                         int pr = f->values[vid]->phys_reg;
-                        if (pr >= 0 && pr < 8)
+                        if (pr >= 0 && pr < g_target->nregs)
                             live_in_regs |= (1u << pr);
                     }
                     bits &= bits - 1;
@@ -1313,21 +1320,21 @@ static void remap_single_use_values(Function *f) {
 
 // Emit function prologue: enter, callee-save stores.
 // Returns callee_frame (total bytes for callee-saved registers).
-static int emit_prologue(Function *f, FILE *out, int frame, int callee_save[4]) {
-    // Detect which r4-r7 are used by non-param values.
+static int emit_prologue(Function *f, FILE *out, int frame, int callee_save[MAX_GPR]) {
+    // Detect which callee-saved registers are used by non-param values.
     for (int i = 0; i < f->nvalues; i++) {
         Value *v = f->values[i];
-        if (v->phys_reg < 4 || v->phys_reg > 7) continue;
+        if (!reg_in(g_target->callee_saved, v->phys_reg)) continue;
         int is_param = 0;
         for (int pi = 0; pi < f->nparams; pi++) {
             if (f->params[pi] == v) { is_param = 1; break; }
         }
         if (!is_param)
-            callee_save[v->phys_reg - 4] = 1;
+            callee_save[v->phys_reg] = 1;
     }
     int callee_frame = 0;
-    for (int r = 4; r <= 7; r++)
-        if (callee_save[r - 4]) callee_frame += 4;
+    for (int r = 0; r < g_target->nregs; r++)
+        if (callee_save[r]) callee_frame += 4;
 
     if (flag_linemap && f->decl_line)
         fprintf(out, "; @src %s %d\n",
@@ -1335,8 +1342,8 @@ static int emit_prologue(Function *f, FILE *out, int frame, int callee_save[4]) 
     fprintf(out, "    enter %d\n", frame + callee_frame);
 
     int callee_tmp = 0;
-    for (int r = 4; r <= 7; r++) {
-        if (callee_save[r - 4]) {
+    for (int r = 0; r < g_target->nregs; r++) {
+        if (callee_save[r]) {
             callee_tmp += 4;
             int off = -(frame + callee_tmp);
             if (f2_range_long(off)) {
@@ -2375,8 +2382,8 @@ static int emit_rotated_branch(Function *f, FILE *out, Inst *inst,
 // Invoked twice: once to a memstream for exact byte-size measurement, once
 // to the real output after branch fusions are committed.
 static void emit_function_body(Function *f, FILE *out, BranchFuse *fuse,
-                               uint8_t *blk_live_regs,
-                               int callee_frame, int callee_save[4],
+                               regmask_t *blk_live_regs,
+                               int callee_frame, int callee_save[MAX_GPR],
                                int frame, int ann_live,
                                const int *block_start, const int *block_size,
                                uint8_t *no_rotate) {
@@ -2390,21 +2397,21 @@ static void emit_function_body(Function *f, FILE *out, BranchFuse *fuse,
         g_blk_live_out_regs = blk_live_regs[bi];
 
         // Per-instruction live register mask (backward dataflow)
-        uint8_t *inst_live = NULL;
+        regmask_t *inst_live = NULL;
         if (ann_live) {
             int ninst = 0;
             for (Inst *p = b->head; p; p = p->next) ninst++;
-            inst_live = arena_alloc(ninst * sizeof(uint8_t));
-            uint8_t live = blk_live_regs[bi];
+            inst_live = arena_alloc(ninst * sizeof(regmask_t));
+            regmask_t live = blk_live_regs[bi];
             int idx = ninst;
             for (Inst *p = b->tail; p; p = p->prev) {
                 inst_live[--idx] = live;
-                if (!p->is_dead && p->dst && p->dst->phys_reg >= 0 && p->dst->phys_reg < 8)
+                if (!p->is_dead && p->dst && p->dst->phys_reg >= 0 && p->dst->phys_reg < g_target->nregs)
                     live &= ~(1u << p->dst->phys_reg);
                 if (!p->is_dead) {
                     for (int i = 0; i < p->nops; i++) {
                         Value *v = val_resolve(p->ops[i]);
-                        if (v && v->kind == VAL_INST && v->phys_reg >= 0 && v->phys_reg < 8)
+                        if (v && v->kind == VAL_INST && v->phys_reg >= 0 && v->phys_reg < g_target->nregs)
                             live |= (1u << v->phys_reg);
                     }
                 }
@@ -2443,8 +2450,8 @@ static void emit_function_body(Function *f, FILE *out, BranchFuse *fuse,
                     }
                 }
                 int tmp_frame = 0;
-                for (int r = 4; r <= 7; r++) {
-                    if (callee_save[r - 4]) {
+                for (int r = 0; r < g_target->nregs; r++) {
+                    if (callee_save[r]) {
                         tmp_frame += 4;
                         int off = -(frame + tmp_frame);
                         if (f2_range_long(off)) {
@@ -2551,11 +2558,12 @@ static void emit_function_body(Function *f, FILE *out, BranchFuse *fuse,
                 fclose(memf);
                 out = real_out;
                 if (memlen > 0) {
-                    uint8_t m = inst_live[inst_idx];
-                    char ann[32];
-                    snprintf(ann, sizeof(ann), " ; live:%c%c%c%c%c%c%c%c",
-                        (m&0x80)?'1':'0', (m&0x40)?'1':'0', (m&0x20)?'1':'0', (m&0x10)?'1':'0',
-                        (m&0x08)?'1':'0', (m&0x04)?'1':'0', (m&0x02)?'1':'0', (m&0x01)?'1':'0');
+                    regmask_t m = inst_live[inst_idx];
+                    char ann[48] = " ; live:";
+                    int an = 8;
+                    for (int r = g_target->nregs - 1; r >= 0 && an < 46; r--)
+                        ann[an++] = ((m >> r) & 1) ? '1' : '0';
+                    ann[an] = 0;
                     // Find last newline, insert annotation at fixed column
                     char *last_nl = NULL;
                     for (size_t i = memlen; i > 0; i--)
@@ -2621,7 +2629,7 @@ void emit_function(Function *f, FILE *out) {
     int frame = f->frame_size;
     if (frame % 4) frame += (4 - frame % 4);
 
-    int callee_save[4] = {0, 0, 0, 0};
+    int callee_save[MAX_GPR] = {0};
     int callee_frame = emit_prologue(f, out, frame, callee_save);
 
     mark_dead_consts(f);
@@ -2631,10 +2639,10 @@ void emit_function(Function *f, FILE *out) {
     detect_bitex_fusions(f);
 
     // Precompute per-block physical-register live_out masks
-    uint8_t *blk_live_regs = arena_alloc(f->nblocks * sizeof(uint8_t));
+    regmask_t *blk_live_regs = arena_alloc(f->nblocks * sizeof(regmask_t));
     for (int bi = 0; bi < f->nblocks; bi++) {
         Block *b = f->blocks[bi];
-        uint8_t mask = 0;
+        regmask_t mask = 0;
         if (b->live_out) {
             for (int w = 0; w < b->nwords; w++) {
                 uint32_t bits = b->live_out[w];
@@ -2643,7 +2651,7 @@ void emit_function(Function *f, FILE *out) {
                     int vid = w * 32 + bit;
                     if (vid < f->nvalues) {
                         int pr = f->values[vid]->phys_reg;
-                        if (pr >= 0 && pr < 8)
+                        if (pr >= 0 && pr < g_target->nregs)
                             mask |= (1u << pr);
                     }
                     bits &= bits - 1;
@@ -2726,7 +2734,7 @@ void emit_function(Function *f, FILE *out) {
 
     // Report emit-time scratch borrows so callers' clobber masks include
     // registers this function writes that never appear as IR-level dsts.
-    irc_add_clobbers(f->name, (uint8_t)(g_scratch_borrows & 0x0F));
+    irc_add_clobbers(f->name, g_scratch_borrows & g_target->caller_saved);
 }
 
 // ============================================================

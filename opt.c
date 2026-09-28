@@ -1,3 +1,4 @@
+#include "target.h"
 #include "opt.h"
 #include "ssa.h"
 #include "dom.h"
@@ -1660,14 +1661,16 @@ void opt_licm_const(Function *f) {
                 if (!inst->is_dead) body_insts++;
         }
 
-        int budget = (body_insts > 16) ? 3 : 6;
+        // Budgets relative to the register count (CPU4, K=8: 3 and 6).
+        int K = g_target->nregs;
+        int budget = (body_insts > 16) ? K - 5 : K - 2;
         if (nlive + 1 > budget) {
             // Budget exceeded for general hoisting.  Still try to hoist the
             // loop-bound constant (VAL_CONST operand of the header's
             // terminator comparison).  P12 (emit_rotated_branch) duplicates
             // the comparison in the latch, so the constant is materialized
             // twice per iteration.  Allow one hoist with a relaxed cap.
-            if (nlive + 1 > 6) continue;
+            if (nlive + 1 > K - 2) continue;
             Inst *hdr_term = h->tail;
             if (!hdr_term || hdr_term->kind != IK_BR || hdr_term->nops < 1)
                 continue;
@@ -1861,7 +1864,7 @@ void opt_licm(Function *f) {
         // temporaries (address computations, intermediate values), and each
         // hoist adds 1 to the cross-loop pressure.  Cap budget when loop-
         // internal definitions are high (tight loops with many values).
-        int budget = 8 - 4 - nlive;   // reserve 4 regs for in-body temps
+        int budget = g_target->nregs - 4 - nlive;   // reserve 4 regs for in-body temps
         if (budget <= 0) continue;
         if (nloop_defs > 10)
             budget = budget < 1 ? 0 : 1;
@@ -2815,7 +2818,7 @@ void opt_lsr(Function *f) {
             // Count external values used inside the loop
             nlive = count_loop_liveins(f, h, live_ids, nlive, live_cap);
         }
-        int lsr_budget = 8 - 4 - nlive;  // K - scratch - existing cross-loop values
+        int lsr_budget = g_target->nregs - 4 - nlive;  // K - scratch - existing cross-loop values
         if (lsr_budget <= 0) continue;
 
         // Step 2: Detect basic induction variables in header phis.

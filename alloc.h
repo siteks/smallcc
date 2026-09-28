@@ -18,8 +18,8 @@
  * Frame_size is updated for spill slots.
  */
 
-#define IRC_K           8   /* total physical registers */
-#define IRC_CALLER_REGS 4   /* r0-r3 are caller-saved */
+#include "target.h"
+#define IRC_K           (g_target->nregs)   /* physical registers (the target's) */
 
 void compute_liveness(Function *f);
 void irc_allocate(Function *f);
@@ -29,6 +29,6 @@ void irc_allocate(Function *f);
 // at emit time (find_free_scratch / pick_scratch / const-base paths) are
 // invisible to the IR-level record_function_clobbers walk, and callers
 // compiled later must not keep values in them across a call.
-void irc_add_clobbers(const char *name, uint8_t mask);
+void irc_add_clobbers(const char *name, regmask_t mask);
 
 #endif // ALLOC_H

@@ -4,7 +4,8 @@
 #include "legalize.h"
 #include "opt.h"     // opt_flags, OPT_LEG_*
 #include "dom.h"     // dominates, compute_dominators
-#include "alloc.h"   // IRC_CALLER_REGS
+#include "alloc.h"
+#include "target.h"
 
 
 // ── Pass H support: frame-slot store→load forwarding ──────────────────────
@@ -301,8 +302,9 @@ void legalize_function(Function *f) {
     // all ABI register knowledge lives in one place.
     // param_idx == idx+1 (1-based: r1 for first arg, r2 for second, r3 for third).
     for (Inst *inst = f->blocks[0]->head; inst; inst = inst->next) {
-        if (inst->kind == IK_PARAM && inst->dst && inst->param_idx >= 1)
-            inst->dst->phys_reg = inst->param_idx;
+        if (inst->kind == IK_PARAM && inst->dst && inst->param_idx >= 1 &&
+            inst->param_idx <= g_target->n_arg_regs)
+            inst->dst->phys_reg = g_target->arg_regs[inst->param_idx - 1];
     }
 
     // ── Pass B: Pre-color call argument copies and ICALL fp copy ────────
@@ -320,13 +322,13 @@ void legalize_function(Function *f) {
             int is_icall = (inst->kind == IK_ICALL);
             int arg_base = is_icall ? 1 : 0;
             int nargs    = inst->nops - arg_base;
-            int nreg     = nargs < (IRC_CALLER_REGS - 1) ? nargs : (IRC_CALLER_REGS - 1);
+            int nreg     = nargs < g_target->n_arg_regs ? nargs : g_target->n_arg_regs;
 
             for (int i = 0; i < nreg; i++) {
                 Value *arg = val_resolve(inst->ops[arg_base + i]);
                 if (!arg) continue;
                 Value *v_ri = new_value(f, VAL_INST, arg->vtype);
-                v_ri->phys_reg = i + 1;  // r1, r2, r3
+                v_ri->phys_reg = g_target->arg_regs[i];
                 Inst  *cp = new_inst(f, b, IK_COPY, v_ri);
                 cp->line = inst->line;
                 inst_add_op(cp, arg);       // +1 on arg (copy's use)
@@ -341,7 +343,7 @@ void legalize_function(Function *f) {
                 Value *fp = val_resolve(inst->ops[0]);
                 if (fp) {
                     Value *v_r0 = new_value(f, VAL_INST, fp->vtype);
-                    v_r0->phys_reg = 0;  // r0 for jlr
+                    v_r0->phys_reg = g_target->ret_reg;  // the jlr register
                     Inst  *fp_cp = new_inst(f, b, IK_COPY, v_r0);
                     fp_cp->line = inst->line;
                     inst_add_op(fp_cp, fp);   // +1 on fp (copy's use)

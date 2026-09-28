@@ -16,11 +16,11 @@
 // registers across calls whose callees happen not to use them.
 //
 // Fallback for unknown callees (not yet seen, ICALL, cross-TU before the
-// callee has been compiled): 0x0F = full caller-saved (r0-r3).
+// callee has been compiled): the target's full caller-saved set.
 
 typedef struct ClobberEntry {
     char *name;
-    uint8_t mask;
+    regmask_t mask;
     struct ClobberEntry *next;
 } ClobberEntry;
 
@@ -33,13 +33,13 @@ static ClobberEntry *find_clobber_entry(const char *name) {
     return NULL;
 }
 
-static uint8_t lookup_clobbers(const char *name) {
+static regmask_t lookup_clobbers(const char *name) {
     ClobberEntry *e = find_clobber_entry(name);
     if (e) return e->mask;
-    return 0x0F;  // unknown: conservatively assume all caller-saved
+    return g_target->caller_saved;  // unknown: conservatively assume all caller-saved
 }
 
-static void record_clobbers(const char *name, uint8_t mask) {
+static void record_clobbers(const char *name, regmask_t mask) {
     if (!name) return;
     ClobberEntry *e = find_clobber_entry(name);
     if (e) { e->mask = mask; return; }
@@ -50,16 +50,16 @@ static void record_clobbers(const char *name, uint8_t mask) {
     clobber_head = e;
 }
 
-void irc_add_clobbers(const char *name, uint8_t mask) {
+void irc_add_clobbers(const char *name, regmask_t mask) {
     if (!name || !mask) return;
     ClobberEntry *e = find_clobber_entry(name);
     if (e) e->mask |= mask;
-    else   record_clobbers(name, (uint8_t)(mask | 0x0F));  // unknown base: conservative
+    else   record_clobbers(name, mask | g_target->caller_saved);  // unknown base: conservative
 }
 
 static void record_function_clobbers(Function *f) {
     if (!f->name) return;
-    uint8_t mask = 0;
+    regmask_t mask = 0;
     for (int bi = 0; bi < f->nblocks; bi++) {
         for (Inst *inst = f->blocks[bi]->head; inst; inst = inst->next) {
             if (inst->is_dead) continue;
@@ -68,12 +68,12 @@ static void record_function_clobbers(Function *f) {
             // caller keeps there survives the call.  Recording them here made
             // callers spill everything live across a call to any callee that
             // happened to use all four.
-            if (inst->dst && inst->dst->phys_reg >= 0 && inst->dst->phys_reg < IRC_CALLER_REGS)
+            if (inst->dst && reg_in(g_target->caller_saved, inst->dst->phys_reg))
                 mask |= (1u << inst->dst->phys_reg);
             if (inst->kind == IK_CALL && inst->fname)
                 mask |= lookup_clobbers(inst->fname);
             else if (inst->kind == IK_ICALL)
-                mask |= 0x0F;  // unknown target: assume all caller-saved
+                mask |= g_target->caller_saved;  // unknown target: assume all caller-saved
         }
     }
     if (getenv("DBG_IRC")) fprintf(stderr, "IRC clobbers %s = 0x%02x\n", f->name, mask);
@@ -190,7 +190,7 @@ void compute_liveness(Function *f) {
 // 3. Assigns colors
 // 4. Rewrites spills if needed
 
-#define MAX_REGS IRC_K   // 8 physical registers
+#define MAX_REGS MAX_GPR   // upper bound; the target's count is g_target->nregs
 
 // Interference graph: adjacency sets using bit vectors
 typedef struct {
@@ -357,13 +357,13 @@ static void coalesce_copies(IGraph *g, Function *f, int K) {
 // Each phantom node is pre-colored with its physical register number.
 //
 // Call-site ABI: at each IK_CALL/IK_ICALL, values live through the call
-// receive interference edges to the phantom nodes for r0..IRC_CALLER_REGS-1.
+// receive interference edges to the phantom nodes of the caller-saved registers.
 // This forces them to be colored with callee-saved registers (r4-r7) or
 // spilled — no separate call_site_live side-channel needed.
 static IGraph *build_interference_graph(Function *f) {
     int nv      = f->nvalues;   // virtual register count
     int phantom = nv;            // base index of phantom physical-register nodes
-    IGraph *g   = ig_new(nv + IRC_K);
+    IGraph *g   = ig_new(nv + IRC_K);   // + one phantom node per physical register
 
     // Mark pre-colored virtual values (call landings, params)
     for (int i = 0; i < nv; i++) {
@@ -429,20 +429,20 @@ static IGraph *build_interference_graph(Function *f) {
             // clobber mask recorded by record_function_clobbers at the end
             // of its irc_allocate; unknown/ICALL fall back to all of r0-r3.
             if (inst->kind == IK_CALL || inst->kind == IK_ICALL || inst->kind == IK_SWITCH) {
-                uint8_t cmask;
+                regmask_t cmask;
                 if (inst->kind == IK_SWITCH)
                     cmask = 0x03;  // dispatch uses a scratch from {r0,r1}
                 else if (inst->kind == IK_ICALL)
-                    cmask = 0x0F;  // unknown target: all caller-saved
+                    cmask = g_target->caller_saved;  // unknown target: all caller-saved
                 else
-                    cmask = lookup_clobbers(inst->fname) & 0x0F;   // caller-saved only
+                    cmask = lookup_clobbers(inst->fname) & g_target->caller_saved;
                 for (int w = 0; w < nw; w++) {
                     uint32_t word = live[w];
                     while (word) {
                         int bit = __builtin_ctz(word); word &= word - 1;
                         int vid = w * 32 + bit;
                         if (vid < nv) {
-                            uint8_t m = cmask;
+                            regmask_t m = cmask;
                             while (m) {
                                 int r = __builtin_ctz(m); m &= m - 1;
                                 ig_add_edge(g, vid, phantom + r);
@@ -1126,7 +1126,7 @@ void irc_allocate(Function *f) {
             // IK_BR condition: jnz now takes any register; no pre-coloring needed.
             if ((inst->kind == IK_CALL || inst->kind == IK_ICALL) && inst->dst) {
                 if (inst->dst->kind == VAL_INST && inst->dst->phys_reg < 0)
-                    inst->dst->phys_reg = 0;  // call result always in r0
+                    inst->dst->phys_reg = g_target->ret_reg;  // call result
             }
         }
     }

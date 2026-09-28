@@ -17,6 +17,7 @@
 #include "cpu4/fpu_model.h"
 #include "lower.h"
 #include "emit.h"
+#include "target.h"
 
 // ============================================================
 // Cross-TU string literal dedup table: (data,len) → assigned _lN id.
@@ -2645,7 +2646,7 @@ Function *braun_function(Node *func_decl, int tu_index, int *strlit_id) {
     }
 
     // For non-variadic: build param home slots for addr-taken params
-    enum { NREG_PARAMS = 3 };
+    const int NREG_PARAMS = g_target->n_arg_regs;
     if (!is_variadic) {
         Symbol *at_params[64]; int n_at = 0;
         for (int i = 0; i < nparams; i++)
