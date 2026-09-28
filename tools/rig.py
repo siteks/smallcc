@@ -101,7 +101,7 @@ class Kind:
         self.sethi = self.pick_sethi()
         self.sp_deltas = {i.name: self.sp_table(i) for i in self.groups['adjust'] + self.groups['prologue']}
         self.mem = {}
-        for g in ('load-bp', 'store-bp', 'load-reg', 'store-reg'):
+        for g in ('load-bp', 'store-bp', 'load-reg', 'store-reg', 'load-abs', 'store-abs'):
             for i in self.groups[g]:
                 self.mem[i.name] = next(_mems(sem.parse(isa, i)))
 
@@ -136,7 +136,8 @@ class Kind:
             return None
         if 'M' in w or 'M' in r:
             if len(a['mem_addr']) != 1: return None
-            base = 'bp' if 'BP' in r else 'reg'
+            addr = next(_mems(sem.parse(self.isa, i)))[0]
+            base = 'bp' if 'BP' in r else 'reg' if next(_regs_in(addr), None) else 'abs'
             return ('store' if 'M' in w else 'load') + '-' + base
         return 'alu'
 
@@ -152,7 +153,8 @@ class Kind:
     def pick_sethi(self):
         for i in self.groups['alu']:
             imms = [o for o in i.ops if not o.reg]
-            if len(i.ops) == 2 and len(imms) == 1 and imms[0].bits >= 16 and '<< 16' in self.isa.semantics[i.name]:
+            sm = self.isa.semantics[i.name]      # sets the high half and keeps the low (immwh, not a lui)
+            if len(i.ops) == 2 and len(imms) == 1 and imms[0].bits >= 16 and '<< 16' in sm and sm.count('R[') >= 2:
                 return i
         return None
 
@@ -219,6 +221,19 @@ class Prog:
         imm_ops = [o for o in i.ops if not o.reg]
         is_store = 'M' in self.k.info[i.name]['writes']
         rop = next(_regs_in(addr), None) if base == 'reg' else None
+        if base == 'abs':                  # the immediate is the address: pick one in the window
+            if len(imm_ops) != 1: return None
+            a = self.r.randrange(REG_WIN[0], REG_WIN[1] - size, size)
+            o = imm_ops[0]
+            env = {'BP': BP_ADDR, '#bits': {o.name: o.bits}, o.name: (a // o.scale) & ((1 << o.bits) - 1)}
+            try:
+                if signed(evaluate(addr, env)) & 0xffff != a: return None
+            except Unevaluable:
+                return None
+            fixed = {o.name: f"0x{a:04x}"}
+            for q in i.ops:
+                if q.reg: fixed[q.name] = self.reg() if is_store else self.reg(avoid_dst)
+            return [self.operands(i, fixed=fixed)]
         for _ in range(40):
             vals = {o.name: self.imm(o) for o in imm_ops}
             env = {'BP': BP_ADDR, '#bits': {o.name: o.bits for o in imm_ops}}
@@ -249,7 +264,7 @@ class Prog:
         """An item with no control flow and no stack effect."""
         g = self.k.groups
         choices = [('alu', 0.62), ('load-bp', 0.08), ('store-bp', 0.0 if in_function else 0.05),
-                   ('load-reg', 0.13), ('store-reg', 0.12)]
+                   ('load-reg', 0.13), ('store-reg', 0.12), ('load-abs', 0.03), ('store-abs', 0.03)]
         for _ in range(20):
             x = self.r.random() * sum(w for _, w in choices)
             for name, w in choices:

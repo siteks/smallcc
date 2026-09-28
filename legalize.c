@@ -50,8 +50,8 @@ static int store_size(Inst *inst) {
     Value *v = val_resolve(inst->ops[inst->nops - 1]);
     return v ? vtype_size(v->vtype) : 4;
 }
-static int is_slot_load(Inst *inst)  { return inst->kind == IK_LOAD  && inst->nops >= 1 && !inst->ops[0] && inst->dst && !inst->is_volatile; }
-static int is_slot_store(Inst *inst) { return inst->kind == IK_STORE && inst->nops == 1 && !inst->is_volatile; }
+static int is_slot_load(Inst *inst)  { return inst->kind == IK_LOAD  && inst->nops >= 1 && !inst->ops[0] && !inst->fname && inst->dst && !inst->is_volatile; }
+static int is_slot_store(Inst *inst) { return inst->kind == IK_STORE && inst->nops == 1 && !inst->fname && !inst->is_volatile; }
 
 // Escaped frame ranges: every IK_ADDR that still has a use after Pass G is a
 // frame address that reaches memory-unaware code (a call argument, a memcpy,
@@ -245,7 +245,7 @@ static void legalize_slot_forward(Function *f) {
                     Value *v = val_resolve(inst->ops[0]);
                     if (sz == 4 && v && v->kind == VAL_INST) v = forwardable(f, v, &wcache, &wcache_n);
                     slotmap_set(&m, inst->imm, sz, (sz == 4 && v && v->kind == VAL_INST) ? v : NULL);
-                } else if (inst->kind == IK_STORE && inst->nops == 1) {
+                } else if (inst->kind == IK_STORE && inst->nops == 1 && !inst->fname) {
                     slotmap_invalidate(&m, inst->imm, store_size(inst));   // a volatile slot store
                 } else {
                     // pointer store: may hit any escaped slot
@@ -282,7 +282,7 @@ static void legalize_slot_forward(Function *f) {
                     int read = 0;
                     for (int bj = 0; bj < nb && !read; bj++)
                         for (Inst *q = f->blocks[bj]->head; q; q = q->next)
-                            if (!q->is_dead && q->kind == IK_LOAD && q->nops >= 1 && !q->ops[0] && q->dst &&
+                            if (!q->is_dead && q->kind == IK_LOAD && q->nops >= 1 && !q->ops[0] && !q->fname && q->dst &&
                                 q->dst->id < f->nvalues && (q->is_volatile || live[q->dst->id]) &&
                                 ranges_overlap(q->imm, load_size(q), inst->imm, sz)) { read = 1; break; }
                     if (getenv("LEG_DEBUG")) fprintf(stderr, "  [H] %s: store [bp%+d]:%d %s\n", f->name, inst->imm, sz, read ? "kept (loaded)" : "dead");
@@ -647,6 +647,43 @@ void legalize_function(Function *f) {
                 }
             }
         }
+    }
+
+    // ── Pass G2: absolute global accesses ────────────────────────────────
+    // On an ISA with an absolute word load and store (ldl/stl), a 4-byte
+    // access to a global plus a constant offset is one instruction instead
+    // of materialising the address. The access keeps the bp-relative shape
+    // (no base operand) and names the symbol in fname; imm is the offset.
+    if ((opt_flags & OPT_LEG_G) && isa_real("ldl") && isa_real("stl")) {
+        for (int bi = 0; bi < f->nblocks; bi++)
+            for (Inst *inst = f->blocks[bi]->head; inst; inst = inst->next) {
+                if (inst->is_dead || inst->fname) continue;
+                if (inst->kind == IK_LOAD  && (inst->nops < 1 || !inst->dst)) continue;
+                if (inst->kind == IK_STORE && inst->nops != 2) continue;
+                if (inst->kind != IK_LOAD && inst->kind != IK_STORE) continue;
+                if ((inst->kind == IK_LOAD ? load_size(inst) : store_size(inst)) != 4) continue;
+                Value *base = inst->ops[0] ? val_resolve(inst->ops[0]) : NULL;
+                if (!base || base->kind != VAL_INST || !base->def || base->def->is_dead) continue;
+                int k = 0;
+                Value *g = base;
+                if (g->def->kind == IK_ADD && g->def->nops == 2) {
+                    Value *a0 = val_resolve(g->def->ops[0]), *a1 = val_resolve(g->def->ops[1]);
+                    if (a1 && get_iconst(a1, &k) && a0 && a0->kind == VAL_INST && a0->def) g = a0;
+                    else if (a0 && get_iconst(a0, &k) && a1 && a1->kind == VAL_INST && a1->def) g = a1;
+                    else continue;
+                }
+                if (g->def->kind != IK_GADDR || !g->def->fname || ((inst->imm + k) & 3)) continue;
+                if (base->use_count > 0) base->use_count--;
+                inst->imm  += k;
+                inst->fname = g->def->fname;
+                if (inst->kind == IK_LOAD) {
+                    inst->ops[0] = NULL;
+                } else {
+                    inst->ops[0] = inst->ops[1];
+                    inst->ops[1] = NULL;
+                    inst->nops   = 1;
+                }
+            }
     }
 
     // ── Pass H: forward frame-slot stores to later loads, drop dead private stores ──

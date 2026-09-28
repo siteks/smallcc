@@ -243,8 +243,9 @@ void print_inst(Inst *inst, FILE *out) {
         break;
     case IK_LOAD:
         fprintf(out, "[");
-        if (inst->nops >= 1) print_val(inst->ops[0], out);
-        else                 fprintf(out, "bp");
+        if (inst->fname)                             fprintf(out, "%s", inst->fname);
+        else if (inst->nops >= 1 && inst->ops[0])    print_val(inst->ops[0], out);
+        else                                         fprintf(out, "bp");
         if (inst->imm) fprintf(out, "+%d", inst->imm);
         fprintf(out, "]:%d", inst->size);
         if (inst->is_volatile) fprintf(out, " volatile");
@@ -252,6 +253,7 @@ void print_inst(Inst *inst, FILE *out) {
     case IK_STORE:
         fprintf(out, " [");
         if (inst->nops >= 2) { print_val(inst->ops[0], out); if (inst->imm) fprintf(out, "+%d", inst->imm); }
+        else if (inst->fname) fprintf(out, "%s+%d", inst->fname, inst->imm);
         else                  fprintf(out, "bp+%d", inst->imm);
         fprintf(out, "]:%d = ", inst->size);
         if (inst->nops >= 2) print_val(inst->ops[1], out);

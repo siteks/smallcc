@@ -495,7 +495,9 @@ static Block *execute_block(IrSim *sim, Block *b, SimFrame *frame)
             int off  = inst->imm;
             int size = inst->size ? inst->size : vt_size(dst ? dst->vtype : VT_I16);
             uint32_t addr;
-            if (!base || base->kind == VAL_UNDEF)
+            if (inst->fname)                               /* absolute: symbol + imm */
+                addr = lookup_gaddr(sim, inst->fname) + (uint32_t)off;
+            else if (!base || base->kind == VAL_UNDEF)
                 addr = (uint32_t)(uint16_t)((int32_t)frame->bp + off);
             else
                 addr = get_val(vreg, base) + (uint32_t)off;  /* 32-bit data address */
@@ -526,7 +528,9 @@ static Block *execute_block(IrSim *sim, Block *b, SimFrame *frame)
             int size = inst->size ? inst->size
                                   : (val_v ? vt_size(val_v->vtype) : 2);
             uint32_t addr;
-            if (!base || base->kind == VAL_UNDEF)
+            if (inst->fname)                               /* absolute: symbol + imm */
+                addr = lookup_gaddr(sim, inst->fname) + (uint32_t)off;
+            else if (!base || base->kind == VAL_UNDEF)
                 addr = (uint32_t)(uint16_t)((int32_t)frame->bp + off);
             else
                 addr = get_val(vreg, base) + (uint32_t)off;  /* 32-bit data address */

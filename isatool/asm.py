@@ -131,13 +131,22 @@ class Assembler:
                         self.dataaddr = x
                     return self.dataaddr
 
+            def sym_value(tok):
+                """A label's address, or label+offset / label-offset."""
+                if tok in self.symbols:
+                    return self.symbols[tok].addr
+                m = re.match(r'^(.+?)([+-](?:0x[0-9a-fA-F]+|\d+))$', tok or '')
+                if m and m.group(1) in self.symbols:
+                    return self.symbols[m.group(1)].addr + int(m.group(2), 0)
+                return None
+
             def resolve(tok, instr_addr=None, instr_len=None, pc_rel=False):
                 """Parse a token as an integer literal or label reference."""
                 try:
                     return int(tok, 0)
                 except (ValueError, TypeError):
-                    if passes == 'assemble' and tok in self.symbols:
-                        v = self.symbols[tok].addr
+                    if passes == 'assemble' and sym_value(tok) is not None:
+                        v = sym_value(tok)
                         if pc_rel and instr_addr is not None:
                             return v - (instr_addr + instr_len)
                         return v
@@ -267,8 +276,8 @@ class Assembler:
                             try:
                                 return int(tok, 0)
                             except (ValueError, TypeError):
-                                if passes == 'assemble' and tok in self.symbols:
-                                    return self.symbols[tok].addr
+                                if passes == 'assemble' and sym_value(tok) is not None:
+                                    return sym_value(tok)
                                 return 0
 
                         i.ins = []

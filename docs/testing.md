@@ -121,7 +121,8 @@ instructions. It builds constrained-random programs from an ISA definition
 (every instruction with semantics, random registers, edge operand values such
 as 0, -1, `INT_MIN`, float specials; forward branches, bounded `dbnz` loops,
 calls to generated leaf functions, balanced `pushr`/`popr` and `adjw`; memory
-accesses confined to initialised data windows) and runs each on `sim_c -arch
+accesses, bp-relative, register-based or absolute, confined to initialised
+data windows) and runs each on `sim_c -arch
 A` and on the Python simulator (`isatool/pysim.py --arch A`), comparing them
 after every instruction. It names no instructions: each is grouped by what its
 semantics line reads and writes and by its operand shapes

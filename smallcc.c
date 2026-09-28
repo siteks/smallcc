@@ -894,6 +894,7 @@ int main(int argc, char **argv)
     if (!run_oos && !run_irc) {
         fprintf(out, "    align\n");
         fprintf(out, "_globals_start:\n");
+        emit_const_pool(out);
         char xbuf[4096];
         size_t n;
         rewind(init_buf);

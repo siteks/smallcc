@@ -496,8 +496,16 @@ static void add_sym(const char *n, uint16_t addr)
 static uint16_t lookup_sym(const char *n)
 {
     int i = find_sym(n);
-    if (i < 0) { fprintf(stderr, "undefined symbol: %s\n", n); exit(1); }
-    return syms[i].addr;
+    if (i >= 0) return syms[i].addr;
+    const char *op = strpbrk(n + 1, "+-");          /* label+offset, label-offset */
+    if (op && (size_t)(op - n) < MAX_NAME) {
+        char base[MAX_NAME];
+        memcpy(base, n, op - n); base[op - n] = '\0';
+        char *e; long off = strtol(op, &e, 0);
+        i = find_sym(base);
+        if (i >= 0 && *e == '\0') return (uint16_t)(syms[i].addr + off);
+    }
+    fprintf(stderr, "undefined symbol: %s\n", n); exit(1);
 }
 
 

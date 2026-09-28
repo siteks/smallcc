@@ -561,6 +561,31 @@ the combined offset is out of F2 range, so any offset is legal. A base of
 result stays within the F3c scaled imm10 (±511 elements, aligned). The
 address arithmetic left behind is removed by IRC's dead-code pass.
 
+### Pass G2 — absolute global accesses
+
+On an ISA with `ldl` and `stl` (below), a 4-byte load or store whose base is
+`IK_GADDR sym`, or `IK_ADD(IK_GADDR sym, k)`, becomes an absolute access:
+no base operand (the bp-relative shape) and `Inst.fname = sym`, `imm` the
+offset. It emits as `ldl rd, sym+k` / `stl rs, sym+k`; the address register
+goes away. Pass H, the IR interpreter and the printer read `fname` first.
+
+### Constant loads the compiler uses when the ISA has them
+
+Nothing in CPU4 or the CPU5 draft defines these yet; the compiler looks them
+up with `isa_real` and uses them as soon as an `<arch>/isa.py` does:
+
+| Mnemonic | Operands | Semantics | Used for |
+|---|---|---|---|
+| `lui` | `rx, imm16` (`raw`) | `R[rx] = imm << 16` | a 32-bit constant whose low half is zero (1.0f, 0.5f, 2.0f ...) |
+| `ldl` | `rx, addr16` (`abs`) | `R[rx] = M32[imm]` | any other 32-bit constant, from a pool of `_kN: long` words (each value once, emitted after `_globals_start`); a 4-byte global scalar or field |
+| `stl` | `rx, addr16` (`abs`) | `M32[imm] = R[rx]` | a store to a 4-byte global scalar or field |
+
+Measured on a copy of CPU5 with the three added (2026-09-28): ray tracer
+48.5M -> 44.4M cycles (-8.4%), by-value ray tracer -6.4%, JPEG -1.2%,
+CoreMark -0.3%. On the ray tracer 32-bit constants were 12.6% of executed
+instructions, and 54% of them had a zero low half. rig puts an instruction
+whose address is its immediate in the `load-abs`/`store-abs` groups.
+
 ### Pass H — frame-slot store→load forwarding
 
 After Pass G a local that never escapes is just a set of bp offsets. Pass H
@@ -723,7 +748,7 @@ used callee-saved register (r4–r7). Callee saves are stored **below** the spil
 | IR | CPU4 |
 |----|------|
 | `IK_CONST rd, k` (k≤16b) | `immw rd, k` |
-| `IK_CONST rd, k` (k>16b) | `immw rd, lo16; immwh rd, hi16` |
+| `IK_CONST rd, k` (k>16b) | `lui rd, hi16` when the low half is zero, else `ldl rd, _kN` from the constant pool, on an ISA that has them; otherwise `immw rd, lo16; immwh rd, hi16` |
 | `IK_GADDR rd, "sym"` | `immw rd, sym` |
 | `IK_ADDR rd, slot` | `lea rd, offset` |
 | `IK_ADD rd, ra, rb` | `add rd, ra, rb` |
@@ -737,6 +762,8 @@ used callee-saved register (r4–r7). Callee saves are stored **below** the spil
 | `IK_SEXT16 rd, ra` | `or rd, ra, ra` (if ra≠rd); `sxw rd` |
 | `IK_ITOF` | `itof` |
 | `IK_FTOI` | `ftoi` |
+| `IK_LOAD rd, [sym+k]` (Pass G2) | `ldl rd, sym+k` |
+| `IK_STORE [sym+k], rb` (Pass G2) | `stl rb, sym+k` |
 | `IK_LOAD rd, [ra+0]` (bp-rel, in F2 range) | `lw/lb/ll rd, [bp+imm]` |
 | `IK_LOAD rd, [ra+0]` (other) | `llw/llb/lll rd, [ra+0]` |
 | `IK_STORE [ra+0], rb` (bp-rel, in F2 range) | `sw/sb/sl rb, [bp+imm]` |

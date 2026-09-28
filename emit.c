@@ -180,7 +180,30 @@ static int preg(Value *v) {
     return v->phys_reg >= 0 ? v->phys_reg : 0;
 }
 
-// Emit an immediate into a register (uses immw + immwh for large values)
+// The constant pool: 32-bit constants loaded with one absolute word load
+// (ldl) on an ISA that has it, each value once, emitted with the data.
+static unsigned *kpool;
+static int nkpool, kpool_cap;
+
+static int kpool_index(unsigned v) {
+    for (int i = 0; i < nkpool; i++) if (kpool[i] == v) return i;
+    if (nkpool == kpool_cap) {
+        kpool_cap = kpool_cap ? 2 * kpool_cap : 64;
+        kpool = realloc(kpool, kpool_cap * sizeof *kpool);
+    }
+    kpool[nkpool] = v;
+    return nkpool++;
+}
+
+void emit_const_pool(FILE *out) {
+    if (!nkpool) return;
+    fprintf(out, "    align\n");
+    for (int i = 0; i < nkpool; i++) fprintf(out, "_k%d:\n    long %u\n", i, kpool[i]);
+}
+
+// Emit an immediate into a register: zeroN, imms or immw when it fits;
+// a 32-bit value as lui (low half zero) or ldl from the constant pool when
+// the ISA has them, else immw + immwh.
 static void emit_imm(FILE *out, int rd, int val) {
     unsigned uval = (unsigned)val;
     char zname[8];
@@ -191,6 +214,10 @@ static void emit_imm(FILE *out, int rd, int val) {
         fprintf(out, "    imms %s, %d\n", regname(rd), val);
     } else if (uval <= 0xffff) {
         fprintf(out, "    immw %s, %u\n", regname(rd), uval);
+    } else if ((uval & 0xffff) == 0 && isa_real("lui")) {
+        fprintf(out, "    lui %s, %u\n", regname(rd), uval >> 16);
+    } else if (isa_real("ldl")) {
+        fprintf(out, "    ldl %s, _k%d\n", regname(rd), kpool_index(uval));
     } else {
         fprintf(out, "    immw %s, %u\n",  regname(rd), uval & 0xffff);
         fprintf(out, "    immwh %s, %u\n", regname(rd), uval >> 16);
@@ -899,7 +926,11 @@ static void emit_inst(Inst *inst, FILE *out) {
         int is_s    = vtype_signed(dst->vtype);
         int off     = inst->imm;
 
-        if (!base || base->kind == VAL_UNDEF) {
+        if (inst->fname) {
+            // Absolute (legalize Pass G2): one ldl from symbol + offset.
+            if (off) fprintf(out, "    ldl %s, %s%+d\n", regname(rd), inst->fname, off);
+            else     fprintf(out, "    ldl %s, %s\n", regname(rd), inst->fname);
+        } else if (!base || base->kind == VAL_UNDEF) {
             // Spill load: base is implicit bp.  Using rd as both address
             // temp and destination in the out-of-F2-range fallback avoids
             // clobbering any other live register.
@@ -969,7 +1000,11 @@ static void emit_inst(Inst *inst, FILE *out) {
             rb = sc;
         }
 
-        if (!base || (inst->nops < 2)) {
+        if (inst->fname) {
+            // Absolute (legalize Pass G2): one stl to symbol + offset.
+            if (off) fprintf(out, "    stl %s, %s%+d\n", regname(rv), inst->fname, off);
+            else     fprintf(out, "    stl %s, %s\n", regname(rv), inst->fname);
+        } else if (!base || (inst->nops < 2)) {
             // Spill store: base is implicit bp. The out-of-F2-range form
             // needs an address temp distinct from rv.
             int tmp = (rv == 0) ? 1 : 0;              // unused by the F2 form

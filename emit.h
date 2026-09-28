@@ -20,5 +20,7 @@ extern int flag_linemap;
 
 void emit_function(Function *f, FILE *out);
 void emit_globals(Sx *program, FILE *init_out, FILE *bss_out);
+// The 32-bit constants emit_function loaded with ldl (none unless the ISA has it).
+void emit_const_pool(FILE *out);
 
 #endif // EMIT_H

@@ -81,6 +81,7 @@ legalize_function()
   Pass F: materialize consts   LEG_F   OPT_LEG_F   (second run; catches anything created since)
   Pass G: frame-slot access    LEG_G   OPT_LEG_G   (IK_ADDR[+k] + load/store → bp-relative F2 form;
                                                    p+k + load/store → register-relative offset)
+  Pass G2: absolute globals    LEG_G   OPT_LEG_G   (4-byte access to sym+k → ldl/stl, if the ISA has them)
   Pass H: slot forwarding      LEG_H   OPT_LEG_H   (store→load forwarding on private frame slots,
                                                    dead private stores removed)
 
@@ -188,6 +189,7 @@ R2J ──→ R2D(2nd)      (unroll creates copies that need propagation)
 | Pass E | `OPT_LEG_E` | `AND(AND(x,c1),c2)` → `AND(x,c1&c2)` | Optimization (reduces register pressure) |
 | Pass F | `OPT_LEG_F` | Materialize large `VAL_CONST` operands (ALU ops and float compares); also run at the start of the post-OOS pipeline | Optimization (avoids pushr/popr scratch; lets CSE/LICM see constants) |
 | Pass G | `OPT_LEG_G` | `IK_ADDR(slot) [+ k]` as a load/store base → bp-relative form (`lea`+`lll` → one F2 `ll`); `p + k` base → folded into the F3c offset when within ±511 elements | Optimization (one instruction per frame-slot access) |
+| Pass G2 | `OPT_LEG_G` | A 4-byte load/store at a global (+ constant) → absolute `ldl`/`stl`, on an ISA that has them (docs/compiler-pipeline.md) | Optimization (one instruction per global access) |
 | Pass H | `OPT_LEG_H` | Forward a frame-slot store to later same-sized loads (same block, or single-predecessor chain); delete stores to private slots nothing loads. Escape analysis: a slot reachable from a live `IK_ADDR` (call arg, memcpy, pointer store) is invalidated by calls and pointer stores. Pre-coloured values are forwarded through a working copy | Optimization (out-param vectors and union puns live in registers) |
 
 Passes A–D are correctness requirements — they must always run. emit.c has no

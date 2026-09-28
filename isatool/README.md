@@ -33,6 +33,10 @@ range it accepts:
 | `abs` | an absolute address | the value | yes |
 | `pcrel` | a target | target − address of the next instruction | yes |
 
+Where labels are allowed, `label+N` and `label-N` (decimal or hex `N`) are
+too, in both assemblers; the compiler uses it for absolute accesses to a
+field of a global.
+
 An instruction without a `SEMANTICS` line still assembles, disassembles and
 decodes; executing it stops the machine with "has no semantics yet", and the
 generated encoding doc lists it. That is how a new ISA can be brought up an
