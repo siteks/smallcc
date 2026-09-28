@@ -26,65 +26,65 @@ Machine state: 16 general registers of 32 bits (`r0`..`r15`); PC 16 bits, SP 16 
 | `zero5` | `11110110` | `` | — | `R[5] = 0` |
 | `zero6` | `11110111` | `` | — | `R[6] = 0` |
 
-## S1 — 2 bytes, `11111110 oooooooo`
+## S1 — 2 bytes, `11111111 00oooooo`
 
 | Mnemonic | Pattern | Operands | Immediates | Semantics |
 |---|---|---|---|---|
-| `halt` | `11111110 00000000` | `` | — | `H = 1` |
-| `zero7` | `11111110 00000001` | `` | — | `R[7] = 0` |
-| `zero8` | `11111110 00000010` | `` | — | `R[8] = 0` |
-| `zero9` | `11111110 00000011` | `` | — | `R[9] = 0` |
-| `zeroa` | `11111110 00000100` | `` | — | `R[10] = 0` |
-| `zerob` | `11111110 00000101` | `` | — | `R[11] = 0` |
-| `zeroc` | `11111110 00000110` | `` | — | `R[12] = 0` |
-| `zerod` | `11111110 00000111` | `` | — | `R[13] = 0` |
-| `zeroe` | `11111110 00001000` | `` | — | `R[14] = 0` |
-| `zerof` | `11111110 00001001` | `` | — | `R[15] = 0` |
+| `halt` | `11111111 00000000` | `` | — | `H = 1` |
+| `zero7` | `11111111 00000001` | `` | — | `R[7] = 0` |
+| `zero8` | `11111111 00000010` | `` | — | `R[8] = 0` |
+| `zero9` | `11111111 00000011` | `` | — | `R[9] = 0` |
+| `zeroa` | `11111111 00000100` | `` | — | `R[10] = 0` |
+| `zerob` | `11111111 00000101` | `` | — | `R[11] = 0` |
+| `zeroc` | `11111111 00000110` | `` | — | `R[12] = 0` |
+| `zerod` | `11111111 00000111` | `` | — | `R[13] = 0` |
+| `zeroe` | `11111111 00001000` | `` | — | `R[14] = 0` |
+| `zerof` | `11111111 00001001` | `` | — | `R[15] = 0` |
 
-## S2 — 2 bytes, `11111111 oooodddd`
-
-| Mnemonic | Pattern | Operands | Immediates | Semantics |
-|---|---|---|---|---|
-| `sxb` | `11111111 0000dddd` | `rd` | — | `R[rd] = sx(R[rd], 8)` |
-| `sxw` | `11111111 0001dddd` | `rd` | — | `R[rd] = sx(R[rd], 16)` |
-| `inc` | `11111111 0010dddd` | `rd` | — | `R[rd] = R[rd] + 1` |
-| `dec` | `11111111 0011dddd` | `rd` | — | `R[rd] = R[rd] - 1` |
-| `pushr` | `11111111 0100dddd` | `rd` | — | `SP = SP - 4; M32[SP] = R[rd]` |
-| `popr` | `11111111 0101dddd` | `rd` | — | `R[rd] = M32[SP]; SP = SP + 4` |
-| `zxb` | `11111111 0110dddd` | `rd` | — | `R[rd] = zx(R[rd], 8)` |
-| `itof` | `11111111 0111dddd` | `rd` | — | `R[rd] = itof(R[rd])` |
-| `ftoi` | `11111111 1000dddd` | `rd` | — | `R[rd] = ftoi(R[rd])` |
-| `jlr` | `11111111 1001dddd` | `rd` | — | `LR = PC; PC = R[rd]` |
-| `jr` | `11111111 1010dddd` | `rd` | — | `PC = R[rd]` |
-| `ssp` | `11111111 1011dddd` | `rd` | — | `SP = R[rd]` |
-| `neg` | `11111111 1100dddd` | `rd` | — | `R[rd] = -R[rd]` |
-| `frecip` | `11111111 1101dddd` | `rd` | — | `R[rd] = frecip(R[rd])` |
-| `frsqrt` | `11111111 1110dddd` | `rd` | — | `R[rd] = frsqrt(R[rd])` |
-| `putchar` | `11111111 1111dddd` | `rd` | — | `putchar(R[rd])` |
-
-## S3 — 2 bytes, `110ooddd diiiiiii`
+## S2 — 2 bytes, `11111110 oooodddd`
 
 | Mnemonic | Pattern | Operands | Immediates | Semantics |
 |---|---|---|---|---|
-| `ll` | `11000ddd diiiiiii` | `rx, imm` | imm: index7, -64..63 | `R[rx] = M32[lo16(BP + sext(imm) * 4)]` |
-| `sl` | `11001ddd diiiiiii` | `rx, imm` | imm: index7, -64..63 | `M32[lo16(BP + sext(imm) * 4)] = R[rx]` |
-| `shli` | `11010ddd diiiiiii` | `rx, imm` | imm: simm7, -64..63 | `R[rx] = R[rx] << (imm & 31)` |
-| `imms` | `11011ddd diiiiiii` | `rx, imm` | imm: simm7, -64..63 | `R[rx] = sext(imm)` |
+| `sxb` | `11111110 0000dddd` | `rd` | — | `R[rd] = sx(R[rd], 8)` |
+| `sxw` | `11111110 0001dddd` | `rd` | — | `R[rd] = sx(R[rd], 16)` |
+| `inc` | `11111110 0010dddd` | `rd` | — | `R[rd] = R[rd] + 1` |
+| `dec` | `11111110 0011dddd` | `rd` | — | `R[rd] = R[rd] - 1` |
+| `pushr` | `11111110 0100dddd` | `rd` | — | `SP = SP - 4; M32[SP] = R[rd]` |
+| `popr` | `11111110 0101dddd` | `rd` | — | `R[rd] = M32[SP]; SP = SP + 4` |
+| `zxb` | `11111110 0110dddd` | `rd` | — | `R[rd] = zx(R[rd], 8)` |
+| `itof` | `11111110 0111dddd` | `rd` | — | `R[rd] = itof(R[rd])` |
+| `ftoi` | `11111110 1000dddd` | `rd` | — | `R[rd] = ftoi(R[rd])` |
+| `jlr` | `11111110 1001dddd` | `rd` | — | `LR = PC; PC = R[rd]` |
+| `jr` | `11111110 1010dddd` | `rd` | — | `PC = R[rd]` |
+| `ssp` | `11111110 1011dddd` | `rd` | — | `SP = R[rd]` |
+| `neg` | `11111110 1100dddd` | `rd` | — | `R[rd] = -R[rd]` |
+| `frecip` | `11111110 1101dddd` | `rd` | — | `R[rd] = frecip(R[rd])` |
+| `frsqrt` | `11111110 1110dddd` | `rd` | — | `R[rd] = frsqrt(R[rd])` |
+| `putchar` | `11111110 1111dddd` | `rd` | — | `putchar(R[rd])` |
 
-## S4 — 2 bytes, `1110oooo ddddxxxx`
+## S3 — 2 bytes, `100ooddd diiiiiii`
 
 | Mnemonic | Pattern | Operands | Immediates | Semantics |
 |---|---|---|---|---|
-| `mov` | `11100000 ddddxxxx` | `rd, rx` | — | `R[rd] = R[rx]` |
-| `zxw` | `11100001 ddddxxxx` | `rd` | — | `R[rd] = zx(R[rd], 16)` |
-| `llb_0` | `11100010 ddddxxxx` | `rd, rx` | — | `R[rd] = M8[R[rx]]` |
-| `llw_0` | `11100011 ddddxxxx` | `rd, rx` | — | `R[rd] = M16[R[rx]]` |
-| `lll_0` | `11100100 ddddxxxx` | `rd, rx` | — | `R[rd] = M32[R[rx]]` |
-| `slb_0` | `11100101 ddddxxxx` | `rx, ry` | — | `M8[R[ry]] = R[rx]` |
-| `slw_0` | `11100110 ddddxxxx` | `rx, ry` | — | `M16[R[ry]] = R[rx]` |
-| `sll_0` | `11100111 ddddxxxx` | `rx, ry` | — | `M32[R[ry]] = R[rx]` |
-| `llbx_0` | `11101000 ddddxxxx` | `rd, rx` | — | `R[rd] = sx(M8[R[rx]], 8)` |
-| `llwx_0` | `11101001 ddddxxxx` | `rd, rx` | — | `R[rd] = sx(M16[R[rx]], 16)` |
+| `ll` | `10000ddd diiiiiii` | `rx, imm` | imm: index7, -64..63 | `R[rx] = M32[lo16(BP + sext(imm) * 4)]` |
+| `sl` | `10001ddd diiiiiii` | `rx, imm` | imm: index7, -64..63 | `M32[lo16(BP + sext(imm) * 4)] = R[rx]` |
+| `shli` | `10010ddd diiiiiii` | `rx, imm` | imm: simm7, -64..63 | `R[rx] = R[rx] << (imm & 31)` |
+| `imms` | `10011ddd diiiiiii` | `rx, imm` | imm: simm7, -64..63 | `R[rx] = sext(imm)` |
+
+## S4 — 2 bytes, `1100oooo ddddxxxx`
+
+| Mnemonic | Pattern | Operands | Immediates | Semantics |
+|---|---|---|---|---|
+| `mov` | `11000000 ddddxxxx` | `rd, rx` | — | `R[rd] = R[rx]` |
+| `zxw` | `11000001 ddddxxxx` | `rd` | — | `R[rd] = zx(R[rd], 16)` |
+| `llb_0` | `11000010 ddddxxxx` | `rd, rx` | — | `R[rd] = M8[R[rx]]` |
+| `llw_0` | `11000011 ddddxxxx` | `rd, rx` | — | `R[rd] = M16[R[rx]]` |
+| `lll_0` | `11000100 ddddxxxx` | `rd, rx` | — | `R[rd] = M32[R[rx]]` |
+| `slb_0` | `11000101 ddddxxxx` | `rx, ry` | — | `M8[R[ry]] = R[rx]` |
+| `slw_0` | `11000110 ddddxxxx` | `rx, ry` | — | `M16[R[ry]] = R[rx]` |
+| `sll_0` | `11000111 ddddxxxx` | `rx, ry` | — | `M32[R[ry]] = R[rx]` |
+| `llbx_0` | `11001000 ddddxxxx` | `rd, rx` | — | `R[rd] = sx(M8[R[rx]], 8)` |
+| `llwx_0` | `11001001 ddddxxxx` | `rd, rx` | — | `R[rd] = sx(M16[R[rx]], 16)` |
 
 ## S5 — 3 bytes, `1111110o oooodddd xxxxyyyy`
 
@@ -118,78 +118,96 @@ Machine state: 16 general registers of 32 bits (`r0`..`r15`); PC 16 bits, SP 16 
 | `zxwor` | `11111101 1001dddd xxxxyyyy` | `rd, rx, ry` | — | `R[rd] = zx(R[rx] \| R[ry], 16)` |
 | `sxwor` | `11111101 1010dddd xxxxyyyy` | `rd, rx, ry` | — | `R[rd] = sx(R[rx] \| R[ry], 16)` |
 
-## S6 — 3 bytes, `0ooodddd iiiiiiii iiiiiiii`
+## S6a — 3 bytes, `00oodddd iiiiiiii iiiiiiii`
 
 | Mnemonic | Pattern | Operands | Immediates | Semantics |
 |---|---|---|---|---|
-| `j` | `0000dddd iiiiiiii iiiiiiii` | `imm` | imm: abs16, label | `PC = imm` |
-| `jl` | `0001dddd iiiiiiii iiiiiiii` | `imm` | imm: abs16, label | `LR = PC; PC = imm` |
-| `enter` | `0010dddd iiiiiiii iiiiiiii` | `imm` | imm: uimm16, 0..65535 | `M32[lo16(SP - 4)] = (LR << 16) \| BP; BP = SP - 4; SP = SP - imm - 4` |
-| `lea` | `0011dddd iiiiiiii iiiiiiii` | `rd, imm` | imm: bytes16 ×4, -131072..131068 | `R[rd] = lo16(BP + sext(imm) * 4)` |
-| `immw` | `0100dddd iiiiiiii iiiiiiii` | `rx, imm` | imm: raw16, -32768..65535 | `R[rx] = imm` |
-| `immwh` | `0101dddd iiiiiiii iiiiiiii` | `rx, imm` | imm: raw16, -32768..65535 | `R[rx] = zx(R[rx], 16) \| (imm << 16)` |
-| `jz` | `0110dddd iiiiiiii iiiiiiii` | `rx, imm` | imm: abs16, label | `if R[rx] == 0 then PC = imm` |
-| `jnz` | `0111dddd iiiiiiii iiiiiiii` | `rx, imm` | imm: abs16, label | `if R[rx] != 0 then PC = imm` |
+| `lea` | `0000dddd iiiiiiii iiiiiiii` | `rd, imm` | imm: bytes16 ×4, -131072..131068 | `R[rd] = lo16(BP + sext(imm) * 4)` |
+| `immw` | `0001dddd iiiiiiii iiiiiiii` | `rx, imm` | imm: raw16, -32768..65535 | `R[rx] = imm` |
+| `ldl` | `0010dddd iiiiiiii iiiiiiii` | `rx, imm` | imm: abs16, label | `R[rx] = M32[imm]` |
+| `stl` | `0011dddd iiiiiiii iiiiiiii` | `rx, imm` | imm: abs16, label | `M32[imm] = R[rx]` |
 
-## S7 — 4 bytes, `10oooooo ddddxxxx iiiiiiii iiiiiiii`
+## S6b — 3 bytes, `101odddd iiiiiiii iiiiiiii`
 
 | Mnemonic | Pattern | Operands | Immediates | Semantics |
 |---|---|---|---|---|
-| `addli` | `10000000 ddddxxxx iiiiiiii iiiiiiii` | `rd, rx, imm` | imm: simm16, -32768..32767 | `R[rd] = R[rx] + sext(imm)` |
-| `subli` | `10000001 ddddxxxx iiiiiiii iiiiiiii` | `rd, rx, imm` | imm: simm16, -32768..32767 | `R[rd] = R[rx] - sext(imm)` |
-| `mulli` | `10000010 ddddxxxx iiiiiiii iiiiiiii` | `rd, rx, imm` | imm: simm16, -32768..32767 | `R[rd] = R[rx] * sext(imm)` |
-| `divli` | `10000011 ddddxxxx iiiiiiii iiiiiiii` | `rd, rx, imm` | imm: simm16, -32768..32767 | `R[rd] = R[rx] /u sext(imm)` |
-| `modli` | `10000100 ddddxxxx iiiiiiii iiiiiiii` | `rd, rx, imm` | imm: simm16, -32768..32767 | `R[rd] = R[rx] %u sext(imm)` |
-| `shlli` | `10000101 ddddxxxx iiiiiiii iiiiiiii` | `rd, rx, imm` | imm: simm16, -32768..32767 | `R[rd] = R[rx] << (imm & 31)` |
-| `shrli` | `10000110 ddddxxxx iiiiiiii iiiiiiii` | `rd, rx, imm` | imm: simm16, -32768..32767 | `R[rd] = R[rx] >> (imm & 31)` |
-| `leli` | `10000111 ddddxxxx iiiiiiii iiiiiiii` | `rd, rx, imm` | imm: simm16, -32768..32767 | `R[rd] = R[rx] <=u sext(imm)` |
-| `gtli` | `10001000 ddddxxxx iiiiiiii iiiiiiii` | `rd, rx, imm` | imm: simm16, -32768..32767 | `R[rd] = R[rx] >u sext(imm)` |
-| `eqli` | `10001001 ddddxxxx iiiiiiii iiiiiiii` | `rd, rx, imm` | imm: simm16, -32768..32767 | `R[rd] = R[rx] == sext(imm)` |
-| `neli` | `10001010 ddddxxxx iiiiiiii iiiiiiii` | `rd, rx, imm` | imm: simm16, -32768..32767 | `R[rd] = R[rx] != sext(imm)` |
-| `andli` | `10001011 ddddxxxx iiiiiiii iiiiiiii` | `rd, rx, imm` | imm: simm16, -32768..32767 | `R[rd] = R[rx] & sext(imm)` |
-| `orli` | `10001100 ddddxxxx iiiiiiii iiiiiiii` | `rd, rx, imm` | imm: simm16, -32768..32767 | `R[rd] = R[rx] \| sext(imm)` |
-| `xorli` | `10001101 ddddxxxx iiiiiiii iiiiiiii` | `rd, rx, imm` | imm: simm16, -32768..32767 | `R[rd] = R[rx] ^ sext(imm)` |
-| `lesli` | `10001110 ddddxxxx iiiiiiii iiiiiiii` | `rd, rx, imm` | imm: simm16, -32768..32767 | `R[rd] = R[rx] <=s sext(imm)` |
-| `gtsli` | `10001111 ddddxxxx iiiiiiii iiiiiiii` | `rd, rx, imm` | imm: simm16, -32768..32767 | `R[rd] = R[rx] >s sext(imm)` |
-| `divsli` | `10010000 ddddxxxx iiiiiiii iiiiiiii` | `rd, rx, imm` | imm: simm16, -32768..32767 | `R[rd] = R[rx] /s sext(imm)` |
-| `modsli` | `10010001 ddddxxxx iiiiiiii iiiiiiii` | `rd, rx, imm` | imm: simm16, -32768..32767 | `R[rd] = R[rx] %s sext(imm)` |
-| `shrsli` | `10010010 ddddxxxx iiiiiiii iiiiiiii` | `rd, rx, imm` | imm: simm16, -32768..32767 | `R[rd] = R[rx] >>s (imm & 31)` |
-| `bitex` | `10010011 ddddxxxx iiiiiiii iiiiiiii` | `rd, rx, imm` | imm: uimm16, 0..65535 | `R[rd] = (R[rx] >> (imm & 31)) & ((2 << ((imm >> 5) & 15)) - 1)` |
-| `rsubli` | `10010100 ddddxxxx iiiiiiii iiiiiiii` | `rd, rx, imm` | imm: simm16, -32768..32767 | `R[rd] = sext(imm) - R[rx]` |
-| `rdivli` | `10010101 ddddxxxx iiiiiiii iiiiiiii` | `rd, rx, imm` | imm: simm16, -32768..32767 | `R[rd] = sext(imm) /u R[rx]` |
-| `rmodli` | `10010110 ddddxxxx iiiiiiii iiiiiiii` | `rd, rx, imm` | imm: simm16, -32768..32767 | `R[rd] = sext(imm) %u R[rx]` |
-| `rdivsli` | `10010111 ddddxxxx iiiiiiii iiiiiiii` | `rd, rx, imm` | imm: simm16, -32768..32767 | `R[rd] = sext(imm) /s R[rx]` |
-| `lb` | `10011000 ddddxxxx iiiiiiii iiiiiiii` | `rx, imm` | imm: index16, -32768..32767 | `R[rx] = M8[lo16(BP + sext(imm))]` |
-| `lw` | `10011001 ddddxxxx iiiiiiii iiiiiiii` | `rx, imm` | imm: index16, -32768..32767 | `R[rx] = M16[lo16(BP + sext(imm) * 2)]` |
-| `sb` | `10011010 ddddxxxx iiiiiiii iiiiiiii` | `rx, imm` | imm: index16, -32768..32767 | `M8[lo16(BP + sext(imm))] = R[rx]` |
-| `sw` | `10011011 ddddxxxx iiiiiiii iiiiiiii` | `rx, imm` | imm: index16, -32768..32767 | `M16[lo16(BP + sext(imm) * 2)] = R[rx]` |
-| `lbx` | `10011100 ddddxxxx iiiiiiii iiiiiiii` | `rx, imm` | imm: index16, -32768..32767 | `R[rx] = sx(M8[lo16(BP + sext(imm))], 8)` |
-| `lwx` | `10011101 ddddxxxx iiiiiiii iiiiiiii` | `rx, imm` | imm: index16, -32768..32767 | `R[rx] = sx(M16[lo16(BP + sext(imm) * 2)], 16)` |
-| `addi` | `10011110 ddddxxxx iiiiiiii iiiiiiii` | `rx, imm` | imm: simm16, -32768..32767 | `R[rx] = R[rx] + sext(imm)` |
-| `andi` | `10011111 ddddxxxx iiiiiiii iiiiiiii` | `rx, imm` | imm: uimm16, 0..65535 | `R[rx] = R[rx] & imm` |
-| `shrsi` | `10100000 ddddxxxx iiiiiiii iiiiiiii` | `rx, imm` | imm: simm16, -32768..32767 | `R[rx] = R[rx] >>s (imm & 31)` |
-| `adjw` | `10100001 ddddxxxx iiiiiiii iiiiiiii` | `imm` | imm: bytes16 ×4, -131072..131068 | `SP = SP + sext(imm) * 4` |
-| `llb` | `10100010 ddddxxxx iiiiiiii iiiiiiii` | `rx, ry, imm` | imm: index16, -32768..32767 | `R[rx] = M8[R[ry] + sext(imm)]` |
-| `llw` | `10100011 ddddxxxx iiiiiiii iiiiiiii` | `rx, ry, imm` | imm: index16, -32768..32767 | `R[rx] = M16[R[ry] + sext(imm) * 2]` |
-| `lll` | `10100100 ddddxxxx iiiiiiii iiiiiiii` | `rx, ry, imm` | imm: index16, -32768..32767 | `R[rx] = M32[R[ry] + sext(imm) * 4]` |
-| `slb` | `10100101 ddddxxxx iiiiiiii iiiiiiii` | `rx, ry, imm` | imm: index16, -32768..32767 | `M8[R[ry] + sext(imm)] = R[rx]` |
-| `slw` | `10100110 ddddxxxx iiiiiiii iiiiiiii` | `rx, ry, imm` | imm: index16, -32768..32767 | `M16[R[ry] + sext(imm) * 2] = R[rx]` |
-| `sll` | `10100111 ddddxxxx iiiiiiii iiiiiiii` | `rx, ry, imm` | imm: index16, -32768..32767 | `M32[R[ry] + sext(imm) * 4] = R[rx]` |
-| `llbx` | `10101000 ddddxxxx iiiiiiii iiiiiiii` | `rx, ry, imm` | imm: index16, -32768..32767 | `R[rx] = sx(M8[R[ry] + sext(imm)], 8)` |
-| `llwx` | `10101001 ddddxxxx iiiiiiii iiiiiiii` | `rx, ry, imm` | imm: index16, -32768..32767 | `R[rx] = sx(M16[R[ry] + sext(imm) * 2], 16)` |
-| `beq` | `10101010 ddddxxxx iiiiiiii iiiiiiii` | `rx, ry, disp` | disp: pcrel16, label | `if R[rx] == R[ry] then PC = PC + sext(disp)` |
-| `bne` | `10101011 ddddxxxx iiiiiiii iiiiiiii` | `rx, ry, disp` | disp: pcrel16, label | `if R[rx] != R[ry] then PC = PC + sext(disp)` |
-| `blt` | `10101100 ddddxxxx iiiiiiii iiiiiiii` | `rx, ry, disp` | disp: pcrel16, label | `if R[rx] <u R[ry] then PC = PC + sext(disp)` |
-| `ble` | `10101101 ddddxxxx iiiiiiii iiiiiiii` | `rx, ry, disp` | disp: pcrel16, label | `if R[rx] <=u R[ry] then PC = PC + sext(disp)` |
-| `blts` | `10101110 ddddxxxx iiiiiiii iiiiiiii` | `rx, ry, disp` | disp: pcrel16, label | `if R[rx] <s R[ry] then PC = PC + sext(disp)` |
-| `bles` | `10101111 ddddxxxx iiiiiiii iiiiiiii` | `rx, ry, disp` | disp: pcrel16, label | `if R[rx] <=s R[ry] then PC = PC + sext(disp)` |
-| `beqz` | `10110000 ddddxxxx iiiiiiii iiiiiiii` | `rx, disp` | disp: pcrel16, label | `if R[rx] == 0 then PC = PC + sext(disp)` |
-| `bnez` | `10110001 ddddxxxx iiiiiiii iiiiiiii` | `rx, disp` | disp: pcrel16, label | `if R[rx] != 0 then PC = PC + sext(disp)` |
-| `dbnz` | `10110010 ddddxxxx iiiiiiii iiiiiiii` | `rx, disp` | disp: pcrel16, label | `R[rx] = R[rx] - 1; if R[rx] != 0 then PC = PC + sext(disp)` |
-| `bltz` | `10110011 ddddxxxx iiiiiiii iiiiiiii` | `rx, disp` | disp: pcrel16, label | `if R[rx] <s 0 then PC = PC + sext(disp)` |
-| `bgez` | `10110100 ddddxxxx iiiiiiii iiiiiiii` | `rx, disp` | disp: pcrel16, label | `if R[rx] >=s 0 then PC = PC + sext(disp)` |
-| `bgtz` | `10110101 ddddxxxx iiiiiiii iiiiiiii` | `rx, disp` | disp: pcrel16, label | `if R[rx] >s 0 then PC = PC + sext(disp)` |
-| `blez` | `10110110 ddddxxxx iiiiiiii iiiiiiii` | `rx, disp` | disp: pcrel16, label | `if R[rx] <=s 0 then PC = PC + sext(disp)` |
+| `jz` | `1010dddd iiiiiiii iiiiiiii` | `rx, imm` | imm: abs16, label | `if R[rx] == 0 then PC = imm` |
+| `lui` | `1011dddd iiiiiiii iiiiiiii` | `rx, imm` | imm: raw16, -32768..65535 | `R[rx] = imm << 16` |
+
+## S6c — 3 bytes, `1101dddd iiiiiiii iiiiiiii`
+
+| Mnemonic | Pattern | Operands | Immediates | Semantics |
+|---|---|---|---|---|
+| `jnz` | `1101dddd iiiiiiii iiiiiiii` | `rx, imm` | imm: abs16, label | `if R[rx] != 0 then PC = imm` |
+
+## S6d — 3 bytes, `1110oooo iiiiiiii iiiiiiii`
+
+| Mnemonic | Pattern | Operands | Immediates | Semantics |
+|---|---|---|---|---|
+| `j` | `11100000 iiiiiiii iiiiiiii` | `imm` | imm: abs16, label | `PC = imm` |
+| `jl` | `11100001 iiiiiiii iiiiiiii` | `imm` | imm: abs16, label | `LR = PC; PC = imm` |
+| `enter` | `11100010 iiiiiiii iiiiiiii` | `imm` | imm: uimm16, 0..65535 | `M32[lo16(SP - 4)] = (LR << 16) \| BP; BP = SP - 4; SP = SP - imm - 4` |
+| `adjw` | `11100011 iiiiiiii iiiiiiii` | `imm` | imm: bytes16 ×4, -131072..131068 | `SP = SP + sext(imm) * 4` |
+
+## S7 — 4 bytes, `01oooooo ddddxxxx iiiiiiii iiiiiiii`
+
+| Mnemonic | Pattern | Operands | Immediates | Semantics |
+|---|---|---|---|---|
+| `addli` | `01000000 ddddxxxx iiiiiiii iiiiiiii` | `rd, rx, imm` | imm: simm16, -32768..32767 | `R[rd] = R[rx] + sext(imm)` |
+| `subli` | `01000001 ddddxxxx iiiiiiii iiiiiiii` | `rd, rx, imm` | imm: simm16, -32768..32767 | `R[rd] = R[rx] - sext(imm)` |
+| `mulli` | `01000010 ddddxxxx iiiiiiii iiiiiiii` | `rd, rx, imm` | imm: simm16, -32768..32767 | `R[rd] = R[rx] * sext(imm)` |
+| `divli` | `01000011 ddddxxxx iiiiiiii iiiiiiii` | `rd, rx, imm` | imm: simm16, -32768..32767 | `R[rd] = R[rx] /u sext(imm)` |
+| `modli` | `01000100 ddddxxxx iiiiiiii iiiiiiii` | `rd, rx, imm` | imm: simm16, -32768..32767 | `R[rd] = R[rx] %u sext(imm)` |
+| `shlli` | `01000101 ddddxxxx iiiiiiii iiiiiiii` | `rd, rx, imm` | imm: simm16, -32768..32767 | `R[rd] = R[rx] << (imm & 31)` |
+| `shrli` | `01000110 ddddxxxx iiiiiiii iiiiiiii` | `rd, rx, imm` | imm: simm16, -32768..32767 | `R[rd] = R[rx] >> (imm & 31)` |
+| `leli` | `01000111 ddddxxxx iiiiiiii iiiiiiii` | `rd, rx, imm` | imm: simm16, -32768..32767 | `R[rd] = R[rx] <=u sext(imm)` |
+| `gtli` | `01001000 ddddxxxx iiiiiiii iiiiiiii` | `rd, rx, imm` | imm: simm16, -32768..32767 | `R[rd] = R[rx] >u sext(imm)` |
+| `eqli` | `01001001 ddddxxxx iiiiiiii iiiiiiii` | `rd, rx, imm` | imm: simm16, -32768..32767 | `R[rd] = R[rx] == sext(imm)` |
+| `neli` | `01001010 ddddxxxx iiiiiiii iiiiiiii` | `rd, rx, imm` | imm: simm16, -32768..32767 | `R[rd] = R[rx] != sext(imm)` |
+| `andli` | `01001011 ddddxxxx iiiiiiii iiiiiiii` | `rd, rx, imm` | imm: simm16, -32768..32767 | `R[rd] = R[rx] & sext(imm)` |
+| `orli` | `01001100 ddddxxxx iiiiiiii iiiiiiii` | `rd, rx, imm` | imm: simm16, -32768..32767 | `R[rd] = R[rx] \| sext(imm)` |
+| `xorli` | `01001101 ddddxxxx iiiiiiii iiiiiiii` | `rd, rx, imm` | imm: simm16, -32768..32767 | `R[rd] = R[rx] ^ sext(imm)` |
+| `lesli` | `01001110 ddddxxxx iiiiiiii iiiiiiii` | `rd, rx, imm` | imm: simm16, -32768..32767 | `R[rd] = R[rx] <=s sext(imm)` |
+| `gtsli` | `01001111 ddddxxxx iiiiiiii iiiiiiii` | `rd, rx, imm` | imm: simm16, -32768..32767 | `R[rd] = R[rx] >s sext(imm)` |
+| `divsli` | `01010000 ddddxxxx iiiiiiii iiiiiiii` | `rd, rx, imm` | imm: simm16, -32768..32767 | `R[rd] = R[rx] /s sext(imm)` |
+| `modsli` | `01010001 ddddxxxx iiiiiiii iiiiiiii` | `rd, rx, imm` | imm: simm16, -32768..32767 | `R[rd] = R[rx] %s sext(imm)` |
+| `shrsli` | `01010010 ddddxxxx iiiiiiii iiiiiiii` | `rd, rx, imm` | imm: simm16, -32768..32767 | `R[rd] = R[rx] >>s (imm & 31)` |
+| `bitex` | `01010011 ddddxxxx iiiiiiii iiiiiiii` | `rd, rx, imm` | imm: uimm16, 0..65535 | `R[rd] = (R[rx] >> (imm & 31)) & ((2 << ((imm >> 5) & 15)) - 1)` |
+| `rsubli` | `01010100 ddddxxxx iiiiiiii iiiiiiii` | `rd, rx, imm` | imm: simm16, -32768..32767 | `R[rd] = sext(imm) - R[rx]` |
+| `rdivli` | `01010101 ddddxxxx iiiiiiii iiiiiiii` | `rd, rx, imm` | imm: simm16, -32768..32767 | `R[rd] = sext(imm) /u R[rx]` |
+| `rmodli` | `01010110 ddddxxxx iiiiiiii iiiiiiii` | `rd, rx, imm` | imm: simm16, -32768..32767 | `R[rd] = sext(imm) %u R[rx]` |
+| `rdivsli` | `01010111 ddddxxxx iiiiiiii iiiiiiii` | `rd, rx, imm` | imm: simm16, -32768..32767 | `R[rd] = sext(imm) /s R[rx]` |
+| `lb` | `01011000 ddddxxxx iiiiiiii iiiiiiii` | `rx, imm` | imm: index16, -32768..32767 | `R[rx] = M8[lo16(BP + sext(imm))]` |
+| `lw` | `01011001 ddddxxxx iiiiiiii iiiiiiii` | `rx, imm` | imm: index16, -32768..32767 | `R[rx] = M16[lo16(BP + sext(imm) * 2)]` |
+| `sb` | `01011010 ddddxxxx iiiiiiii iiiiiiii` | `rx, imm` | imm: index16, -32768..32767 | `M8[lo16(BP + sext(imm))] = R[rx]` |
+| `sw` | `01011011 ddddxxxx iiiiiiii iiiiiiii` | `rx, imm` | imm: index16, -32768..32767 | `M16[lo16(BP + sext(imm) * 2)] = R[rx]` |
+| `lbx` | `01011100 ddddxxxx iiiiiiii iiiiiiii` | `rx, imm` | imm: index16, -32768..32767 | `R[rx] = sx(M8[lo16(BP + sext(imm))], 8)` |
+| `lwx` | `01011101 ddddxxxx iiiiiiii iiiiiiii` | `rx, imm` | imm: index16, -32768..32767 | `R[rx] = sx(M16[lo16(BP + sext(imm) * 2)], 16)` |
+| `addi` | `01011110 ddddxxxx iiiiiiii iiiiiiii` | `rx, imm` | imm: simm16, -32768..32767 | `R[rx] = R[rx] + sext(imm)` |
+| `andi` | `01011111 ddddxxxx iiiiiiii iiiiiiii` | `rx, imm` | imm: uimm16, 0..65535 | `R[rx] = R[rx] & imm` |
+| `shrsi` | `01100000 ddddxxxx iiiiiiii iiiiiiii` | `rx, imm` | imm: simm16, -32768..32767 | `R[rx] = R[rx] >>s (imm & 31)` |
+| `llb` | `01100001 ddddxxxx iiiiiiii iiiiiiii` | `rx, ry, imm` | imm: index16, -32768..32767 | `R[rx] = M8[R[ry] + sext(imm)]` |
+| `llw` | `01100010 ddddxxxx iiiiiiii iiiiiiii` | `rx, ry, imm` | imm: index16, -32768..32767 | `R[rx] = M16[R[ry] + sext(imm) * 2]` |
+| `lll` | `01100011 ddddxxxx iiiiiiii iiiiiiii` | `rx, ry, imm` | imm: index16, -32768..32767 | `R[rx] = M32[R[ry] + sext(imm) * 4]` |
+| `slb` | `01100100 ddddxxxx iiiiiiii iiiiiiii` | `rx, ry, imm` | imm: index16, -32768..32767 | `M8[R[ry] + sext(imm)] = R[rx]` |
+| `slw` | `01100101 ddddxxxx iiiiiiii iiiiiiii` | `rx, ry, imm` | imm: index16, -32768..32767 | `M16[R[ry] + sext(imm) * 2] = R[rx]` |
+| `sll` | `01100110 ddddxxxx iiiiiiii iiiiiiii` | `rx, ry, imm` | imm: index16, -32768..32767 | `M32[R[ry] + sext(imm) * 4] = R[rx]` |
+| `llbx` | `01100111 ddddxxxx iiiiiiii iiiiiiii` | `rx, ry, imm` | imm: index16, -32768..32767 | `R[rx] = sx(M8[R[ry] + sext(imm)], 8)` |
+| `llwx` | `01101000 ddddxxxx iiiiiiii iiiiiiii` | `rx, ry, imm` | imm: index16, -32768..32767 | `R[rx] = sx(M16[R[ry] + sext(imm) * 2], 16)` |
+| `beq` | `01101001 ddddxxxx iiiiiiii iiiiiiii` | `rx, ry, disp` | disp: pcrel16, label | `if R[rx] == R[ry] then PC = PC + sext(disp)` |
+| `bne` | `01101010 ddddxxxx iiiiiiii iiiiiiii` | `rx, ry, disp` | disp: pcrel16, label | `if R[rx] != R[ry] then PC = PC + sext(disp)` |
+| `blt` | `01101011 ddddxxxx iiiiiiii iiiiiiii` | `rx, ry, disp` | disp: pcrel16, label | `if R[rx] <u R[ry] then PC = PC + sext(disp)` |
+| `ble` | `01101100 ddddxxxx iiiiiiii iiiiiiii` | `rx, ry, disp` | disp: pcrel16, label | `if R[rx] <=u R[ry] then PC = PC + sext(disp)` |
+| `blts` | `01101101 ddddxxxx iiiiiiii iiiiiiii` | `rx, ry, disp` | disp: pcrel16, label | `if R[rx] <s R[ry] then PC = PC + sext(disp)` |
+| `bles` | `01101110 ddddxxxx iiiiiiii iiiiiiii` | `rx, ry, disp` | disp: pcrel16, label | `if R[rx] <=s R[ry] then PC = PC + sext(disp)` |
+| `beqz` | `01101111 ddddxxxx iiiiiiii iiiiiiii` | `rx, disp` | disp: pcrel16, label | `if R[rx] == 0 then PC = PC + sext(disp)` |
+| `bnez` | `01110000 ddddxxxx iiiiiiii iiiiiiii` | `rx, disp` | disp: pcrel16, label | `if R[rx] != 0 then PC = PC + sext(disp)` |
+| `dbnz` | `01110001 ddddxxxx iiiiiiii iiiiiiii` | `rx, disp` | disp: pcrel16, label | `R[rx] = R[rx] - 1; if R[rx] != 0 then PC = PC + sext(disp)` |
+| `bltz` | `01110010 ddddxxxx iiiiiiii iiiiiiii` | `rx, disp` | disp: pcrel16, label | `if R[rx] <s 0 then PC = PC + sext(disp)` |
+| `bgez` | `01110011 ddddxxxx iiiiiiii iiiiiiii` | `rx, disp` | disp: pcrel16, label | `if R[rx] >=s 0 then PC = PC + sext(disp)` |
+| `bgtz` | `01110100 ddddxxxx iiiiiiii iiiiiiii` | `rx, disp` | disp: pcrel16, label | `if R[rx] >s 0 then PC = PC + sext(disp)` |
+| `blez` | `01110101 ddddxxxx iiiiiiii iiiiiiii` | `rx, disp` | disp: pcrel16, label | `if R[rx] <=s 0 then PC = PC + sext(disp)` |
+| `immwh` | `01110110 ddddxxxx iiiiiiii iiiiiiii` | `rx, imm` | imm: raw16, -32768..65535 | `R[rx] = zx(R[rx], 16) \| (imm << 16)` |
 
 ## S8 — 4 bytes, `111110oo ddddiiii iiiijjjj jjjjjjjj`
 

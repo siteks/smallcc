@@ -571,8 +571,9 @@ goes away. Pass H, the IR interpreter and the printer read `fname` first.
 
 ### Constant loads the compiler uses when the ISA has them
 
-Nothing in CPU4 or the CPU5 draft defines these yet; the compiler looks them
-up with `isa_real` and uses them as soon as an `<arch>/isa.py` does:
+CPU5 defines them (S6a `ldl`/`stl`, S6b `lui`; CPU4 does not). The compiler
+looks them up with `isa_real`, so any `<arch>/isa.py` that defines them gets
+them:
 
 | Mnemonic | Operands | Semantics | Used for |
 |---|---|---|---|
@@ -580,9 +581,9 @@ up with `isa_real` and uses them as soon as an `<arch>/isa.py` does:
 | `ldl` | `rx, addr16` (`abs`) | `R[rx] = M32[imm]` | any other 32-bit constant, from a pool of `_kN: long` words (each value once, emitted after `_globals_start`); a 4-byte global scalar or field |
 | `stl` | `rx, addr16` (`abs`) | `M32[imm] = R[rx]` | a store to a 4-byte global scalar or field |
 
-Measured on a copy of CPU5 with the three added (2026-09-28): ray tracer
-48.5M -> 44.4M cycles (-8.4%), by-value ray tracer -6.4%, JPEG -1.2%,
-CoreMark -0.3%. On the ray tracer 32-bit constants were 12.6% of executed
+Adding them to CPU5 (2026-09-28): ray tracer 48.5M -> 44.4M cycles
+(-8.4%), by-value ray tracer -6.4%, JPEG -1.2%, CoreMark -0.3%. CPU5 keeps
+`immwh` (S7) for hand-written code; the compiler no longer emits it there. On the ray tracer 32-bit constants were 12.6% of executed
 instructions, and 54% of them had a zero low half. rig puts an instruction
 whose address is its immediate in the `load-abs`/`store-abs` groups.
 

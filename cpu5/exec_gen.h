@@ -587,6 +587,66 @@ static void cpu5_gx_sxwor(Core *cc, uint32_t w, uint16_t oldpc) {
     cc->r[f_rd] = sx32((uint32_t)(cc->r[f_rx] | cc->r[f_ry]), 16);
 }
 
+/* lea: R[rd] = lo16(BP + sext(imm) * 4) */
+static void cpu5_gx_lea(Core *cc, uint32_t w, uint16_t oldpc) {
+    const uint32_t f_rd = ((w >> 16) & 0xfu); (void)f_rd;
+    const uint32_t f_imm = ((w >> 0) & 0xffffu); (void)f_imm;
+    (void)w; (void)oldpc;
+    cc->r[f_rd] = ((uint32_t)((uint32_t)cc->bp + (uint32_t)(sx32(f_imm, 16) * 0x4u)) & 0xffffu);
+}
+
+/* immw: R[rx] = imm */
+static void cpu5_gx_immw(Core *cc, uint32_t w, uint16_t oldpc) {
+    const uint32_t f_rx = ((w >> 16) & 0xfu); (void)f_rx;
+    const uint32_t f_imm = ((w >> 0) & 0xffffu); (void)f_imm;
+    (void)w; (void)oldpc;
+    cc->r[f_rx] = f_imm;
+}
+
+/* ldl: R[rx] = M32[imm] */
+static void cpu5_gx_ldl(Core *cc, uint32_t w, uint16_t oldpc) {
+    const uint32_t f_rx = ((w >> 16) & 0xfu); (void)f_rx;
+    const uint32_t f_imm = ((w >> 0) & 0xffffu); (void)f_imm;
+    (void)w; (void)oldpc;
+    cc->r[f_rx] = gen_rd32(f_imm, oldpc);
+}
+
+/* stl: M32[imm] = R[rx] */
+static void cpu5_gx_stl(Core *cc, uint32_t w, uint16_t oldpc) {
+    const uint32_t f_rx = ((w >> 16) & 0xfu); (void)f_rx;
+    const uint32_t f_imm = ((w >> 0) & 0xffffu); (void)f_imm;
+    (void)w; (void)oldpc;
+    gen_wr32(f_imm, cc->r[f_rx], oldpc);
+}
+
+/* jz: if R[rx] == 0 then PC = imm */
+static void cpu5_gx_jz(Core *cc, uint32_t w, uint16_t oldpc) {
+    const uint32_t f_rx = ((w >> 16) & 0xfu); (void)f_rx;
+    const uint32_t f_imm = ((w >> 0) & 0xffffu); (void)f_imm;
+    (void)w; (void)oldpc;
+    if ((uint32_t)(cc->r[f_rx] == 0x0u)) {
+        cc->pc = (uint16_t)(f_imm);
+    }
+}
+
+/* lui: R[rx] = imm << 16 */
+static void cpu5_gx_lui(Core *cc, uint32_t w, uint16_t oldpc) {
+    const uint32_t f_rx = ((w >> 16) & 0xfu); (void)f_rx;
+    const uint32_t f_imm = ((w >> 0) & 0xffffu); (void)f_imm;
+    (void)w; (void)oldpc;
+    cc->r[f_rx] = shl32(f_imm, 0x10u);
+}
+
+/* jnz: if R[rx] != 0 then PC = imm */
+static void cpu5_gx_jnz(Core *cc, uint32_t w, uint16_t oldpc) {
+    const uint32_t f_rx = ((w >> 16) & 0xfu); (void)f_rx;
+    const uint32_t f_imm = ((w >> 0) & 0xffffu); (void)f_imm;
+    (void)w; (void)oldpc;
+    if ((uint32_t)(cc->r[f_rx] != 0x0u)) {
+        cc->pc = (uint16_t)(f_imm);
+    }
+}
+
 /* j: PC = imm */
 static void cpu5_gx_j(Core *cc, uint32_t w, uint16_t oldpc) {
     const uint32_t f_imm = ((w >> 0) & 0xffffu); (void)f_imm;
@@ -611,48 +671,11 @@ static void cpu5_gx_enter(Core *cc, uint32_t w, uint16_t oldpc) {
     cc->sp = (uint16_t)((uint32_t)((uint32_t)((uint32_t)cc->sp - f_imm) - 0x4u));
 }
 
-/* lea: R[rd] = lo16(BP + sext(imm) * 4) */
-static void cpu5_gx_lea(Core *cc, uint32_t w, uint16_t oldpc) {
-    const uint32_t f_rd = ((w >> 16) & 0xfu); (void)f_rd;
+/* adjw: SP = SP + sext(imm) * 4 */
+static void cpu5_gx_adjw(Core *cc, uint32_t w, uint16_t oldpc) {
     const uint32_t f_imm = ((w >> 0) & 0xffffu); (void)f_imm;
     (void)w; (void)oldpc;
-    cc->r[f_rd] = ((uint32_t)((uint32_t)cc->bp + (uint32_t)(sx32(f_imm, 16) * 0x4u)) & 0xffffu);
-}
-
-/* immw: R[rx] = imm */
-static void cpu5_gx_immw(Core *cc, uint32_t w, uint16_t oldpc) {
-    const uint32_t f_rx = ((w >> 16) & 0xfu); (void)f_rx;
-    const uint32_t f_imm = ((w >> 0) & 0xffffu); (void)f_imm;
-    (void)w; (void)oldpc;
-    cc->r[f_rx] = f_imm;
-}
-
-/* immwh: R[rx] = zx(R[rx], 16) | (imm << 16) */
-static void cpu5_gx_immwh(Core *cc, uint32_t w, uint16_t oldpc) {
-    const uint32_t f_rx = ((w >> 16) & 0xfu); (void)f_rx;
-    const uint32_t f_imm = ((w >> 0) & 0xffffu); (void)f_imm;
-    (void)w; (void)oldpc;
-    cc->r[f_rx] = (uint32_t)((cc->r[f_rx] & 0xffffu) | shl32(f_imm, 0x10u));
-}
-
-/* jz: if R[rx] == 0 then PC = imm */
-static void cpu5_gx_jz(Core *cc, uint32_t w, uint16_t oldpc) {
-    const uint32_t f_rx = ((w >> 16) & 0xfu); (void)f_rx;
-    const uint32_t f_imm = ((w >> 0) & 0xffffu); (void)f_imm;
-    (void)w; (void)oldpc;
-    if ((uint32_t)(cc->r[f_rx] == 0x0u)) {
-        cc->pc = (uint16_t)(f_imm);
-    }
-}
-
-/* jnz: if R[rx] != 0 then PC = imm */
-static void cpu5_gx_jnz(Core *cc, uint32_t w, uint16_t oldpc) {
-    const uint32_t f_rx = ((w >> 16) & 0xfu); (void)f_rx;
-    const uint32_t f_imm = ((w >> 0) & 0xffffu); (void)f_imm;
-    (void)w; (void)oldpc;
-    if ((uint32_t)(cc->r[f_rx] != 0x0u)) {
-        cc->pc = (uint16_t)(f_imm);
-    }
+    cc->sp = (uint16_t)((uint32_t)((uint32_t)cc->sp + (uint32_t)(sx32(f_imm, 16) * 0x4u)));
 }
 
 /* addli: R[rd] = R[rx] + sext(imm) */
@@ -943,13 +966,6 @@ static void cpu5_gx_shrsi(Core *cc, uint32_t w, uint16_t oldpc) {
     cc->r[f_rx] = sar32(cc->r[f_rx], (uint32_t)(f_imm & 0x1fu));
 }
 
-/* adjw: SP = SP + sext(imm) * 4 */
-static void cpu5_gx_adjw(Core *cc, uint32_t w, uint16_t oldpc) {
-    const uint32_t f_imm = ((w >> 0) & 0xffffu); (void)f_imm;
-    (void)w; (void)oldpc;
-    cc->sp = (uint16_t)((uint32_t)((uint32_t)cc->sp + (uint32_t)(sx32(f_imm, 16) * 0x4u)));
-}
-
 /* llb: R[rx] = M8[R[ry] + sext(imm)] */
 static void cpu5_gx_llb(Core *cc, uint32_t w, uint16_t oldpc) {
     const uint32_t f_rx = ((w >> 20) & 0xfu); (void)f_rx;
@@ -1159,6 +1175,14 @@ static void cpu5_gx_blez(Core *cc, uint32_t w, uint16_t oldpc) {
     }
 }
 
+/* immwh: R[rx] = zx(R[rx], 16) | (imm << 16) */
+static void cpu5_gx_immwh(Core *cc, uint32_t w, uint16_t oldpc) {
+    const uint32_t f_rx = ((w >> 20) & 0xfu); (void)f_rx;
+    const uint32_t f_imm = ((w >> 0) & 0xffffu); (void)f_imm;
+    (void)w; (void)oldpc;
+    cc->r[f_rx] = (uint32_t)((cc->r[f_rx] & 0xffffu) | shl32(f_imm, 0x10u));
+}
+
 /* cbeq: if R[rx] == imm8 then PC = PC + sext(disp) */
 static void cpu5_gx_cbeq(Core *cc, uint32_t w, uint16_t oldpc) {
     const uint32_t f_rx = ((w >> 20) & 0xfu); (void)f_rx;
@@ -1195,311 +1219,323 @@ static int cpu5_gen_step(Core *cc) {
     switch (read8(oldpc)) {
     case 0x00: case 0x01: case 0x02: case 0x03: case 0x04: case 0x05: case 0x06: case 0x07: case 0x08: case 0x09: case 0x0a: case 0x0b: case 0x0c: case 0x0d: case 0x0e: case 0x0f:
         n = 3; w = gen_fetch(oldpc, 3); cc->pc = (uint16_t)(oldpc + 3);
-        cpu5_gx_j(cc, w, oldpc);
+        cpu5_gx_lea(cc, w, oldpc);
         break;
     case 0x10: case 0x11: case 0x12: case 0x13: case 0x14: case 0x15: case 0x16: case 0x17: case 0x18: case 0x19: case 0x1a: case 0x1b: case 0x1c: case 0x1d: case 0x1e: case 0x1f:
         n = 3; w = gen_fetch(oldpc, 3); cc->pc = (uint16_t)(oldpc + 3);
-        cpu5_gx_jl(cc, w, oldpc);
+        cpu5_gx_immw(cc, w, oldpc);
         break;
     case 0x20: case 0x21: case 0x22: case 0x23: case 0x24: case 0x25: case 0x26: case 0x27: case 0x28: case 0x29: case 0x2a: case 0x2b: case 0x2c: case 0x2d: case 0x2e: case 0x2f:
         n = 3; w = gen_fetch(oldpc, 3); cc->pc = (uint16_t)(oldpc + 3);
-        cpu5_gx_enter(cc, w, oldpc);
+        cpu5_gx_ldl(cc, w, oldpc);
         break;
     case 0x30: case 0x31: case 0x32: case 0x33: case 0x34: case 0x35: case 0x36: case 0x37: case 0x38: case 0x39: case 0x3a: case 0x3b: case 0x3c: case 0x3d: case 0x3e: case 0x3f:
         n = 3; w = gen_fetch(oldpc, 3); cc->pc = (uint16_t)(oldpc + 3);
-        cpu5_gx_lea(cc, w, oldpc);
+        cpu5_gx_stl(cc, w, oldpc);
         break;
-    case 0x40: case 0x41: case 0x42: case 0x43: case 0x44: case 0x45: case 0x46: case 0x47: case 0x48: case 0x49: case 0x4a: case 0x4b: case 0x4c: case 0x4d: case 0x4e: case 0x4f:
-        n = 3; w = gen_fetch(oldpc, 3); cc->pc = (uint16_t)(oldpc + 3);
-        cpu5_gx_immw(cc, w, oldpc);
-        break;
-    case 0x50: case 0x51: case 0x52: case 0x53: case 0x54: case 0x55: case 0x56: case 0x57: case 0x58: case 0x59: case 0x5a: case 0x5b: case 0x5c: case 0x5d: case 0x5e: case 0x5f:
-        n = 3; w = gen_fetch(oldpc, 3); cc->pc = (uint16_t)(oldpc + 3);
-        cpu5_gx_immwh(cc, w, oldpc);
-        break;
-    case 0x60: case 0x61: case 0x62: case 0x63: case 0x64: case 0x65: case 0x66: case 0x67: case 0x68: case 0x69: case 0x6a: case 0x6b: case 0x6c: case 0x6d: case 0x6e: case 0x6f:
-        n = 3; w = gen_fetch(oldpc, 3); cc->pc = (uint16_t)(oldpc + 3);
-        cpu5_gx_jz(cc, w, oldpc);
-        break;
-    case 0x70: case 0x71: case 0x72: case 0x73: case 0x74: case 0x75: case 0x76: case 0x77: case 0x78: case 0x79: case 0x7a: case 0x7b: case 0x7c: case 0x7d: case 0x7e: case 0x7f:
-        n = 3; w = gen_fetch(oldpc, 3); cc->pc = (uint16_t)(oldpc + 3);
-        cpu5_gx_jnz(cc, w, oldpc);
-        break;
-    case 0x80:
+    case 0x40:
         n = 4; w = gen_fetch(oldpc, 4); cc->pc = (uint16_t)(oldpc + 4);
         cpu5_gx_addli(cc, w, oldpc);
         break;
-    case 0x81:
+    case 0x41:
         n = 4; w = gen_fetch(oldpc, 4); cc->pc = (uint16_t)(oldpc + 4);
         cpu5_gx_subli(cc, w, oldpc);
         break;
-    case 0x82:
+    case 0x42:
         n = 4; w = gen_fetch(oldpc, 4); cc->pc = (uint16_t)(oldpc + 4);
         cpu5_gx_mulli(cc, w, oldpc);
         break;
-    case 0x83:
+    case 0x43:
         n = 4; w = gen_fetch(oldpc, 4); cc->pc = (uint16_t)(oldpc + 4);
         cpu5_gx_divli(cc, w, oldpc);
         break;
-    case 0x84:
+    case 0x44:
         n = 4; w = gen_fetch(oldpc, 4); cc->pc = (uint16_t)(oldpc + 4);
         cpu5_gx_modli(cc, w, oldpc);
         break;
-    case 0x85:
+    case 0x45:
         n = 4; w = gen_fetch(oldpc, 4); cc->pc = (uint16_t)(oldpc + 4);
         cpu5_gx_shlli(cc, w, oldpc);
         break;
-    case 0x86:
+    case 0x46:
         n = 4; w = gen_fetch(oldpc, 4); cc->pc = (uint16_t)(oldpc + 4);
         cpu5_gx_shrli(cc, w, oldpc);
         break;
-    case 0x87:
+    case 0x47:
         n = 4; w = gen_fetch(oldpc, 4); cc->pc = (uint16_t)(oldpc + 4);
         cpu5_gx_leli(cc, w, oldpc);
         break;
-    case 0x88:
+    case 0x48:
         n = 4; w = gen_fetch(oldpc, 4); cc->pc = (uint16_t)(oldpc + 4);
         cpu5_gx_gtli(cc, w, oldpc);
         break;
-    case 0x89:
+    case 0x49:
         n = 4; w = gen_fetch(oldpc, 4); cc->pc = (uint16_t)(oldpc + 4);
         cpu5_gx_eqli(cc, w, oldpc);
         break;
-    case 0x8a:
+    case 0x4a:
         n = 4; w = gen_fetch(oldpc, 4); cc->pc = (uint16_t)(oldpc + 4);
         cpu5_gx_neli(cc, w, oldpc);
         break;
-    case 0x8b:
+    case 0x4b:
         n = 4; w = gen_fetch(oldpc, 4); cc->pc = (uint16_t)(oldpc + 4);
         cpu5_gx_andli(cc, w, oldpc);
         break;
-    case 0x8c:
+    case 0x4c:
         n = 4; w = gen_fetch(oldpc, 4); cc->pc = (uint16_t)(oldpc + 4);
         cpu5_gx_orli(cc, w, oldpc);
         break;
-    case 0x8d:
+    case 0x4d:
         n = 4; w = gen_fetch(oldpc, 4); cc->pc = (uint16_t)(oldpc + 4);
         cpu5_gx_xorli(cc, w, oldpc);
         break;
-    case 0x8e:
+    case 0x4e:
         n = 4; w = gen_fetch(oldpc, 4); cc->pc = (uint16_t)(oldpc + 4);
         cpu5_gx_lesli(cc, w, oldpc);
         break;
-    case 0x8f:
+    case 0x4f:
         n = 4; w = gen_fetch(oldpc, 4); cc->pc = (uint16_t)(oldpc + 4);
         cpu5_gx_gtsli(cc, w, oldpc);
         break;
-    case 0x90:
+    case 0x50:
         n = 4; w = gen_fetch(oldpc, 4); cc->pc = (uint16_t)(oldpc + 4);
         cpu5_gx_divsli(cc, w, oldpc);
         break;
-    case 0x91:
+    case 0x51:
         n = 4; w = gen_fetch(oldpc, 4); cc->pc = (uint16_t)(oldpc + 4);
         cpu5_gx_modsli(cc, w, oldpc);
         break;
-    case 0x92:
+    case 0x52:
         n = 4; w = gen_fetch(oldpc, 4); cc->pc = (uint16_t)(oldpc + 4);
         cpu5_gx_shrsli(cc, w, oldpc);
         break;
-    case 0x93:
+    case 0x53:
         n = 4; w = gen_fetch(oldpc, 4); cc->pc = (uint16_t)(oldpc + 4);
         cpu5_gx_bitex(cc, w, oldpc);
         break;
-    case 0x94:
+    case 0x54:
         n = 4; w = gen_fetch(oldpc, 4); cc->pc = (uint16_t)(oldpc + 4);
         cpu5_gx_rsubli(cc, w, oldpc);
         break;
-    case 0x95:
+    case 0x55:
         n = 4; w = gen_fetch(oldpc, 4); cc->pc = (uint16_t)(oldpc + 4);
         cpu5_gx_rdivli(cc, w, oldpc);
         break;
-    case 0x96:
+    case 0x56:
         n = 4; w = gen_fetch(oldpc, 4); cc->pc = (uint16_t)(oldpc + 4);
         cpu5_gx_rmodli(cc, w, oldpc);
         break;
-    case 0x97:
+    case 0x57:
         n = 4; w = gen_fetch(oldpc, 4); cc->pc = (uint16_t)(oldpc + 4);
         cpu5_gx_rdivsli(cc, w, oldpc);
         break;
-    case 0x98:
+    case 0x58:
         n = 4; w = gen_fetch(oldpc, 4); cc->pc = (uint16_t)(oldpc + 4);
         cpu5_gx_lb(cc, w, oldpc);
         break;
-    case 0x99:
+    case 0x59:
         n = 4; w = gen_fetch(oldpc, 4); cc->pc = (uint16_t)(oldpc + 4);
         cpu5_gx_lw(cc, w, oldpc);
         break;
-    case 0x9a:
+    case 0x5a:
         n = 4; w = gen_fetch(oldpc, 4); cc->pc = (uint16_t)(oldpc + 4);
         cpu5_gx_sb(cc, w, oldpc);
         break;
-    case 0x9b:
+    case 0x5b:
         n = 4; w = gen_fetch(oldpc, 4); cc->pc = (uint16_t)(oldpc + 4);
         cpu5_gx_sw(cc, w, oldpc);
         break;
-    case 0x9c:
+    case 0x5c:
         n = 4; w = gen_fetch(oldpc, 4); cc->pc = (uint16_t)(oldpc + 4);
         cpu5_gx_lbx(cc, w, oldpc);
         break;
-    case 0x9d:
+    case 0x5d:
         n = 4; w = gen_fetch(oldpc, 4); cc->pc = (uint16_t)(oldpc + 4);
         cpu5_gx_lwx(cc, w, oldpc);
         break;
-    case 0x9e:
+    case 0x5e:
         n = 4; w = gen_fetch(oldpc, 4); cc->pc = (uint16_t)(oldpc + 4);
         cpu5_gx_addi(cc, w, oldpc);
         break;
-    case 0x9f:
+    case 0x5f:
         n = 4; w = gen_fetch(oldpc, 4); cc->pc = (uint16_t)(oldpc + 4);
         cpu5_gx_andi(cc, w, oldpc);
         break;
-    case 0xa0:
+    case 0x60:
         n = 4; w = gen_fetch(oldpc, 4); cc->pc = (uint16_t)(oldpc + 4);
         cpu5_gx_shrsi(cc, w, oldpc);
         break;
-    case 0xa1:
-        n = 4; w = gen_fetch(oldpc, 4); cc->pc = (uint16_t)(oldpc + 4);
-        cpu5_gx_adjw(cc, w, oldpc);
-        break;
-    case 0xa2:
+    case 0x61:
         n = 4; w = gen_fetch(oldpc, 4); cc->pc = (uint16_t)(oldpc + 4);
         cpu5_gx_llb(cc, w, oldpc);
         break;
-    case 0xa3:
+    case 0x62:
         n = 4; w = gen_fetch(oldpc, 4); cc->pc = (uint16_t)(oldpc + 4);
         cpu5_gx_llw(cc, w, oldpc);
         break;
-    case 0xa4:
+    case 0x63:
         n = 4; w = gen_fetch(oldpc, 4); cc->pc = (uint16_t)(oldpc + 4);
         cpu5_gx_lll(cc, w, oldpc);
         break;
-    case 0xa5:
+    case 0x64:
         n = 4; w = gen_fetch(oldpc, 4); cc->pc = (uint16_t)(oldpc + 4);
         cpu5_gx_slb(cc, w, oldpc);
         break;
-    case 0xa6:
+    case 0x65:
         n = 4; w = gen_fetch(oldpc, 4); cc->pc = (uint16_t)(oldpc + 4);
         cpu5_gx_slw(cc, w, oldpc);
         break;
-    case 0xa7:
+    case 0x66:
         n = 4; w = gen_fetch(oldpc, 4); cc->pc = (uint16_t)(oldpc + 4);
         cpu5_gx_sll(cc, w, oldpc);
         break;
-    case 0xa8:
+    case 0x67:
         n = 4; w = gen_fetch(oldpc, 4); cc->pc = (uint16_t)(oldpc + 4);
         cpu5_gx_llbx(cc, w, oldpc);
         break;
-    case 0xa9:
+    case 0x68:
         n = 4; w = gen_fetch(oldpc, 4); cc->pc = (uint16_t)(oldpc + 4);
         cpu5_gx_llwx(cc, w, oldpc);
         break;
-    case 0xaa:
+    case 0x69:
         n = 4; w = gen_fetch(oldpc, 4); cc->pc = (uint16_t)(oldpc + 4);
         cpu5_gx_beq(cc, w, oldpc);
         break;
-    case 0xab:
+    case 0x6a:
         n = 4; w = gen_fetch(oldpc, 4); cc->pc = (uint16_t)(oldpc + 4);
         cpu5_gx_bne(cc, w, oldpc);
         break;
-    case 0xac:
+    case 0x6b:
         n = 4; w = gen_fetch(oldpc, 4); cc->pc = (uint16_t)(oldpc + 4);
         cpu5_gx_blt(cc, w, oldpc);
         break;
-    case 0xad:
+    case 0x6c:
         n = 4; w = gen_fetch(oldpc, 4); cc->pc = (uint16_t)(oldpc + 4);
         cpu5_gx_ble(cc, w, oldpc);
         break;
-    case 0xae:
+    case 0x6d:
         n = 4; w = gen_fetch(oldpc, 4); cc->pc = (uint16_t)(oldpc + 4);
         cpu5_gx_blts(cc, w, oldpc);
         break;
-    case 0xaf:
+    case 0x6e:
         n = 4; w = gen_fetch(oldpc, 4); cc->pc = (uint16_t)(oldpc + 4);
         cpu5_gx_bles(cc, w, oldpc);
         break;
-    case 0xb0:
+    case 0x6f:
         n = 4; w = gen_fetch(oldpc, 4); cc->pc = (uint16_t)(oldpc + 4);
         cpu5_gx_beqz(cc, w, oldpc);
         break;
-    case 0xb1:
+    case 0x70:
         n = 4; w = gen_fetch(oldpc, 4); cc->pc = (uint16_t)(oldpc + 4);
         cpu5_gx_bnez(cc, w, oldpc);
         break;
-    case 0xb2:
+    case 0x71:
         n = 4; w = gen_fetch(oldpc, 4); cc->pc = (uint16_t)(oldpc + 4);
         cpu5_gx_dbnz(cc, w, oldpc);
         break;
-    case 0xb3:
+    case 0x72:
         n = 4; w = gen_fetch(oldpc, 4); cc->pc = (uint16_t)(oldpc + 4);
         cpu5_gx_bltz(cc, w, oldpc);
         break;
-    case 0xb4:
+    case 0x73:
         n = 4; w = gen_fetch(oldpc, 4); cc->pc = (uint16_t)(oldpc + 4);
         cpu5_gx_bgez(cc, w, oldpc);
         break;
-    case 0xb5:
+    case 0x74:
         n = 4; w = gen_fetch(oldpc, 4); cc->pc = (uint16_t)(oldpc + 4);
         cpu5_gx_bgtz(cc, w, oldpc);
         break;
-    case 0xb6:
+    case 0x75:
         n = 4; w = gen_fetch(oldpc, 4); cc->pc = (uint16_t)(oldpc + 4);
         cpu5_gx_blez(cc, w, oldpc);
         break;
-    case 0xc0: case 0xc1: case 0xc2: case 0xc3: case 0xc4: case 0xc5: case 0xc6: case 0xc7:
+    case 0x76:
+        n = 4; w = gen_fetch(oldpc, 4); cc->pc = (uint16_t)(oldpc + 4);
+        cpu5_gx_immwh(cc, w, oldpc);
+        break;
+    case 0x80: case 0x81: case 0x82: case 0x83: case 0x84: case 0x85: case 0x86: case 0x87:
         n = 2; w = gen_fetch(oldpc, 2); cc->pc = (uint16_t)(oldpc + 2);
         cpu5_gx_ll(cc, w, oldpc);
         break;
-    case 0xc8: case 0xc9: case 0xca: case 0xcb: case 0xcc: case 0xcd: case 0xce: case 0xcf:
+    case 0x88: case 0x89: case 0x8a: case 0x8b: case 0x8c: case 0x8d: case 0x8e: case 0x8f:
         n = 2; w = gen_fetch(oldpc, 2); cc->pc = (uint16_t)(oldpc + 2);
         cpu5_gx_sl(cc, w, oldpc);
         break;
-    case 0xd0: case 0xd1: case 0xd2: case 0xd3: case 0xd4: case 0xd5: case 0xd6: case 0xd7:
+    case 0x90: case 0x91: case 0x92: case 0x93: case 0x94: case 0x95: case 0x96: case 0x97:
         n = 2; w = gen_fetch(oldpc, 2); cc->pc = (uint16_t)(oldpc + 2);
         cpu5_gx_shli(cc, w, oldpc);
         break;
-    case 0xd8: case 0xd9: case 0xda: case 0xdb: case 0xdc: case 0xdd: case 0xde: case 0xdf:
+    case 0x98: case 0x99: case 0x9a: case 0x9b: case 0x9c: case 0x9d: case 0x9e: case 0x9f:
         n = 2; w = gen_fetch(oldpc, 2); cc->pc = (uint16_t)(oldpc + 2);
         cpu5_gx_imms(cc, w, oldpc);
         break;
-    case 0xe0:
+    case 0xa0: case 0xa1: case 0xa2: case 0xa3: case 0xa4: case 0xa5: case 0xa6: case 0xa7: case 0xa8: case 0xa9: case 0xaa: case 0xab: case 0xac: case 0xad: case 0xae: case 0xaf:
+        n = 3; w = gen_fetch(oldpc, 3); cc->pc = (uint16_t)(oldpc + 3);
+        cpu5_gx_jz(cc, w, oldpc);
+        break;
+    case 0xb0: case 0xb1: case 0xb2: case 0xb3: case 0xb4: case 0xb5: case 0xb6: case 0xb7: case 0xb8: case 0xb9: case 0xba: case 0xbb: case 0xbc: case 0xbd: case 0xbe: case 0xbf:
+        n = 3; w = gen_fetch(oldpc, 3); cc->pc = (uint16_t)(oldpc + 3);
+        cpu5_gx_lui(cc, w, oldpc);
+        break;
+    case 0xc0:
         n = 2; w = gen_fetch(oldpc, 2); cc->pc = (uint16_t)(oldpc + 2);
         cpu5_gx_mov(cc, w, oldpc);
         break;
-    case 0xe1:
+    case 0xc1:
         n = 2; w = gen_fetch(oldpc, 2); cc->pc = (uint16_t)(oldpc + 2);
         cpu5_gx_zxw(cc, w, oldpc);
         break;
-    case 0xe2:
+    case 0xc2:
         n = 2; w = gen_fetch(oldpc, 2); cc->pc = (uint16_t)(oldpc + 2);
         cpu5_gx_llb_0(cc, w, oldpc);
         break;
-    case 0xe3:
+    case 0xc3:
         n = 2; w = gen_fetch(oldpc, 2); cc->pc = (uint16_t)(oldpc + 2);
         cpu5_gx_llw_0(cc, w, oldpc);
         break;
-    case 0xe4:
+    case 0xc4:
         n = 2; w = gen_fetch(oldpc, 2); cc->pc = (uint16_t)(oldpc + 2);
         cpu5_gx_lll_0(cc, w, oldpc);
         break;
-    case 0xe5:
+    case 0xc5:
         n = 2; w = gen_fetch(oldpc, 2); cc->pc = (uint16_t)(oldpc + 2);
         cpu5_gx_slb_0(cc, w, oldpc);
         break;
-    case 0xe6:
+    case 0xc6:
         n = 2; w = gen_fetch(oldpc, 2); cc->pc = (uint16_t)(oldpc + 2);
         cpu5_gx_slw_0(cc, w, oldpc);
         break;
-    case 0xe7:
+    case 0xc7:
         n = 2; w = gen_fetch(oldpc, 2); cc->pc = (uint16_t)(oldpc + 2);
         cpu5_gx_sll_0(cc, w, oldpc);
         break;
-    case 0xe8:
+    case 0xc8:
         n = 2; w = gen_fetch(oldpc, 2); cc->pc = (uint16_t)(oldpc + 2);
         cpu5_gx_llbx_0(cc, w, oldpc);
         break;
-    case 0xe9:
+    case 0xc9:
         n = 2; w = gen_fetch(oldpc, 2); cc->pc = (uint16_t)(oldpc + 2);
         cpu5_gx_llwx_0(cc, w, oldpc);
+        break;
+    case 0xd0: case 0xd1: case 0xd2: case 0xd3: case 0xd4: case 0xd5: case 0xd6: case 0xd7: case 0xd8: case 0xd9: case 0xda: case 0xdb: case 0xdc: case 0xdd: case 0xde: case 0xdf:
+        n = 3; w = gen_fetch(oldpc, 3); cc->pc = (uint16_t)(oldpc + 3);
+        cpu5_gx_jnz(cc, w, oldpc);
+        break;
+    case 0xe0:
+        n = 3; w = gen_fetch(oldpc, 3); cc->pc = (uint16_t)(oldpc + 3);
+        cpu5_gx_j(cc, w, oldpc);
+        break;
+    case 0xe1:
+        n = 3; w = gen_fetch(oldpc, 3); cc->pc = (uint16_t)(oldpc + 3);
+        cpu5_gx_jl(cc, w, oldpc);
+        break;
+    case 0xe2:
+        n = 3; w = gen_fetch(oldpc, 3); cc->pc = (uint16_t)(oldpc + 3);
+        cpu5_gx_enter(cc, w, oldpc);
+        break;
+    case 0xe3:
+        n = 3; w = gen_fetch(oldpc, 3); cc->pc = (uint16_t)(oldpc + 3);
+        cpu5_gx_adjw(cc, w, oldpc);
         break;
     case 0xf0:
         n = 1; w = gen_fetch(oldpc, 1); cc->pc = (uint16_t)(oldpc + 1);
@@ -1582,22 +1618,6 @@ static int cpu5_gen_step(Core *cc) {
         break;
     case 0xfe:
         n = 2; w = gen_fetch(oldpc, 2); cc->pc = (uint16_t)(oldpc + 2);
-        switch (((w >> 0) & 0xffu)) {
-        case 0x0: cpu5_gx_halt(cc, w, oldpc); break;
-        case 0x1: cpu5_gx_zero7(cc, w, oldpc); break;
-        case 0x2: cpu5_gx_zero8(cc, w, oldpc); break;
-        case 0x3: cpu5_gx_zero9(cc, w, oldpc); break;
-        case 0x4: cpu5_gx_zeroa(cc, w, oldpc); break;
-        case 0x5: cpu5_gx_zerob(cc, w, oldpc); break;
-        case 0x6: cpu5_gx_zeroc(cc, w, oldpc); break;
-        case 0x7: cpu5_gx_zerod(cc, w, oldpc); break;
-        case 0x8: cpu5_gx_zeroe(cc, w, oldpc); break;
-        case 0x9: cpu5_gx_zerof(cc, w, oldpc); break;
-        default: gen_unknown(cc, w, oldpc); break;
-        }
-        break;
-    case 0xff:
-        n = 2; w = gen_fetch(oldpc, 2); cc->pc = (uint16_t)(oldpc + 2);
         switch (((w >> 4) & 0xfu)) {
         case 0x0: cpu5_gx_sxb(cc, w, oldpc); break;
         case 0x1: cpu5_gx_sxw(cc, w, oldpc); break;
@@ -1615,6 +1635,22 @@ static int cpu5_gen_step(Core *cc) {
         case 0xd: cpu5_gx_frecip(cc, w, oldpc); break;
         case 0xe: cpu5_gx_frsqrt(cc, w, oldpc); break;
         case 0xf: cpu5_gx_putchar(cc, w, oldpc); break;
+        default: gen_unknown(cc, w, oldpc); break;
+        }
+        break;
+    case 0xff:
+        n = 2; w = gen_fetch(oldpc, 2); cc->pc = (uint16_t)(oldpc + 2);
+        switch (((w >> 0) & 0xffu)) {
+        case 0x0: cpu5_gx_halt(cc, w, oldpc); break;
+        case 0x1: cpu5_gx_zero7(cc, w, oldpc); break;
+        case 0x2: cpu5_gx_zero8(cc, w, oldpc); break;
+        case 0x3: cpu5_gx_zero9(cc, w, oldpc); break;
+        case 0x4: cpu5_gx_zeroa(cc, w, oldpc); break;
+        case 0x5: cpu5_gx_zerob(cc, w, oldpc); break;
+        case 0x6: cpu5_gx_zeroc(cc, w, oldpc); break;
+        case 0x7: cpu5_gx_zerod(cc, w, oldpc); break;
+        case 0x8: cpu5_gx_zeroe(cc, w, oldpc); break;
+        case 0x9: cpu5_gx_zerof(cc, w, oldpc); break;
         default: gen_unknown(cc, w, oldpc); break;
         }
         break;

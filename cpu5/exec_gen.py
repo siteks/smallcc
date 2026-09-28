@@ -485,6 +485,50 @@ def gx_sxwor(s, m, w, oldpc):
     f_ry = ((w >> 0) & 0xf)
     s.r[f_rd] = sx32((s.r[f_rx] | s.r[f_ry]), 16)
 
+def gx_lea(s, m, w, oldpc):
+    # R[rd] = lo16(BP + sext(imm) * 4)
+    f_rd = ((w >> 16) & 0xf)
+    f_imm = ((w >> 0) & 0xffff)
+    s.r[f_rd] = (((s.bp + ((sx32(f_imm, 16) * 4) & 0xffffffff)) & 0xffffffff) & 0xffff)
+
+def gx_immw(s, m, w, oldpc):
+    # R[rx] = imm
+    f_rx = ((w >> 16) & 0xf)
+    f_imm = ((w >> 0) & 0xffff)
+    s.r[f_rx] = f_imm
+
+def gx_ldl(s, m, w, oldpc):
+    # R[rx] = M32[imm]
+    f_rx = ((w >> 16) & 0xf)
+    f_imm = ((w >> 0) & 0xffff)
+    s.r[f_rx] = rd32(m, f_imm, oldpc)
+
+def gx_stl(s, m, w, oldpc):
+    # M32[imm] = R[rx]
+    f_rx = ((w >> 16) & 0xf)
+    f_imm = ((w >> 0) & 0xffff)
+    wr32(m, f_imm, s.r[f_rx], oldpc)
+
+def gx_jz(s, m, w, oldpc):
+    # if R[rx] == 0 then PC = imm
+    f_rx = ((w >> 16) & 0xf)
+    f_imm = ((w >> 0) & 0xffff)
+    if int(s.r[f_rx] == 0):
+        s.pc = f_imm & 0xffff
+
+def gx_lui(s, m, w, oldpc):
+    # R[rx] = imm << 16
+    f_rx = ((w >> 16) & 0xf)
+    f_imm = ((w >> 0) & 0xffff)
+    s.r[f_rx] = shl32(f_imm, 16)
+
+def gx_jnz(s, m, w, oldpc):
+    # if R[rx] != 0 then PC = imm
+    f_rx = ((w >> 16) & 0xf)
+    f_imm = ((w >> 0) & 0xffff)
+    if int(s.r[f_rx] != 0):
+        s.pc = f_imm & 0xffff
+
 def gx_j(s, m, w, oldpc):
     # PC = imm
     f_imm = ((w >> 0) & 0xffff)
@@ -503,37 +547,10 @@ def gx_enter(s, m, w, oldpc):
     s.bp = ((s.sp - 4) & 0xffffffff) & 0xffff
     s.sp = ((((s.sp - f_imm) & 0xffffffff) - 4) & 0xffffffff) & 0xffff
 
-def gx_lea(s, m, w, oldpc):
-    # R[rd] = lo16(BP + sext(imm) * 4)
-    f_rd = ((w >> 16) & 0xf)
+def gx_adjw(s, m, w, oldpc):
+    # SP = SP + sext(imm) * 4
     f_imm = ((w >> 0) & 0xffff)
-    s.r[f_rd] = (((s.bp + ((sx32(f_imm, 16) * 4) & 0xffffffff)) & 0xffffffff) & 0xffff)
-
-def gx_immw(s, m, w, oldpc):
-    # R[rx] = imm
-    f_rx = ((w >> 16) & 0xf)
-    f_imm = ((w >> 0) & 0xffff)
-    s.r[f_rx] = f_imm
-
-def gx_immwh(s, m, w, oldpc):
-    # R[rx] = zx(R[rx], 16) | (imm << 16)
-    f_rx = ((w >> 16) & 0xf)
-    f_imm = ((w >> 0) & 0xffff)
-    s.r[f_rx] = ((s.r[f_rx] & 65535) | shl32(f_imm, 16))
-
-def gx_jz(s, m, w, oldpc):
-    # if R[rx] == 0 then PC = imm
-    f_rx = ((w >> 16) & 0xf)
-    f_imm = ((w >> 0) & 0xffff)
-    if int(s.r[f_rx] == 0):
-        s.pc = f_imm & 0xffff
-
-def gx_jnz(s, m, w, oldpc):
-    # if R[rx] != 0 then PC = imm
-    f_rx = ((w >> 16) & 0xf)
-    f_imm = ((w >> 0) & 0xffff)
-    if int(s.r[f_rx] != 0):
-        s.pc = f_imm & 0xffff
+    s.sp = ((s.sp + ((sx32(f_imm, 16) * 4) & 0xffffffff)) & 0xffffffff) & 0xffff
 
 def gx_addli(s, m, w, oldpc):
     # R[rd] = R[rx] + sext(imm)
@@ -757,11 +774,6 @@ def gx_shrsi(s, m, w, oldpc):
     f_imm = ((w >> 0) & 0xffff)
     s.r[f_rx] = sar32(s.r[f_rx], (f_imm & 31))
 
-def gx_adjw(s, m, w, oldpc):
-    # SP = SP + sext(imm) * 4
-    f_imm = ((w >> 0) & 0xffff)
-    s.sp = ((s.sp + ((sx32(f_imm, 16) * 4) & 0xffffffff)) & 0xffffffff) & 0xffff
-
 def gx_llb(s, m, w, oldpc):
     # R[rx] = M8[R[ry] + sext(imm)]
     f_rx = ((w >> 20) & 0xf)
@@ -916,6 +928,12 @@ def gx_blez(s, m, w, oldpc):
     if int(s32(s.r[f_rx]) <= s32(0)):
         s.pc = ((s.pc + sx32(f_disp, 16)) & 0xffffffff) & 0xffff
 
+def gx_immwh(s, m, w, oldpc):
+    # R[rx] = zx(R[rx], 16) | (imm << 16)
+    f_rx = ((w >> 20) & 0xf)
+    f_imm = ((w >> 0) & 0xffff)
+    s.r[f_rx] = ((s.r[f_rx] & 65535) | shl32(f_imm, 16))
+
 def gx_cbeq(s, m, w, oldpc):
     # if R[rx] == imm8 then PC = PC + sext(disp)
     f_rx = ((w >> 20) & 0xf)
@@ -940,235 +958,223 @@ def check(s, oldpc):
     pass
 
 def _key0(w): return ((w >> 12) & 0xf)
-def _key1(w): return ((w >> 0) & 0xff)
-def _key2(w): return ((w >> 4) & 0xf)
+def _key1(w): return ((w >> 4) & 0xf)
+def _key2(w): return ((w >> 0) & 0xff)
 
 DECODE = {
-    0x00: (3, gx_j, None, None),
-    0x01: (3, gx_j, None, None),
-    0x02: (3, gx_j, None, None),
-    0x03: (3, gx_j, None, None),
-    0x04: (3, gx_j, None, None),
-    0x05: (3, gx_j, None, None),
-    0x06: (3, gx_j, None, None),
-    0x07: (3, gx_j, None, None),
-    0x08: (3, gx_j, None, None),
-    0x09: (3, gx_j, None, None),
-    0x0a: (3, gx_j, None, None),
-    0x0b: (3, gx_j, None, None),
-    0x0c: (3, gx_j, None, None),
-    0x0d: (3, gx_j, None, None),
-    0x0e: (3, gx_j, None, None),
-    0x0f: (3, gx_j, None, None),
-    0x10: (3, gx_jl, None, None),
-    0x11: (3, gx_jl, None, None),
-    0x12: (3, gx_jl, None, None),
-    0x13: (3, gx_jl, None, None),
-    0x14: (3, gx_jl, None, None),
-    0x15: (3, gx_jl, None, None),
-    0x16: (3, gx_jl, None, None),
-    0x17: (3, gx_jl, None, None),
-    0x18: (3, gx_jl, None, None),
-    0x19: (3, gx_jl, None, None),
-    0x1a: (3, gx_jl, None, None),
-    0x1b: (3, gx_jl, None, None),
-    0x1c: (3, gx_jl, None, None),
-    0x1d: (3, gx_jl, None, None),
-    0x1e: (3, gx_jl, None, None),
-    0x1f: (3, gx_jl, None, None),
-    0x20: (3, gx_enter, None, None),
-    0x21: (3, gx_enter, None, None),
-    0x22: (3, gx_enter, None, None),
-    0x23: (3, gx_enter, None, None),
-    0x24: (3, gx_enter, None, None),
-    0x25: (3, gx_enter, None, None),
-    0x26: (3, gx_enter, None, None),
-    0x27: (3, gx_enter, None, None),
-    0x28: (3, gx_enter, None, None),
-    0x29: (3, gx_enter, None, None),
-    0x2a: (3, gx_enter, None, None),
-    0x2b: (3, gx_enter, None, None),
-    0x2c: (3, gx_enter, None, None),
-    0x2d: (3, gx_enter, None, None),
-    0x2e: (3, gx_enter, None, None),
-    0x2f: (3, gx_enter, None, None),
-    0x30: (3, gx_lea, None, None),
-    0x31: (3, gx_lea, None, None),
-    0x32: (3, gx_lea, None, None),
-    0x33: (3, gx_lea, None, None),
-    0x34: (3, gx_lea, None, None),
-    0x35: (3, gx_lea, None, None),
-    0x36: (3, gx_lea, None, None),
-    0x37: (3, gx_lea, None, None),
-    0x38: (3, gx_lea, None, None),
-    0x39: (3, gx_lea, None, None),
-    0x3a: (3, gx_lea, None, None),
-    0x3b: (3, gx_lea, None, None),
-    0x3c: (3, gx_lea, None, None),
-    0x3d: (3, gx_lea, None, None),
-    0x3e: (3, gx_lea, None, None),
-    0x3f: (3, gx_lea, None, None),
-    0x40: (3, gx_immw, None, None),
-    0x41: (3, gx_immw, None, None),
-    0x42: (3, gx_immw, None, None),
-    0x43: (3, gx_immw, None, None),
-    0x44: (3, gx_immw, None, None),
-    0x45: (3, gx_immw, None, None),
-    0x46: (3, gx_immw, None, None),
-    0x47: (3, gx_immw, None, None),
-    0x48: (3, gx_immw, None, None),
-    0x49: (3, gx_immw, None, None),
-    0x4a: (3, gx_immw, None, None),
-    0x4b: (3, gx_immw, None, None),
-    0x4c: (3, gx_immw, None, None),
-    0x4d: (3, gx_immw, None, None),
-    0x4e: (3, gx_immw, None, None),
-    0x4f: (3, gx_immw, None, None),
-    0x50: (3, gx_immwh, None, None),
-    0x51: (3, gx_immwh, None, None),
-    0x52: (3, gx_immwh, None, None),
-    0x53: (3, gx_immwh, None, None),
-    0x54: (3, gx_immwh, None, None),
-    0x55: (3, gx_immwh, None, None),
-    0x56: (3, gx_immwh, None, None),
-    0x57: (3, gx_immwh, None, None),
-    0x58: (3, gx_immwh, None, None),
-    0x59: (3, gx_immwh, None, None),
-    0x5a: (3, gx_immwh, None, None),
-    0x5b: (3, gx_immwh, None, None),
-    0x5c: (3, gx_immwh, None, None),
-    0x5d: (3, gx_immwh, None, None),
-    0x5e: (3, gx_immwh, None, None),
-    0x5f: (3, gx_immwh, None, None),
-    0x60: (3, gx_jz, None, None),
-    0x61: (3, gx_jz, None, None),
-    0x62: (3, gx_jz, None, None),
-    0x63: (3, gx_jz, None, None),
-    0x64: (3, gx_jz, None, None),
-    0x65: (3, gx_jz, None, None),
-    0x66: (3, gx_jz, None, None),
-    0x67: (3, gx_jz, None, None),
-    0x68: (3, gx_jz, None, None),
-    0x69: (3, gx_jz, None, None),
-    0x6a: (3, gx_jz, None, None),
-    0x6b: (3, gx_jz, None, None),
-    0x6c: (3, gx_jz, None, None),
-    0x6d: (3, gx_jz, None, None),
-    0x6e: (3, gx_jz, None, None),
-    0x6f: (3, gx_jz, None, None),
-    0x70: (3, gx_jnz, None, None),
-    0x71: (3, gx_jnz, None, None),
-    0x72: (3, gx_jnz, None, None),
-    0x73: (3, gx_jnz, None, None),
-    0x74: (3, gx_jnz, None, None),
-    0x75: (3, gx_jnz, None, None),
-    0x76: (3, gx_jnz, None, None),
-    0x77: (3, gx_jnz, None, None),
-    0x78: (3, gx_jnz, None, None),
-    0x79: (3, gx_jnz, None, None),
-    0x7a: (3, gx_jnz, None, None),
-    0x7b: (3, gx_jnz, None, None),
-    0x7c: (3, gx_jnz, None, None),
-    0x7d: (3, gx_jnz, None, None),
-    0x7e: (3, gx_jnz, None, None),
-    0x7f: (3, gx_jnz, None, None),
-    0x80: (4, gx_addli, None, None),
-    0x81: (4, gx_subli, None, None),
-    0x82: (4, gx_mulli, None, None),
-    0x83: (4, gx_divli, None, None),
-    0x84: (4, gx_modli, None, None),
-    0x85: (4, gx_shlli, None, None),
-    0x86: (4, gx_shrli, None, None),
-    0x87: (4, gx_leli, None, None),
-    0x88: (4, gx_gtli, None, None),
-    0x89: (4, gx_eqli, None, None),
-    0x8a: (4, gx_neli, None, None),
-    0x8b: (4, gx_andli, None, None),
-    0x8c: (4, gx_orli, None, None),
-    0x8d: (4, gx_xorli, None, None),
-    0x8e: (4, gx_lesli, None, None),
-    0x8f: (4, gx_gtsli, None, None),
-    0x90: (4, gx_divsli, None, None),
-    0x91: (4, gx_modsli, None, None),
-    0x92: (4, gx_shrsli, None, None),
-    0x93: (4, gx_bitex, None, None),
-    0x94: (4, gx_rsubli, None, None),
-    0x95: (4, gx_rdivli, None, None),
-    0x96: (4, gx_rmodli, None, None),
-    0x97: (4, gx_rdivsli, None, None),
-    0x98: (4, gx_lb, None, None),
-    0x99: (4, gx_lw, None, None),
-    0x9a: (4, gx_sb, None, None),
-    0x9b: (4, gx_sw, None, None),
-    0x9c: (4, gx_lbx, None, None),
-    0x9d: (4, gx_lwx, None, None),
-    0x9e: (4, gx_addi, None, None),
-    0x9f: (4, gx_andi, None, None),
-    0xa0: (4, gx_shrsi, None, None),
-    0xa1: (4, gx_adjw, None, None),
-    0xa2: (4, gx_llb, None, None),
-    0xa3: (4, gx_llw, None, None),
-    0xa4: (4, gx_lll, None, None),
-    0xa5: (4, gx_slb, None, None),
-    0xa6: (4, gx_slw, None, None),
-    0xa7: (4, gx_sll, None, None),
-    0xa8: (4, gx_llbx, None, None),
-    0xa9: (4, gx_llwx, None, None),
-    0xaa: (4, gx_beq, None, None),
-    0xab: (4, gx_bne, None, None),
-    0xac: (4, gx_blt, None, None),
-    0xad: (4, gx_ble, None, None),
-    0xae: (4, gx_blts, None, None),
-    0xaf: (4, gx_bles, None, None),
-    0xb0: (4, gx_beqz, None, None),
-    0xb1: (4, gx_bnez, None, None),
-    0xb2: (4, gx_dbnz, None, None),
-    0xb3: (4, gx_bltz, None, None),
-    0xb4: (4, gx_bgez, None, None),
-    0xb5: (4, gx_bgtz, None, None),
-    0xb6: (4, gx_blez, None, None),
-    0xc0: (2, gx_ll, None, None),
-    0xc1: (2, gx_ll, None, None),
-    0xc2: (2, gx_ll, None, None),
-    0xc3: (2, gx_ll, None, None),
-    0xc4: (2, gx_ll, None, None),
-    0xc5: (2, gx_ll, None, None),
-    0xc6: (2, gx_ll, None, None),
-    0xc7: (2, gx_ll, None, None),
-    0xc8: (2, gx_sl, None, None),
-    0xc9: (2, gx_sl, None, None),
-    0xca: (2, gx_sl, None, None),
-    0xcb: (2, gx_sl, None, None),
-    0xcc: (2, gx_sl, None, None),
-    0xcd: (2, gx_sl, None, None),
-    0xce: (2, gx_sl, None, None),
-    0xcf: (2, gx_sl, None, None),
-    0xd0: (2, gx_shli, None, None),
-    0xd1: (2, gx_shli, None, None),
-    0xd2: (2, gx_shli, None, None),
-    0xd3: (2, gx_shli, None, None),
-    0xd4: (2, gx_shli, None, None),
-    0xd5: (2, gx_shli, None, None),
-    0xd6: (2, gx_shli, None, None),
-    0xd7: (2, gx_shli, None, None),
-    0xd8: (2, gx_imms, None, None),
-    0xd9: (2, gx_imms, None, None),
-    0xda: (2, gx_imms, None, None),
-    0xdb: (2, gx_imms, None, None),
-    0xdc: (2, gx_imms, None, None),
-    0xdd: (2, gx_imms, None, None),
-    0xde: (2, gx_imms, None, None),
-    0xdf: (2, gx_imms, None, None),
-    0xe0: (2, gx_mov, None, None),
-    0xe1: (2, gx_zxw, None, None),
-    0xe2: (2, gx_llb_0, None, None),
-    0xe3: (2, gx_llw_0, None, None),
-    0xe4: (2, gx_lll_0, None, None),
-    0xe5: (2, gx_slb_0, None, None),
-    0xe6: (2, gx_slw_0, None, None),
-    0xe7: (2, gx_sll_0, None, None),
-    0xe8: (2, gx_llbx_0, None, None),
-    0xe9: (2, gx_llwx_0, None, None),
+    0x00: (3, gx_lea, None, None),
+    0x01: (3, gx_lea, None, None),
+    0x02: (3, gx_lea, None, None),
+    0x03: (3, gx_lea, None, None),
+    0x04: (3, gx_lea, None, None),
+    0x05: (3, gx_lea, None, None),
+    0x06: (3, gx_lea, None, None),
+    0x07: (3, gx_lea, None, None),
+    0x08: (3, gx_lea, None, None),
+    0x09: (3, gx_lea, None, None),
+    0x0a: (3, gx_lea, None, None),
+    0x0b: (3, gx_lea, None, None),
+    0x0c: (3, gx_lea, None, None),
+    0x0d: (3, gx_lea, None, None),
+    0x0e: (3, gx_lea, None, None),
+    0x0f: (3, gx_lea, None, None),
+    0x10: (3, gx_immw, None, None),
+    0x11: (3, gx_immw, None, None),
+    0x12: (3, gx_immw, None, None),
+    0x13: (3, gx_immw, None, None),
+    0x14: (3, gx_immw, None, None),
+    0x15: (3, gx_immw, None, None),
+    0x16: (3, gx_immw, None, None),
+    0x17: (3, gx_immw, None, None),
+    0x18: (3, gx_immw, None, None),
+    0x19: (3, gx_immw, None, None),
+    0x1a: (3, gx_immw, None, None),
+    0x1b: (3, gx_immw, None, None),
+    0x1c: (3, gx_immw, None, None),
+    0x1d: (3, gx_immw, None, None),
+    0x1e: (3, gx_immw, None, None),
+    0x1f: (3, gx_immw, None, None),
+    0x20: (3, gx_ldl, None, None),
+    0x21: (3, gx_ldl, None, None),
+    0x22: (3, gx_ldl, None, None),
+    0x23: (3, gx_ldl, None, None),
+    0x24: (3, gx_ldl, None, None),
+    0x25: (3, gx_ldl, None, None),
+    0x26: (3, gx_ldl, None, None),
+    0x27: (3, gx_ldl, None, None),
+    0x28: (3, gx_ldl, None, None),
+    0x29: (3, gx_ldl, None, None),
+    0x2a: (3, gx_ldl, None, None),
+    0x2b: (3, gx_ldl, None, None),
+    0x2c: (3, gx_ldl, None, None),
+    0x2d: (3, gx_ldl, None, None),
+    0x2e: (3, gx_ldl, None, None),
+    0x2f: (3, gx_ldl, None, None),
+    0x30: (3, gx_stl, None, None),
+    0x31: (3, gx_stl, None, None),
+    0x32: (3, gx_stl, None, None),
+    0x33: (3, gx_stl, None, None),
+    0x34: (3, gx_stl, None, None),
+    0x35: (3, gx_stl, None, None),
+    0x36: (3, gx_stl, None, None),
+    0x37: (3, gx_stl, None, None),
+    0x38: (3, gx_stl, None, None),
+    0x39: (3, gx_stl, None, None),
+    0x3a: (3, gx_stl, None, None),
+    0x3b: (3, gx_stl, None, None),
+    0x3c: (3, gx_stl, None, None),
+    0x3d: (3, gx_stl, None, None),
+    0x3e: (3, gx_stl, None, None),
+    0x3f: (3, gx_stl, None, None),
+    0x40: (4, gx_addli, None, None),
+    0x41: (4, gx_subli, None, None),
+    0x42: (4, gx_mulli, None, None),
+    0x43: (4, gx_divli, None, None),
+    0x44: (4, gx_modli, None, None),
+    0x45: (4, gx_shlli, None, None),
+    0x46: (4, gx_shrli, None, None),
+    0x47: (4, gx_leli, None, None),
+    0x48: (4, gx_gtli, None, None),
+    0x49: (4, gx_eqli, None, None),
+    0x4a: (4, gx_neli, None, None),
+    0x4b: (4, gx_andli, None, None),
+    0x4c: (4, gx_orli, None, None),
+    0x4d: (4, gx_xorli, None, None),
+    0x4e: (4, gx_lesli, None, None),
+    0x4f: (4, gx_gtsli, None, None),
+    0x50: (4, gx_divsli, None, None),
+    0x51: (4, gx_modsli, None, None),
+    0x52: (4, gx_shrsli, None, None),
+    0x53: (4, gx_bitex, None, None),
+    0x54: (4, gx_rsubli, None, None),
+    0x55: (4, gx_rdivli, None, None),
+    0x56: (4, gx_rmodli, None, None),
+    0x57: (4, gx_rdivsli, None, None),
+    0x58: (4, gx_lb, None, None),
+    0x59: (4, gx_lw, None, None),
+    0x5a: (4, gx_sb, None, None),
+    0x5b: (4, gx_sw, None, None),
+    0x5c: (4, gx_lbx, None, None),
+    0x5d: (4, gx_lwx, None, None),
+    0x5e: (4, gx_addi, None, None),
+    0x5f: (4, gx_andi, None, None),
+    0x60: (4, gx_shrsi, None, None),
+    0x61: (4, gx_llb, None, None),
+    0x62: (4, gx_llw, None, None),
+    0x63: (4, gx_lll, None, None),
+    0x64: (4, gx_slb, None, None),
+    0x65: (4, gx_slw, None, None),
+    0x66: (4, gx_sll, None, None),
+    0x67: (4, gx_llbx, None, None),
+    0x68: (4, gx_llwx, None, None),
+    0x69: (4, gx_beq, None, None),
+    0x6a: (4, gx_bne, None, None),
+    0x6b: (4, gx_blt, None, None),
+    0x6c: (4, gx_ble, None, None),
+    0x6d: (4, gx_blts, None, None),
+    0x6e: (4, gx_bles, None, None),
+    0x6f: (4, gx_beqz, None, None),
+    0x70: (4, gx_bnez, None, None),
+    0x71: (4, gx_dbnz, None, None),
+    0x72: (4, gx_bltz, None, None),
+    0x73: (4, gx_bgez, None, None),
+    0x74: (4, gx_bgtz, None, None),
+    0x75: (4, gx_blez, None, None),
+    0x76: (4, gx_immwh, None, None),
+    0x80: (2, gx_ll, None, None),
+    0x81: (2, gx_ll, None, None),
+    0x82: (2, gx_ll, None, None),
+    0x83: (2, gx_ll, None, None),
+    0x84: (2, gx_ll, None, None),
+    0x85: (2, gx_ll, None, None),
+    0x86: (2, gx_ll, None, None),
+    0x87: (2, gx_ll, None, None),
+    0x88: (2, gx_sl, None, None),
+    0x89: (2, gx_sl, None, None),
+    0x8a: (2, gx_sl, None, None),
+    0x8b: (2, gx_sl, None, None),
+    0x8c: (2, gx_sl, None, None),
+    0x8d: (2, gx_sl, None, None),
+    0x8e: (2, gx_sl, None, None),
+    0x8f: (2, gx_sl, None, None),
+    0x90: (2, gx_shli, None, None),
+    0x91: (2, gx_shli, None, None),
+    0x92: (2, gx_shli, None, None),
+    0x93: (2, gx_shli, None, None),
+    0x94: (2, gx_shli, None, None),
+    0x95: (2, gx_shli, None, None),
+    0x96: (2, gx_shli, None, None),
+    0x97: (2, gx_shli, None, None),
+    0x98: (2, gx_imms, None, None),
+    0x99: (2, gx_imms, None, None),
+    0x9a: (2, gx_imms, None, None),
+    0x9b: (2, gx_imms, None, None),
+    0x9c: (2, gx_imms, None, None),
+    0x9d: (2, gx_imms, None, None),
+    0x9e: (2, gx_imms, None, None),
+    0x9f: (2, gx_imms, None, None),
+    0xa0: (3, gx_jz, None, None),
+    0xa1: (3, gx_jz, None, None),
+    0xa2: (3, gx_jz, None, None),
+    0xa3: (3, gx_jz, None, None),
+    0xa4: (3, gx_jz, None, None),
+    0xa5: (3, gx_jz, None, None),
+    0xa6: (3, gx_jz, None, None),
+    0xa7: (3, gx_jz, None, None),
+    0xa8: (3, gx_jz, None, None),
+    0xa9: (3, gx_jz, None, None),
+    0xaa: (3, gx_jz, None, None),
+    0xab: (3, gx_jz, None, None),
+    0xac: (3, gx_jz, None, None),
+    0xad: (3, gx_jz, None, None),
+    0xae: (3, gx_jz, None, None),
+    0xaf: (3, gx_jz, None, None),
+    0xb0: (3, gx_lui, None, None),
+    0xb1: (3, gx_lui, None, None),
+    0xb2: (3, gx_lui, None, None),
+    0xb3: (3, gx_lui, None, None),
+    0xb4: (3, gx_lui, None, None),
+    0xb5: (3, gx_lui, None, None),
+    0xb6: (3, gx_lui, None, None),
+    0xb7: (3, gx_lui, None, None),
+    0xb8: (3, gx_lui, None, None),
+    0xb9: (3, gx_lui, None, None),
+    0xba: (3, gx_lui, None, None),
+    0xbb: (3, gx_lui, None, None),
+    0xbc: (3, gx_lui, None, None),
+    0xbd: (3, gx_lui, None, None),
+    0xbe: (3, gx_lui, None, None),
+    0xbf: (3, gx_lui, None, None),
+    0xc0: (2, gx_mov, None, None),
+    0xc1: (2, gx_zxw, None, None),
+    0xc2: (2, gx_llb_0, None, None),
+    0xc3: (2, gx_llw_0, None, None),
+    0xc4: (2, gx_lll_0, None, None),
+    0xc5: (2, gx_slb_0, None, None),
+    0xc6: (2, gx_slw_0, None, None),
+    0xc7: (2, gx_sll_0, None, None),
+    0xc8: (2, gx_llbx_0, None, None),
+    0xc9: (2, gx_llwx_0, None, None),
+    0xd0: (3, gx_jnz, None, None),
+    0xd1: (3, gx_jnz, None, None),
+    0xd2: (3, gx_jnz, None, None),
+    0xd3: (3, gx_jnz, None, None),
+    0xd4: (3, gx_jnz, None, None),
+    0xd5: (3, gx_jnz, None, None),
+    0xd6: (3, gx_jnz, None, None),
+    0xd7: (3, gx_jnz, None, None),
+    0xd8: (3, gx_jnz, None, None),
+    0xd9: (3, gx_jnz, None, None),
+    0xda: (3, gx_jnz, None, None),
+    0xdb: (3, gx_jnz, None, None),
+    0xdc: (3, gx_jnz, None, None),
+    0xdd: (3, gx_jnz, None, None),
+    0xde: (3, gx_jnz, None, None),
+    0xdf: (3, gx_jnz, None, None),
+    0xe0: (3, gx_j, None, None),
+    0xe1: (3, gx_jl, None, None),
+    0xe2: (3, gx_enter, None, None),
+    0xe3: (3, gx_adjw, None, None),
     0xf0: (1, gx_ret, None, None),
     0xf1: (1, gx_zero0, None, None),
     0xf2: (1, gx_zero1, None, None),
@@ -1181,8 +1187,8 @@ DECODE = {
     0xf9: (4, gx_cbne, None, None),
     0xfc: (3, None, _key0, {0x0: gx_add, 0x1: gx_sub, 0x2: gx_mul, 0x3: gx_div, 0x4: gx_mod, 0x5: gx_shl, 0x6: gx_shr, 0x7: gx_lt, 0x8: gx_le, 0x9: gx_eq, 0xa: gx_ne, 0xb: gx_and, 0xc: gx_or, 0xd: gx_xor, 0xe: gx_lts, 0xf: gx_les}),
     0xfd: (3, None, _key0, {0x0: gx_divs, 0x1: gx_mods, 0x2: gx_shrs, 0x3: gx_fadd, 0x4: gx_fsub, 0x5: gx_fmul, 0x6: gx_fdiv, 0x7: gx_flt, 0x8: gx_fle, 0x9: gx_zxwor, 0xa: gx_sxwor}),
-    0xfe: (2, None, _key1, {0x0: gx_halt, 0x1: gx_zero7, 0x2: gx_zero8, 0x3: gx_zero9, 0x4: gx_zeroa, 0x5: gx_zerob, 0x6: gx_zeroc, 0x7: gx_zerod, 0x8: gx_zeroe, 0x9: gx_zerof}),
-    0xff: (2, None, _key2, {0x0: gx_sxb, 0x1: gx_sxw, 0x2: gx_inc, 0x3: gx_dec, 0x4: gx_pushr, 0x5: gx_popr, 0x6: gx_zxb, 0x7: gx_itof, 0x8: gx_ftoi, 0x9: gx_jlr, 0xa: gx_jr, 0xb: gx_ssp, 0xc: gx_neg, 0xd: gx_frecip, 0xe: gx_frsqrt, 0xf: gx_putchar}),
+    0xfe: (2, None, _key1, {0x0: gx_sxb, 0x1: gx_sxw, 0x2: gx_inc, 0x3: gx_dec, 0x4: gx_pushr, 0x5: gx_popr, 0x6: gx_zxb, 0x7: gx_itof, 0x8: gx_ftoi, 0x9: gx_jlr, 0xa: gx_jr, 0xb: gx_ssp, 0xc: gx_neg, 0xd: gx_frecip, 0xe: gx_frsqrt, 0xf: gx_putchar}),
+    0xff: (2, None, _key2, {0x0: gx_halt, 0x1: gx_zero7, 0x2: gx_zero8, 0x3: gx_zero9, 0x4: gx_zeroa, 0x5: gx_zerob, 0x6: gx_zeroc, 0x7: gx_zerod, 0x8: gx_zeroe, 0x9: gx_zerof}),
 }
 
 def step(s, m):
