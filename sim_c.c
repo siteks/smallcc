@@ -401,9 +401,15 @@ static void write32_inner(uint32_t a, uint32_t v) {
     write16_inner(a + 2, (uint16_t)(v >> 16));
 }
 
-#define write8  write8_inner
-#define write16 write16_inner
-#define write32 write32_inner
+/* Every architectural store goes through these; with -retire each one is
+ * recorded so the retirement line can list it. */
+static FILE *g_retire_out = NULL;
+static struct { uint32_t a, v; int n; } g_mw[16];
+static int g_nmw = 0;
+static void mw_log(uint32_t a, uint32_t v, int n) { if (g_retire_out && g_nmw < 16) { g_mw[g_nmw].a = a; g_mw[g_nmw].v = v; g_mw[g_nmw].n = n; g_nmw++; } }
+static void write8 (uint32_t a, uint8_t  v) { mw_log(a, v, 1); write8_inner(a, v); }
+static void write16(uint32_t a, uint16_t v) { mw_log(a, v, 2); write16_inner(a, v); }
+static void write32(uint32_t a, uint32_t v) { mw_log(a, v, 4); write32_inner(a, v); }
 
 static uint8_t read8(uint32_t a) {
     if (addr_is_bram(a))   return g_bram[a];
@@ -1327,6 +1333,26 @@ static int32_t sx16(int32_t v) { return (int32_t)(int16_t)(v & 0xffff); }
 /* ------------------------------------------------------------------ */
 
 static FILE *g_trace_out = NULL;
+static int   g_gen_exec = 0;          /* -gen: execute with the generated step */
+static int   g_last_len = 1;          /* length of the instruction just executed */
+
+#include "cpu4/exec_gen.h"            /* generated from cpu4/isa.py SEMANTICS */
+
+/* -retire: one line per retired instruction, listing everything it changed.
+ * The format is the contract a retirement port on the RTL will match. */
+static void retire_line(int ci, uint16_t pc0, int len, const uint32_t *r0, uint16_t sp0, uint16_t bp0, uint16_t lr0, const Core *cc) {
+    FILE *f = g_retire_out;
+    if (g_ncores > 1) fprintf(f, "c%d ", ci);
+    fprintf(f, "%04x ", pc0);
+    for (int i = 0; i < len; i++) fprintf(f, "%02x", read8((uint16_t)(pc0 + i)));
+    for (int i = 0; i < 8; i++) if (cc->r[i] != r0[i]) fprintf(f, " r%d=%08x", i, cc->r[i]);
+    if (cc->sp != sp0) fprintf(f, " sp=%04x", cc->sp);
+    if (cc->bp != bp0) fprintf(f, " bp=%04x", cc->bp);
+    if (cc->lr != lr0) fprintf(f, " lr=%04x", cc->lr);
+    for (int i = 0; i < g_nmw; i++) fprintf(f, " m%d[%08x]=%0*x", g_mw[i].n, g_mw[i].a, g_mw[i].n * 2, g_mw[i].v);
+    if (cc->H) fprintf(f, " halt");
+    fprintf(f, " >%04x\n", cc->pc);
+}
 
 static void run_cpu4(void)
 {
@@ -1357,6 +1383,16 @@ static void run_cpu4(void)
         g_curcore = ci;
         g_bram    = cc->bram;
 
+        const uint16_t step_pc = pc;
+        uint32_t r_before[8]; uint16_t sp_before = sp, bp_before = bp, lr_before = lr;
+        if (g_retire_out) { memcpy(r_before, r, sizeof r_before); g_nmw = 0; }
+        if (g_gen_exec) {
+            if (g_profile) prof_count[step_pc]++;
+            g_watch_pc = step_pc; g_watch_r0 = r[0]; g_watch_sp = sp; g_watch_bp = bp;
+            g_last_len = gen_step(cc);
+            goto executed;
+        }
+        {
         uint8_t  b0 = read8(pc);
         uint16_t oldpc = pc;
         pc++;
@@ -1447,6 +1483,7 @@ static void run_cpu4(void)
             }
         }
 
+        g_last_len = (int)(uint16_t)(pc - oldpc);
         g_watch_pc = oldpc; g_watch_r0 = r[0]; g_watch_sp = sp; g_watch_bp = bp;
         trace[trace_idx].t_pc = oldpc; trace[trace_idx].t_op = b0;
         trace[trace_idx].t_r0 = r[0]; trace[trace_idx].t_sp = sp; trace[trace_idx].t_bp = bp;
@@ -1671,19 +1708,21 @@ static void run_cpu4(void)
             H = 1;
             break;
         }
-
+        }
+executed:
         for (int i = 0; i < 8; i++) r[i] &= 0xffffffff;
         sp &= 0xffff; bp &= 0xffff; lr &= 0xffff; pc &= 0xffff;
 
         /* SP/BP must be 4-byte aligned at all times */
         if (sp & 3) {
-            fprintf(stderr, "CPU4 alignment error: SP misaligned 0x%04x at pc=0x%04x\n", sp, oldpc);
+            fprintf(stderr, "CPU4 alignment error: SP misaligned 0x%04x at pc=0x%04x\n", sp, step_pc);
             H = 1;
         }
         if (bp & 3) {
-            fprintf(stderr, "CPU4 alignment error: BP misaligned 0x%04x at pc=0x%04x\n", bp, oldpc);
+            fprintf(stderr, "CPU4 alignment error: BP misaligned 0x%04x at pc=0x%04x\n", bp, step_pc);
             H = 1;
         }
+        if (g_retire_out) retire_line(ci, step_pc, g_last_len, r_before, sp_before, bp_before, lr_before, cc);
 
         cc->insns++;
         if (H) g_live--;
@@ -1836,6 +1875,9 @@ static const char *usage_text =
 "  -fb FILE           After running, dump the bitmap framebuffer to FILE.ppm\n"
 "                     (640x480 32bpp by default; honors DISP_MODE bits — 320x240 / 8bpp).\n"
 "  -profile           Collect and print a per-source-line execution profile\n"
+"  -gen               Execute with the executor generated from cpu4/isa.py SEMANTICS\n"
+"  -retire FILE       Write one line per retired instruction: pc, bytes, every\n"
+"                     register and memory change, next pc\n"
 "  -linemap FILE      Assemble and write a PC->source JSON map; do not execute\n"
 "  -hex FILE          Assemble and write whitespace-delimited hex bytes; do not execute\n"
 "\n"
@@ -1858,6 +1900,11 @@ int main(int argc, char **argv)
         }
         else if (strcmp(argv[i], "-trace") == 0 && i+1 < argc) trace_path = argv[++i];
         else if (strcmp(argv[i], "-profile") == 0) g_profile = 1;
+        else if (strcmp(argv[i], "-gen") == 0) g_gen_exec = 1;
+        else if (strcmp(argv[i], "-retire") == 0 && i+1 < argc) {
+            g_retire_out = fopen(argv[++i], "w");
+            if (!g_retire_out) { perror(argv[i]); return 1; }
+        }
         else if (strcmp(argv[i], "-dump") == 0 && i+1 < argc) g_dump_out = argv[++i];
         else if (strcmp(argv[i], "-dumpfb") == 0) dumpfb = 1;
         else if (strcmp(argv[i], "-fb") == 0 && i+1 < argc) fb_out = argv[++i];
@@ -1931,6 +1978,7 @@ int main(int argc, char **argv)
     g_bram = g_cores[0].bram;
     run_cpu4();
     if (g_trace_out) fclose(g_trace_out);
+    if (g_retire_out) fclose(g_retire_out);
     if (dumpfb) dump_framebuffer();
     if (fb_out)  dump_bitmap_fb(fb_out);
     if (g_profile) print_profile();

@@ -11,181 +11,214 @@ offset encoded ÷4, `raw16` 16-bit pattern, `pcrel` PC-relative displacement
 
 ## F0a — 1 byte
 
-| Mnemonic | First byte | Sub-op | Operands | Immediate | Range (source units) |
-|---|---|---|---|---|---|
-| `halt` | `0x00` | — | `` | — | — |
-| `ret` | `0x01` | — | `` | — | — |
-| `zero0` | `0x02` | — | `` | — | — |
-| `zero1` | `0x03` | — | `` | — | — |
-| `zero2` | `0x04` | — | `` | — | — |
-| `zero3` | `0x05` | — | `` | — | — |
-| `zero4` | `0x06` | — | `` | — | — |
-| `zero5` | `0x07` | — | `` | — | — |
-| `zero6` | `0x08` | — | `` | — | — |
-| `zero7` | `0x09` | — | `` | — | — |
+| Mnemonic | First byte | Sub-op | Operands | Immediate | Range (source units) | Semantics |
+|---|---|---|---|---|---|---|
+| `halt` | `0x00` | — | `` | — | — | `H = 1` |
+| `ret` | `0x01` | — | `` | — | — | `SP = BP; BP = M32[SP]; PC = M32[SP] >> 16; SP = SP + 4` |
+| `zero0` | `0x02` | — | `` | — | — | `R[0] = 0` |
+| `zero1` | `0x03` | — | `` | — | — | `R[1] = 0` |
+| `zero2` | `0x04` | — | `` | — | — | `R[2] = 0` |
+| `zero3` | `0x05` | — | `` | — | — | `R[3] = 0` |
+| `zero4` | `0x06` | — | `` | — | — | `R[4] = 0` |
+| `zero5` | `0x07` | — | `` | — | — | `R[5] = 0` |
+| `zero6` | `0x08` | — | `` | — | — | `R[6] = 0` |
+| `zero7` | `0x09` | — | `` | — | — | `R[7] = 0` |
 
 ## F0b — 3 bytes
 
-| Mnemonic | First byte | Sub-op | Operands | Immediate | Range (source units) |
-|---|---|---|---|---|---|
-| `addli` | `0x10` | 0 | `rd, rx, imm9` | simm9 | -256..255 |
-| `subli` | `0x10` | 1 | `rd, rx, imm9` | simm9 | -256..255 |
-| `mulli` | `0x11` | 0 | `rd, rx, imm9` | simm9 | -256..255 |
-| `divli` | `0x11` | 1 | `rd, rx, imm9` | simm9 | -256..255 |
-| `modli` | `0x12` | 0 | `rd, rx, imm9` | simm9 | -256..255 |
-| `shlli` | `0x12` | 1 | `rd, rx, imm9` | simm9 | -256..255 |
-| `shrli` | `0x13` | 0 | `rd, rx, imm9` | simm9 | -256..255 |
-| `leli` | `0x13` | 1 | `rd, rx, imm9` | simm9 | -256..255 |
-| `gtli` | `0x14` | 0 | `rd, rx, imm9` | simm9 | -256..255 |
-| `eqli` | `0x14` | 1 | `rd, rx, imm9` | simm9 | -256..255 |
-| `neli` | `0x15` | 0 | `rd, rx, imm9` | simm9 | -256..255 |
-| `andli` | `0x15` | 1 | `rd, rx, imm9` | simm9 | -256..255 |
-| `orli` | `0x16` | 0 | `rd, rx, imm9` | simm9 | -256..255 |
-| `xorli` | `0x16` | 1 | `rd, rx, imm9` | simm9 | -256..255 |
-| `lesli` | `0x17` | 0 | `rd, rx, imm9` | simm9 | -256..255 |
-| `gtsli` | `0x17` | 1 | `rd, rx, imm9` | simm9 | -256..255 |
-| `divsli` | `0x18` | 0 | `rd, rx, imm9` | simm9 | -256..255 |
-| `modsli` | `0x18` | 1 | `rd, rx, imm9` | simm9 | -256..255 |
-| `shrsli` | `0x19` | 0 | `rd, rx, imm9` | simm9 | -256..255 |
-| `bitex` | `0x19` | 1 | `rd, rx, imm9` | uimm9 | 0..511 |
-| `rsubli` | `0x1a` | 0 | `rd, rx, imm9` | simm9 | -256..255 |
-| `rdivli` | `0x1a` | 1 | `rd, rx, imm9` | simm9 | -256..255 |
-| `rmodli` | `0x1b` | 0 | `rd, rx, imm9` | simm9 | -256..255 |
-| `rdivsli` | `0x1b` | 1 | `rd, rx, imm9` | simm9 | -256..255 |
+| Mnemonic | First byte | Sub-op | Operands | Immediate | Range (source units) | Semantics |
+|---|---|---|---|---|---|---|
+| `addli` | `0x10` | 0 | `rd, rx, imm9` | simm9 | -256..255 | `R[rd] = R[rx] + sext(imm)` |
+| `subli` | `0x10` | 1 | `rd, rx, imm9` | simm9 | -256..255 | `R[rd] = R[rx] - sext(imm)` |
+| `mulli` | `0x11` | 0 | `rd, rx, imm9` | simm9 | -256..255 | `R[rd] = R[rx] * sext(imm)` |
+| `divli` | `0x11` | 1 | `rd, rx, imm9` | simm9 | -256..255 | `R[rd] = R[rx] /u sext(imm)` |
+| `modli` | `0x12` | 0 | `rd, rx, imm9` | simm9 | -256..255 | `R[rd] = R[rx] %u sext(imm)` |
+| `shlli` | `0x12` | 1 | `rd, rx, imm9` | simm9 | -256..255 | `R[rd] = R[rx] << (imm & 31)` |
+| `shrli` | `0x13` | 0 | `rd, rx, imm9` | simm9 | -256..255 | `R[rd] = R[rx] >> (imm & 31)` |
+| `leli` | `0x13` | 1 | `rd, rx, imm9` | simm9 | -256..255 | `R[rd] = R[rx] <=u sext(imm)` |
+| `gtli` | `0x14` | 0 | `rd, rx, imm9` | simm9 | -256..255 | `R[rd] = R[rx] >u sext(imm)` |
+| `eqli` | `0x14` | 1 | `rd, rx, imm9` | simm9 | -256..255 | `R[rd] = R[rx] == sext(imm)` |
+| `neli` | `0x15` | 0 | `rd, rx, imm9` | simm9 | -256..255 | `R[rd] = R[rx] != sext(imm)` |
+| `andli` | `0x15` | 1 | `rd, rx, imm9` | simm9 | -256..255 | `R[rd] = R[rx] & sext(imm)` |
+| `orli` | `0x16` | 0 | `rd, rx, imm9` | simm9 | -256..255 | `R[rd] = R[rx] \| sext(imm)` |
+| `xorli` | `0x16` | 1 | `rd, rx, imm9` | simm9 | -256..255 | `R[rd] = R[rx] ^ sext(imm)` |
+| `lesli` | `0x17` | 0 | `rd, rx, imm9` | simm9 | -256..255 | `R[rd] = R[rx] <=s sext(imm)` |
+| `gtsli` | `0x17` | 1 | `rd, rx, imm9` | simm9 | -256..255 | `R[rd] = R[rx] >s sext(imm)` |
+| `divsli` | `0x18` | 0 | `rd, rx, imm9` | simm9 | -256..255 | `R[rd] = R[rx] /s sext(imm)` |
+| `modsli` | `0x18` | 1 | `rd, rx, imm9` | simm9 | -256..255 | `R[rd] = R[rx] %s sext(imm)` |
+| `shrsli` | `0x19` | 0 | `rd, rx, imm9` | simm9 | -256..255 | `R[rd] = R[rx] >>s (imm & 31)` |
+| `bitex` | `0x19` | 1 | `rd, rx, imm9` | uimm9 | 0..511 | `R[rd] = (R[rx] >> (imm & 31)) & ((2 << ((imm >> 5) & 15)) - 1)` |
+| `rsubli` | `0x1a` | 0 | `rd, rx, imm9` | simm9 | -256..255 | `R[rd] = sext(imm) - R[rx]` |
+| `rdivli` | `0x1a` | 1 | `rd, rx, imm9` | simm9 | -256..255 | `R[rd] = sext(imm) /u R[rx]` |
+| `rmodli` | `0x1b` | 0 | `rd, rx, imm9` | simm9 | -256..255 | `R[rd] = sext(imm) %u R[rx]` |
+| `rdivsli` | `0x1b` | 1 | `rd, rx, imm9` | simm9 | -256..255 | `R[rd] = sext(imm) /s R[rx]` |
 
 ## F0c — 3 bytes
 
-| Mnemonic | First byte | Sub-op | Operands | Immediate | Range (source units) |
-|---|---|---|---|---|---|
-| `cbeq` | `0x20` | — | `rx, imm7, disp10` | uimm7 | 0..127 |
-| `cbne` | `0x30` | — | `rx, imm7, disp10` | uimm7 | 0..127 |
+| Mnemonic | First byte | Sub-op | Operands | Immediate | Range (source units) | Semantics |
+|---|---|---|---|---|---|---|
+| `cbeq` | `0x20` | — | `rx, imm7, disp10` | uimm7 | 0..127 | `if R[rx] == imm7 then PC = PC + sext(disp)` |
+| `cbne` | `0x30` | — | `rx, imm7, disp10` | uimm7 | 0..127 | `if R[rx] != imm7 then PC = PC + sext(disp)` |
 
 ## F1a — 2 bytes
 
-| Mnemonic | First byte | Sub-op | Operands | Immediate | Range (source units) |
-|---|---|---|---|---|---|
-| `add` | `0x40` | — | `rd, rx, ry` | — | — |
-| `sub` | `0x42` | — | `rd, rx, ry` | — | — |
-| `mul` | `0x44` | — | `rd, rx, ry` | — | — |
-| `div` | `0x46` | — | `rd, rx, ry` | — | — |
-| `mod` | `0x48` | — | `rd, rx, ry` | — | — |
-| `shl` | `0x4a` | — | `rd, rx, ry` | — | — |
-| `shr` | `0x4c` | — | `rd, rx, ry` | — | — |
-| `lt` | `0x4e` | — | `rd, rx, ry` | — | — |
-| `le` | `0x50` | — | `rd, rx, ry` | — | — |
-| `eq` | `0x52` | — | `rd, rx, ry` | — | — |
-| `ne` | `0x54` | — | `rd, rx, ry` | — | — |
-| `and` | `0x56` | — | `rd, rx, ry` | — | — |
-| `or` | `0x58` | — | `rd, rx, ry` | — | — |
-| `xor` | `0x5a` | — | `rd, rx, ry` | — | — |
-| `lts` | `0x5c` | — | `rd, rx, ry` | — | — |
-| `les` | `0x5e` | — | `rd, rx, ry` | — | — |
-| `divs` | `0x60` | — | `rd, rx, ry` | — | — |
-| `mods` | `0x62` | — | `rd, rx, ry` | — | — |
-| `shrs` | `0x64` | — | `rd, rx, ry` | — | — |
-| `fadd` | `0x66` | — | `rd, rx, ry` | — | — |
-| `fsub` | `0x68` | — | `rd, rx, ry` | — | — |
-| `fmul` | `0x6a` | — | `rd, rx, ry` | — | — |
-| `fdiv` | `0x6c` | — | `rd, rx, ry` | — | — |
-| `flt` | `0x6e` | — | `rd, rx, ry` | — | — |
-| `fle` | `0x70` | — | `rd, rx, ry` | — | — |
-| `zxwor` | `0x72` | — | `rd, rx, ry` | — | — |
-| `sxwor` | `0x74` | — | `rd, rx, ry` | — | — |
+| Mnemonic | First byte | Sub-op | Operands | Immediate | Range (source units) | Semantics |
+|---|---|---|---|---|---|---|
+| `add` | `0x40` | — | `rd, rx, ry` | — | — | `R[rd] = R[rx] + R[ry]` |
+| `sub` | `0x42` | — | `rd, rx, ry` | — | — | `R[rd] = R[rx] - R[ry]` |
+| `mul` | `0x44` | — | `rd, rx, ry` | — | — | `R[rd] = R[rx] * R[ry]` |
+| `div` | `0x46` | — | `rd, rx, ry` | — | — | `R[rd] = R[rx] /u R[ry]` |
+| `mod` | `0x48` | — | `rd, rx, ry` | — | — | `R[rd] = R[rx] %u R[ry]` |
+| `shl` | `0x4a` | — | `rd, rx, ry` | — | — | `R[rd] = R[rx] << (R[ry] & 31)` |
+| `shr` | `0x4c` | — | `rd, rx, ry` | — | — | `R[rd] = R[rx] >> (R[ry] & 31)` |
+| `lt` | `0x4e` | — | `rd, rx, ry` | — | — | `R[rd] = R[rx] <u R[ry]` |
+| `le` | `0x50` | — | `rd, rx, ry` | — | — | `R[rd] = R[rx] <=u R[ry]` |
+| `eq` | `0x52` | — | `rd, rx, ry` | — | — | `R[rd] = R[rx] == R[ry]` |
+| `ne` | `0x54` | — | `rd, rx, ry` | — | — | `R[rd] = R[rx] != R[ry]` |
+| `and` | `0x56` | — | `rd, rx, ry` | — | — | `R[rd] = R[rx] & R[ry]` |
+| `or` | `0x58` | — | `rd, rx, ry` | — | — | `R[rd] = R[rx] \| R[ry]` |
+| `xor` | `0x5a` | — | `rd, rx, ry` | — | — | `R[rd] = R[rx] ^ R[ry]` |
+| `lts` | `0x5c` | — | `rd, rx, ry` | — | — | `R[rd] = R[rx] <s R[ry]` |
+| `les` | `0x5e` | — | `rd, rx, ry` | — | — | `R[rd] = R[rx] <=s R[ry]` |
+| `divs` | `0x60` | — | `rd, rx, ry` | — | — | `R[rd] = R[rx] /s R[ry]` |
+| `mods` | `0x62` | — | `rd, rx, ry` | — | — | `R[rd] = R[rx] %s R[ry]` |
+| `shrs` | `0x64` | — | `rd, rx, ry` | — | — | `R[rd] = R[rx] >>s (R[ry] & 31)` |
+| `fadd` | `0x66` | — | `rd, rx, ry` | — | — | `R[rd] = fadd(R[rx], R[ry])` |
+| `fsub` | `0x68` | — | `rd, rx, ry` | — | — | `R[rd] = fsub(R[rx], R[ry])` |
+| `fmul` | `0x6a` | — | `rd, rx, ry` | — | — | `R[rd] = fmul(R[rx], R[ry])` |
+| `fdiv` | `0x6c` | — | `rd, rx, ry` | — | — | `R[rd] = fdiv(R[rx], R[ry])` |
+| `flt` | `0x6e` | — | `rd, rx, ry` | — | — | `R[rd] = flt(R[rx], R[ry])` |
+| `fle` | `0x70` | — | `rd, rx, ry` | — | — | `R[rd] = fle(R[rx], R[ry])` |
+| `zxwor` | `0x72` | — | `rd, rx, ry` | — | — | `R[rd] = zx(R[rx] \| R[ry], 16)` |
+| `sxwor` | `0x74` | — | `rd, rx, ry` | — | — | `R[rd] = sx(R[rx] \| R[ry], 16)` |
 
 ## F1b — 2 bytes
 
-| Mnemonic | First byte | Sub-op | Operands | Immediate | Range (source units) |
-|---|---|---|---|---|---|
-| `sxb` | `0x7e` | 0x00 | `rd` | — | — |
-| `sxw` | `0x7e` | 0x01 | `rd` | — | — |
-| `inc` | `0x7e` | 0x02 | `rd` | — | — |
-| `dec` | `0x7e` | 0x03 | `rd` | — | — |
-| `pushr` | `0x7e` | 0x04 | `rd` | — | — |
-| `popr` | `0x7e` | 0x05 | `rd` | — | — |
-| `zxb` | `0x7e` | 0x06 | `rd` | — | — |
-| `zxw` | `0x7e` | 0x07 | `rd` | — | — |
-| `itof` | `0x7e` | 0x08 | `rd` | — | — |
-| `ftoi` | `0x7e` | 0x09 | `rd` | — | — |
-| `jlr` | `0x7e` | 0x0a | `rd` | — | — |
-| `jr` | `0x7e` | 0x0b | `rd` | — | — |
-| `ssp` | `0x7e` | 0x0c | `rd` | — | — |
-| `neg` | `0x7e` | 0x0d | `rd` | — | — |
-| `frecip` | `0x7e` | 0x0e | `rd` | — | — |
-| `frsqrt` | `0x7e` | 0x0f | `rd` | — | — |
-| `putchar` | `0x7e` | 0x3f | `rd` | — | — |
+| Mnemonic | First byte | Sub-op | Operands | Immediate | Range (source units) | Semantics |
+|---|---|---|---|---|---|---|
+| `sxb` | `0x7e` | 0x00 | `rd` | — | — | `R[rd] = sx(R[rd], 8)` |
+| `sxw` | `0x7e` | 0x01 | `rd` | — | — | `R[rd] = sx(R[rd], 16)` |
+| `inc` | `0x7e` | 0x02 | `rd` | — | — | `R[rd] = R[rd] + 1` |
+| `dec` | `0x7e` | 0x03 | `rd` | — | — | `R[rd] = R[rd] - 1` |
+| `pushr` | `0x7e` | 0x04 | `rd` | — | — | `SP = SP - 4; M32[SP] = R[rd]` |
+| `popr` | `0x7e` | 0x05 | `rd` | — | — | `R[rd] = M32[SP]; SP = SP + 4` |
+| `zxb` | `0x7e` | 0x06 | `rd` | — | — | `R[rd] = zx(R[rd], 8)` |
+| `zxw` | `0x7e` | 0x07 | `rd` | — | — | `R[rd] = zx(R[rd], 16)` |
+| `itof` | `0x7e` | 0x08 | `rd` | — | — | `R[rd] = itof(R[rd])` |
+| `ftoi` | `0x7e` | 0x09 | `rd` | — | — | `R[rd] = ftoi(R[rd])` |
+| `jlr` | `0x7e` | 0x0a | `rd` | — | — | `LR = PC; PC = R[rd]` |
+| `jr` | `0x7e` | 0x0b | `rd` | — | — | `PC = R[rd]` |
+| `ssp` | `0x7e` | 0x0c | `rd` | — | — | `SP = R[rd]` |
+| `neg` | `0x7e` | 0x0d | `rd` | — | — | `R[rd] = -R[rd]` |
+| `frecip` | `0x7e` | 0x0e | `rd` | — | — | `R[rd] = frecip(R[rd])` |
+| `frsqrt` | `0x7e` | 0x0f | `rd` | — | — | `R[rd] = frsqrt(R[rd])` |
+| `putchar` | `0x7e` | 0x3f | `rd` | — | — | `putchar(R[rd])` |
 
 ## F2 — 2 bytes
 
-| Mnemonic | First byte | Sub-op | Operands | Immediate | Range (source units) |
-|---|---|---|---|---|---|
-| `lb` | `0x80` | — | `rx, imm7` | index7 | -64..63 |
-| `lw` | `0x84` | — | `rx, imm7` | index7 | -64..63 |
-| `ll` | `0x88` | — | `rx, imm7` | index7 | -64..63 |
-| `sb` | `0x8c` | — | `rx, imm7` | index7 | -64..63 |
-| `sw` | `0x90` | — | `rx, imm7` | index7 | -64..63 |
-| `sl` | `0x94` | — | `rx, imm7` | index7 | -64..63 |
-| `lbx` | `0x98` | — | `rx, imm7` | index7 | -64..63 |
-| `lwx` | `0x9c` | — | `rx, imm7` | index7 | -64..63 |
-| `addi` | `0xa0` | — | `rx, imm7` | simm7 | -64..63 |
-| `shli` | `0xa4` | — | `rx, imm7` | simm7 | -64..63 |
-| `andi` | `0xa8` | — | `rx, imm7` | uimm7 | 0..127 |
-| `shrsi` | `0xac` | — | `rx, imm7` | simm7 | -64..63 |
-| `imms` | `0xb0` | — | `rx, imm7` | simm7 | -64..63 |
+| Mnemonic | First byte | Sub-op | Operands | Immediate | Range (source units) | Semantics |
+|---|---|---|---|---|---|---|
+| `lb` | `0x80` | — | `rx, imm7` | index7 | -64..63 | `R[rx] = M8[lo16(BP + sext(imm))]` |
+| `lw` | `0x84` | — | `rx, imm7` | index7 | -64..63 | `R[rx] = M16[lo16(BP + sext(imm) * 2)]` |
+| `ll` | `0x88` | — | `rx, imm7` | index7 | -64..63 | `R[rx] = M32[lo16(BP + sext(imm) * 4)]` |
+| `sb` | `0x8c` | — | `rx, imm7` | index7 | -64..63 | `M8[lo16(BP + sext(imm))] = R[rx]` |
+| `sw` | `0x90` | — | `rx, imm7` | index7 | -64..63 | `M16[lo16(BP + sext(imm) * 2)] = R[rx]` |
+| `sl` | `0x94` | — | `rx, imm7` | index7 | -64..63 | `M32[lo16(BP + sext(imm) * 4)] = R[rx]` |
+| `lbx` | `0x98` | — | `rx, imm7` | index7 | -64..63 | `R[rx] = sx(M8[lo16(BP + sext(imm))], 8)` |
+| `lwx` | `0x9c` | — | `rx, imm7` | index7 | -64..63 | `R[rx] = sx(M16[lo16(BP + sext(imm) * 2)], 16)` |
+| `addi` | `0xa0` | — | `rx, imm7` | simm7 | -64..63 | `R[rx] = R[rx] + sext(imm)` |
+| `shli` | `0xa4` | — | `rx, imm7` | simm7 | -64..63 | `R[rx] = R[rx] << (imm & 31)` |
+| `andi` | `0xa8` | — | `rx, imm7` | uimm7 | 0..127 | `R[rx] = R[rx] & imm` |
+| `shrsi` | `0xac` | — | `rx, imm7` | simm7 | -64..63 | `R[rx] = R[rx] >>s (imm & 31)` |
+| `imms` | `0xb0` | — | `rx, imm7` | simm7 | -64..63 | `R[rx] = sext(imm)` |
 
 ## F3a — 3 bytes
 
-| Mnemonic | First byte | Sub-op | Operands | Immediate | Range (source units) |
-|---|---|---|---|---|---|
-| `j` | `0xc0` | — | `addr16` | abs1616 | label |
-| `jl` | `0xc1` | — | `addr16` | abs1616 | label |
-| `enter` | `0xc2` | — | `imm16` | uimm16 | 0..65535 |
+| Mnemonic | First byte | Sub-op | Operands | Immediate | Range (source units) | Semantics |
+|---|---|---|---|---|---|---|
+| `j` | `0xc0` | — | `addr16` | abs1616 | label | `PC = imm` |
+| `jl` | `0xc1` | — | `addr16` | abs1616 | label | `LR = PC; PC = imm` |
+| `enter` | `0xc2` | — | `imm16` | uimm16 | 0..65535 | `M32[lo16(SP - 4)] = (LR << 16) \| BP; BP = SP - 4; SP = SP - imm - 4` |
 
 ## F3b — 3 bytes
 
-| Mnemonic | First byte | Sub-op | Operands | Immediate | Range (source units) |
-|---|---|---|---|---|---|
-| `adjw` | `0xc4` | — | `imm14` | bytes414 ×4 | -32768..32764 |
-| `lea` | `0xc6` | — | `rd, imm14` | bytes414 ×4 | -32768..32764 |
+| Mnemonic | First byte | Sub-op | Operands | Immediate | Range (source units) | Semantics |
+|---|---|---|---|---|---|---|
+| `adjw` | `0xc4` | — | `imm14` | bytes414 ×4 | -32768..32764 | `SP = SP + sext(imm) * 4` |
+| `lea` | `0xc6` | — | `rd, imm14` | bytes414 ×4 | -32768..32764 | `R[rd] = lo16(BP + sext(imm) * 4)` |
 
 ## F3c — 3 bytes
 
-| Mnemonic | First byte | Sub-op | Operands | Immediate | Range (source units) |
-|---|---|---|---|---|---|
-| `llb` | `0xd0` | — | `rx, ry, imm10` | index10 | -512..511 |
-| `llw` | `0xd1` | — | `rx, ry, imm10` | index10 | -512..511 |
-| `lll` | `0xd2` | — | `rx, ry, imm10` | index10 | -512..511 |
-| `slb` | `0xd3` | — | `rx, ry, imm10` | index10 | -512..511 |
-| `slw` | `0xd4` | — | `rx, ry, imm10` | index10 | -512..511 |
-| `sll` | `0xd5` | — | `rx, ry, imm10` | index10 | -512..511 |
-| `llbx` | `0xd6` | — | `rx, ry, imm10` | index10 | -512..511 |
-| `llwx` | `0xd7` | — | `rx, ry, imm10` | index10 | -512..511 |
-| `beq` | `0xd8` | — | `rx, ry, disp10` | pcrel10 | label |
-| `bne` | `0xd9` | — | `rx, ry, disp10` | pcrel10 | label |
-| `blt` | `0xda` | — | `rx, ry, disp10` | pcrel10 | label |
-| `ble` | `0xdb` | — | `rx, ry, disp10` | pcrel10 | label |
-| `blts` | `0xdc` | — | `rx, ry, disp10` | pcrel10 | label |
-| `bles` | `0xdd` | — | `rx, ry, disp10` | pcrel10 | label |
+| Mnemonic | First byte | Sub-op | Operands | Immediate | Range (source units) | Semantics |
+|---|---|---|---|---|---|---|
+| `llb` | `0xd0` | — | `rx, ry, imm10` | index10 | -512..511 | `R[rx] = M8[R[ry] + sext(imm)]` |
+| `llw` | `0xd1` | — | `rx, ry, imm10` | index10 | -512..511 | `R[rx] = M16[R[ry] + sext(imm) * 2]` |
+| `lll` | `0xd2` | — | `rx, ry, imm10` | index10 | -512..511 | `R[rx] = M32[R[ry] + sext(imm) * 4]` |
+| `slb` | `0xd3` | — | `rx, ry, imm10` | index10 | -512..511 | `M8[R[ry] + sext(imm)] = R[rx]` |
+| `slw` | `0xd4` | — | `rx, ry, imm10` | index10 | -512..511 | `M16[R[ry] + sext(imm) * 2] = R[rx]` |
+| `sll` | `0xd5` | — | `rx, ry, imm10` | index10 | -512..511 | `M32[R[ry] + sext(imm) * 4] = R[rx]` |
+| `llbx` | `0xd6` | — | `rx, ry, imm10` | index10 | -512..511 | `R[rx] = sx(M8[R[ry] + sext(imm)], 8)` |
+| `llwx` | `0xd7` | — | `rx, ry, imm10` | index10 | -512..511 | `R[rx] = sx(M16[R[ry] + sext(imm) * 2], 16)` |
+| `beq` | `0xd8` | — | `rx, ry, disp10` | pcrel10 | label | `if R[rx] == R[ry] then PC = PC + sext(disp)` |
+| `bne` | `0xd9` | — | `rx, ry, disp10` | pcrel10 | label | `if R[rx] != R[ry] then PC = PC + sext(disp)` |
+| `blt` | `0xda` | — | `rx, ry, disp10` | pcrel10 | label | `if R[rx] <u R[ry] then PC = PC + sext(disp)` |
+| `ble` | `0xdb` | — | `rx, ry, disp10` | pcrel10 | label | `if R[rx] <=u R[ry] then PC = PC + sext(disp)` |
+| `blts` | `0xdc` | — | `rx, ry, disp10` | pcrel10 | label | `if R[rx] <s R[ry] then PC = PC + sext(disp)` |
+| `bles` | `0xdd` | — | `rx, ry, disp10` | pcrel10 | label | `if R[rx] <=s R[ry] then PC = PC + sext(disp)` |
 
 ## F3d — 3 bytes
 
-| Mnemonic | First byte | Sub-op | Operands | Immediate | Range (source units) |
-|---|---|---|---|---|---|
-| `beqz` | `0xdf` | 0x00 | `rx, disp10` | pcrel10 | label |
-| `bnez` | `0xdf` | 0x01 | `rx, disp10` | pcrel10 | label |
-| `dbnz` | `0xdf` | 0x02 | `rx, disp10` | pcrel10 | label |
-| `bltz` | `0xdf` | 0x03 | `rx, disp10` | pcrel10 | label |
-| `bgez` | `0xdf` | 0x04 | `rx, disp10` | pcrel10 | label |
-| `bgtz` | `0xdf` | 0x05 | `rx, disp10` | pcrel10 | label |
-| `blez` | `0xdf` | 0x06 | `rx, disp10` | pcrel10 | label |
+| Mnemonic | First byte | Sub-op | Operands | Immediate | Range (source units) | Semantics |
+|---|---|---|---|---|---|---|
+| `beqz` | `0xdf` | 0x00 | `rx, disp10` | pcrel10 | label | `if R[rx] == 0 then PC = PC + sext(disp)` |
+| `bnez` | `0xdf` | 0x01 | `rx, disp10` | pcrel10 | label | `if R[rx] != 0 then PC = PC + sext(disp)` |
+| `dbnz` | `0xdf` | 0x02 | `rx, disp10` | pcrel10 | label | `R[rx] = R[rx] - 1; if R[rx] != 0 then PC = PC + sext(disp)` |
+| `bltz` | `0xdf` | 0x03 | `rx, disp10` | pcrel10 | label | `if R[rx] <s 0 then PC = PC + sext(disp)` |
+| `bgez` | `0xdf` | 0x04 | `rx, disp10` | pcrel10 | label | `if R[rx] >=s 0 then PC = PC + sext(disp)` |
+| `bgtz` | `0xdf` | 0x05 | `rx, disp10` | pcrel10 | label | `if R[rx] >s 0 then PC = PC + sext(disp)` |
+| `blez` | `0xdf` | 0x06 | `rx, disp10` | pcrel10 | label | `if R[rx] <=s 0 then PC = PC + sext(disp)` |
 
 ## F3e — 3 bytes
 
-| Mnemonic | First byte | Sub-op | Operands | Immediate | Range (source units) |
-|---|---|---|---|---|---|
-| `immw` | `0xe0` | — | `rx, imm16` | raw1616 | -32768..65535 |
-| `immwh` | `0xe8` | — | `rx, imm16` | raw1616 | -32768..65535 |
-| `jz` | `0xf0` | — | `rx, addr16` | abs1616 | label |
-| `jnz` | `0xf8` | — | `rx, addr16` | abs1616 | label |
+| Mnemonic | First byte | Sub-op | Operands | Immediate | Range (source units) | Semantics |
+|---|---|---|---|---|---|---|
+| `immw` | `0xe0` | — | `rx, imm16` | raw1616 | -32768..65535 | `R[rx] = imm` |
+| `immwh` | `0xe8` | — | `rx, imm16` | raw1616 | -32768..65535 | `R[rx] = zx(R[rx], 16) \| (imm << 16)` |
+| `jz` | `0xf0` | — | `rx, addr16` | abs1616 | label | `if R[rx] == 0 then PC = imm` |
+| `jnz` | `0xf8` | — | `rx, addr16` | abs1616 | label | `if R[rx] != 0 then PC = imm` |
+
+## Semantics notation
+
+Each instruction's Semantics cell is one line of register-transfer notation
+(`SEMANTICS` in `cpu4/isa.py`). `cpu4/sem.py` parses it and generates `cpu4/exec_gen.h`,
+the executor `sim_c -gen` runs. The notation is defined as follows.
+
+```
+State: R[0..7] are 32-bit; PC, SP, BP, LR are 16-bit; H is the halt flag.
+Memory is byte-addressed, little-endian, 32-bit addresses. Memory the
+program image does not cover reads as 0 after reset. M8[a], M16[a],
+M32[a] read or write 1, 2, 4 bytes at a. M16 and M32 accesses must be
+naturally aligned: a misaligned access is an alignment fault and stops the
+machine (sim_c reports it; the RTL must match).
+Operands: rd rx ry name register fields; imm imm7 disp name the raw immediate
+field, unsigned. sext(f) is field f sign-extended from its width.
+Values: every expression is a 32-bit unsigned value, arithmetic wraps mod 2^32.
+Operators, loosest binding first: ?: | ^ & (== !=) (<u <=u >u >=u <s <=s >s >=s)
+(<< >> >>s) (+ -) (* /u %u /s %s) unary (- ~ !). Comparisons give 1 or 0; the
+suffix says unsigned (u) or signed (s). >> is logical, >>s arithmetic; a shift
+by 32 or more gives 0 (>>s: 0 or all ones). /u %u /s %s truncate toward zero;
+dividing by zero gives 0; INT_MIN /s -1 gives INT_MIN and INT_MIN %s -1 gives 0.
+sx(e,n) sign-extends and zx(e,n) zero-extends the low n bits of e; lo16(e) is
+zx(e,16).
+Statements are separated by ';' and run in order: each sees the writes of the
+ones before it. 'if c then s' runs s when c is non-zero. An assignment keeps
+the low bits that fit its destination (PC SP BP LR 16, M8 8, M16 16, H 1).
+PC, when read, is the address of the next instruction.
+Primitives: fadd fsub fmul fdiv flt fle itof ftoi frecip frsqrt are defined
+bit-exactly by cpu4/fpu_model.h; putchar(e) writes the low byte of e to the
+console.
+After every instruction SP and BP must be multiples of 4, or the machine stops.
+```
 
 ## Pseudo-ops (assembler only)
 

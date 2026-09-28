@@ -28,8 +28,11 @@ An ISA or ABI change is **one commit in smallcc** that touches, together:
   it (`cpu4/isa_table_c.h`, `cpu4/isa_table.py`, `docs/isa/cpu4-encoding.md`);
 - `docs/isa/cpu4.md` (or `docs/abi.md`) — the semantics in prose, and
   `cpu4/fpu_model.h` for a float op;
-- `sim_c.c` `run_cpu4()` and `cpu4/cpu.py` `CPU.step()` — the semantics,
-  executable, hand-written in each (the generated tables only decode);
+- `cpu4/isa.py` `SEMANTICS` — the semantics, one line per instruction, from
+  which `make isa` generates `sim_c`'s `-gen` executor;
+- `sim_c.c` `run_cpu4()` and `cpu4/cpu.py` `CPU.step()` — the hand-written
+  executors, until proposal 0005 retires them (`make rig` checks the first
+  against the generated one);
 - the compiler (`emit.c`, `legalize.c`, `braun.c` for a builtin);
 - at least one corpus test that executes the change.
 

@@ -34,3 +34,5 @@ smallcc
 smallcc_asan
 cm_results*.txt
 git_log.txt
+rig_failures/
+fuzz_failures/

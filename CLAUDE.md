@@ -41,7 +41,7 @@ Tests are pytest-collected `.c` files under `tests/cases/` with `EXPECT_R0`/`EXP
 
 `sim_c` (`sim_c.c`) is the primary simulator and the executable ISA spec — a self-contained C program that assembles and executes CPU4 assembly. Build with `make sim_c`. `cpu4/cpu.py` is the independent Python model (`python3 cpu4/sim.py --maxsteps N file.s`); it decodes through the same generated table as `sim_c`'s assembler but executes through its own hand-written `step()`.
 
-**Instruction definition flow:** encoding in `cpu4/isa.py` (generated into `sim_c`, `cpu.py`, the assembler and `docs/isa/cpu4-encoding.md` by `make isa`); semantics written by hand in `docs/isa/cpu4.md`, `sim_c.c` `run_cpu4()` and `cpu4/cpu.py` `step()`; float arithmetic in `cpu4/fpu_model.h`. The full checklist is "Where an instruction is defined" in `docs/isa/cpu4.md`.
+**Instruction definition flow:** `cpu4/isa.py` holds each instruction's encoding and its semantics (one line of register-transfer notation, `SEMANTICS`, defined by `SEMANTICS_PREAMBLE`); `make isa` generates the simulator and assembler tables, `docs/isa/cpu4-encoding.md` and `cpu4/exec_gen.h`, the executor `sim_c -gen` runs. Float arithmetic is `cpu4/fpu_model.h`. The hand-written executors (`sim_c.c` `run_cpu4()`, the default for now, and `cpu4/cpu.py` `step()`) are being retired under proposal 0005; `make rig` checks the first against the generated one. The full checklist is "Where an instruction is defined" in `docs/isa/cpu4.md`.
 
 **`sim_c` usage:**
 ```
@@ -57,6 +57,8 @@ Tests are pytest-collected `.c` files under `tests/cases/` with `EXPECT_R0`/`EXP
 | Write watchpoints | Writes to addresses below `0x5000` print to stderr: `WRITE8/16/32 to addr = val  at pc=... sp=... bp=... r0=...`; useful for catching stray stores into the code/data area |
 | Crash trace | On unknown opcode, dumps the last 32 executed instructions (pc, opcode, r0, sp, bp) to help locate the crash |
 | MMIO cycle counter | A 32-bit read-only cycle counter at address `0xFF00` incremented once per instruction; used by `core_portme.c` for timing |
+| `-gen` | Execute with the executor generated from `cpu4/isa.py` `SEMANTICS` (`cpu4/exec_gen.h`) instead of the hand-written one; identical results, about 5% slower |
+| `-retire FILE` | One line per retired instruction: pc, bytes, every register and memory change, next pc. Two runs that behave the same produce identical files; `tools/rig.py` compares executors this way |
 
 ### CoreMark Benchmark
 

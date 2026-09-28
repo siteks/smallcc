@@ -6,7 +6,7 @@ SRCS_NEW    = sx.c lower.c ssa.c braun.c dom.c oos.c opt.c legalize.c alloc.c em
 
 smallcc: $(SRCS_COMMON) $(SRCS_NEW) cpu4/fpu_model.h cpu4/fpu_roms.h
 	$(CC) $(CFLAGS) -o smallcc $(SRCS_COMMON) $(SRCS_NEW) -lm
-sim_c: sim_c.c cpu4/fpu_model.h cpu4/fpu_roms.h cpu4/isa_table_c.h
+sim_c: sim_c.c cpu4/fpu_model.h cpu4/fpu_roms.h cpu4/isa_table_c.h cpu4/exec_gen.h
 	$(CC) $(CFLAGS) -O2 -o sim_c sim_c.c -lm
 
 isa:
@@ -15,10 +15,10 @@ isa:
 isa-check:
 	python3 cpu4/gen_isa.py --check
 
-cpu4/isa_table_c.h cpu4/isa_table.py: cpu4/isa.py cpu4/gen_isa.py
+cpu4/isa_table_c.h cpu4/isa_table.py cpu4/exec_gen.h: cpu4/isa.py cpu4/gen_isa.py cpu4/sem.py
 	python3 cpu4/gen_isa.py
 
-test: smallcc sim_c isa-check
+test: smallcc sim_c isa-check rig-quick
 	python3 -m pytest tests/cases/ -q
 	python3 -m pytest tests/cases/ -q --irsim
 
@@ -57,6 +57,8 @@ help:
 	@echo "  test_irsim    Run all pytest cases via -runoos and -runirc"
 	@echo "  test_irsim_v  Same, verbose"
 	@echo "  test_irsim_p  Same, parallel"
+	@echo "  rig-quick     100 random instruction programs, hand vs generated executor (part of test)"
+	@echo "  rig           1000 random programs with a fresh seed; rig-long: 10000, failures kept"
 	@echo "  isa-check     Fail if cpu4/isa_table_c.h, cpu4/isa_table.py or"
 	@echo "                docs/isa/cpu4-encoding.md is stale vs cpu4/isa.py (part of test)"
 	@echo ""
@@ -66,4 +68,13 @@ help:
 	@echo "Misc"
 	@echo "  clean      Remove compiler, simulator, and temp files"
 
-.PHONY: isa isa-check test test_v test_p test_irsim test_irsim_v test_irsim_p clean help
+.PHONY: isa isa-check rig rig-quick rig-long test test_v test_p test_irsim test_irsim_v test_irsim_p clean help
+
+# Random instruction generator: constrained-random programs run in lockstep on
+# sim_c's hand-written executor and the one generated from cpu4/isa.py SEMANTICS.
+rig-quick: sim_c
+	python3 tools/rig.py -n 100 -len 300 -seed 1
+rig: sim_c
+	python3 tools/rig.py -n 1000 -len 400 -seed $$(date +%s)
+rig-long: sim_c
+	python3 tools/rig.py -n 10000 -len 400 -seed $$(date +%s) --keep rig_failures
