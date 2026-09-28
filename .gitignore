@@ -36,3 +36,7 @@ cm_results*.txt
 git_log.txt
 rig_failures/
 fuzz_failures/
+
+# make isa stamp
+.isa-stamp
+isatool/arches.h

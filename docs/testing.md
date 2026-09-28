@@ -24,8 +24,9 @@ the IR interpreter has no device model.
 
 ## The C Simulator (`sim_c`)
 
-`sim_c` is a native C binary that assembles and runs CPU4 assembly files. It
-is the de-facto executable ISA spec (see `coordination.md`).
+`sim_c` is a native C binary that assembles and runs assembly for every ISA
+defined by an `<arch>/isa.py` (`-arch`, default `cpu4`). It is the de-facto
+executable ISA spec (see `coordination.md`).
 
 ### Build
 
@@ -40,7 +41,7 @@ This compiles `sim_c.c` (self-contained) against the system libc with `-lm`.
 ```
 ./sim_c [options] file.s
   -trace FILE        per-instruction execution trace
-  -arch cpu4         target architecture (only cpu4)
+  -arch NAME         ISA (default cpu4; any <arch>/isa.py present)
   -maxsteps N        override the instruction-step cap
   -dump FILE         assemble + write bytecode dump; no execution
   -dumpfb            dump the 80x30 text framebuffer at 0xF000 after running
@@ -98,31 +99,34 @@ make test_irsim_p   # same, parallel
 
 ## Encoding consistency (`make isa-check`)
 
-`cpu4/isa.py` is the single definition of the instruction encoding.
-`cpu4/gen_isa.py` writes `cpu4/isa_table_c.h` (sim_c), `cpu4/isa_table.py`
-(cpu.py, assembler.py) and `docs/isa/cpu4-encoding.md`; `make isa-check`, run
-by `make test`, fails when any of them is stale. In the hardware repo
-`make isa-check` compares `rtl/decode.v`'s case labels with the table and
-`scripts/imm_range_check.py` takes its immediate ranges from it.
+`cpu4/isa.py` is the single definition of the instruction set, in the format
+of `isatool/README.md`. `isatool/gen.py` (`make isa`) writes, for it and every
+other `<arch>/isa.py`, the C table (`<arch>/isa_table_c.h`), both executors
+(`<arch>/exec_gen.h`, `<arch>/exec_gen.py`) and `docs/isa/<arch>-encoding.md`;
+`make isa-check`, run by `make test`, fails when any of them is stale. The
+Python assembler reads the definition directly through `isatool/model.py`, and
+so do the hardware's `scripts/imm_range_check.py` (immediate ranges) and
+`scripts/check_decode.py` (`make -C hw isa-check`, `rtl/decode.v`'s case
+labels).
 
 This checks encodings only. Whether an instruction is *executed*, and
-executed the same way, by `sim_c`, the IR interpreter and the RTL is what the
-corpus establishes (`make test`, `make test_irsim`, `make -C hw test-sim`).
-`cpu4/cpu.py`'s executor has no corpus harness: its float functions are the
-source of the `fpu_vectors` expectations, and the rest is checked by running
-`python3 cpu4/sim.py --maxsteps N file.s` against `sim_c` by hand when an
-instruction is added (see "Where an instruction is defined" in
-`docs/isa/cpu4.md`).
+executed the same way, by `sim_c`, the Python simulator, the IR interpreter
+and the RTL is what the corpus and rig establish (`make test`, `make
+test_irsim`, `make -C hw test-sim`, below).
 
 ## Random instruction testing (`tools/rig.py`)
 
 The corpus checks programs; the random instruction generator checks
-instructions. It builds constrained-random programs from the table in
-`cpu4/isa.py` (every instruction, random registers, edge operand values such
+instructions. It builds constrained-random programs from an ISA definition
+(every instruction with semantics, random registers, edge operand values such
 as 0, -1, `INT_MIN`, float specials; forward branches, bounded `dbnz` loops,
 calls to generated leaf functions, balanced `pushr`/`popr` and `adjw`; memory
-accesses confined to initialised data windows) and runs each on `sim_c` and on
-`cpu4/cpu.py`, comparing them after every instruction.
+accesses confined to initialised data windows) and runs each on `sim_c -arch
+A` and on the Python simulator (`isatool/pysim.py --arch A`), comparing them
+after every instruction. It names no instructions: each is grouped by what its
+semantics line reads and writes and by its operand shapes
+(`python3 tools/rig.py --show`), so a new ISA is covered as soon as its
+definition exists.
 
 Both simulators execute code generated from the same semantics lines, through
 different back ends (C and Python) and different float implementations
@@ -131,20 +135,23 @@ generators, the float port and the two state and memory models against each
 other.
 
 The comparison is the retirement trace, `sim_c -retire FILE` and
-`cpu4/sim.py --retire FILE`: one line per retired instruction with its pc,
-bytes, every register and memory change, and the next pc. A retirement port
+`isatool/pysim.py --retire FILE` (`cpu4/sim.py --retire FILE` for CPU4): one
+line per retired instruction with its pc, bytes, every register and memory
+change, and the next pc. A retirement port
 on the RTL bench is meant to produce the same lines, so the RTL can join the
 lockstep comparison.
 
 ```bash
-make rig-quick                                  # 100 programs (part of make test)
+make rig-quick                                  # 100 cpu4 programs, 30 per other ISA (part of make test)
 make rig                                        # 1000 programs, fresh seed
 make rig-long                                   # 10000 programs, failures saved to rig_failures/
 python3 tools/rig.py -n 500 -seed 3 --keep out  # a specific seed, failures saved
+python3 tools/rig.py --arch cpu5 -n 100         # another ISA
 ```
 
-It reports how many of the 123 instructions it executed, which is all of them
-on any run of a hundred programs or more.
+It reports how many of the ISA's instructions with semantics it executed,
+which for CPU4 is all 123 on any run of a hundred programs or more, and lists
+the instructions that have no semantics yet.
 
 ## Floating-point conformance (`tests/cases/floats/fpu_vectors.c`)
 

@@ -1,56 +1,20 @@
 #!/usr/bin/env python3
+"""Run a CPU4 assembly file on the Python model: isatool/pysim.py with --arch cpu4.
 
-import argparse
-import sys
-import assembler
-import cpu
+  python3 cpu4/sim.py [--maxsteps N] [--retire FILE] file.s
+"""
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from isatool import pysim
 
 
 def runfile(sourcefile, maxsteps=1000, verbose=False, retire=None):
-    # Get text of C program
-    text = open(sourcefile).read()
-    return runasm(text, sourcefile, maxsteps, verbose, retire)
+    return pysim.runfile(sourcefile, maxsteps, verbose, retire, 'cpu4')
 
 
 def runasm(text, filename, maxsteps=1000, verbose=True, retire=None):
-
-    # Create memory
-    m = cpu.Mem()
-    # Assemble the code and output result
-    a = assembler.Assembler()
-    #print(text)
-    a.assemble(text, showsymbols=verbose)
-
-    # Put machine code image in memory
-    a.makeimage(m)
-
-    if verbose:
-        a.dumpasm('%s.lst' % filename)
-        a.dumpasm(sys.stdout)
-        m.dumpmem(0, 128)
-        m.dumpmem(0x2000, 0x20)
-
-    # Create the CPU and step until halted or run out of steps
-    c = cpu.CPU(m, retire=retire)
-    c.reset()
-    for i in range(maxsteps):
-        s = c.step(trace=verbose)
-        if s.H:
-            break
-
-    return s
+    return pysim.runasm(text, filename, maxsteps, verbose, retire, 'cpu4')
 
 
 if __name__ == "__main__":
-    argparser = argparse.ArgumentParser('Dump AST')
-    argparser.add_argument('filename', help='name of file to parse')
-    argparser.add_argument('-v', '--verbose', action='store_true', help='verbose')
-    argparser.add_argument('--maxsteps', type=int, default=1000, help='max simulation steps')
-    argparser.add_argument('--retire', metavar='FILE', help='write one line per retired instruction (sim_c -retire format)')
-    args = argparser.parse_args()
-
-    ret = open(args.retire, 'w') if args.retire else None
-    s = runfile(args.filename, maxsteps=args.maxsteps, verbose=args.verbose, retire=ret)
-    if ret: ret.close()
-    print(s)
-
+    pysim.main('cpu4')

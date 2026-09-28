@@ -6,17 +6,25 @@ SRCS_NEW    = sx.c lower.c ssa.c braun.c dom.c oos.c opt.c legalize.c alloc.c em
 
 smallcc: $(SRCS_COMMON) $(SRCS_NEW) cpu4/fpu_model.h cpu4/fpu_roms.h
 	$(CC) $(CFLAGS) -o smallcc $(SRCS_COMMON) $(SRCS_NEW) -lm
-sim_c: sim_c.c cpu4/fpu_model.h cpu4/fpu_roms.h cpu4/isa_table_c.h cpu4/exec_gen.h
+ISA_DEFS  = $(wildcard */isa.py)
+ISA_TOOLS = isatool/gen.py isatool/model.py isatool/sem.py
+ISA_GEN   = isatool/arches.h $(ISA_DEFS:isa.py=isa_table_c.h) $(ISA_DEFS:isa.py=exec_gen.h) $(ISA_DEFS:isa.py=exec_gen.py)
+
+sim_c: sim_c.c cpu4/fpu_model.h cpu4/fpu_roms.h isatool/isa_types.h isatool/exec_common.h .isa-stamp
 	$(CC) $(CFLAGS) -O2 -o sim_c sim_c.c -lm
 
+# Every generated ISA file (tables, both executors, encoding docs) for every
+# <arch>/isa.py; `make isa ARCH=cpu5` regenerates one ISA.
 isa:
-	python3 cpu4/gen_isa.py
+	python3 isatool/gen.py $(if $(ARCH),--arch $(ARCH))
+	@touch .isa-stamp
 
 isa-check:
-	python3 cpu4/gen_isa.py --check
+	python3 isatool/gen.py --check
 
-cpu4/isa_table_c.h cpu4/isa_table.py cpu4/exec_gen.h cpu4/exec_gen.py: cpu4/isa.py cpu4/gen_isa.py cpu4/sem.py
-	python3 cpu4/gen_isa.py
+.isa-stamp: $(ISA_DEFS) $(ISA_TOOLS)
+	python3 isatool/gen.py
+	@touch .isa-stamp
 
 test: smallcc sim_c isa-check rig-quick
 	python3 -m pytest tests/cases/ -q
@@ -42,7 +50,7 @@ fuzz: smallcc sim_c
 
 clean:
 	rm -f smallcc sim_c mycc_* *.o *~ tmp* _tmp*.c test.s *.lst error.log
-	rm -rf .pytest_cache __pycache__ cpu4/__pycache__
+	rm -rf .pytest_cache __pycache__ cpu4/__pycache__ isatool/__pycache__ .isa-stamp
 	rm -rf *.dSYM
 
 help:
@@ -57,13 +65,12 @@ help:
 	@echo "  test_irsim    Run all pytest cases via -runoos and -runirc"
 	@echo "  test_irsim_v  Same, verbose"
 	@echo "  test_irsim_p  Same, parallel"
-	@echo "  rig-quick     100 random instruction programs, hand vs generated executor (part of test)"
+	@echo "  rig-quick     100 random instruction programs, sim_c vs the Python simulator (part of test)"
 	@echo "  rig           1000 random programs with a fresh seed; rig-long: 10000, failures kept"
-	@echo "  isa-check     Fail if cpu4/isa_table_c.h, cpu4/isa_table.py or"
-	@echo "                docs/isa/cpu4-encoding.md is stale vs cpu4/isa.py (part of test)"
+	@echo "  isa-check     Fail if any file generated from an <arch>/isa.py is stale (part of test)"
 	@echo ""
 	@echo "ISA"
-	@echo "  isa        Regenerate the encoding tables from cpu4/isa.py (after editing it)"
+	@echo "  isa        Regenerate tables, executors and docs from every <arch>/isa.py (ARCH=name for one)"
 	@echo ""
 	@echo "Misc"
 	@echo "  clean      Remove compiler, simulator, and temp files"
@@ -74,6 +81,7 @@ help:
 # sim_c and cpu4/cpu.py, whose executors are both generated from cpu4/isa.py SEMANTICS.
 rig-quick: sim_c
 	python3 tools/rig.py -n 100 -len 300 -seed 1
+	@for a in $(filter-out cpu4,$(ISA_DEFS:/isa.py=)); do python3 tools/rig.py --arch $$a -n 30 -len 300 -seed 1 || exit 1; done
 rig: sim_c
 	python3 tools/rig.py -n 1000 -len 400 -seed $$(date +%s)
 rig-long: sim_c
