@@ -314,7 +314,10 @@ With `-Oparam=inline_cf_nodes=N` (the CPU5 default is 160) functions with
 control flow up to N AST nodes are also candidates; they are expanded by
 running the whole body through `cg_stmt` with `return` redirected to a
 continuation block, and their memory-resident locals get frame slots in the
-caller (`local_bpoff`). See docs/optimization-passes.md.
+caller (`local_bpoff`). Struct-returning functions and straight-line
+bodies with struct locals inline the same way (with `inline_cf_nodes = 0`
+too). Arguments are all evaluated before any parameter is bound, since an
+argument may itself inline the same function. See docs/optimization-passes.md.
 
 ### R2C — Algebraic simplification (in `emit_binop`)
 
@@ -739,7 +742,7 @@ used callee-saved register (r4–r7). Callee saves are stored **below** the spil
 | `IK_STORE [ra+0], rb` (bp-rel, in F2 range) | `sw/sb/sl rb, [bp+imm]` |
 | `IK_STORE [ra+0], rb` (other) | `slw/slb/sll rb, [ra+0]` |
 | `IK_COPY rd, rs` | `or rd, rs, rs` (mov pseudo) |
-| `IK_MEMCPY dst, src, n` | inlined word/byte moves (always; no libcall) |
+| `IK_MEMCPY dst, src, n` | inlined halfword/byte moves (always; no libcall). A 4-aligned struct copy of up to 64 bytes never reaches here: braun emits it as word loads and stores |
 | `IK_FRECIP` / `IK_FRSQRT` (`__builtin_frecip/frsqrt`) | `frecip rd` / `frsqrt rd` (F1b seeds) |
 | `IK_CALL "fname"` | `jl fname` |
 | `IK_ICALL fp` | `jlr` (fp in r0) |

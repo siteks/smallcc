@@ -832,6 +832,8 @@ int main(int argc, char **argv)
                     if (opt_flags & OPT_FOLD_BR)        STAT("pre", opt_stat_fold_br,  opt_fold_branches(f));
                     if (opt_flags & OPT_DEAD_BLOCKS)    STAT("pre", opt_stat_dead_blk, opt_remove_dead_blocks(f));
                     verify_function(f, "pre-cleanup", VERIFY_PRE_OOS);
+                    if (g_tune.frame_promote) opt_frame_promote(f);
+                    verify_function(f, "frame-promote", VERIFY_PRE_OOS);
                     compute_dominators(f);
                     // Pre-OOS pattern simplification: feed cleaner IR to GVN
                     if (opt_flags & OPT_REDUNDANT_BOOL) opt_redundant_bool(f);

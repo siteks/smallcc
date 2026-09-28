@@ -131,7 +131,6 @@ static int is_pure_kind(Inst *inst) {
 }
 static unsigned char *mark_live_values(Function *f) {
     unsigned char *live = calloc(f->nvalues + 1, 1);
-    Value **work = malloc((f->nvalues + 1) * sizeof(Value *)); int nw = 0;
     for (int bi = 0; bi < f->nblocks; bi++)
         for (Inst *inst = f->blocks[bi]->head; inst; inst = inst->next) {
             if (inst->is_dead) continue;
@@ -140,18 +139,24 @@ static unsigned char *mark_live_values(Function *f) {
             if (inst->dst && inst->dst->id < f->nvalues) live[inst->dst->id] = 1;
             for (int j = 0; j < inst->nops; j++) {
                 Value *v = val_resolve(inst->ops[j]);
-                if (v && v->kind == VAL_INST && v->id < f->nvalues && !live[v->id]) { live[v->id] = 1; work[nw++] = v; }
+                if (v && v->kind == VAL_INST && v->id < f->nvalues) live[v->id] = 1;
             }
         }
-    while (nw > 0) {
-        Value *v = work[--nw];
-        if (!v->def) continue;
-        for (int j = 0; j < v->def->nops; j++) {
-            Value *o = val_resolve(v->def->ops[j]);
-            if (o && o->kind == VAL_INST && o->id < f->nvalues && !live[o->id]) { live[o->id] = 1; work[nw++] = o; }
-        }
+    // Every definition of a live value is live. After out-of-SSA a value
+    // can have several (one copy per phi predecessor) and Value.def names
+    // only one of them, so this walks instructions to a fixpoint rather
+    // than following def pointers.
+    for (int changed = 1; changed; ) {
+        changed = 0;
+        for (int bi = 0; bi < f->nblocks; bi++)
+            for (Inst *inst = f->blocks[bi]->head; inst; inst = inst->next) {
+                if (inst->is_dead || !inst->dst || inst->dst->id >= f->nvalues || !live[inst->dst->id]) continue;
+                for (int j = 0; j < inst->nops; j++) {
+                    Value *v = val_resolve(inst->ops[j]);
+                    if (v && v->kind == VAL_INST && v->id < f->nvalues && !live[v->id]) { live[v->id] = 1; changed = 1; }
+                }
+            }
     }
-    free(work);
     return live;
 }
 

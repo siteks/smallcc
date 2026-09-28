@@ -292,13 +292,17 @@ static Node *inline_qualify(Node *func_decl) {
 // and labels (they would collide with the caller's), static locals (one
 // object, not one per call site), variadic access and &param. Locals that
 // live in memory get a frame slot in each caller (local_bpoff).
-static int cf_walk(Node *n, Symbol *self, int *count) {
+static int cf_walk(Node *n, Symbol *self, int *count, int limit, int straight) {
     for (; n; n = n->next) {
-        if (++(*count) > g_tune.inline_cf_nodes) return 0;
+        if (++(*count) > limit) return 0;
         switch (n->kind) {
         case ND_GOTOSTMT: case ND_LABELSTMT:
         case ND_VA_START: case ND_VA_ARG: case ND_VA_END:
             return 0;
+        case ND_IFSTMT: case ND_WHILESTMT: case ND_FORSTMT: case ND_DOWHILESTMT:
+        case ND_SWITCHSTMT: case ND_BREAKSTMT: case ND_CONTINUESTMT:
+            if (straight) return 0;
+            break;
         default: break;
         }
         if (n->kind == ND_UNARYOP && n->op_kind == TK_AMPERSAND && n->ch[0] &&
@@ -308,7 +312,7 @@ static int cf_walk(Node *n, Symbol *self, int *count) {
         if (n->kind == ND_IDENT && n->u.ident.is_function && n->symbol == self) return 0;
         if (n->kind == ND_DECLARATOR && n->symbol && n->symbol->kind == SYM_STATIC_LOCAL) return 0;
         for (int i = 0; i < 4; i++)
-            if (n->ch[i] && !cf_walk(n->ch[i], self, count)) return 0;
+            if (n->ch[i] && !cf_walk(n->ch[i], self, count, limit, straight)) return 0;
     }
     return 1;
 }
@@ -321,24 +325,31 @@ static void mark_inlined_locals(Node *n) {
     }
 }
 
+// With inline_cf_nodes = 0, still a straight-line body up to the plain
+// inliner's size whose only obstacle was a struct local or struct result.
 static int cf_qualify(Node *func_decl) {
-    if (g_tune.inline_cf_nodes <= 0) return 0;
+    int straight = g_tune.inline_cf_nodes <= 0;
+    int limit = straight ? INLINE_MAX_NODES : g_tune.inline_cf_nodes;
     if (!func_decl || func_decl->kind != ND_DECLARATION || !func_decl->u.declaration.is_func_defn) return 0;
     Node *declarator = func_decl->ch[1], *body = func_decl->ch[2];
     if (!declarator || !body || body->kind != ND_COMPSTMT) return 0;
     Symbol *fsym = declarator->symbol;
     if (!fsym || !fsym->type || fsym->type->base != TB_FUNCTION) return 0;
     if (fsym->type->u.fn.is_variadic) return 0;
-    Type *rt = fsym->type->u.fn.ret;
-    if (rt && rt->base == TB_STRUCT) return 0;
     int np = 0;
     if (body->symtable)
         for (Symbol *s = body->symtable->symbols; s; s = s->next)
             if (s->kind == SYM_PARAM && s->ns == NS_IDENT) np++;
     if (np > INLINE_MAX_PARAMS) return 0;
+    if (straight)                                 // a return only as the last statement
+        for (Node *st = body->ch[0]; st; st = st->next) {
+            Node *u = st;
+            while (u && u->kind == ND_STMT) u = u->ch[0];
+            if (u && u->kind == ND_RETURNSTMT && st->next) return 0;
+        }
     int count = 0;
     Node *next = body->next; body->next = NULL;
-    int ok = cf_walk(body, fsym, &count);
+    int ok = cf_walk(body, fsym, &count, limit, straight);
     body->next = next;
     return ok;
 }
@@ -1337,6 +1348,46 @@ static CallDesc *make_calldesc(Type *fn_type) {
 // Helper: emit args list (Node* linked via ->next) into call inst
 // ============================================================
 
+// The value type of the 4-byte word at byte offset off of an object of
+// type t: the scalar field that covers it exactly, else VT_I32.
+static ValType word_vt_at(Type *t, int off) {
+    if (!t) return VT_I32;
+    if (t->base == TB_STRUCT) {
+        for (Field *fl = t->u.composite.members; fl; fl = fl->next)
+            if (off >= fl->offset && off < fl->offset + fl->type->size)
+                return word_vt_at(fl->type, off - fl->offset);
+        return VT_I32;
+    }
+    if (t->base == TB_ARRAY) {
+        Type *e = t->u.arr.elem;
+        return (e && e->size > 0) ? word_vt_at(e, off % e->size) : VT_I32;
+    }
+    if (t->size == 4 && off == 0) return vt_of(t);
+    return VT_I32;
+}
+
+// Copy a struct: word loads and stores when it is small and 4-aligned
+// (visible to frame promotion and to load/store optimisation, one
+// instruction per word), otherwise IK_MEMCPY.
+#define STRUCT_COPY_WORDS 16
+static void emit_struct_copy(BraunCtx *ctx, Block *b, Value *dst, Value *src, Type *ty, int vol) {
+    int size = ty->size;
+    if (ty->align >= 4 && size % 4 == 0 && size <= 4 * STRUCT_COPY_WORDS && !vol && !type_is_volatile(ty)) {
+        for (int off = 0; off < size; off += 4) {
+            ValType vt = word_vt_at(ty, off);
+            Value *w = emit_load(ctx, b, src, 4, off, vt);
+            emit_store(ctx, b, dst, w, 4, off);
+        }
+        return;
+    }
+    Inst *mc = bi(ctx, b, IK_MEMCPY, NULL);
+    mc->imm  = size;
+    mc->size = size;
+    inst_add_op(mc, dst);
+    inst_add_op(mc, src);
+    inst_append(b, mc);
+}
+
 // ABI §4.3: struct arguments are passed as a pointer to a caller-owned
 // copy. Allocate a fresh frame temp per struct argument and memcpy the
 // struct into it immediately after evaluating the argument, so that
@@ -1352,12 +1403,7 @@ static Value *copy_struct_arg(BraunCtx *ctx, Block **cur, Type *ty, Value *src) 
     int off = -f->frame_size;
     Block *b = *cur;
     Value *tmp = emit_frame_addr(ctx, b, off);
-    Inst *mc = bi(ctx, b, IK_MEMCPY, NULL);
-    mc->imm  = size;
-    mc->size = size;
-    inst_add_op(mc, tmp);
-    inst_add_op(mc, src);
-    inst_append(b, mc);
+    emit_struct_copy(ctx, b, tmp, src, ty, 0);
     return tmp;
 }
 
@@ -1499,10 +1545,15 @@ static Value *braun_try_inline(BraunCtx *ctx, Block **cur, Symbol *fsym,
 
     Block *b = *cur;
 
-    // Evaluate arguments and write to callee's param symbols.
+    // Evaluate every argument, then bind the callee's param symbols: an
+    // argument that inlines the same function (f(1, f(2, 3))) binds them
+    // too, so binding as we go would let the inner call overwrite the
+    // outer call's earlier arguments.
     // Struct args get the same caller-owned copy as real calls (ABI §4.3):
     // the inlined body reads/writes the copy, never the caller's variable,
     // and a nested call's dead-frame result is secured immediately.
+    Value *avs[INLINE_MAX_PARAMS];
+    int nav = 0;
     Node *arg = args_head;
     for (int i = 0; i < ic->nparams; i++) {
         if (!arg) break;
@@ -1510,10 +1561,11 @@ static Value *braun_try_inline(BraunCtx *ctx, Block **cur, Symbol *fsym,
         Type *aty = arg_value_type(arg);
         if (aty && aty->base == TB_STRUCT)
             av = copy_struct_arg(ctx, cur, aty, av);
-        b = *cur;
-        write_var(b, ic->param_syms[i], av);
+        avs[nav++] = av;
         arg = arg->next;
     }
+    b = *cur;
+    for (int i = 0; i < nav; i++) write_var(b, ic->param_syms[i], avs[i]);
 
     if (ic->has_cf) {
         // The whole body through cg_stmt; `return` writes the result
@@ -1879,12 +1931,8 @@ static Value *cg_expr(BraunCtx *ctx, Block **cur, Node *n) {
         if (n->ch[0]->type && n->ch[0]->type->base == TB_STRUCT) {
             Value *dst_v = cg_addr(ctx, cur, n->ch[0]); b = *cur;
             Value *src = cg_expr(ctx, cur, n->ch[1]); b = *cur;
-            Inst *mc = bi(ctx, b, IK_MEMCPY, NULL);
-            mc->imm  = n->ch[0]->type->size;
-            mc->size = n->ch[0]->type->size;
-            inst_add_op(mc, dst_v);
-            inst_add_op(mc, src);
-            inst_append(b, mc);
+            emit_struct_copy(ctx, b, dst_v, src, n->ch[0]->type,
+                             lv_volatile(n->ch[0]) || lv_volatile(n->ch[1]));
             return src;
         }
 
@@ -2320,12 +2368,7 @@ static void cg_decl_init(BraunCtx *ctx, Block **cur, Symbol *sym, Node *init) {
         } else {
             // Struct from expression: memcpy
             Value *src_addr = cg_expr(ctx, cur, init); b = *cur;
-            Inst *mc = bi(ctx, b, IK_MEMCPY, NULL);
-            mc->imm  = ty->size;
-            mc->size = ty->size;
-            inst_add_op(mc, dst_addr);
-            inst_add_op(mc, src_addr);
-            inst_append(b, mc);
+            emit_struct_copy(ctx, b, dst_addr, src_addr, ty, 0);
         }
         return;
     }

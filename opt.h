@@ -121,6 +121,10 @@ void opt_narrow_wrap_range(Function *f);   // drop an unsigned narrow wrap a dom
 // accumulator phi.  Runs pre-OOS after GVN (so addresses are CSE'd).
 void opt_scalar_promote(Function *f);
 
+// Frame-slot promotion: 4-byte fields of locals that never escape become SSA
+// values (scalar replacement of aggregates).  Runs first among the pre-OOS passes.
+int opt_frame_promote(Function *f);
+
 // Address induction variables: replace address recomputations inside loops with
 // pointer IVs that increment each iteration.  Runs pre-OOS after scalar_promote.
 void opt_addr_iv(Function *f);

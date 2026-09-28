@@ -208,6 +208,9 @@ void print_inst(Inst *inst, FILE *out) {
     case IK_CONST:
         fprintf(out, " %d", inst->imm);
         break;
+    case IK_ADDR:
+        fprintf(out, " bp%+d", inst->imm);
+        break;
     case IK_CALL:
         fprintf(out, " %s(", inst->fname ? inst->fname : "?");
         for (int i = 0; i < inst->nops; i++) {

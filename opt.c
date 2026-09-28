@@ -3471,3 +3471,244 @@ void opt_addr_iv(Function *f) {
     // them later.
     recount_uses(f);
 }
+
+/*
+ * Frame-slot promotion (scalar replacement of aggregates).
+ *
+ * A local that never escapes is, after braun, a set of loads and stores at
+ * constant offsets from its IK_ADDR base.  Each 4-byte field (a key: frame
+ * offset and size) that is always accessed whole becomes an SSA value:
+ * stores define it, loads read it, and phis merge it at joins, built on
+ * demand as braun builds variables (Braun 2013 on a finished CFG).  This
+ * is what keeps a struct local, and the locals of inlined callees that
+ * took their addresses (vset(&n, ...)), in registers across loops and
+ * branches; legalize Pass H, which runs later, only forwards along
+ * single-predecessor chains.
+ *
+ * An object escapes when a frame address derived from it reaches anything
+ * but a load or store address or a constant add: a call argument, a
+ * memcpy, a phi, a stored value, a variable index.  Its extent is taken to
+ * run to the next IK_ADDR base above it, as in Pass H.  Keys at
+ * non-negative offsets (parameters) are left alone: their memory is
+ * defined on entry.
+ */
+typedef struct { int off, size; ValType vt; int bad; } FPKey;
+
+// The frame offset v points to, and the base of the object it points into.
+static int fp_frame_off(Value *v, int *off, int *base, int depth) {
+    v = val_resolve(v);
+    if (!v || v->kind != VAL_INST || !v->def || depth > 8) return 0;
+    Inst *d = v->def;
+    if (d->kind == IK_ADDR) { *off = *base = d->imm; return 1; }
+    if (d->kind == IK_ADD && d->nops == 2) {
+        for (int s = 0; s < 2; s++) {
+            Value *k = val_resolve(d->ops[s]);
+            int kv;
+            if (k && k->kind == VAL_CONST) kv = k->iconst;
+            else if (k && k->kind == VAL_INST && k->def && k->def->kind == IK_CONST) kv = k->def->imm;
+            else continue;
+            if (fp_frame_off(d->ops[1 - s], off, base, depth + 1)) { *off += kv; return 1; }
+        }
+    }
+    return 0;
+}
+
+static int fp_access_size(Inst *inst) {
+    if (inst->size) return inst->size;
+    return inst->kind == IK_LOAD ? vtype_size(inst->dst->vtype) : vtype_size(val_resolve(inst->ops[1])->vtype);
+}
+
+typedef struct {
+    Function *f;
+    FPKey    *keys; int nkeys;
+    Value   **last;     // [key * nb + block]: value of the last store in the block, or NULL
+    Value   **entry;    // [key * nb + block]: value on entry to the block, once known
+    Inst    **phis; int nphis, phicap;
+    int      *bix;      // block id -> index in f->blocks
+} FPState;
+
+static Value *fp_entry(FPState *s, int k, Block *b);
+
+static Value *fp_end(FPState *s, int k, Block *b) {
+    Value *v = s->last[k * s->f->nblocks + s->bix[b->id]];
+    return v ? v : fp_entry(s, k, b);
+}
+
+static Value *fp_entry(FPState *s, int k, Block *b) {
+    int nb = s->f->nblocks, slot = k * nb + s->bix[b->id];
+    if (s->entry[slot]) return s->entry[slot];
+    if (b->npreds == 0)
+        return s->entry[slot] = new_value(s->f, VAL_UNDEF, s->keys[k].vt);
+    if (b->npreds == 1)
+        return s->entry[slot] = fp_end(s, k, b->preds[0]);
+    Value *pv = new_value(s->f, VAL_INST, s->keys[k].vt);
+    Inst *phi = new_inst(s->f, b, IK_PHI, pv);
+    if (b->head) inst_insert_before(b->head, phi); else inst_append(b, phi);
+    s->entry[slot] = pv;                  // before the operands: a loop reads it back
+    for (int p = 0; p < b->npreds; p++) inst_add_op(phi, fp_end(s, k, b->preds[p]));
+    if (s->nphis == s->phicap) {
+        s->phicap = s->phicap ? 2 * s->phicap : 32;
+        s->phis = realloc(s->phis, s->phicap * sizeof(Inst *));
+    }
+    s->phis[s->nphis++] = phi;
+    return pv;
+}
+
+static int fp_find(FPKey *keys, int n, int off, int size) {
+    for (int i = 0; i < n; i++) if (keys[i].off == off && keys[i].size == size) return i;
+    return -1;
+}
+
+int opt_frame_promote(Function *f) {
+    int nb = f->nblocks;
+    if (nb == 0 || f->blocks[0]->npreds > 0) return 0;
+
+    // Object bases, for escape extents.
+    int nbase = 0, capb = 16;
+    int *bases = malloc(capb * sizeof(int));
+    for (int bi = 0; bi < nb; bi++)
+        for (Inst *i = f->blocks[bi]->head; i; i = i->next)
+            if (!i->is_dead && i->kind == IK_ADDR) {
+                if (nbase == capb) { capb *= 2; bases = realloc(bases, capb * sizeof(int)); }
+                bases[nbase++] = i->imm;
+            }
+    if (nbase == 0) { free(bases); return 0; }
+
+    // Escapes and accesses.
+    int nesc = 0, cape = 8, nk = 0, capk = 32;
+    int *esc = malloc(cape * sizeof(int));
+    FPKey *keys = malloc(capk * sizeof(FPKey));
+    for (int bi = 0; bi < nb; bi++)
+        for (Inst *i = f->blocks[bi]->head; i; i = i->next) {
+            if (i->is_dead) continue;
+            for (int j = 0; j < i->nops; j++) {
+                int off, base;
+                if (!fp_frame_off(i->ops[j], &off, &base, 0)) continue;
+                int is_addr = (i->kind == IK_LOAD && j == 0) || (i->kind == IK_STORE && j == 0 && i->nops == 2);
+                int derived = (i->kind == IK_ADD && i->dst && fp_frame_off(i->dst, &(int){0}, &(int){0}, 0));
+                if (derived) continue;
+                if (!is_addr) {
+                    if (nesc == cape) { cape *= 2; esc = realloc(esc, cape * sizeof(int)); }
+                    esc[nesc++] = base;
+                    continue;
+                }
+                int a = off + i->imm, sz = fp_access_size(i);
+                ValType vt = i->kind == IK_LOAD ? i->dst->vtype : VT_VOID;
+                int k = fp_find(keys, nk, a, sz);
+                if (k < 0) {
+                    if (nk == capk) { capk *= 2; keys = realloc(keys, capk * sizeof(FPKey)); }
+                    keys[nk] = (FPKey){a, sz, vt, 0};
+                    k = nk++;
+                } else if (vt != VT_VOID) {
+                    if (keys[k].vt == VT_VOID) keys[k].vt = vt;
+                }
+                if (i->is_volatile || sz != 4 || a >= 0) keys[k].bad = 1;
+            }
+        }
+
+    // A key is promoted when nothing else touches its bytes: no escaped
+    // object's extent and no differently shaped access.
+    for (int e = 0; e < nesc; e++) {
+        int lo = esc[e], hi = lo < 0 ? 0 : 0x7fff;
+        for (int q = 0; q < nbase; q++) if (bases[q] > lo && bases[q] < hi) hi = bases[q];
+        for (int k = 0; k < nk; k++)
+            if (keys[k].off < hi && lo < keys[k].off + keys[k].size) keys[k].bad = 1;
+    }
+    for (int k = 0; k < nk; k++)
+        for (int q = 0; q < nk; q++)
+            if (q != k && keys[q].off < keys[k].off + keys[k].size && keys[k].off < keys[q].off + keys[q].size)
+                keys[k].bad = 1;
+    int ngood = 0;
+    for (int k = 0; k < nk; k++) {
+        if (keys[k].vt == VT_VOID) keys[k].vt = VT_I32;    // stored, never loaded
+        if (!keys[k].bad) ngood++;
+    }
+    free(bases); free(esc);
+    if (ngood == 0) { free(keys); return 0; }
+    if (getenv("FP_DEBUG"))
+        for (int k = 0; k < nk; k++)
+            fprintf(stderr, "  [fp] %s: bp%+d:%d %s\n", f->name, keys[k].off, keys[k].size, keys[k].bad ? "kept" : "promoted");
+
+    int maxid = 0;
+    for (int bi = 0; bi < nb; bi++) if (f->blocks[bi]->id > maxid) maxid = f->blocks[bi]->id;
+    int *bix = malloc((maxid + 1) * sizeof(int));
+    for (int bi = 0; bi < nb; bi++) bix[f->blocks[bi]->id] = bi;
+    FPState s = { f, keys, nk, calloc((size_t)nk * nb, sizeof(Value *)), calloc((size_t)nk * nb, sizeof(Value *)), NULL, 0, 0, bix };
+
+    // The key an instruction accesses, if promoted.
+    #define FP_KEY_OF(i, out) do { int _o, _b; (out) = -1; \
+        if (!(i)->is_dead && ((i)->kind == IK_LOAD || ((i)->kind == IK_STORE && (i)->nops == 2)) && \
+            fp_frame_off((i)->ops[0], &_o, &_b, 0)) { \
+            int _k = fp_find(keys, nk, _o + (i)->imm, fp_access_size(i)); \
+            if (_k >= 0 && !keys[_k].bad) (out) = _k; } } while (0)
+
+    for (int bi = 0; bi < nb; bi++)
+        for (Inst *i = f->blocks[bi]->head; i; i = i->next) {
+            int k; FP_KEY_OF(i, k);
+            if (k >= 0 && i->kind == IK_STORE) s.last[k * nb + bi] = i->ops[1];
+        }
+
+    int changed = 0;
+    Value **cur = calloc(nk, sizeof(Value *));
+    for (int bi = 0; bi < nb; bi++) {
+        Block *b = f->blocks[bi];
+        memset(cur, 0, nk * sizeof(Value *));
+        Inst *i = b->head;
+        while (i) {
+            Inst *next = i->next;
+            int k; FP_KEY_OF(i, k);
+            if (k >= 0) {
+                if (i->kind == IK_STORE) {
+                    cur[k] = i->ops[1];
+                } else {
+                    Value *v = cur[k] ? cur[k] : fp_entry(&s, k, b);
+                    Value *rv = val_resolve(v);
+                    if (rv->vtype == i->dst->vtype && rv->kind != VAL_CONST) {
+                        i->dst->alias = v;
+                    } else {
+                        // Another C type over the same bits (a union pun), or a
+                        // constant typed for its expression: keep the load's type.
+                        Value *nv = i->dst;
+                        Inst *cp = new_inst(f, b, IK_COPY, nv);
+                        inst_insert_before(i, cp);
+                        inst_add_op(cp, v);
+                        cp->line = i->line;
+                    }
+                }
+                if (i->prev) i->prev->next = i->next; else b->head = i->next;
+                if (i->next) i->next->prev = i->prev; else b->tail = i->prev;
+                i->is_dead = 1;
+                changed++;
+            }
+            i = next;
+        }
+    }
+    #undef FP_KEY_OF
+
+    // Trivial phis (every operand the phi itself or one other value) fold.
+    for (int again = 1; again; ) {
+        again = 0;
+        for (int p = 0; p < s.nphis; p++) {
+            Inst *phi = s.phis[p];
+            if (phi->is_dead) continue;
+            Value *same = NULL; int trivial = 1;
+            for (int j = 0; j < phi->nops; j++) {
+                Value *o = val_resolve(phi->ops[j]);
+                if (o == phi->dst || o == same) continue;
+                if (same) { trivial = 0; break; }
+                same = o;
+            }
+            if (!trivial) continue;
+            if (!same) same = new_value(f, VAL_UNDEF, phi->dst->vtype);
+            phi->dst->alias = same;
+            Block *b = phi->block;
+            if (phi->prev) phi->prev->next = phi->next; else b->head = phi->next;
+            if (phi->next) phi->next->prev = phi->prev; else b->tail = phi->prev;
+            phi->is_dead = 1;
+            again = 1;
+        }
+    }
+    free(cur); free(s.last); free(s.entry); free(s.phis); free(keys); free(bix);
+    if (changed) recount_uses(f);
+    return changed;
+}

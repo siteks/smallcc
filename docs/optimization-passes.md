@@ -35,6 +35,7 @@ compute_dominators()         structural prerequisite
 
 ── Pre-OOS passes (true SSA form, phis present) ───────────────────
 
+opt_frame_promote()                (frame_promote)
 opt_redundant_bool()         R2G   OPT_REDUNDANT_BOOL
 opt_narrow_loads()           R2H   OPT_NARROW_LOADS
 opt_known_bits()             R2K   (always on)
@@ -130,6 +131,7 @@ detection and accumulator promotion.
 | R2L | — | `opt_bitwise_dist` | `OP(AND(a,c),AND(b,c))` → `AND(OP(a,b),c)` |
 | GVN | `OPT_CSE` | `opt_pre_oos_cse` | Dominator-tree CSE on true SSA form |
 | — | `OPT_CSE` | `opt_load_cse` | Reuse identical dominating loads (clobber-free region; const addrs skipped) |
+| — | — | `opt_frame_promote` | Scalar replacement of aggregates: each 4-byte field of a local that never escapes becomes an SSA value (stores define it, loads read it, phis built on demand at joins). Escape = a frame address reaching anything but a load/store address or a constant add; the object's extent runs to the next frame base, as in Pass H. Parameters are left in memory. `frame_promote` |
 | — | — | `opt_range_check` | `AND(LE(a,x), LE(x,b))` → `ULE(SUB(x,a), b-a)` |
 | — | — | `opt_narrow_wrap_range` | Drop braun's wrap of an unsigned char/short `x + k` when a dominating branch bounds `x` (`i < 8` before `i++`), so counted loops stay visible to down-counting |
 | — | — | `opt_scalar_promote` | Hoist load-modify-store to register accumulator phi |
@@ -267,6 +269,8 @@ Rerun it after a change to the ISA or to these passes.
 | `ipra` | allocator, emission | qualifying static functions take their own convention | 1 | 1 |
 | `ipra_reserve` | allocator | ... only if they leave this many registers unwritten | 2 | 0 |
 | `inline_cf_nodes` | braun inliner | inline functions with control flow up to this many AST nodes (0: only straight-line bodies) | 0 | 160 |
+| `frame_promote` | `opt_frame_promote` | promote non-escaping frame slots to SSA values | 1 | 1 |
+| `spill_cost` | allocator | spill cost: 0 = use count scaled by the def's loop depth; 1 = every use and def weighted by its own loop depth | 1 | 1 |
 
 Both targets settle on less aggressive constant hoisting and strength
 reduction than the old hand-set values (2, 5, 16, 2, 4, 1, 4, 4, 10, 6, 4):
@@ -291,6 +295,22 @@ fail to converge (it then refuses to emit code). Legalize Pass F also turns
 a constant stored to memory into an `IK_CONST` so LICM can hoist it: a store
 has no immediate form, and inlining a fill loop with a constant value
 otherwise materialised it on every iteration.
+
+Struct-returning functions inline through the same path: the result is the
+address of the callee's local (a slot in the caller's frame), which every
+consumer copies at once, as with a real call (docs/abi.md §4.4). With
+`inline_cf_nodes = 0` a straight-line body of up to 80 nodes still takes
+this path when a struct local or a struct result is all that kept it from
+the plain inliner. A small 4-aligned struct copy is emitted as word loads
+and stores rather than `IK_MEMCPY`, so `opt_frame_promote` sees through
+struct assignments and arguments, and the copy costs two instructions per
+word instead of per halfword. Together these took the by-value ray tracer
+from 260M to 87M cycles on CPU5 (283M to 126M on CPU4).
+
+`spill_cost = 1` weights each reload and spill store by the loop depth of
+the block it would go in, so a value defined outside a loop but used inside
+it is expensive to spill. The older cost (use count scaled by the def's
+depth) undervalued exactly those values.
 
 Two policies are fixed rather than tuned:
 

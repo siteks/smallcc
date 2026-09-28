@@ -654,6 +654,25 @@ static int assign_colors(IGraph *g, Function *f, int K, int pessimistic,
     for (int bi = 0; bi < f->nblocks && !has_loops; bi++)
         if (f->blocks[bi]->loop_depth > 0) has_loops = 1;
 
+    // spill_cost = 1: the cost of spilling a node is its reloads and spill
+    // stores, every use and def weighted by its own block's loop depth
+    // (coalesced nodes summed). 0: use_count scaled by the def's depth.
+    long long *usew = g_tune.spill_cost ? calloc(nv, sizeof(long long)) : NULL;
+    if (usew)
+        for (int bi = 0; bi < f->nblocks; bi++) {
+            int d = f->blocks[bi]->loop_depth; if (d > 20) d = 20;
+            long long w = 1LL << d;
+            for (Inst *inst = f->blocks[bi]->head; inst; inst = inst->next) {
+                if (inst->is_dead) continue;
+                for (int j = 0; j < inst->nops; j++) {
+                    Value *o = val_resolve(inst->ops[j]);
+                    if (o && o->kind == VAL_INST && o->id >= 0 && o->id < nv) usew[ig_find(g, o->id)] += w;
+                }
+                if (inst->dst && inst->dst->kind == VAL_INST && inst->dst->id >= 0 && inst->dst->id < nv)
+                    usew[ig_find(g, inst->dst->id)] += w;
+            }
+        }
+
     while (remaining > 0) {
         // Find a node with degree < K.
         // In loop-free leaf functions, defer pre-scan-hinted values so
@@ -710,7 +729,7 @@ static int assign_colors(IGraph *g, Function *f, int K, int pessimistic,
                     int depth = (vi->def && vi->def->block)
                                 ? vi->def->block->loop_depth : 0;
                     if (depth > 20) depth = 20;
-                    long long cost_i = (long long)vi->use_count << depth;
+                    long long cost_i = usew ? usew[i] : (long long)vi->use_count << depth;
                     // Prefer minimum cost_i/degree[i]; compare via cross-multiply
                     // to avoid division: cost_i/deg_i < cost_w/deg_w
                     //   ⟺  cost_i * deg_w < cost_w * deg_i
@@ -762,6 +781,8 @@ static int assign_colors(IGraph *g, Function *f, int K, int pessimistic,
             }
         }
     }
+
+    free(usew);
 
     // Assign colors from stack (pop order). Values that already have a
     // spill slot go first: rewrite_spills cut them to [def, spill store],
