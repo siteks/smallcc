@@ -494,6 +494,15 @@ void legalize_function(Function *f) {
     // copy zero-extends (high bits 0) so AND with any mask c2 ≤ 0xff is safe.
     // Dead inner AND + IK_CONST(255) + copy are removed by irc_allocate DCE.
     if (opt_flags & OPT_LEG_E) {
+        // After out-of-SSA a phi-variable has one definition per incoming
+        // path, and Value.def is only one of them: following it (or
+        // repointing to a value that is redefined) is unsound. Everything the
+        // fold looks through or repoints to must have a single definition.
+        int *ndefs = calloc(f->nvalues + 1, sizeof(int));
+        for (int bi = 0; bi < f->nblocks; bi++)
+            for (Inst *d = f->blocks[bi]->head; d; d = d->next)
+                if (!d->is_dead && d->dst && d->dst->id < f->nvalues) ndefs[d->dst->id]++;
+#define SINGLE_DEF(v) ((v)->kind != VAL_INST || ((v)->id < f->nvalues && ndefs[(v)->id] == 1))
         for (int bi = 0; bi < f->nblocks; bi++) {
             Block *b = f->blocks[bi];
             for (Inst *inst = b->head; inst; inst = inst->next) {
@@ -511,13 +520,17 @@ void legalize_function(Function *f) {
                 // hangs the compiler (found by tools/fuzz.py, seed 77).
                 Value *orig0 = val_resolve(inst->ops[0]);  // the value the AND actually uses
                 Value *inner = orig0;
+                int multi = 0;
                 for (int hops = 0;
                      inner && inner->kind == VAL_INST && inner->def &&
                      inner->def->kind == IK_COPY && inner->def->nops >= 1 &&
-                     hops < 16; hops++)
+                     hops < 16; hops++) {
+                    if (!SINGLE_DEF(inner)) { multi = 1; break; }
                     inner = val_resolve(inner->def->ops[0]);
+                }
+                if (multi) continue;
 
-                if (!inner || inner->kind != VAL_INST || !inner->def) continue;
+                if (!inner || inner->kind != VAL_INST || !inner->def || !SINGLE_DEF(inner)) continue;
                 if (inner->def->kind != IK_AND || inner->def->nops < 2) continue;
                 // ILP32 safety: the inner AND must be in the same block as the
                 // outer AND. Without this, the repoint at line 200 can move a
@@ -533,6 +546,7 @@ void legalize_function(Function *f) {
                 if (get_iconst(val_resolve(inner->def->ops[1]), &c1))      inner_const_pos = 1;
                 else if (get_iconst(val_resolve(inner->def->ops[0]), &c1)) inner_const_pos = 0;
                 if (inner_const_pos < 0) continue;
+                if (!SINGLE_DEF(val_resolve(inner->def->ops[1 - inner_const_pos]))) continue;
 
                 int combined = c1 & c2;
                 // Repoint outer AND's first operand past the inner AND (and any
@@ -559,6 +573,8 @@ void legalize_function(Function *f) {
                 // If combined == c2, ops[1] is already the right constant; leave it alone.
             }
         }
+#undef SINGLE_DEF
+        free(ndefs);
     }
 
     // ── Pass F: Materialize large VAL_CONST binary ALU operands ────────────

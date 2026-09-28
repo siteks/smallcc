@@ -32,6 +32,8 @@ typedef struct Tune {
     int licm_dense_hi;     //   more loop-defined values than this: at most 1 hoist
     int licm_dense_lo;     //   more than this: at most 2
     int lsr_reserve;       // LSR: K - this - live-ins reductions
+    int ipra;              // 1: qualifying static functions save no registers (irc_is_internal) ...
+    int ipra_reserve;      //   ... if they leave at least this many registers unwritten for callers
 } Tune;
 extern Tune g_tune;        // the target's, then -Oparam overrides
 int tune_set(const char *name_eq_value);   // 0 if the name is unknown

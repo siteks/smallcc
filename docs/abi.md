@@ -74,6 +74,15 @@ above (a returned `char` is sign- or zero-extended into r0).
 
 **Struct return value:** see §4.4.
 
+**Static functions with their own convention.** A `static` function whose
+address is never taken and which no earlier function in its file (nor
+itself) calls may skip saving callee-save registers: every call to it is
+compiled after it, and the compiler records exactly which registers it
+writes, so callers keep their live values elsewhere. On CPU5 a qualifying
+function always does this; on CPU4 only if it leaves at least two registers
+unwritten (`ipra`, `ipra_reserve` in `target.c`). Such a function is never
+visible outside its file, so nothing outside the compiler depends on this.
+
 **CPU5 (draft, `-arch cpu5`).** Sixteen general registers with the smallest
 change from the CPU4 table above: `r0` returns and `r1`–`r3` carry the first
 three arguments exactly as on CPU4; `r0`–`r7` are caller-save and `r8`–`r15`

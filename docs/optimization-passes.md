@@ -264,12 +264,21 @@ Rerun it after a change to the ISA or to these passes.
 | `licm_dense_hi` | `opt_licm` | more loop-defined values than this: at most 1 hoist | 30 | 1000 (off) |
 | `licm_dense_lo` | `opt_licm` | more than this: at most 2 | 6 | 14 |
 | `lsr_reserve` | `opt_lsr` | reductions K - this - live-ins | 7 | 15 (LSR effectively off) |
+| `ipra` | allocator, emission | qualifying static functions take their own convention | 1 | 1 |
+| `ipra_reserve` | allocator | ... only if they leave this many registers unwritten | 2 | 0 |
 
 Both targets settle on less aggressive constant hoisting and strength
 reduction than the old hand-set values (2, 5, 16, 2, 4, 1, 4, 4, 10, 6, 4):
 on CPU4 a hoisted constant or reduced multiply competes for 8 registers,
 and on CPU5 most constants fit a 16-bit immediate, so hoisting one replaces a
 free operand with a register.
+
+`ipra` and `ipra_reserve` control the per-function convention for
+qualifying static functions (docs/abi.md): with `ipra = 1` such a function
+saves no callee-saved registers and its callers avoid every register it
+writes, provided it leaves at least `ipra_reserve` registers unwritten.
+CPU4 uses 1 and 2 (8 registers: a callee that writes almost all of them
+pushes spills into its callers), CPU5 1 and 0.
 
 Two policies are fixed rather than tuned:
 

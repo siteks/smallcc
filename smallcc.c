@@ -333,6 +333,77 @@ static void run_post_oos_pipeline(Function *f) {
     verify_function(f, "irc", VERIFY_POST_IRC);
 }
 
+// ---- Functions with their own calling convention ---------------------
+//
+// A static function whose address is never taken, and which neither calls
+// itself nor is called by any function defined before it in this file, has
+// every call to it compiled after it (functions are compiled in source
+// order). Its callers therefore know exactly which
+// registers it writes (alloc.c records them), so it need not save the
+// callee-saved ones; they keep live values only in registers it leaves
+// alone. irc_set_internal marks it.
+
+typedef struct { const char *label; int index; int addr_taken; int called_early; } IpraFn;
+
+static IpraFn *ipra_find(IpraFn *fs, int n, const char *label) {
+    for (int i = 0; i < n; i++) if (!strcmp(fs[i].label, label)) return &fs[i];
+    return NULL;
+}
+
+// Walk n, recording calls made from the function at `from` (-1: outside any
+// function) and non-call uses (address taken) of the file's static functions.
+static void ipra_walk(Node *n, int from, IpraFn *fs, int nfs) {
+    for (; n; n = n->next) {
+        if (n->kind == ND_IDENT && n->symbol && n->symbol->type &&
+            istype_function(n->symbol->type) && n->symbol->kind == SYM_STATIC_GLOBAL) {
+            IpraFn *t = ipra_find(fs, nfs, sym_label(n->symbol));
+            if (t) {
+                if (!n->u.ident.is_function) t->addr_taken = 1;
+                else if (from < 0 || from <= t->index) t->called_early = 1;   // itself, or an earlier caller
+            }
+        }
+        for (int i = 0; i < 4; i++) ipra_walk(n->ch[i], from, fs, nfs);
+        if (n->kind == ND_PROGRAM) return;
+    }
+}
+
+static void mark_internal_functions(Node *decls) {
+    int nfs = 0;
+    for (Node *d = decls; d; d = d->next)
+        if (d->kind == ND_DECLARATION && d->u.declaration.is_func_defn) nfs++;
+    if (!nfs) return;
+    IpraFn *fs = calloc(nfs, sizeof *fs);
+    int k = 0;
+    for (Node *d = decls; d; d = d->next) {
+        if (d->kind != ND_DECLARATION || !d->u.declaration.is_func_defn) continue;
+        Node *decl = d->ch[1];
+        Symbol *sym = decl ? decl->symbol : NULL;
+        fs[k].label = sym ? sym_label(sym) : "";
+        fs[k].index = k;
+        fs[k].addr_taken = !sym || sym->kind != SYM_STATIC_GLOBAL;   // only static functions qualify
+        k++;
+    }
+    k = 0;
+    for (Node *d = decls; d; d = d->next) {
+        if (d->kind != ND_DECLARATION) continue;
+        if (d->u.declaration.is_func_defn) {
+            Node *next = d->next; d->next = NULL;      // walk this definition alone
+            ipra_walk(d, k++, fs, nfs);
+            d->next = next;
+        } else {
+            Node *next = d->next; d->next = NULL;      // initialisers can take addresses
+            ipra_walk(d, -1, fs, nfs);
+            d->next = next;
+        }
+    }
+    for (int i = 0; i < nfs; i++)
+        if (!fs[i].addr_taken && !fs[i].called_early && fs[i].label[0]) {
+            irc_set_internal(fs[i].label);
+            if (getenv("IPRA_DEBUG")) fprintf(stderr, "ipra: %s has its own convention\n", fs[i].label);
+        }
+    free(fs);
+}
+
 int main(int argc, char **argv)
 {
     // Parse flags: -o outfile, -stats, -DNAME[=VALUE]
@@ -729,6 +800,7 @@ int main(int argc, char **argv)
             if (irsim) irsim_populate_globals(irsim, sx_prog);
             // Phase 2: compile each function directly from Node* to SSA
             Node *decls = (node && node->kind == ND_PROGRAM) ? node->ch[0] : node;
+            mark_internal_functions(decls);
             for (Node *d = decls; d; d = d->next) {
                 if (d->kind != ND_DECLARATION || !d->u.declaration.is_func_defn) continue;
                 Function *f = braun_function(d, tu, &cpu4_strlit_id);

@@ -26,6 +26,36 @@ typedef struct ClobberEntry {
 
 static ClobberEntry *clobber_head = NULL;
 
+// Functions with their own convention (irc_set_internal): static, address
+// never taken, and every call compiled after them, so each caller sees their
+// real clobber set. They save no registers; their recorded clobbers are
+// every register they write, callee-saved ones included.
+// A qualifying function takes the convention only if, once allocated, it
+// leaves at least ipra_reserve registers unwritten for its callers' live
+// values (else its callers would spill those values for their whole live
+// range, which costs more than its saves); the choice is made when its
+// clobbers are recorded, before any caller is compiled.
+typedef struct InternalName { char *name; int decided, internal; struct InternalName *next; } InternalName;
+static InternalName *internal_head = NULL;
+
+static InternalName *internal_find(const char *name) {
+    for (InternalName *e = internal_head; e; e = e->next)
+        if (!strcmp(e->name, name)) return e;
+    return NULL;
+}
+
+void irc_set_internal(const char *name) {
+    InternalName *e = calloc(1, sizeof *e);
+    e->name = strdup(name); e->next = internal_head; internal_head = e;
+}
+
+// Whether f may use the convention (qualifies and, if decided, took it).
+int irc_is_internal(const char *name) {
+    if (!name || !g_tune.ipra) return 0;
+    InternalName *e = internal_find(name);
+    return e && (!e->decided || e->internal);
+}
+
 static ClobberEntry *find_clobber_entry(const char *name) {
     if (!name) return NULL;
     for (ClobberEntry *e = clobber_head; e; e = e->next)
@@ -59,6 +89,26 @@ void irc_add_clobbers(const char *name, regmask_t mask) {
 
 static void record_function_clobbers(Function *f) {
     if (!f->name) return;
+    int internal = irc_is_internal(f->name);
+    if (internal) {
+        // Decide: every register it writes (and its callees clobber) must
+        // leave ipra_reserve registers free.
+        regmask_t all = 0;
+        for (int bi = 0; bi < f->nblocks; bi++)
+            for (Inst *inst = f->blocks[bi]->head; inst; inst = inst->next) {
+                if (inst->is_dead) continue;
+                if (inst->dst && inst->dst->phys_reg >= 0) all |= 1u << inst->dst->phys_reg;
+                if (inst->kind == IK_CALL && inst->fname) all |= lookup_clobbers(inst->fname);
+                else if (inst->kind == IK_ICALL) all |= g_target->caller_saved;
+            }
+        InternalName *e = internal_find(f->name);
+        e->decided = 1;
+        e->internal = __builtin_popcount(all) <= g_target->nregs - g_tune.ipra_reserve;
+        internal = e->internal;
+        if (getenv("IPRA_DEBUG"))
+            fprintf(stderr, "ipra: %s writes %d registers: %s\n", f->name,
+                    __builtin_popcount(all), internal ? "own convention" : "standard");
+    }
     regmask_t mask = 0;
     for (int bi = 0; bi < f->nblocks; bi++) {
         for (Inst *inst = f->blocks[bi]->head; inst; inst = inst->next) {
@@ -68,7 +118,8 @@ static void record_function_clobbers(Function *f) {
             // caller keeps there survives the call.  Recording them here made
             // callers spill everything live across a call to any callee that
             // happened to use all four.
-            if (inst->dst && reg_in(g_target->caller_saved, inst->dst->phys_reg))
+            if (inst->dst && reg_in(internal ? target_all_regs() : g_target->caller_saved,
+                                    inst->dst->phys_reg))
                 mask |= (1u << inst->dst->phys_reg);
             if (inst->kind == IK_CALL && inst->fname)
                 mask |= lookup_clobbers(inst->fname);
@@ -435,7 +486,7 @@ static IGraph *build_interference_graph(Function *f) {
                 else if (inst->kind == IK_ICALL)
                     cmask = g_target->caller_saved;  // unknown target: all caller-saved
                 else
-                    cmask = lookup_clobbers(inst->fname) & g_target->caller_saved;
+                    cmask = lookup_clobbers(inst->fname);   // callee-saved too for an internal callee
                 for (int w = 0; w < nw; w++) {
                     uint32_t word = live[w];
                     while (word) {

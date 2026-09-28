@@ -31,4 +31,9 @@ void irc_allocate(Function *f);
 // compiled later must not keep values in them across a call.
 void irc_add_clobbers(const char *name, regmask_t mask);
 
+// Mark a function as having its own convention (see smallcc.c
+// mark_internal_functions); irc_is_internal is false when -Oparam=ipra=0.
+void irc_set_internal(const char *name);
+int  irc_is_internal(const char *name);
+
 #endif // ALLOC_H

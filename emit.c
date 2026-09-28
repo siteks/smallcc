@@ -1304,15 +1304,18 @@ static void remap_single_use_values(Function *f) {
             // (typical case: an IK_GADDR computed before a call, with
             // its single user being a pre-colored IK_COPY for a *later*
             // call's argument list).
+            // Any call counts: a callee may clobber any caller-saved
+            // register, and one with its own convention (irc_is_internal)
+            // callee-saved ones too. (This test used to be `target <= 3`,
+            // CPU4's caller-saved set, and let CPU5 values in r4-r7 be
+            // clobbered.)
             int between = 0;
-            int target_caller_saved = (target >= 0 && target <= 3);
             for (Inst *p = inst->next; p != user; p = p->next) {
                 if (p->is_dead) continue;
                 if (p->dst && p->dst->phys_reg == target)
                     { between = 1; break; }
-                if (target_caller_saved &&
-                    (p->kind == IK_CALL || p->kind == IK_ICALL ||
-                     p->kind == IK_PUTCHAR || p->kind == IK_SWITCH))
+                if (p->kind == IK_CALL || p->kind == IK_ICALL ||
+                    p->kind == IK_PUTCHAR || p->kind == IK_SWITCH)
                     { between = 1; break; }
                 for (int i = 0; i < p->nops; i++) {
                     Value *op = val_resolve(p->ops[i]);
@@ -1341,7 +1344,10 @@ static void remap_single_use_values(Function *f) {
 // Returns callee_frame (total bytes for callee-saved registers).
 static int emit_prologue(Function *f, FILE *out, int frame, int callee_save[MAX_GPR]) {
     // Detect which callee-saved registers are used by non-param values.
-    for (int i = 0; i < f->nvalues; i++) {
+    // A function with its own convention saves none: its callers know it
+    // clobbers them.
+    int internal = irc_is_internal(f->name);
+    for (int i = 0; i < f->nvalues && !internal; i++) {
         Value *v = f->values[i];
         if (!reg_in(g_target->callee_saved, v->phys_reg)) continue;
         int is_param = 0;
