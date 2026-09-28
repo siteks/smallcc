@@ -294,6 +294,25 @@ static void legalize_slot_forward(Function *f) {
     free(order); free(exit); free(done); free(esc); free(wcache); free(live);
 }
 
+// The immediate instruction emit.c uses for a constant operand of kind k
+// (the P18/P19 forms); FEQ/FNE emit as integer eq/ne.
+static const char *passf_imm_mnem(InstKind k) {
+    switch (k) {
+    case IK_MUL:  return "mulli";
+    case IK_DIV:  return "divsli";
+    case IK_UDIV: return "divli";
+    case IK_MOD:  return "modsli";
+    case IK_UMOD: return "modli";
+    case IK_OR:   return "orli";
+    case IK_XOR:  return "xorli";
+    case IK_SHL:  return "shlli";
+    case IK_SHR:  return "shrsli";
+    case IK_USHR: return "shrli";
+    case IK_FNE:  return "neli";
+    default:      return "eqli";
+    }
+}
+
 void legalize_function(Function *f) {
     if (!f || f->nblocks == 0) return;
 
@@ -584,7 +603,8 @@ void legalize_function(Function *f) {
                     if (p->def->kind == IK_ADDR && !p->def->is_dead) {
                         // fall into the frame case below (base keeps its use until then)
                     } else {
-                        if (noff % size != 0 || noff / size < -511 || noff / size > 511) continue;
+                        if (noff % size != 0 ||
+                            !isa_imm_fits(size == 1 ? "llb" : size == 2 ? "llw" : "lll", 0, noff / size)) continue;
                         inst->imm    = noff;
                         inst->ops[0] = p;
                         if (base->use_count > 0) base->use_count--;
@@ -662,7 +682,7 @@ void legalize_materialize_consts(Function *f) {
                         Value *v = inst->ops[j] ? val_resolve(inst->ops[j]) : NULL;
                         if (!v || v->kind != VAL_CONST) continue;
                         int k = v->iconst;
-                        if (k >= -256 && k <= 255) continue;  // F0b immediate range
+                        if (isa_imm_fits(passf_imm_mnem(inst->kind), 0, k)) continue;  // an immediate form takes it
                         int is_cmp = inst->kind == IK_FLT || inst->kind == IK_FLE ||
                                      inst->kind == IK_FEQ || inst->kind == IK_FNE;
                         Value *cv = new_value(f, VAL_INST, is_cmp ? v->vtype : inst->dst->vtype);
@@ -681,7 +701,11 @@ void legalize_materialize_consts(Function *f) {
                         if (!v || v->kind != VAL_CONST) continue;
                         int k = v->iconst;
                         if (inst->kind == IK_SUB && j == 1) k = -k;
-                        if (k >= -512 && k <= 511) continue;
+                        // Historical threshold: twice addli's range (CPU4
+                        // +-511). Constants just beyond addli take emit's
+                        // fallback; worth retuning.
+                        long alo, ahi;
+                        if (isa_imm_range("addli", 0, &alo, &ahi) && k >= 2 * alo && k <= 2 * ahi + 1) continue;
                         Value *cv = new_value(f, VAL_INST, inst->dst->vtype);
                         Inst  *ci = new_inst(f, b, IK_CONST, cv);
                         ci->imm  = v->iconst;
@@ -697,7 +721,7 @@ void legalize_materialize_consts(Function *f) {
                         Value *v = inst->ops[j] ? val_resolve(inst->ops[j]) : NULL;
                         if (!v || v->kind != VAL_CONST) continue;
                         int k = v->iconst;
-                        if (k >= 0 && k <= 255) continue;  // P14 andi/andli
+                        if (k >= 0 && isa_imm_fits("andli", 0, k)) continue;  // P14 andi/andli
                         if (k == 0xffff) continue;  // P8 zxw
                         Value *cv = new_value(f, VAL_INST, inst->dst->vtype);
                         Inst  *ci = new_inst(f, b, IK_CONST, cv);

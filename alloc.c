@@ -823,9 +823,9 @@ static int spill_size(ValType vt) {
 // encoding and instead picks an arbitrary tmp register — potential clobber.
 // Inserting an explicit IK_ADDR avoids the problem entirely.
 static int spill_in_f2_range(int off, int sz) {
-    if (sz == 4) return (off % 4) == 0 && off >= -256 && off <= 252;
-    if (sz == 2) return (off % 2) == 0 && off >= -128 && off <= 126;
-    return off >= -64 && off <= 63;
+    if (sz == 4) return (off % 4) == 0 && isa_imm_fits("ll", 0, off / 4);
+    if (sz == 2) return (off % 2) == 0 && isa_imm_fits("lw", 0, off / 2);
+    return isa_imm_fits("lb", 0, off);
 }
 
 // Insert an IK_ADDR instruction to compute bp+slot_offset into a fresh register.

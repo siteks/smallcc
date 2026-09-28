@@ -76,15 +76,21 @@ static void emit_src_comment(int line, FILE *out)
 // Helpers
 // ============================================================
 
-// Immediate-range limits used by the peephole range checks.
-// See docs/isa/cpu4.md for the encodings.
-#define IMM7_MIN      (-64)  // F2 signed 7-bit (addi, imm7-scaled load/store)
-#define IMM7_MAX        63
-#define IMM9_MIN     (-256)  // F0b signed 9-bit (addli/mulli/orli/...)
-#define IMM9_MAX       255
-#define ANDI_MAX       127   // F2 andi raw (unsigned) 7-bit mask
-#define CB_CONST_MAX   127   // F0c cbeq/cbne 7-bit unsigned compare value
-#define BR_DISP_RANGE  511   // F3c/F0c/F3d 10-bit signed branch displacement
+// Immediate ranges and branch reach come from the ISA definition through
+// the encoding queries in target.h (isa_imm_fits / isa_imm_range): each
+// check names the instruction it is about to emit.
+
+// Lower bound of mnemonic m's first immediate.
+static long imm_lo(const char *m) { long lo, hi; return isa_imm_range(m, 0, &lo, &hi) ? lo : 0; }
+
+// Forward reach in bytes of branch m's PC-relative displacement (its last
+// immediate); the backward reach is one more.
+static int br_reach(const char *m) {
+    long lo, hi;
+    for (int k = 2; k >= 0; k--)
+        if (isa_imm_range(m, k, &lo, &hi)) return (int)hi;
+    return 0;
+}
 
 static const char *regname(int r) {
     static const char *names[MAX_GPR] = {
@@ -174,9 +180,11 @@ static int preg(Value *v) {
 // Emit an immediate into a register (uses immw + immwh for large values)
 static void emit_imm(FILE *out, int rd, int val) {
     unsigned uval = (unsigned)val;
-    if (val == 0 && rd >= 0 && rd < g_target->nregs) {
-        fprintf(out, "    zero%d\n", rd);
-    } else if (val >= -64 && val <= 63) {
+    char zname[8];
+    snprintf(zname, sizeof zname, "zero%x", rd >= 0 ? rd : 0);
+    if (val == 0 && rd >= 0 && rd < g_target->nregs && isa_has(zname)) {
+        fprintf(out, "    %s\n", zname);
+    } else if (isa_imm_fits("imms", 0, val)) {
         fprintf(out, "    imms %s, %d\n", regname(rd), val);
     } else if (uval <= 0xffff) {
         fprintf(out, "    immw %s, %u\n", regname(rd), uval);
@@ -214,9 +222,9 @@ static int get_val_reg(FILE *out, Value *v, int scratch_rd) {
 // ll/sl: offset is imm7 * 4, range -256..+252 (must be mult of 4)
 // lb/sb: offset is imm7, range -64..+63
 
-static int f2_range_byte(int off) { return off >= IMM7_MIN && off <= IMM7_MAX; }
-static int f2_range_word(int off) { return (off % 2) == 0 && off >= IMM7_MIN*2 && off <= IMM7_MAX*2; }
-static int f2_range_long(int off) { return (off % 4) == 0 && off >= IMM7_MIN*4 && off <= IMM7_MAX*4; }
+static int f2_range_byte(int off) { return isa_imm_fits("lb", 0, off); }
+static int f2_range_word(int off) { return (off % 2) == 0 && isa_imm_fits("lw", 0, off / 2); }
+static int f2_range_long(int off) { return (off % 4) == 0 && isa_imm_fits("ll", 0, off / 4); }
 
 static int f2_range(int off, int size) {
     if (size == 1) return f2_range_byte(off);
@@ -444,7 +452,7 @@ static int p7_fold(InstKind kind, int32_t a, int32_t b, int32_t *result) {
 // P8/P14: AND(x, kv) with a single constant operand — zxb/zxw for
 // 0xFF/0xFFFF (P8), andi/andli for 0..255 (P14).
 static int p8_p14_and_fires(int kv) {
-    return (kv >= 0 && kv <= IMM9_MAX) || kv == 0xffff;
+    return (kv >= 0 && isa_imm_fits("andli", 0, kv)) || kv == 0xffff;
 }
 
 // P11/P13: SHL/SHR/USHR(x, k) with a resolvable constant shift amount
@@ -635,7 +643,7 @@ static void emit_inst(Inst *inst, FILE *out) {
                     fprintf(out, "    zxw %s\n", regname(rd));
                 else
                     fprintf(out, "    zxwor %s, %s, %s\n", regname(rd), regname(kreg), regname(kreg));
-            } else if (kv <= ANDI_MAX && kreg == rd) {
+            } else if (isa_imm_fits("andi", 0, kv) && kreg == rd) {
                 fprintf(out, "    andi %s, %d\n", regname(rd), kv);
             } else {
                 fprintf(out, "    andli %s, %s, %d\n", regname(rd), regname(kreg), kv);
@@ -655,16 +663,15 @@ static void emit_inst(Inst *inst, FILE *out) {
                     { fprintf(out, "    inc %s\n", regname(rd)); break; }
                 if (k == -1 && creg == rd)
                     { fprintf(out, "    dec %s\n", regname(rd)); break; }
-                if (k >= IMM7_MIN && k <= IMM7_MAX && creg == rd)
+                if (isa_imm_fits("addi", 0, k) && creg == rd)
                     { fprintf(out, "    addi %s, %d\n", regname(rd), k); break; }
-                if (k >= IMM9_MIN && k <= IMM9_MAX)
+                if (isa_imm_fits("addli", 0, k))
                     { fprintf(out, "    addli %s, %s, %d\n", regname(rd), regname(creg), k); break; }
             }
         }
 
         // P18: MUL(x, k) where k fits sext9 → mulli (F0b, 3 bytes vs 5 for immw+mul)
-        if (inst->kind == IK_MUL && (c0 ^ c1) &&
-            cv >= IMM9_MIN && cv <= IMM9_MAX) {
+        if (inst->kind == IK_MUL && (c0 ^ c1) && isa_imm_fits("mulli", 0, cv)) {
             fprintf(out, "    mulli %s, %s, %d\n", regname(rd), regname(creg), cv);
             break;
         }
@@ -702,7 +709,7 @@ static void emit_inst(Inst *inst, FILE *out) {
 
         // P19: F0b immediate ALU (3 bytes vs 5 for immw+alu)
         // Covers comparisons, div/mod, or/xor, reverse-sub not handled by P2-P18.
-        if ((c0 ^ c1) && cv >= IMM9_MIN && cv <= IMM9_MAX) {
+        if (c0 ^ c1) {
             const char *mnem = NULL;
             int k = cv;
             switch (inst->kind) {
@@ -713,7 +720,7 @@ static void emit_inst(Inst *inst, FILE *out) {
             // LE with const on left → a > const-1 → gtsli/gtli
             case IK_LE:
                 if (c1) { mnem = is_signed ? "lesli" : "leli"; }
-                else if (k > (is_signed ? IMM9_MIN : 0))
+                else if (k > (is_signed ? imm_lo("gtsli") : 0))
                     { mnem = is_signed ? "gtsli" : "gtli"; k--; }
                 break;
             case IK_ULE:
@@ -724,7 +731,7 @@ static void emit_inst(Inst *inst, FILE *out) {
             // LT with const on right → a <= const-1 → lesli/leli
             case IK_LT:
                 if (c0) { mnem = is_signed ? "gtsli" : "gtli"; }
-                else if (k > (is_signed ? IMM9_MIN : 0))
+                else if (k > (is_signed ? imm_lo("lesli") : 0))
                     { mnem = is_signed ? "lesli" : "leli"; k--; }
                 break;
             case IK_ULT:
@@ -743,7 +750,9 @@ static void emit_inst(Inst *inst, FILE *out) {
             case IK_XOR:  mnem = "xorli"; break;
             default: break;
             }
-            if (mnem) {
+            // The constant must fit the chosen instruction as written and
+            // as adjusted (k - 1 for the strict/non-strict flips).
+            if (mnem && isa_imm_fits(mnem, 0, cv) && isa_imm_fits(mnem, 0, k)) {
                 fprintf(out, "    %s %s, %s, %d\n", mnem, regname(rd), regname(creg), k);
                 break;
             }
@@ -1739,27 +1748,24 @@ static int is_known_zero(Value *v) {
 
 // Byte count for a CPU4 mnemonic. Returns 0 for unknown / non-instructions
 // (labels, directives, blank lines). See docs/isa/cpu4.md.
-static int cpu4_mnem_bytes(const char *m) {
+// Bytes a line of emitted assembly assembles to: an instruction's size from
+// the ISA definition; data directives (jump tables) by their values.
+static int line_bytes(const char *m, const char *args, const char *lend) {
     if (!m || !*m) return 0;
-    // F0a (1 byte)
-    if (!strcmp(m, "halt") || !strcmp(m, "ret")) return 1;
-    // F1a (2 bytes): three-reg ALU + pseudo-ops
-    static const char *const two[] = {
-        "add","sub","mul","div","mod","shl","shr","lt","le","eq","ne",
-        "and","or","xor","lts","les","divs","mods","shrs",
-        "fadd","fsub","fmul","fdiv","flt","fle",
-        "gt","ge","gts","ges","fgt","fge","mov",
-        // F1b (2 bytes): single-reg
-        "sxb","sxw","inc","dec","pushr","popr","zxb","zxw",
-        "itof","ftoi","jlr","jr","ssp","putchar",
-        // F2 (2 bytes): bp-relative load/store/addi
-        "lb","lw","ll","sb","sw","sl","lbx","lwx",
-        "addi","shli","andi","shrsi",
-    };
-    for (size_t i = 0; i < sizeof(two)/sizeof(two[0]); i++)
-        if (!strcmp(m, two[i])) return 2;
-    // Everything else (F0b, F0c, F3a-F3e): 3 bytes
-    return 3;
+    int n = isa_bytes(m);
+    if (n) return n;
+    int unit = !strcmp(m, "byte") ? 1 : !strcmp(m, "word") ? 2 : !strcmp(m, "long") ? 4 : 0;
+    if (unit) {
+        int vals = 0;
+        for (const char *r = args; r < lend; ) {
+            while (r < lend && (*r == ' ' || *r == '\t' || *r == ',')) r++;
+            if (r >= lend || *r == ';') break;
+            vals++;
+            while (r < lend && *r != ' ' && *r != '\t' && *r != ',') r++;
+        }
+        return unit * vals;
+    }
+    return 3;   // unknown: the old conservative guess
 }
 
 // Parse an assembly buffer emitted for this function's body and compute
@@ -1822,7 +1828,7 @@ static void parse_block_offsets(Function *f, const char *buf, size_t len,
                     char mnem[16];
                     memcpy(mnem, mstart, mlen);
                     mnem[mlen] = 0;
-                    cum += cpu4_mnem_bytes(mnem);
+                    cum += line_bytes(mnem, mend, lend);
                 }
             }
         }
@@ -1978,10 +1984,11 @@ static int detect_branch_fusions(Function *f, BranchFuse *fuse,
                 for (Inst *ii = f->blocks[k]->head; ii; ii = ii->next)
                     if (!ii->is_dead) est_bytes += 3;
         }
-        // F3c displacement is ±BR_DISP_RANGE bytes (10-bit signed,
-        // PC-relative from end of branch instruction). Use 500 when
-        // measured, 450 for the conservative heuristic fallback.
-        int p5_cap = block_size ? 500 : 450;
+        // The fused branch's displacement reach (br_reach; CPU4 F3c ±511,
+        // PC-relative from end of branch instruction). Use the reach less
+        // 11 bytes when measured, less 61 for the heuristic fallback (CPU4:
+        // 500 and 450 of 511).
+        int p5_cap = br_reach("beq") - (block_size ? 11 : 61);
         int in_range = (est_bytes <= p5_cap);
 
         // P6: NE(x, 0) or EQ(x, 0) → jnz/jz directly (checked before P5
@@ -2053,10 +2060,10 @@ static int detect_branch_fusions(Function *f, BranchFuse *fuse,
             Value *cb_reg = NULL;
             int cb_k = 0, tmp = 0;
             if (dop0 && dop0->kind == VAL_INST && dop0->phys_reg >= 0 &&
-                resolve_const(dop1, &tmp) && tmp >= 0 && tmp <= CB_CONST_MAX)
+                resolve_const(dop1, &tmp) && isa_imm_fits("cbeq", 0, tmp))
                 { cb_reg = dop0; cb_k = tmp; }
             else if (dop1 && dop1->kind == VAL_INST && dop1->phys_reg >= 0 &&
-                     resolve_const(dop0, &tmp) && tmp >= 0 && tmp <= CB_CONST_MAX)
+                     resolve_const(dop0, &tmp) && isa_imm_fits("cbeq", 0, tmp))
                 { cb_reg = dop1; cb_k = tmp; }
             if (cb_reg) {
                 // Determine which target we'll actually branch to
@@ -2077,10 +2084,9 @@ static int detect_branch_fusions(Function *f, BranchFuse *fuse,
                             for (Inst *ii = f->blocks[k]->head; ii; ii = ii->next)
                                 if (!ii->is_dead) cb_est += 3;
                     }
-                    // F0c displacement is ±BR_DISP_RANGE bytes (10-bit
-                    // signed, PC-relative). 500 when measured, 450 for the
-                    // conservative heuristic fallback (same margins as P5).
-                    int p17_cap = block_size ? 500 : 450;
+                    // cbeq's displacement reach (br_reach; CPU4 F0c ±511),
+                    // with the same margins as P5.
+                    int p17_cap = br_reach("cbeq") - (block_size ? 11 : 61);
                     if (cb_est <= p17_cap) {
                         def->is_dead        = 1;
                         fuse[fbi].fused     = 4;
@@ -2272,7 +2278,7 @@ static int detect_dbnz(Function *f, BranchFuse *fuse,
         // loop body (the header BR's true target).
         int end  = block_start[b->id] + block_size[bi];
         int disp = block_start[hdr_br->target->id] - end;
-        if (disp < -512 || disp > 511) continue;
+        if (disp < -(br_reach("dbnz") + 1) || disp > br_reach("dbnz")) continue;
 
         g_dbnz_latch[bi] = 1;
         dec->is_dead = 1;
@@ -2352,7 +2358,9 @@ static int emit_rotated_branch(Function *f, FILE *out, Inst *inst,
         // Branch is encoded as (rel-to-end-of-instruction). The fused form
         // is 3 bytes; its end is at cur_offset + 3.
         int disp = tgt_off - (cur_offset + 3);
-        if (disp > BR_DISP_RANGE || disp < -(BR_DISP_RANGE + 1)) {
+        const char *fm = fuse[hbi].fused == 4 ? "cbeq" : fuse[hbi].fused == 5 ? "bltz" : "beq";
+        int reach = br_reach(fm);
+        if (disp > reach || disp < -(reach + 1)) {
             // Out of F3c/F0c reach — sticky decision so we don't oscillate.
             if (no_rotate) no_rotate[bi] = 1;
             return 0;

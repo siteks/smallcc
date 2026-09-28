@@ -920,7 +920,7 @@ static Value *addr_at(BraunCtx *ctx, Block *b, Value *base, int off) {
 static int absorbable_offset(int k, int size) {
     if (k % size != 0) return 0;
     int scaled = k / size;
-    return scaled >= -512 && scaled <= 511;
+    return isa_imm_fits(size == 1 ? "llb" : size == 2 ? "llw" : "lll", 0, scaled);
 }
 
 // Set just before emitting a load or store through a volatile lvalue; the

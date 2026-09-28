@@ -14,8 +14,12 @@
 typedef uint32_t regmask_t;          // bit r = register r
 #define MAX_GPR 32
 
+struct IsaInstr_s;
+
 typedef struct Target {
     const char *name;
+    const void *instrs;              // the ISA's generated IsaInstr table (<arch>/isa_table_c.h)
+    const void *pseudos;             // ... and its IsaPseudo table
     int         nregs;               // allocatable general registers (IRC's K)
     regmask_t   caller_saved;        // a call may clobber these (scratch pool)
     regmask_t   callee_saved;        // a function that uses these saves them
@@ -36,5 +40,17 @@ static inline regmask_t target_arg_mask(void) {
     return m;
 }
 static inline int reg_in(regmask_t m, int r) { return r >= 0 && r < 32 && (m >> r) & 1; }
+
+/* Encodings, from the ISA definition's generated table: one query per
+ * mnemonic the back end is about to emit, so no range or size is written
+ * into the compiler. Pseudo-ops resolve to their real instruction. */
+int  isa_has(const char *mnem);                    // the target has this instruction
+int  isa_bytes(const char *mnem);                  // its size in bytes (0: unknown)
+// Source-unit range of the k-th immediate operand (0-based, registers not
+// counted): what the assembler accepts. Returns 0 if there is none.
+int  isa_imm_range(const char *mnem, int k, long *lo, long *hi);
+// Whether v is accepted as that immediate (range, and a multiple of the
+// scale for a byte offset). False for an unknown mnemonic.
+int  isa_imm_fits(const char *mnem, int k, long v);
 
 #endif
