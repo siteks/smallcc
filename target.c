@@ -143,6 +143,17 @@ int isa_has(const char *m)   { return isa_lookup(m) != NULL; }
 int isa_real(const char *m)  { const IsaInstr *i = isa_lookup(m); return i && !strcmp(i->name, m); }
 int isa_bytes(const char *m) { const IsaInstr *i = isa_lookup(m); return i ? i->len : 0; }
 
+int isa_pcrel_range(const char *m, long *lo, long *hi) {
+    const IsaInstr *in = isa_lookup(m);
+    if (!in) return 0;
+    for (int j = 0; j < in->nops; j++)
+        if (in->ops[j].kind == ISA_PCREL) {
+            *lo = -(1L << (in->ops[j].bits - 1)); *hi = (1L << (in->ops[j].bits - 1)) - 1;
+            return 1;
+        }
+    return 0;
+}
+
 int isa_imm_range(const char *m, int k, long *lo, long *hi) {
     const IsaInstr *in = isa_lookup(m);
     if (!in) return 0;

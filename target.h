@@ -79,6 +79,7 @@ int  isa_bytes(const char *mnem);                  // its size in bytes (0: unkn
 // Source-unit range of the k-th immediate operand (0-based, registers not
 // counted): what the assembler accepts. Returns 0 if there is none.
 int  isa_imm_range(const char *mnem, int k, long *lo, long *hi);
+int  isa_pcrel_range(const char *mnem, long *lo, long *hi); // a PC-relative operand's displacement range
 // Whether v is accepted as that immediate (range, and a multiple of the
 // scale for a byte offset). False for an unknown mnemonic.
 int  isa_imm_fits(const char *mnem, int k, long v);

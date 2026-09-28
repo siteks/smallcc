@@ -1916,11 +1916,65 @@ static int block_size_from_offsets(Function *f, int bi,
 // a block with fuse[bi].fused != 0 is skipped. Any committed fusion
 // only shrinks blocks (marks cmp as is_dead, compact terminator), so
 // re-measuring after each call is monotonic.
+// Exact reach check on a dry-run's text: every PC-relative branch to one of
+// this function's blocks, measured with the assembler's byte counts. Marks
+// the block holding each branch that does not reach in bad[] (by layout
+// index) and returns how many there were. The fusion detectors estimate
+// distances before later decisions (loop rotation) grow the code between.
+static int check_branch_reach(Function *f, const char *buf, size_t len,
+                              const int *block_start, uint8_t *bad) {
+    char prefix[64];
+    int plen = snprintf(prefix, sizeof(prefix), "_%s_B", f->name);
+    int max_id = 0;
+    for (int i = 0; i < f->nblocks; i++) if (f->blocks[i]->id > max_id) max_id = f->blocks[i]->id;
+    int *bix = calloc(max_id + 1, sizeof(int));
+    for (int i = 0; i < f->nblocks; i++) bix[f->blocks[i]->id] = i;
+    int cum = 0, cur = 0, nbad = 0;
+    const char *p = buf, *end = buf + len;
+    while (p < end) {
+        const char *eol = memchr(p, '\n', end - p);
+        const char *lend = eol ? eol : end;
+        const char *q = p;
+        while (q < lend && (*q == ' ' || *q == '\t')) q++;
+        if (q < lend && *q != ';') {
+            const char *r = q;
+            while (r < lend && (isalnum((unsigned char)*r) || *r == '_')) r++;
+            if (r > q && r < lend && *r == ':') {             // a label
+                if (r - q > plen && !memcmp(q, prefix, plen)) {
+                    int id = atoi(q + plen);
+                    if (id >= 0 && id <= max_id) cur = bix[id];
+                }
+            } else if (r > q && r - q < 16) {
+                char mnem[16];
+                memcpy(mnem, q, r - q); mnem[r - q] = 0;
+                int n = line_bytes(mnem, r, lend);
+                long lo, hi;
+                const char *t = lend;                      // the last operand
+                while (t > r && t[-1] != ' ' && t[-1] != ',' && t[-1] != '\t') t--;
+                if (isa_pcrel_range(mnem, &lo, &hi) && lend - t > plen && !memcmp(t, prefix, plen)) {
+                    int id = atoi(t + plen);
+                    if (id >= 0 && id <= max_id && block_start[id] >= 0) {
+                        long disp = block_start[id] - (cum + n);
+                        if ((disp < lo || disp > hi) && !bad[cur]) { bad[cur] = 1; nbad++; }
+                    }
+                }
+                cum += n;
+            }
+        }
+        p = eol ? eol + 1 : end;
+    }
+    free(bix);
+    return nbad;
+}
+
+static uint8_t *g_no_fuse;   // blocks whose fused branch did not reach (layout index)
+
 static int detect_branch_fusions(Function *f, BranchFuse *fuse,
                                  const int *block_size) {
     int committed = 0;
     for (int fbi = 0; fbi < f->nblocks; fbi++) {
         if (fuse[fbi].fused != 0) continue;
+        if (g_no_fuse && g_no_fuse[fbi]) continue;
         Block *fb  = f->blocks[fbi];
         Inst  *term = fb->tail;
         if (!term || term->kind != IK_BR || term->nops < 1) continue;
@@ -2031,8 +2085,10 @@ static int detect_branch_fusions(Function *f, BranchFuse *fuse,
             if (f->blocks[k] == br_tgt) { target_bi = k; break; }
         }
         if (target_bi < 0) continue;
+        // A backward branch also crosses its own block, up to the branch
+        // at its end (the whole block is counted).
         int lo = (fbi < target_bi) ? fbi + 1 : target_bi;
-        int hi = (fbi < target_bi) ? target_bi : fbi;
+        int hi = (fbi < target_bi) ? target_bi : fbi + 1;
         int est_bytes = 0;
         if (block_size) {
             for (int k = lo; k < hi; k++) est_bytes += block_size[k];
@@ -2132,7 +2188,7 @@ static int detect_branch_fusions(Function *f, BranchFuse *fuse,
                     if (f->blocks[k] == cb_tgt) { cb_tbi = k; break; }
                 if (cb_tbi >= 0) {
                     int cb_lo = (fbi < cb_tbi) ? fbi + 1 : cb_tbi;
-                    int cb_hi = (fbi < cb_tbi) ? cb_tbi : fbi;
+                    int cb_hi = (fbi < cb_tbi) ? cb_tbi : fbi + 1;   // backward: its own block too
                     int cb_est = 0;
                     if (block_size) {
                         for (int k = cb_lo; k < cb_hi; k++) cb_est += block_size[k];
@@ -2278,6 +2334,7 @@ static int detect_dbnz(Function *f, BranchFuse *fuse,
     for (int bi = 0; bi < f->nblocks; bi++) {
         if (g_dbnz_latch[bi]) continue;
         if (no_rotate && no_rotate[bi]) continue;
+        if (g_no_fuse && g_no_fuse[bi]) continue;
         Block *b = f->blocks[bi];
         Inst *term = b->tail;
         while (term && term->is_dead) term = term->prev;
@@ -2753,6 +2810,21 @@ void emit_function(Function *f, FILE *out) {
     // sticky on out-of-range, so the decision converges monotonically.
     const int *cur_block_start = NULL;
 
+    // The detectors mark the compares they fuse dead; a retry after the
+    // exact reach check below starts again from these flags.
+    int nsnap = 0;
+    for (int bi = 0; bi < f->nblocks; bi++)
+        for (Inst *ii = f->blocks[bi]->head; ii; ii = ii->next) nsnap++;
+    Inst **snap_i = malloc((nsnap + 1) * sizeof(Inst *));
+    uint8_t *snap_d = malloc(nsnap + 1);
+    nsnap = 0;
+    for (int bi = 0; bi < f->nblocks; bi++)
+        for (Inst *ii = f->blocks[bi]->head; ii; ii = ii->next) { snap_i[nsnap] = ii; snap_d[nsnap++] = ii->is_dead; }
+    g_no_fuse = arena_alloc(f->nblocks * sizeof(uint8_t));
+    memset(g_no_fuse, 0, f->nblocks * sizeof(uint8_t));
+    uint8_t *bad = arena_alloc(f->nblocks * sizeof(uint8_t));
+
+    for (int attempt = 0; ; attempt++) {
     int committed;
     do {
         char *mbuf = NULL; size_t mlen = 0;
@@ -2776,6 +2848,10 @@ void emit_function(Function *f, FILE *out) {
     // decisions match what the real emit will produce. (If the previous loop
     // iteration's dry-run used an older block_start, a rotation may have
     // gotten enabled or skipped that we want to lock in for the real pass.)
+    // Its text is then checked exactly: a fused branch that no longer
+    // reaches (the detectors' estimate predates later growth) is banned and
+    // the whole search restarts.
+    int newbad = 0;
     {
         char *mbuf = NULL; size_t mlen = 0;
         FILE *mf = open_memstream(&mbuf, &mlen);
@@ -2786,10 +2862,20 @@ void emit_function(Function *f, FILE *out) {
         fclose(mf);
         int total_bytes = 0;
         parse_block_offsets(f, mbuf, mlen, block_start, &total_bytes);
-        free(mbuf);
         for (int bi = 0; bi < f->nblocks; bi++)
             block_size[bi] = block_size_from_offsets(f, bi, block_start, total_bytes);
+        memset(bad, 0, f->nblocks * sizeof(uint8_t));
+        if (check_branch_reach(f, mbuf, mlen, block_start, bad))
+            for (int bi = 0; bi < f->nblocks; bi++)
+                if (bad[bi] && !g_no_fuse[bi]) { g_no_fuse[bi] = 1; no_rotate[bi] = 1; newbad++; }
+        free(mbuf);
     }
+    if (!newbad || attempt >= 16) break;
+    for (int k = 0; k < nsnap; k++) snap_i[k]->is_dead = snap_d[k];
+    memset(fuse, 0, f->nblocks * sizeof(BranchFuse));
+    memset(g_dbnz_latch, 0, f->nblocks * sizeof(uint8_t));
+    }
+    free(snap_i); free(snap_d);
 
     // Real emission pass.
     int ann_live = (getenv("LIVE_REGS") != NULL);

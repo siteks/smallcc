@@ -840,7 +840,10 @@ Supported fused comparisons: `IK_LT/LE/EQ/NE` (signed: `blts/bles/beq/bne`) and
 `IK_ULT/ULE` (unsigned: `blt/ble`). Float comparisons are not fused (no F3c float-branch).
 
 Fusion is skipped when the estimated byte distance to the true target exceeds the F3c
-signed 10-bit offset range (±511 bytes from the instruction end).
+signed 10-bit offset range (±511 bytes from the instruction end). The estimate is made
+before later decisions (loop rotation) settle, so the final dry run measures every
+PC-relative branch exactly; a fused branch that does not reach is banned for its block
+and the fusion search restarts (`check_branch_reach`).
 
 **P16 — Bitex fusion (SHR + AND → bitex)**
 
