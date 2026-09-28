@@ -74,6 +74,13 @@ above (a returned `char` is sign- or zero-extended into r0).
 
 **Struct return value:** see §4.4.
 
+**CPU5 (draft, `-arch cpu5`).** Sixteen general registers with the smallest
+change from the CPU4 table above: `r0` returns and `r1`–`r3` carry the first
+three arguments exactly as on CPU4; `r0`–`r7` are caller-save and `r8`–`r15`
+callee-save. Everything else in this document (stack, frame, `enter`/`ret`,
+variadics, structs, MMIO) is the same. The compiler reads these sets from
+`target.c`, so trying another split is a one-line change there.
+
 ---
 
 ## 3. Stack and frame layout

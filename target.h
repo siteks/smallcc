@@ -29,7 +29,7 @@ typedef struct Target {
 } Target;
 
 extern const Target *g_target;
-extern const Target  target_cpu4;
+extern const Target  target_cpu4, target_cpu5;
 const Target *target_find(const char *name);   // by -arch name, or NULL
 const char   *target_names(void);              // "cpu4, cpu5" for messages
 
@@ -46,7 +46,8 @@ static inline int reg_in(regmask_t m, int r) { return r >= 0 && r < 32 && (m >> 
 /* Encodings, from the ISA definition's generated table: one query per
  * mnemonic the back end is about to emit, so no range or size is written
  * into the compiler. Pseudo-ops resolve to their real instruction. */
-int  isa_has(const char *mnem);                    // the target has this instruction
+int  isa_has(const char *mnem);                    // the target has this instruction (or pseudo-op)
+int  isa_real(const char *mnem);                   // ... as a real instruction, not a pseudo-op
 int  isa_bytes(const char *mnem);                  // its size in bytes (0: unknown)
 // Source-unit range of the k-th immediate operand (0-based, registers not
 // counted): what the assembler accepts. Returns 0 if there is none.

@@ -106,7 +106,10 @@ static regmask_t   g_blk_live_out_regs = 0xffffffffu; // conservative default: a
 // Emit a register move (mov pseudo-op: or rd, rs, rs), skipped when the
 // value is already in the destination register.
 static void emit_mov(FILE *out, int rd, int rs) {
-    if (rs != rd)
+    if (rs == rd) return;
+    if (isa_real("mov"))                       // a real move (CPU5); CPU4's mov is a pseudo for or
+        fprintf(out, "    mov %s, %s\n", regname(rd), regname(rs));
+    else
         fprintf(out, "    or %s, %s, %s\n", regname(rd), regname(rs), regname(rs));
 }
 
@@ -254,6 +257,18 @@ static const char *store_f2(int size) {
 }
 
 // CPU4 load mnemonic for size (register-relative F3c)
+// A register-relative load or store `m rv, rb, k` (k the encoded, scaled
+// offset), using the ISA's zero-offset form `m_0 rv, rb` when it has one
+// (CPU5's 2-byte llb_0 ... sll_0) and k is 0.
+static void emit_rr(FILE *out, const char *m, int rv, int rb, int k) {
+    char z[16];
+    snprintf(z, sizeof z, "%s_0", m);
+    if (k == 0 && isa_real(z))
+        fprintf(out, "    %s %s, %s\n", z, regname(rv), regname(rb));
+    else
+        fprintf(out, "    %s %s, %s, %d\n", m, regname(rv), regname(rb), k);
+}
+
 static const char *load_f3c(int size, int is_signed) {
     if (size == 1) return is_signed ? "llbx" : "llb";
     if (size == 2) return is_signed ? "llwx" : "llw";
@@ -282,8 +297,7 @@ static void emit_bp_load(FILE *out, int rd, int off, int size, int is_signed) {
     int base = off - adj;
     fprintf(out, "    lea %s, %d\n", regname(rd), base);
     if (adj) fprintf(out, "    addi %s, %d\n", regname(rd), adj);
-    fprintf(out, "    %s %s, %s, 0\n",
-            load_f3c(size, is_signed), regname(rd), regname(rd));
+    emit_rr(out, load_f3c(size, is_signed), rd, rd, 0);
 }
 
 // Emit a bp-relative store of `rv`.  Uses F2 when the offset fits; otherwise
@@ -299,7 +313,7 @@ static void emit_bp_store(FILE *out, int rv, int tmp, int off, int size) {
     int base = off - adj;
     fprintf(out, "    lea %s, %d\n", regname(tmp), base);
     if (adj) fprintf(out, "    addi %s, %d\n", regname(tmp), adj);
-    fprintf(out, "    %s %s, %s, 0\n", store_f3c(size), regname(rv), regname(tmp));
+    emit_rr(out, store_f3c(size), rv, tmp, 0);
 }
 
 // Is a ValType signed?
@@ -535,9 +549,9 @@ static void emit_inst(Inst *inst, FILE *out) {
         // Emit nothing — value is already in rd at function entry.
         // (If IRC chose a different register despite pre-coloring, emit a move.)
         if (!dst) break;
-        int pidx = inst->param_idx;
-        if (pidx > 7) pidx = 7;
-        emit_mov(out, rd, pidx);
+        int pidx = inst->param_idx;                     // 1-based
+        if (pidx >= 1 && pidx <= g_target->n_arg_regs)
+            emit_mov(out, rd, g_target->arg_regs[pidx - 1]);
         break;
     }
 
@@ -896,12 +910,10 @@ static void emit_inst(Inst *inst, FILE *out) {
                 // null base, use imm as absolute (unusual): the destination
                 // is being written, so it can hold the address.
                 emit_imm(out, rd, off);
-                fprintf(out, "    %s %s, %s, 0\n", load_f3c(size, is_s), regname(rd), regname(rd));
+                emit_rr(out, load_f3c(size, is_s), rd, rd, 0);
             } else {
                 // F3c: mnem rx, ry, scaled_imm10
-                fprintf(out, "    %s %s, %s, %d\n",
-                        load_f3c(size, is_s), regname(rd), regname(rb),
-                        f_scaled(off, size));
+                emit_rr(out, load_f3c(size, is_s), rd, rb, f_scaled(off, size));
             }
         }
         break;
@@ -974,9 +986,7 @@ static void emit_inst(Inst *inst, FILE *out) {
             emit_bp_store(out, rv, tmp, off, size);
         } else {
             // F3c: mnem rv, ry, scaled_imm10
-            fprintf(out, "    %s %s, %s, %d\n",
-                    store_f3c(size), regname(rv), regname(rb),
-                    f_scaled(off, size));
+            emit_rr(out, store_f3c(size), rv, rb, f_scaled(off, size));
         }
         while (nsaved > 0) fprintf(out, "    popr %s\n", regname(saved[--nsaved]));
         break;
@@ -1028,11 +1038,11 @@ static void emit_inst(Inst *inst, FILE *out) {
         for (int off2 = 0; off2 < bytes; off2 += 2) {
             int rem = bytes - off2;
             if (rem >= 2) {
-                fprintf(out, "    llw %s, %s, %d\n", regname(tmp), regname(rsrc), off2/2);
-                fprintf(out, "    slw %s, %s, %d\n", regname(tmp), regname(rdst), off2/2);
+                emit_rr(out, "llw", tmp, rsrc, off2 / 2);
+                emit_rr(out, "slw", tmp, rdst, off2 / 2);
             } else {
-                fprintf(out, "    llb %s, %s, %d\n", regname(tmp), regname(rsrc), off2);
-                fprintf(out, "    slb %s, %s, %d\n", regname(tmp), regname(rdst), off2);
+                emit_rr(out, "llb", tmp, rsrc, off2);
+                emit_rr(out, "slb", tmp, rdst, off2);
             }
         }
         if (saved) fprintf(out, "    popr %s\n", regname(tmp));
@@ -1364,7 +1374,7 @@ static int emit_prologue(Function *f, FILE *out, int frame, int callee_save[MAX_
                 // r0 is caller-saved and free immediately after enter (params
                 // live in r1/r2/r3 only), so it's safe to clobber as scratch.
                 fprintf(out, "    lea r0, %d\n", off);
-                fprintf(out, "    sll r%d, r0, 0\n", r);
+                emit_rr(out, "sll", r, 0, 0);
             }
         }
     }
@@ -2474,7 +2484,7 @@ static void emit_function_body(Function *f, FILE *out, BranchFuse *fuse,
                             // doesn't collide. r3 is caller-saved and not
                             // used for return; we don't need it after ret.
                             fprintf(out, "    lea r3, %d\n", off);
-                            fprintf(out, "    lll r%d, r3, 0\n", r);
+                            emit_rr(out, "lll", r, 3, 0);
                         }
                     }
                 }
@@ -2547,7 +2557,7 @@ static void emit_function_body(Function *f, FILE *out, BranchFuse *fuse,
                 fprintf(out, "    immw %s, _%s_jt%d\n", regname(sel_r), f->name, jt_count);
                 fprintf(out, "    add %s, %s, %s\n",
                         regname(scr), regname(sel_r), regname(scr));
-                fprintf(out, "    llw %s, %s, 0\n", regname(scr), regname(scr));
+                emit_rr(out, "llw", scr, scr, 0);
                 fprintf(out, "    popr %s\n", regname(sel_r));
                 fprintf(out, "    jr %s\n", regname(scr));
                 fprintf(out, "_%s_sw%d:\n", f->name, jt_count);

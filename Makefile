@@ -29,7 +29,7 @@ isa-check:
 	@touch .isa-stamp
 
 test: smallcc sim_c isa-check rig-quick
-	python3 -m pytest tests/cases/ -q
+	python3 -m pytest tests/cases/ -q --arch cpu4,cpu5
 	python3 -m pytest tests/cases/ -q --irsim
 
 test_v: smallcc sim_c

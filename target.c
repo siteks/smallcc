@@ -4,6 +4,7 @@
 #include "target.h"
 #include "isatool/isa_types.h"
 #include "cpu4/isa_table_c.h"
+#include "cpu5/isa_table_c.h"
 
 const Target target_cpu4 = {
     .name         = "cpu4",
@@ -17,9 +18,24 @@ const Target target_cpu4 = {
     .arg_regs     = {1, 2, 3},
 };
 
+// CPU5 (proposal 0004): 16 registers. The minimal ABI change from CPU4:
+// r0 returns, r1-r3 carry the first arguments, r0-r7 are caller-saved and
+// r8-r15 callee-saved.
+const Target target_cpu5 = {
+    .name         = "cpu5",
+    .instrs       = cpu5_instrs,
+    .pseudos      = cpu5_pseudos,
+    .nregs        = 16,
+    .caller_saved = 0x00ff,          // r0-r7
+    .callee_saved = 0xff00,          // r8-r15
+    .ret_reg      = 0,
+    .n_arg_regs   = 3,
+    .arg_regs     = {1, 2, 3},
+};
+
 const Target *g_target = &target_cpu4;
 
-static const Target *const all_targets[] = { &target_cpu4, NULL };
+static const Target *const all_targets[] = { &target_cpu4, &target_cpu5, NULL };
 
 const Target *target_find(const char *name) {
     for (int i = 0; all_targets[i]; i++)
@@ -77,6 +93,7 @@ static const IsaInstr *isa_lookup(const char *m) {
 }
 
 int isa_has(const char *m)   { return isa_lookup(m) != NULL; }
+int isa_real(const char *m)  { const IsaInstr *i = isa_lookup(m); return i && !strcmp(i->name, m); }
 int isa_bytes(const char *m) { const IsaInstr *i = isa_lookup(m); return i ? i->len : 0; }
 
 int isa_imm_range(const char *m, int k, long *lo, long *hi) {

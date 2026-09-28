@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "verify.h"
+#include "target.h"
 
 int ir_verify_enabled(void)
 {
@@ -191,7 +192,7 @@ void verify_function(Function *f, const char *stage, VerifyPhase phase)
                 // failure mode (the IRC livelock bug).
                 if (inst->dst) {
                     Value *d = val_resolve(inst->dst);
-                    if ((d->phys_reg < 0 && d->spill_slot < 0) || d->phys_reg > 7) {
+                    if ((d->phys_reg < 0 && d->spill_slot < 0) || d->phys_reg >= g_target->nregs) {
                         // One benign shape: a def that was spilled via an
                         // IG-coalescing alias (its slot lives on the
                         // union-find canonical, invisible here) is emitted
@@ -213,7 +214,7 @@ void verify_function(Function *f, const char *stage, VerifyPhase phase)
                     if (!v) continue;
                     v = val_resolve(v);
                     if (v->kind == VAL_INST &&
-                        ((v->phys_reg < 0 && v->spill_slot < 0) || v->phys_reg > 7)) {
+                        ((v->phys_reg < 0 && v->spill_slot < 0) || v->phys_reg >= g_target->nregs)) {
                         // Matching exemption: the spill store itself reads
                         // the uncolored def (see above).
                         int is_spill_store_use =

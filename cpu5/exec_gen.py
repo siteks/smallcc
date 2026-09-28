@@ -291,10 +291,10 @@ def gx_llbx_0(s, m, w, oldpc):
     s.r[f_rd] = sx32(rd8(m, s.r[f_rx], oldpc), 8)
 
 def gx_llwx_0(s, m, w, oldpc):
-    # R[rd] = sx(M8[R[rx]], 16)
+    # R[rd] = sx(M16[R[rx]], 16)
     f_rd = ((w >> 4) & 0xf)
     f_rx = ((w >> 0) & 0xf)
-    s.r[f_rd] = sx32(rd8(m, s.r[f_rx], oldpc), 16)
+    s.r[f_rd] = sx32(rd16(m, s.r[f_rx], oldpc), 16)
 
 def gx_add(s, m, w, oldpc):
     # R[rd] = R[rx] + R[ry]

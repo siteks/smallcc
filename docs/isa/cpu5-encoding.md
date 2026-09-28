@@ -84,7 +84,7 @@ Machine state: 16 general registers of 32 bits (`r0`..`r15`); PC 16 bits, SP 16 
 | `slw_0` | `11100110 ddddxxxx` | `rx, ry` | — | `M16[R[ry]] = R[rx]` |
 | `sll_0` | `11100111 ddddxxxx` | `rx, ry` | — | `M32[R[ry]] = R[rx]` |
 | `llbx_0` | `11101000 ddddxxxx` | `rd, rx` | — | `R[rd] = sx(M8[R[rx]], 8)` |
-| `llwx_0` | `11101001 ddddxxxx` | `rd, rx` | — | `R[rd] = sx(M8[R[rx]], 16)` |
+| `llwx_0` | `11101001 ddddxxxx` | `rd, rx` | — | `R[rd] = sx(M16[R[rx]], 16)` |
 
 ## S5 — 3 bytes, `1111110o oooodddd xxxxyyyy`
 

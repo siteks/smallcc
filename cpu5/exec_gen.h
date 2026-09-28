@@ -336,12 +336,12 @@ static void cpu5_gx_llbx_0(Core *cc, uint32_t w, uint16_t oldpc) {
     cc->r[f_rd] = sx32(gen_rd8(cc->r[f_rx], oldpc), 8);
 }
 
-/* llwx_0: R[rd] = sx(M8[R[rx]], 16) */
+/* llwx_0: R[rd] = sx(M16[R[rx]], 16) */
 static void cpu5_gx_llwx_0(Core *cc, uint32_t w, uint16_t oldpc) {
     const uint32_t f_rd = ((w >> 4) & 0xfu); (void)f_rd;
     const uint32_t f_rx = ((w >> 0) & 0xfu); (void)f_rx;
     (void)w; (void)oldpc;
-    cc->r[f_rd] = sx32(gen_rd8(cc->r[f_rx], oldpc), 16);
+    cc->r[f_rd] = sx32(gen_rd16(cc->r[f_rx], oldpc), 16);
 }
 
 /* add: R[rd] = R[rx] + R[ry] */
