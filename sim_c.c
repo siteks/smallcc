@@ -101,6 +101,8 @@ static uint32_t g_cycles = 0;
 /* ------------------------------------------------------------------ */
 
 static int       g_profile   = 0;
+static const char *g_pccount_out = NULL;   /* -pccount FILE: "pc count" per executed pc */
+static FILE      *g_imap = NULL;           /* -imap FILE: "addr len mnemonic" per assembled instruction */
 static const char *g_dump_out = NULL;
 static uint16_t  g_asm_end   = 0;   /* high-water mark of assembler cur */
 static uint32_t  prof_count[65536];   /* execution count per PC address */
@@ -814,6 +816,7 @@ static void assemble_cpu4(const char *src)
             isa_encode(instr, ops, nops, cur, pass, cur_lineno+1, enc);
             if (pass == 2)
                 for (int k = 0; k < instr->len; k++) write8((uint16_t)(cur + k), enc[k]);
+            if (pass == 2 && g_imap) fprintf(g_imap, "%04x %d %s\n", cur & 0xffff, instr->len, instr->name);
             cur += instr->len;
         }
         if (pass == 2 && (uint16_t)cur > g_asm_end)
@@ -1027,7 +1030,7 @@ static void run_cpu4(void)
         const uint16_t step_pc = pc;
         uint32_t r_before[ISA_MAX_GPR]; uint16_t sp_before = sp, bp_before = bp, lr_before = lr;
         if (g_retire_out || g_trace_out) { memcpy(r_before, r, sizeof r_before); g_nmw = 0; }
-        if (g_profile) prof_count[step_pc]++;
+        if (g_profile || g_pccount_out) prof_count[step_pc]++;
         g_watch_pc = step_pc; g_watch_r0 = r[0]; g_watch_sp = sp; g_watch_bp = bp;
         trace[trace_idx].t_pc = step_pc; trace[trace_idx].t_op = read8(step_pc);
         trace[trace_idx].t_r0 = r[0]; trace[trace_idx].t_sp = sp; trace[trace_idx].t_bp = bp;
@@ -1212,6 +1215,8 @@ static const char *usage_text =
 "  -fb FILE           After running, dump the bitmap framebuffer to FILE.ppm\n"
 "                     (640x480 32bpp by default; honors DISP_MODE bits — 320x240 / 8bpp).\n"
 "  -profile           Collect and print a per-source-line execution profile\n"
+"  -pccount FILE      Write each executed pc with its execution count (tools/isaprof.py)\n"
+"  -imap FILE         Write each assembled instruction's address, length and mnemonic\n"
 "  -retire FILE       Write one line per retired instruction: pc, bytes, every\n"
 "                     register and memory change, next pc\n"
 "  -linemap FILE      Assemble and write a PC->source JSON map; do not execute\n"
@@ -1236,6 +1241,11 @@ int main(int argc, char **argv)
         }
         else if (strcmp(argv[i], "-trace") == 0 && i+1 < argc) trace_path = argv[++i];
         else if (strcmp(argv[i], "-profile") == 0) g_profile = 1;
+        else if (strcmp(argv[i], "-pccount") == 0 && i+1 < argc) g_pccount_out = argv[++i];
+        else if (strcmp(argv[i], "-imap") == 0 && i+1 < argc) {
+            g_imap = fopen(argv[++i], "w");
+            if (!g_imap) { perror(argv[i]); return 1; }
+        }
         else if (strcmp(argv[i], "-retire") == 0 && i+1 < argc) {
             g_retire_out = fopen(argv[++i], "w");
             if (!g_retire_out) { perror(argv[i]); return 1; }
@@ -1322,5 +1332,13 @@ int main(int argc, char **argv)
     if (dumpfb) dump_framebuffer();
     if (fb_out)  dump_bitmap_fb(fb_out);
     if (g_profile) print_profile();
+    if (g_pccount_out) {
+        FILE *pf = fopen(g_pccount_out, "w");
+        if (pf) {
+            for (int a = 0; a < 65536; a++)
+                if (prof_count[a]) fprintf(pf, "%04x %u\n", a, prof_count[a]);
+            fclose(pf);
+        }
+    }
     return 0;
 }

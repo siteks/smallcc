@@ -59,6 +59,7 @@ Tests are pytest-collected `.c` files under `tests/cases/` with `EXPECT_R0`/`EXP
 | Crash trace | On unknown opcode, dumps the last 32 executed instructions (pc, opcode, r0, sp, bp) to help locate the crash |
 | MMIO cycle counter | A 32-bit read-only cycle counter at address `0xFF00` incremented once per instruction; used by `core_portme.c` for timing |
 | `-retire FILE` | One line per retired instruction: pc, bytes, every register and memory change, next pc. `isatool/pysim.py --retire` (and `cpu4/sim.py --retire`) writes the same format; `tools/rig.py` compares the two this way |
+| `-pccount FILE`, `-imap FILE` | Execution count per pc; the assembler's instruction addresses, lengths and mnemonics. `tools/isaprof.py` (the ISA profile of the standard workloads, `--arch`) is built on them; see docs/testing.md |
 
 ### CoreMark Benchmark
 
