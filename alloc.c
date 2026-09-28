@@ -1191,6 +1191,227 @@ static void dce_pass(Function *f) {
     }
 }
 
+
+// ============================================================
+// Spill-slot coalescing (after allocation)
+// ============================================================
+//
+// Out-of-SSA copies between two spilled values become `load r <- A; store
+// r -> B` (two instructions for a copy). When slots A and B are never live
+// at once they can be one slot, and the store is then redundant: memory
+// already holds the value. Incoming stack parameters take part too (a
+// parameter reloaded and re-spilled to a new slot keeps living in its own).
+//
+// Slots are 4-byte spill slots and 4-byte stack-parameter slots, accessed
+// only as bp-relative loads/stores (no IK_ADDR reaches them). Liveness is
+// the usual backward dataflow over the slots; two slots interfere when one
+// is stored while the other is live, and every slot live on entry
+// interferes with every other.
+
+typedef struct { int a, b; Inst *load, *store; long long w; } SlotPair;
+
+static int slot_access(Inst *inst, int *is_store) {
+    if (inst->is_dead || inst->fname) return 0;
+    if (inst->kind == IK_LOAD && inst->nops >= 1 && !inst->ops[0] && inst->dst) { *is_store = 0; return 1; }
+    if (inst->kind == IK_STORE && inst->nops == 1) { *is_store = 1; return 1; }
+    return 0;
+}
+
+static int acc_size(Inst *inst) {
+    if (inst->size) return inst->size;
+    Value *v = inst->kind == IK_LOAD ? inst->dst : val_resolve(inst->ops[0]);
+    return v ? spill_size(v->vtype) : 4;
+}
+
+static void coalesce_spill_slots(Function *f) {
+    if (!g_tune.spill_slots || f->is_variadic) return;
+    int nb = f->nblocks;
+    // Candidate offsets: 4-byte spill slots, plus stack parameters when no
+    // frame address of the parameter area is ever taken.
+    int cap = 64, n = 0;
+    int *off = malloc(cap * sizeof(int));
+    uint8_t *bad = NULL;
+    int param_addr = 0;
+    for (int bi = 0; bi < nb; bi++)
+        for (Inst *i = f->blocks[bi]->head; i; i = i->next)
+            if (!i->is_dead && i->kind == IK_ADDR && i->imm >= 0) param_addr = 1;
+    #define ADD_OFF(o) do { int _o = (o), _k; for (_k = 0; _k < n && off[_k] != _o; _k++); \
+        if (_k == n) { if (n == cap) { cap *= 2; off = realloc(off, cap * sizeof(int)); } off[n++] = _o; } } while (0)
+    for (int i = 0; i < f->nvalues; i++) {
+        Value *v = f->values[i];
+        if (v->spill_slot != -1 && v->spill_slot < 0 && spill_size(v->vtype) == 4) ADD_OFF(v->spill_slot);
+    }
+    for (int bi = 0; bi < nb; bi++)
+        for (Inst *i = f->blocks[bi]->head; i; i = i->next) {
+            int st;
+            if (!param_addr && slot_access(i, &st) && !st && i->imm > 0 && acc_size(i) == 4 && !(i->imm & 3))
+                ADD_OFF(i->imm);
+        }
+    #undef ADD_OFF
+    if (n < 2) { free(off); return; }
+    bad = calloc(n, 1);
+    // Anything else touching these bytes disqualifies the slot.
+    for (int bi = 0; bi < nb; bi++)
+        for (Inst *i = f->blocks[bi]->head; i; i = i->next) {
+            if (i->is_dead) continue;
+            int st, lo = 0, sz = 0, is_acc = slot_access(i, &st);
+            if (is_acc) { lo = i->imm; sz = acc_size(i); }
+            else if (i->kind == IK_ADDR) { lo = i->imm; sz = 4; }
+            else continue;
+            for (int k = 0; k < n; k++)
+                if (lo < off[k] + 4 && off[k] < lo + sz &&
+                    (!is_acc || lo != off[k] || sz != 4 || i->is_volatile)) bad[k] = 1;
+            if (is_acc && st) for (int k = 0; k < n; k++) if (off[k] > 0 && lo == off[k]) bad[k] = 1;
+        }
+    int W = (n + 63) / 64;
+    #define IDX(o) ({ int _r = -1; for (int _k = 0; _k < n; _k++) if (off[_k] == (o) && !bad[_k]) { _r = _k; break; } _r; })
+    uint64_t *in = calloc((size_t)nb * W, 8), *out = calloc((size_t)nb * W, 8);
+    int maxid = 0;
+    for (int bi = 0; bi < nb; bi++) if (f->blocks[bi]->id > maxid) maxid = f->blocks[bi]->id;
+    int *bix = malloc((maxid + 1) * sizeof(int));
+    for (int bi = 0; bi < nb; bi++) bix[f->blocks[bi]->id] = bi;
+    uint64_t *live = malloc(W * 8);
+    for (int changed = 1; changed; ) {
+        changed = 0;
+        for (int bi = nb - 1; bi >= 0; bi--) {
+            Block *b = f->blocks[bi];
+            memset(live, 0, W * 8);
+            for (int s2 = 0; s2 < b->nsuccs; s2++)
+                for (int w = 0; w < W; w++) live[w] |= in[(size_t)bix[b->succs[s2]->id] * W + w];
+            memcpy(&out[(size_t)bi * W], live, W * 8);
+            for (Inst *i = b->tail; i; i = i->prev) {
+                int st, k;
+                if (!slot_access(i, &st) || (k = IDX(i->imm)) < 0) continue;
+                if (st) live[k / 64] &= ~(1ULL << (k % 64)); else live[k / 64] |= 1ULL << (k % 64);
+            }
+            if (memcmp(&in[(size_t)bi * W], live, W * 8)) { memcpy(&in[(size_t)bi * W], live, W * 8); changed = 1; }
+        }
+    }
+    uint8_t *intf = calloc((size_t)n * n, 1);
+    for (int k = 0; k < n; k++)                       // parameters are live on entry
+        if (off[k] > 0) in[k / 64] |= 1ULL << (k % 64);
+    for (int a = 0; a < n; a++) for (int c = 0; c < n; c++)
+        if (a != c && (in[a / 64] >> (a % 64) & 1) && (in[c / 64] >> (c % 64) & 1)) intf[a * n + c] = 1;
+    for (int bi = 0; bi < nb; bi++) {
+        memcpy(live, &out[(size_t)bi * W], W * 8);
+        for (Inst *i = f->blocks[bi]->tail; i; i = i->prev) {
+            int st, k;
+            if (!slot_access(i, &st) || (k = IDX(i->imm)) < 0) continue;
+            if (st) {
+                for (int c = 0; c < n; c++)
+                    if (c != k && (live[c / 64] >> (c % 64) & 1)) intf[k * n + c] = intf[c * n + k] = 1;
+                live[k / 64] &= ~(1ULL << (k % 64));
+            } else live[k / 64] |= 1ULL << (k % 64);
+        }
+    }
+    // Copy pairs: a slot store whose value, followed back through copies
+    // to its reaching definitions in the same block, is a load of another
+    // candidate slot.
+    int np = 0, pcap = 32;
+    SlotPair *pr = malloc(pcap * sizeof(SlotPair));
+    for (int bi = 0; bi < nb; bi++) {
+        Block *b = f->blocks[bi];
+        for (Inst *S = b->head; S; S = S->next) {
+            int st, kb;
+            if (!slot_access(S, &st) || !st || (kb = IDX(S->imm)) < 0) continue;
+            Value *v = S->ops[0];
+            Inst *L = NULL;
+            for (Inst *q = S->prev; q && v; q = q->prev) {
+                if (q->dst != v) continue;                  // nearest (reaching) def of v
+                if (q->kind == IK_COPY && q->nops >= 1) { v = q->ops[0]; continue; }
+                if (q->kind == IK_LOAD) { int s3; if (slot_access(q, &s3) && !s3) L = q; }
+                break;
+            }
+            int ka;
+            if (!L || (ka = IDX(L->imm)) < 0 || ka == kb) continue;
+            if (np == pcap) { pcap *= 2; pr = realloc(pr, pcap * sizeof(SlotPair)); }
+            int d = b->loop_depth > 20 ? 20 : b->loop_depth;
+            pr[np++] = (SlotPair){ ka, kb, L, S, 1LL << d };
+        }
+    }
+    // Greedy union, heaviest pairs first.
+    int *rep = malloc(n * sizeof(int));
+    for (int k = 0; k < n; k++) rep[k] = k;
+    #define FIND(x) ({ int _x = (x); while (rep[_x] != _x) _x = rep[_x]; _x; })
+    for (int pass = 0; pass < np; pass++) {
+        int best = -1;
+        for (int q = 0; q < np; q++) if (pr[q].w > 0 && (best < 0 || pr[q].w > pr[best].w)) best = q;
+        if (best < 0) break;
+        long long wbest = pr[best].w; pr[best].w = -wbest;
+        int ra = FIND(pr[best].a), rb = FIND(pr[best].b);
+        if (ra == rb || intf[ra * n + rb]) continue;
+        if (off[rb] > 0) { int t = ra; ra = rb; rb = t; }   // a parameter slot stays where it is
+        if (off[rb] > 0) continue;
+        rep[rb] = ra;
+        for (int c = 0; c < n; c++) if (intf[rb * n + c]) { intf[ra * n + c] = intf[c * n + ra] = 1; }
+    }
+    // Rewrite offsets to each class's representative.
+    int merged = 0;
+    for (int bi = 0; bi < nb; bi++)
+        for (Inst *i = f->blocks[bi]->head; i; i = i->next) {
+            int st, k;
+            if (!slot_access(i, &st) || (k = IDX(i->imm)) < 0) continue;
+            int r = FIND(k);
+            if (r != k) { i->imm = off[r]; merged = 1; }
+        }
+    // A pair now in one slot: the store writes back what was just loaded.
+    // Also drop the load (and the copies between) when nothing else uses them.
+    for (int q = 0; merged && q < np; q++) {
+        Inst *L = pr[q].load, *S = pr[q].store;
+        if (L->is_dead || S->is_dead || L->imm != S->imm) continue;
+        int clobbered = 0;
+        for (Inst *x = L->next; x && x != S; x = x->next) {
+            int st;
+            if (slot_access(x, &st) && st && x->imm == S->imm) { clobbered = 1; break; }
+        }
+        if (clobbered) continue;
+        // The chain L.dst -> copies -> S.op. The load and the copies go too
+        // when no link is used by anything else before it is redefined or
+        // leaves the block (value-level: several defs of a phi copy's dst
+        // each feed their own store).
+        Inst *chain[64]; int nc = 0, only = 1;
+        {
+            Value *v = S->ops[0];
+            for (Inst *x = S->prev; x && v; x = x->prev) {
+                if (x->dst != v) continue;
+                if (nc < 64) chain[nc++] = x; else only = 0;
+                if (x == L) break;
+                v = x->ops[0];
+            }
+        }
+        for (int c = 0; c < nc && only; c++) {
+            Inst *x = chain[c];
+            Inst *next_link = c > 0 ? chain[c - 1] : S;
+            Value *v = x->dst;
+            int redefined = 0;
+            for (Inst *y = x->next; y; y = y->next) {
+                if (y != next_link && !(y->is_dead && y->kind != IK_COPY))
+                    for (int j = 0; j < y->nops; j++)
+                        if (y->ops[j] && val_resolve(y->ops[j]) == val_resolve(v)) { only = 0; break; }
+                if (!only) break;
+                if (y->dst == v && y != x) { redefined = 1; break; }
+            }
+            Block *xb = x->block;
+            if (only && !redefined && xb->live_out && v->id < xb->nwords * 32 &&
+                (xb->live_out[v->id / 32] >> (v->id % 32) & 1)) only = 0;
+            if (only && !redefined && !xb->live_out) only = 0;
+        }
+        Block *b = S->block;
+        if (S->prev) S->prev->next = S->next; else b->head = S->next;
+        if (S->next) S->next->prev = S->prev; else b->tail = S->prev;
+        S->is_dead = 1;
+        if (only)
+            for (int c = 0; c < nc; c++) chain[c]->is_dead = 1;     // the copies and L
+    }
+    if (getenv("SLOT_DEBUG")) {
+        int m = 0; for (int k = 0; k < n; k++) if (!bad[k] && FIND(k) != k) m++;
+        fprintf(stderr, "[slots] %s: %d candidates, %d pairs, %d merged\n", f->name, n, np, m);
+    }
+    #undef FIND
+    #undef IDX
+    free(off); free(bad); free(in); free(out); free(bix); free(live); free(intf); free(pr); free(rep);
+}
+
 // ============================================================
 // Main IRC entry point
 // ============================================================
@@ -1314,6 +1535,7 @@ void irc_allocate(Function *f) {
             }
             ig_free(g);
             record_function_clobbers(f);
+            coalesce_spill_slots(f);
             break;
         }
 

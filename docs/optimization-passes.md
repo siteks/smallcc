@@ -273,6 +273,7 @@ Rerun it after a change to the ISA or to these passes.
 | `inline_cf_nodes` | braun inliner | inline functions with control flow up to this many AST nodes (0: only straight-line bodies) | 0 | 160 |
 | `frame_promote` | `opt_frame_promote` | promote non-escaping frame slots to SSA values | 1 | 1 |
 | `spill_cost` | allocator | spill cost: 0 = use count scaled by the def's loop depth; 1 = every use and def weighted by its own loop depth | 1 | 1 |
+| `spill_slots` | allocator | after allocation, merge the slots of copy-related spilled values (and stack parameters) that are never live together; drop the copies | 1 | 1 |
 
 Both targets settle on less aggressive constant hoisting and strength
 reduction than the old hand-set values (2, 5, 16, 2, 4, 1, 4, 4, 10, 6, 4):

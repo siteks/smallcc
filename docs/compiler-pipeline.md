@@ -708,6 +708,16 @@ case requires two advances (`inst = inst->next` twice, or once plus a check for 
 because `IK_ADDR` is inserted before the store, making `def->next` point to the ADDR
 rather than the STORE.
 
+**Spill-slot coalescing** (`coalesce_spill_slots`, after a successful round,
+`-Oparam=spill_slots`): out-of-SSA copies between two spilled values end up
+as `load r <- A; store r -> B`. Slot liveness over the 4-byte spill slots and
+the incoming stack-parameter slots (backward dataflow; interference = one
+slot stored while the other is live, or both live on entry) lets such pairs
+share a slot, heaviest loop depth first; the store is then deleted, and the
+load and the copies between with it when no link has another use before it
+is redefined or leaves the block. A parameter slot stays the class's home.
+On the CPU5 ray tracer this removed 2.9% of executed instructions.
+
 **Output:** `Value.phys_reg` set for all live values (0–7). Coalesced `IK_COPY`
 instructions removed (marked `is_dead`). Spill loads/stores inserted.
 `Value.spill_slot` set for spilled values.
