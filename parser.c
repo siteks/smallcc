@@ -919,6 +919,8 @@ static void parse_decl_specifiers(DeclParseState *ds)
     {
         if (is_sc_spec(token_ctx.current->kind))  ds->sclass = tk_to_sc(token_ctx.current->kind);
         if (is_typespec(token_ctx.current->kind)) ds->typespec |= to_typespec(token_ctx.current->kind);
+        if (token_ctx.current->kind == TK_VOLATILE) ds->qual |= TQ_VOLATILE;
+        if (token_ctx.current->kind == TK_CONST)    ds->qual |= TQ_CONST;
         if (token_ctx.current->kind == TK_IDENT && is_typedef_name(token_ctx.current->val))
         {
             ds->typespec    |= DS_TYPEDEF;
@@ -936,6 +938,7 @@ static Node *make_decl_node(DeclParseState *ds, Node *spec, Node *decls)
     // ch[2] = func_body (set by declaration() if this is a function definition)
     node->u.declaration.typespec = ds->typespec;
     node->u.declaration.sclass   = ds->sclass;
+    node->u.declaration.qual     = ds->qual;
     // Propagate typedef_type into node->type for use by type2_from_decl_node
     if (ds->typedef_type)
         node->type = ds->typedef_type;

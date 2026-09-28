@@ -219,6 +219,7 @@ typedef struct {
     Decl_spec   typespec;      // accumulated type-specifier bitmask
     StorageClass sclass;       // storage class
     Type        *typedef_type; // resolved typedef type (set when DS_TYPEDEF is present)
+    Type_qual    qual;         // const/volatile on the specifiers
 } DeclParseState;
 
 // Linked list of structure members
@@ -275,6 +276,7 @@ struct Type
     }           u;
     Type        *next;       // enumeration list (type_list)
     Type        *hash_next;  // chain in derived-type hash bucket
+    Type        *unqual;     // qualified variant: the unqualified type (else NULL)
 };
 
 typedef enum
@@ -359,7 +361,7 @@ struct Node
         // ND_PTYPE_LIST: variadic flag
         struct { bool is_variadic; } ptype_list;
         // ND_DECLARATION: type specifier bitmask, storage class, func-defn flag, typedef type
-        struct { Decl_spec typespec; StorageClass sclass; bool is_func_defn; Type *typedef_type; } declaration;
+        struct { Decl_spec typespec; StorageClass sclass; bool is_func_defn; Type *typedef_type; Type_qual qual; } declaration;
         // ND_STRUCT: union-vs-struct flag
         struct { bool is_union; } struct_spec;
         // ND_LITERAL: integer/float/string value
@@ -482,6 +484,9 @@ Type *find_typedef_type(char *name);
 // Factory functions for Type
 Type *get_basic_type(Type_base base);
 Type *get_pointer_type(Type *pointee);
+// t with qualifiers q added (an interned variant; t itself when nothing changes).
+Type *get_qualified_type(Type *t, Type_qual q);
+static inline bool type_is_volatile(Type *t) { return t && (t->qual & TQ_VOLATILE); }
 Type *get_array_type(Type *elem, int count);
 Type *get_function_type(Type *ret, Param *params, bool is_variadic);
 Type *get_struct_type(Symbol *tag, Field *members, bool is_union);

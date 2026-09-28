@@ -66,7 +66,7 @@ int opt_stat_bd_change  = 0;
  * sees the final list; the is_dead guard here then handles any residual
  * is_dead instructions that were not unlinked.
  */
-static void recount_uses(Function *f) {
+void recount_uses(Function *f) {
     for (int i = 0; i < f->nvalues; i++) f->values[i]->use_count = 0;
     for (int bi = 0; bi < f->nblocks; bi++) {
         Block *b = f->blocks[bi];
@@ -753,6 +753,7 @@ void opt_narrow_loads(Function *f) {
             if (load_v->kind != VAL_INST || !load_v->def) continue;
             if (load_v->def->kind != IK_LOAD) continue;
             if (load_v->use_count != 1) continue;
+            if (load_v->def->is_volatile) continue;   // the access width is observable
 
             int mask = mask_v->iconst;
             int lsz = load_v->def->size;
@@ -960,7 +961,10 @@ static void compute_known_bits(Function *f) {
                 }
                 break;
             case IK_LOAD:
-                // Unsigned loads produce zero-extended results
+                // Unsigned narrow loads zero-extend; signed ones (llbx/llwx,
+                // chosen by the destination type) sign-extend, so nothing is
+                // known about their upper bits (issue 0008).
+                if (inst->dst && (inst->dst->vtype == VT_I8 || inst->dst->vtype == VT_I16)) break;
                 if (inst->size == 1) r.zero = ~0xFFu;
                 else if (inst->size == 2) r.zero = ~0xFFFFu;
                 break;
@@ -1285,7 +1289,8 @@ void opt_load_cse(Function *f) {
     for (int bi = 0; bi < f->nblocks; bi++) {
         Block *b = f->blocks[bi];
         for (Inst *l2 = b->head; l2; l2 = l2->next) {
-            if (l2->is_dead || l2->kind != IK_LOAD || l2->nops < 1 || !l2->dst)
+            if (l2->is_dead || l2->kind != IK_LOAD || l2->nops < 1 || !l2->dst ||
+                l2->is_volatile)
                 continue;
             Value *base = l2->ops[0] ? val_resolve(l2->ops[0]) : NULL;
             if (!base || base->kind != VAL_INST) continue;   // skip bp-relative & const
@@ -1301,7 +1306,7 @@ void opt_load_cse(Function *f) {
                 if (lc_clobbers(p)) { blocked = 1; break; }
                 if (p->kind == IK_LOAD && p->nops >= 1 && p->dst &&
                     p->ops[0] && val_resolve(p->ops[0]) == base &&
-                    p->imm == l2->imm && p->size == l2->size &&
+                    p->imm == l2->imm && p->size == l2->size && !p->is_volatile &&
                     p->dst->vtype == l2->dst->vtype) { l1 = p; break; }
             }
 
@@ -1316,7 +1321,7 @@ void opt_load_cse(Function *f) {
                         if (lc_clobbers(p)) break;
                         if (p->kind == IK_LOAD && p->nops >= 1 && p->dst &&
                             p->ops[0] && val_resolve(p->ops[0]) == base &&
-                            p->imm == l2->imm && p->size == l2->size &&
+                            p->imm == l2->imm && p->size == l2->size && !p->is_volatile &&
                             p->dst->vtype == l2->dst->vtype) { cand = p; break; }
                     }
                     if (!cand) continue;
@@ -1922,6 +1927,7 @@ void opt_licm(Function *f) {
                     if (inv[did]) continue;
                     if (!is_cse_pure(inst->kind) &&
                         !(inst->kind == IK_LOAD && loop_store_free)) continue;
+                    if (inst->is_volatile) continue;          // every access happens
                     // Exclude division/mod — could trap if loop runs 0 times
                     if (inst->kind == IK_DIV  || inst->kind == IK_UDIV ||
                         inst->kind == IK_MOD  || inst->kind == IK_UMOD ||
@@ -2948,6 +2954,35 @@ void opt_lsr(Function *f) {
 // This eliminates a load+store per iteration, freeing the address register
 // inside the loop body and reducing register pressure.
 
+// Whether [a+ia, a+ia+sa) and [b+ib, b+ib+sb) are provably different
+// memory: the same base with non-overlapping offsets, two different globals,
+// a global and a frame slot, or two frame slots whose ranges do not meet.
+// Through two unrelated pointers, C's aliasing rule (C89 3.3) still applies:
+// an object is accessed only through its own type or a character type, so
+// accesses of different sizes, neither of them a byte, are different objects
+// (an int accumulator and short matrix elements in CoreMark's
+// matrix_mul_vect). Same-size accesses through unrelated pointers may alias.
+static bool sp_disjoint(Value *a, int ia, int sa, Value *b, int ib, int sb) {
+    a = val_resolve(a); b = val_resolve(b);
+    if (a == b) return ia + sa <= ib || ib + sb <= ia;
+    if (sa != sb && sa != 1 && sb != 1) return true;
+    Inst *da = (a->kind == VAL_INST) ? a->def : NULL;
+    Inst *db = (b->kind == VAL_INST) ? b->def : NULL;
+    if (!da || !db) return false;
+    if (da->kind == IK_GADDR && db->kind == IK_GADDR) {
+        if (!da->fname || !db->fname) return false;
+        if (strcmp(da->fname, db->fname)) return true;
+        return ia + sa <= ib || ib + sb <= ia;
+    }
+    if ((da->kind == IK_GADDR && db->kind == IK_ADDR) ||
+        (da->kind == IK_ADDR && db->kind == IK_GADDR)) return true;
+    if (da->kind == IK_ADDR && db->kind == IK_ADDR) {
+        int oa = da->imm + ia, ob = db->imm + ib;
+        return oa + sa <= ob || ob + sb <= oa;
+    }
+    return false;
+}
+
 void opt_scalar_promote(Function *f) {
     LoopInfo *loops;
     int nloops = find_loops(f, &loops);
@@ -3025,6 +3060,7 @@ void opt_scalar_promote(Function *f) {
                     if (val_resolve(i->ops[0]) == addr) { load = i; break; }
                 }
                 if (!load) continue;
+                if (load->is_volatile || store->is_volatile) continue;
 
                 // Store value must depend on load result (1-hop check)
                 Value *sv = val_resolve(store->ops[1]);
@@ -3045,6 +3081,25 @@ void opt_scalar_promote(Function *f) {
                     }
                 }
                 if (other_st) continue;
+
+                // Every other load in the loop must read provably different
+                // memory: it would otherwise see the stale value while the
+                // promoted copy lives in a register (issue 0009).
+                int other_ld = 0;
+                for (int bi2 = 0; bi2 < f->nblocks && !other_ld; bi2++) {
+                    Block *bb = f->blocks[bi2];
+                    if (!in_body[bb->id]) continue;
+                    for (Inst *i = bb->head; i && !other_ld; i = i->next) {
+                        if (i->is_dead || i->kind != IK_LOAD || i == load) continue;
+                        if (!sp_disjoint(i->ops[0], i->imm, i->size, addr, imm, sz))
+                            other_ld = 1;
+                    }
+                }
+                if (other_ld) continue;
+
+                // The store must run on every iteration: its value feeds the
+                // accumulator phi along the back edge.
+                if (!dominates(b, latch)) continue;
 
                 // Find init store in pre-header (same address, same size)
                 Inst *init_st = NULL;

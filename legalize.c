@@ -49,8 +49,8 @@ static int store_size(Inst *inst) {
     Value *v = val_resolve(inst->ops[inst->nops - 1]);
     return v ? vtype_size(v->vtype) : 4;
 }
-static int is_slot_load(Inst *inst)  { return inst->kind == IK_LOAD  && inst->nops >= 1 && !inst->ops[0] && inst->dst; }
-static int is_slot_store(Inst *inst) { return inst->kind == IK_STORE && inst->nops == 1; }
+static int is_slot_load(Inst *inst)  { return inst->kind == IK_LOAD  && inst->nops >= 1 && !inst->ops[0] && inst->dst && !inst->is_volatile; }
+static int is_slot_store(Inst *inst) { return inst->kind == IK_STORE && inst->nops == 1 && !inst->is_volatile; }
 
 // Escaped frame ranges: every IK_ADDR that still has a use after Pass G is a
 // frame address that reaches memory-unaware code (a call argument, a memcpy,
@@ -122,6 +122,8 @@ static int is_pure_kind(Inst *inst) {
     case IK_STORE: case IK_CALL: case IK_ICALL: case IK_BR: case IK_JMP:
     case IK_RET: case IK_SWITCH: case IK_PUTCHAR: case IK_MEMCPY:
         return 0;
+    case IK_LOAD:
+        return !inst->is_volatile && inst->dst != NULL;
     default:
         return inst->dst != NULL;
     }
@@ -237,6 +239,8 @@ static void legalize_slot_forward(Function *f) {
                     Value *v = val_resolve(inst->ops[0]);
                     if (sz == 4 && v && v->kind == VAL_INST) v = forwardable(f, v, &wcache, &wcache_n);
                     slotmap_set(&m, inst->imm, sz, (sz == 4 && v && v->kind == VAL_INST) ? v : NULL);
+                } else if (inst->kind == IK_STORE && inst->nops == 1) {
+                    slotmap_invalidate(&m, inst->imm, store_size(inst));   // a volatile slot store
                 } else {
                     // pointer store: may hit any escaped slot
                     int w = 0;
@@ -272,7 +276,8 @@ static void legalize_slot_forward(Function *f) {
                     int read = 0;
                     for (int bj = 0; bj < nb && !read; bj++)
                         for (Inst *q = f->blocks[bj]->head; q; q = q->next)
-                            if (!q->is_dead && is_slot_load(q) && q->dst->id < f->nvalues && live[q->dst->id] &&
+                            if (!q->is_dead && q->kind == IK_LOAD && q->nops >= 1 && !q->ops[0] && q->dst &&
+                                q->dst->id < f->nvalues && (q->is_volatile || live[q->dst->id]) &&
                                 ranges_overlap(q->imm, load_size(q), inst->imm, sz)) { read = 1; break; }
                     if (getenv("LEG_DEBUG")) fprintf(stderr, "  [H] %s: store [bp%+d]:%d %s\n", f->name, inst->imm, sz, read ? "kept (loaded)" : "dead");
                     if (!read) {

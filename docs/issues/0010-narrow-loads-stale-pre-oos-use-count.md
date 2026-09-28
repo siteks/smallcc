@@ -1,6 +1,9 @@
 # 0010 — Pre-OOS use_count is approximate, yet opt_narrow_loads mutates a shared load on use_count == 1
 
-Status: OPEN (found 2026-09-26 by the compiler review, `docs/review-2026-09.md`; reproduced on `sim_c` and, where marked, at `-O0` as well).
+Status: FIXED 2026-09-28: the driver recounts uses right after
+`split_critical_edges`, and `verify.c` rejects an undercount from the first
+pre-OOS verification on (`IR_VERIFY=1` passes on the corpus, CoreMark and the
+ray tracer).
 
 Reproducer: `tests/cases/opt/narrow_loads_stale_use_count.c` (`// XFAIL: issue 0010`).
 A loop that tests `x & 0xff` and also compares `i < x` returns 1 instead of 20 at `-O2`.

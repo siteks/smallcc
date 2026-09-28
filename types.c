@@ -168,6 +168,25 @@ Type *get_basic_type(Type_base base)
     return t;
 }
 
+Type *get_qualified_type(Type *t, Type_qual q)
+{
+    if (!t || (t->qual | q) == t->qual) return t;
+    Type *base = t->unqual ? t->unqual : t;
+    Type_qual want = t->qual | q;
+    for (Type *p = type_ctx.type_list; p; p = p->next)
+        if (p->unqual == base && p->qual == want) return p;
+    // A copy of the (complete) type; a struct completed after this point is
+    // not seen through the variant.
+    Type *v = arena_alloc(sizeof(Type));
+    *v = *base;
+    v->qual = want;
+    v->unqual = base;
+    v->next = NULL;
+    v->hash_next = NULL;
+    append_type(v);
+    return v;
+}
+
 Type *get_pointer_type(Type *pointee)
 {
     uint32_t idx = (ptr_mix((uintptr_t)pointee) ^ ((uint32_t)TB_POINTER * 0x9e3779b1u))
@@ -440,6 +459,7 @@ Type *type2_from_decl_node(Node *node, DeclParseState ds)
     {
         base = typespec_to_base(ds.typespec);
     }
+    base = get_qualified_type(base, ds.qual);
     // A declarator may be present (type_name() for casts/sizeof builds ND_DECLARATION
     // with a declarator stored as the first entry in u.declaration.decls).
     Node *first_decl = node->ch[1];   // decls list head
@@ -723,6 +743,7 @@ static Type *generate_struct_type(Node *decl_node, DeclParseState ds, int depth)
                 {
                     base = typespec_to_base(d->u.declaration.typespec);
                 }
+                base = get_qualified_type(base, d->u.declaration.qual);
 
                 Type       *mty   = type_from_declarator(m, base);
                 const char *fname = get_decl_ident(m);
@@ -860,6 +881,7 @@ void add_types_and_symbols(Node *node, DeclParseState ds, bool is_param, bool is
     {
         base = typespec_to_base(ds.typespec);
     }
+    base = get_qualified_type(base, ds.qual);
 
     // Second pass: process every ND_DECLARATOR child
     bool first_decl = true;

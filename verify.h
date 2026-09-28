@@ -21,7 +21,7 @@
  */
 
 typedef enum {
-    VERIFY_PRE_OOS,   // true SSA: phis present; use_count approximate
+    VERIFY_PRE_OOS,   // true SSA: phis present; use_count never undercounts
     VERIFY_OOS,       // phis eliminated; use_count still approximate
                       // (Braun's counts are only trued up by the first
                       //  recount_uses, inside opt_copy_prop)

@@ -351,6 +351,14 @@ echo "all on (mask=0x1FFF):"
 
 ---
 
+## Volatile accesses
+
+A load or store through a volatile lvalue carries `Inst.is_volatile` (set by
+braun). Every pass that could move, merge, narrow or delete a memory access
+must skip it: `opt_licm`, `opt_load_cse`, `opt_narrow_loads`,
+`opt_scalar_promote`, IRC's dead-code pass (`is_pure_inst`) and legalize
+Pass H do. A new pass that touches loads or stores must do the same.
+
 ## Correctness Constraints
 
 Passes that **must** always run (not gated by bitmask):

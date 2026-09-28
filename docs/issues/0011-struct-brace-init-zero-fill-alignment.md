@@ -1,6 +1,10 @@
 # 0011 — Struct brace-initialiser zero-fill stores halfwords regardless of alignment and size
 
-Status: OPEN (found 2026-09-26 by the compiler review, `docs/review-2026-09.md`; reproduced on `sim_c` and, where marked, at `-O0` as well).
+Status: FIXED 2026-09-28: `cg_decl_init` zeroes only the bytes the field
+stores leave (holes, padding, members without an initialiser), each run with
+the largest naturally aligned stores that fit the object (`cover_struct`,
+`zero_uncovered` in `braun.c`). Fewer stores for ordinary structs. Test:
+`struct_init/partial_brace_zero.c`.
 
 Reproducer: `tests/cases/struct_init/char3_brace_init.c` (`// XFAIL: issue 0011`).
 `struct { char a, b, c; } s = {1, 2, 3};` aborts `sim_c` with an alignment error at

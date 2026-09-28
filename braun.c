@@ -9,6 +9,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 #include "braun.h"
 #include "ssa.h"
 #include "sx.h"
@@ -399,6 +400,9 @@ static ValType vt_of(Type *t) {
 }
 
 static bool is_addr_taken(BraunCtx *ctx, Symbol *sym) {
+    // A volatile local lives in its frame slot, like an address-taken one,
+    // so every access is a real load or store.
+    if (sym && sym->kind == SYM_LOCAL && type_is_volatile(sym->type)) return true;
     for (int i = 0; i < ctx->n_addr_taken; i++)
         if (ctx->addr_taken[i] == sym) return true;
     return false;
@@ -918,6 +922,25 @@ static int absorbable_offset(int k, int size) {
     return scaled >= -512 && scaled <= 511;
 }
 
+// Set just before emitting a load or store through a volatile lvalue; the
+// next emit_load / emit_store marks its instruction and clears it.
+static int g_next_volatile;
+
+// Whether the lvalue n designates a volatile object: its own type, or the
+// struct it is a member of (s.f of a volatile s, p->f with p to volatile).
+static int lv_volatile(Node *n) {
+    if (!n) return 0;
+    if (type_is_volatile(n->type)) return 1;
+    if (n->kind == ND_MEMBER && n->ch[0]) {
+        if (n->op_kind == TK_ARROW)
+            return n->ch[0]->type && n->ch[0]->type->base == TB_POINTER &&
+                   type_is_volatile(n->ch[0]->type->u.ptr.pointee);
+        return lv_volatile(n->ch[0]);
+    }
+    if (n->kind == ND_IDENT && n->symbol) return type_is_volatile(n->symbol->type);
+    return 0;
+}
+
 static Value *emit_load(BraunCtx *ctx, Block *b, Value *ptr, int size, int offset, ValType vt) {
     // Absorb constant ADD offset into load: LOAD(ADD(base, k), 0) → LOAD(base, k)
     if (offset == 0 && ptr && ptr->kind == VAL_INST && ptr->def &&
@@ -943,6 +966,7 @@ static Value *emit_load(BraunCtx *ctx, Block *b, Value *ptr, int size, int offse
     inst_add_op(inst, ptr);
     inst->imm  = offset;
     inst->size = size;
+    inst->is_volatile = g_next_volatile; g_next_volatile = 0;
     inst_append(b, inst);
     return dst;
 }
@@ -979,6 +1003,7 @@ static void emit_store(BraunCtx *ctx, Block *b, Value *ptr, Value *val, int size
     inst_add_op(inst, val);
     inst->imm  = offset;
     inst->size = size;
+    inst->is_volatile = g_next_volatile; g_next_volatile = 0;
     inst_append(b, inst);
 }
 
@@ -1153,12 +1178,13 @@ static Value *cg_rmw_as(BraunCtx *ctx, Block **cur, Node *lhs, InstKind bop,
     if (ssa) old = read_var(ctx, b, lhs->symbol);
     else {
         addr = cg_addr(ctx, cur, lhs); b = *cur;
+        g_next_volatile = lv_volatile(lhs);
         old  = emit_load(ctx, b, addr, sz, 0, vt);
     }
     Value *newv;
     if (op_vt == vt) newv = emit_binop(ctx, b, bop, old, rhs, vt);
     else newv = emit_convert(ctx, b, emit_binop(ctx, b, bop, emit_convert(ctx, b, old, op_vt), rhs, op_vt), vt);
-    if (!ssa) emit_store(ctx, b, addr, newv, sz, 0);     // the store truncates
+    if (!ssa) { g_next_volatile = lv_volatile(lhs); emit_store(ctx, b, addr, newv, sz, 0); } // the store truncates
     // An unsigned char/short value is assumed in range wherever it is widened
     // (the widening is a plain copy), so the result of arithmetic in that
     // type must wrap here: 250 + 10 is 4. Signed narrow values are
@@ -1514,6 +1540,7 @@ static Value *cg_expr(BraunCtx *ctx, Block **cur, Node *n) {
             sym->kind == SYM_STATIC_GLOBAL || sym->kind == SYM_STATIC_LOCAL) {
             Value *addr = emit_gaddr(ctx, b, sym_label(sym));
             int sz = sym->type ? sym->type->size : 2;
+            g_next_volatile = type_is_volatile(sym->type);
             return emit_load(ctx, b, addr, sz, 0, vt);
         }
 
@@ -1528,6 +1555,7 @@ static Value *cg_expr(BraunCtx *ctx, Block **cur, Node *n) {
             }
             Value *addr = emit_frame_addr(ctx, b, bpoff);
             int sz = sym->type ? sym->type->size : 2;
+            g_next_volatile = type_is_volatile(sym->type);
             return emit_load(ctx, b, addr, sz, 0, vt);
         }
 
@@ -1576,6 +1604,7 @@ static Value *cg_expr(BraunCtx *ctx, Block **cur, Node *n) {
                 return cg_expr(ctx, cur, n->ch[0]);
             Value *ptr = cg_expr(ctx, cur, n->ch[0]); b = *cur;
             int sz = n->type ? n->type->size : 2;
+            g_next_volatile = lv_volatile(n);
             return emit_load(ctx, b, ptr, sz, 0, vt);
         }
 
@@ -1740,6 +1769,7 @@ static Value *cg_expr(BraunCtx *ctx, Block **cur, Node *n) {
         }
         Value *addr = cg_addr(ctx, cur, n->ch[0]); b = *cur;
         int sz = n->ch[0]->type ? n->ch[0]->type->size : 2;
+        g_next_volatile = lv_volatile(n->ch[0]);
         emit_store(ctx, b, addr, rhs, sz, 0);
         return rhs;
     }
@@ -1838,6 +1868,7 @@ static Value *cg_expr(BraunCtx *ctx, Block **cur, Node *n) {
         // Load scalar member
         Value *addr = cg_addr(ctx, cur, n); b = *cur;
         int sz = n->type ? n->type->size : 2;
+        g_next_volatile = lv_volatile(n);
         return emit_load(ctx, b, addr, sz, 0, vt);
     }
 
@@ -2022,6 +2053,76 @@ static void cg_fill_struct(BraunCtx *ctx, Block **cur, Value *base_addr, int bas
     }
 }
 
+// Mark the bytes cg_fill_array / cg_fill_struct will store (mirrors them
+// exactly, including the zero literals cg_fill_array skips).
+static void cover_array(Type *ty, Node *init_list, int *byte_off, char *cov, int total);
+static void cover_struct(Type *ty, int base_off, Node *init_list, char *cov, int total) {
+    if (!ty || ty->base != TB_STRUCT || !init_list) return;
+    Field *f = ty->u.composite.members;
+    for (Node *item = init_list->ch[0]; f && item; f = f->next, item = item->next) {
+        Node *raw = item;
+        while (raw && raw->kind == ND_CAST) raw = raw->ch[1];
+        int foff = base_off + f->offset;
+        if (raw && raw->kind == ND_INITLIST && f->type && f->type->base == TB_STRUCT)
+            cover_struct(f->type, foff, raw, cov, total);
+        else if (raw && raw->kind == ND_INITLIST && f->type && istype_array(f->type)) {
+            int off = foff;
+            cover_array(f->type, raw, &off, cov, total);
+        } else {
+            int fsz = f->type ? f->type->size : 2;
+            for (int k = foff; k < foff + fsz && k < total; k++) cov[k] = 1;
+        }
+    }
+}
+static void cover_array(Type *ty, Node *init_list, int *byte_off, char *cov, int total) {
+    if (!ty || !istype_array(ty) || !init_list) return;
+    Type *elem_type = ty->u.arr.elem;
+    int   elem_size = elem_type ? elem_type->size : 2;
+    Type *leaf_type = array_elem_type(ty);
+    int   lsz       = (leaf_type && leaf_type->size > 0) ? leaf_type->size : 2;
+    for (Node *item = init_list->ch[0]; item; item = item->next) {
+        Node *raw = item;
+        while (raw && raw->kind == ND_CAST) raw = raw->ch[1];
+        if (raw && raw->kind == ND_INITLIST && elem_type && istype_array(elem_type)) {
+            if (elem_size > 0 && *byte_off % elem_size != 0)
+                *byte_off = ((*byte_off / elem_size) + 1) * elem_size;
+            cover_array(elem_type, raw, byte_off, cov, total);
+            if (elem_size > 0 && *byte_off % elem_size != 0)
+                *byte_off = ((*byte_off / elem_size) + 1) * elem_size;
+        } else if (raw && raw->kind == ND_INITLIST && elem_type && elem_type->base == TB_STRUCT) {
+            if (elem_size > 0 && *byte_off % elem_size != 0)
+                *byte_off = ((*byte_off / elem_size) + 1) * elem_size;
+            cover_struct(elem_type, *byte_off, raw, cov, total);
+            *byte_off += elem_size;
+        } else if (raw && raw->kind == ND_LITERAL && raw->u.literal.ival == 0 && !raw->u.literal.strval) {
+            *byte_off += lsz;                      // skipped: left to the zero fill
+        } else {
+            for (int k = *byte_off; k < *byte_off + lsz && k < total; k++) cov[k] = 1;
+            *byte_off += lsz;
+        }
+    }
+}
+
+// Zero the bytes of a `total`-byte, `align`-aligned object at base that the
+// initialiser does not store, each run with the largest naturally aligned
+// stores (at most `align` bytes) that stay inside it (issue 0011).
+static void zero_uncovered(BraunCtx *ctx, Block *b, Value *base, int total, int align, const char *cov) {
+    int unit_max = align >= 4 ? 4 : align >= 2 ? 2 : 1;
+    for (int off = 0; off < total; ) {
+        if (cov[off]) { off++; continue; }
+        int u = unit_max;
+        while (u > 1) {
+            int ok = (off % u == 0) && off + u <= total;
+            for (int k = off; ok && k < off + u; k++) if (cov[k]) ok = 0;
+            if (ok) break;
+            u >>= 1;
+        }
+        Value *ptr = addr_at(ctx, b, base, off);
+        emit_store(ctx, b, ptr, new_const(ctx->f, 0, u == 1 ? VT_I8 : u == 2 ? VT_I16 : VT_I32), u, 0);
+        off += u;
+    }
+}
+
 // ============================================================
 // cg_decl_init — handle local declaration initializer
 // ============================================================
@@ -2081,13 +2182,13 @@ static void cg_decl_init(BraunCtx *ctx, Block **cur, Symbol *sym, Node *init) {
         Value *dst_addr = emit_frame_addr(ctx, b, -(sym->offset));
 
         if (init->kind == ND_INITLIST) {
-            // Zero-fill struct
+            // Zero what the fields below leave (holes, padding, members
+            // without an initialiser), then store each field.
             int total = ty->size;
-            for (int off = 0; off < total; off += 2) {
-                Value *ptr = addr_at(ctx, b, dst_addr, off);
-                emit_store(ctx, b, ptr, new_const(ctx->f, 0, VT_I16), 2, 0);
-            }
-            // Store each field (recursive for nested struct/array fields)
+            char *cov = calloc(total > 0 ? total : 1, 1);
+            cover_struct(ty, 0, init, cov, total);
+            zero_uncovered(ctx, b, dst_addr, total, ty->align, cov);
+            free(cov);
             cg_fill_struct(ctx, cur, dst_addr, 0, ty, init);
         } else {
             // Struct from expression: memcpy

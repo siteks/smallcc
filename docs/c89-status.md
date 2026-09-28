@@ -71,7 +71,7 @@ Preprocessor excluded. Features are assessed against ANSI C89/ISO C90.
 | `typedef` | ✅ | Scalar, pointer, struct/union aliases; lexical scoping with shadowing |
 | Function pointers | ✅ | Declare, assign, call via `fp(args)`, `(*fp)(args)`, `arr[i](args)`, `s.fp(args)`, `s->fp(args)`; pass as arguments; use as parameters (`int (*f)(int)`) |
 | Bit fields in structs | N/A | Deliberately not supported — see deviations |
-| `const` / `volatile` qualifiers | ⚠️ | Parsed and stored; semantics not enforced |
+| `const` / `volatile` qualifiers | ⚠️ | `volatile` is honoured: every access through a volatile object, struct member or pointee is a real load or store, in order, never merged, hoisted, narrowed or deleted, and a volatile local lives in memory. Not supported: a qualifier on the pointer itself (`int *volatile p`) and volatile parameters. `const` is stored but not enforced |
 
 ## Declarations and Linkage
 

@@ -1,6 +1,18 @@
 # 0007 — LICM hoists loads out of store-free loops regardless of address; volatile is not implemented
 
-Status: OPEN (found 2026-09-26 by the compiler review, `docs/review-2026-09.md`; reproduced on `sim_c` and, where marked, at `-O0` as well).
+Status: FIXED 2026-09-28 (the wrong code). `volatile` is implemented: the
+parser keeps const/volatile on types (`get_qualified_type`), braun marks every
+load and store through a volatile lvalue (`Inst.is_volatile`: a volatile
+object, a member of a volatile struct, a pointee of a pointer to volatile),
+a volatile local lives in its frame slot, and LICM, load CSE, load narrowing,
+scalar promotion, IRC's dead-code pass and legalize Pass H leave marked
+accesses alone. Every MMIO access in `sw/` is already through `volatile`.
+Still open, as an optimisation rather than a correctness item: the loop passes
+use "dominated by the header" as the loop body, which over-approximates
+(making them conservative); switching the thirteen sites to the natural loop
+body needs the LICM budgets retuned against CoreMark and the ray tracer.
+Not implemented: qualifiers on the pointer itself (`int *volatile p`) and
+volatile parameters. Tests: `opt/licm_mmio_spin.c`, `hw/volatile_accesses.c`.
 
 Reproducer: `tests/cases/opt/licm_mmio_spin.c` (`// XFAIL: issue 0007`,
 `SIM_ARGS: -maxsteps 200000`). `while (*t - t0 < 100u) {}` on the cycle counter at

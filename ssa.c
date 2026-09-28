@@ -244,6 +244,7 @@ void print_inst(Inst *inst, FILE *out) {
         else                 fprintf(out, "bp");
         if (inst->imm) fprintf(out, "+%d", inst->imm);
         fprintf(out, "]:%d", inst->size);
+        if (inst->is_volatile) fprintf(out, " volatile");
         break;
     case IK_STORE:
         fprintf(out, " [");

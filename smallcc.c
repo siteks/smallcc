@@ -730,6 +730,11 @@ int main(int argc, char **argv)
                 if (f) {
                     if (ssa_out) { fprintf(ssa_out, "=== SSA: %s ===\n", f->name); print_function(f, ssa_out); }
                     split_critical_edges(f);
+                    // Braun leaves approximate use counts (trivial-phi removal
+                    // redirects uses without recounting); make them exact before
+                    // any pass reads them (issue 0010). verify.c holds every
+                    // pass to exactness from here on.
+                    recount_uses(f);
                     verify_function(f, "braun+split", VERIFY_PRE_OOS);
                     // Pre-OOS cleanup: CFG-structural, no phis/copies needed
                     if (opt_flags & OPT_FOLD_BR)        STAT("pre", opt_stat_fold_br,  opt_fold_branches(f));

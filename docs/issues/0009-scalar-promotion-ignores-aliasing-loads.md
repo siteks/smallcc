@@ -1,6 +1,11 @@
 # 0009 — Scalar promotion promotes a location without proving it is private (always-on pass)
 
-Status: OPEN (found 2026-09-26 by the compiler review, `docs/review-2026-09.md`; reproduced on `sim_c` and, where marked, at `-O0` as well).
+Status: FIXED 2026-09-28: every other load in the loop must be provably
+disjoint from the promoted location (same base with non-overlapping offsets,
+different globals, global vs frame slot, or C's aliasing rule: accesses of
+different sizes, neither a byte, are different objects), and the store must
+dominate the latch. CoreMark's matrix promotion (int accumulator, short
+elements) is kept by the aliasing rule. Test: `opt/scalar_promote_alias_ptrs.c`.
 
 Reproducer: `tests/cases/opt/scalar_promote_alias_load.c` (`// XFAIL: issue 0009`).
 `*p += 1; s += g;` in a loop with `p == &g` returns 0 instead of 15, at every `-O`

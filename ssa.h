@@ -124,6 +124,7 @@ struct Inst {
     Inst     *prev, *next;
     Block    *block;
     int       is_dead;
+    int       is_volatile;  // IK_LOAD/IK_STORE through a volatile lvalue: never moved, merged, narrowed or deleted
     int       line;         // source line (0 = unknown); used by -ann emission
 };
 

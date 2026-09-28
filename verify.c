@@ -162,11 +162,12 @@ void verify_function(Function *f, const char *stage, VerifyPhase phase)
         // emission's remap_single_use_values would delete or repurpose a
         // computation that still has other consumers.
         //
-        // Only enforced post-OOS: Braun construction leaves approximate
-        // counts (trivial-phi removal rewires uses without recounting), and
-        // every use_count consumer runs after one of the opt passes has
-        // called recount_uses. From copy_prop onward, exactness must hold.
-        if (phase != VERIFY_PRE_OOS && phase != VERIFY_OOS) {
+        // Braun construction leaves approximate counts (trivial-phi removal
+        // rewires uses without recounting); the driver recounts right after
+        // split_critical_edges, so from the first verification on no pass
+        // may leave an undercount (issue 0010: opt_narrow_loads mutated a
+        // shared load on a stale count of 1).
+        if (phase != VERIFY_OOS) {
             for (int i = 0; i < f->nvalues; i++) {
                 Value *v = f->values[i];
                 if (v->kind != VAL_INST || v->alias) continue;

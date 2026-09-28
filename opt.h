@@ -114,6 +114,7 @@ void opt_lsr(Function *f);
 // countdown loops (c = phi(bound, c-1); exit when c == 0) so emission can
 // fuse the back edge into dbnz and no bound register is live in the loop.
 void opt_downcount(Function *f);
+void recount_uses(Function *f);            // rebuild every use_count from the live instructions
 void opt_narrow_wrap_range(Function *f);   // drop an unsigned narrow wrap a dominating bound makes redundant
 
 // Scalar promotion: hoist load-modify-store to loop-invariant address into a register

@@ -879,11 +879,10 @@ static void emit_inst(Inst *inst, FILE *out) {
         } else {
             int rb = preg(base);
             if (base->kind == VAL_CONST && base->iconst == 0) {
-                // null base, use imm as absolute (unusual)
-                int tmp = (rd == 0) ? 1 : 0;
-                g_scratch_borrows |= (uint8_t)(1u << tmp);
-                emit_imm(out, tmp, off);
-                fprintf(out, "    %s %s, %s, 0\n", load_f3c(size, is_s), regname(rd), regname(tmp));
+                // null base, use imm as absolute (unusual): the destination
+                // is being written, so it can hold the address.
+                emit_imm(out, rd, off);
+                fprintf(out, "    %s %s, %s, 0\n", load_f3c(size, is_s), regname(rd), regname(rd));
             } else {
                 // F3c: mnem rx, ry, scaled_imm10
                 fprintf(out, "    %s %s, %s, %d\n",
@@ -902,28 +901,62 @@ static void emit_inst(Inst *inst, FILE *out) {
         int size    = inst->size ? inst->size : (val ? vtype_size(val->vtype) : 2);
         int off     = inst->imm;
 
-        // Pick scratch registers for base and val, avoiding conflicts
+        // A constant (or unallocated) value or base is materialised in a
+        // scratch register that is provably dead here (find_free_scratch
+        // counts registers live out of the block); when none is, one is
+        // saved around the store. A fixed r0/r1 used to clobber live values
+        // (a loop counter at -O0, where Pass F leaves constants in place).
         int rb = base ? (base->kind == VAL_CONST ? -1 : preg(base)) : -1;
-        // Materialize constants
-        int rv_scratch = 0; // default scratch for value
-        if (rb == 0) rv_scratch = 1;
-        if (val && (val->kind == VAL_CONST || val->kind == VAL_UNDEF ||
-                    val->phys_reg < 0))
-            g_scratch_borrows |= (uint8_t)(1u << rv_scratch);
-        int rv = get_val_reg(out, val, rv_scratch);
+        int saved[3], nsaved = 0;
+        unsigned used = (rb >= 0) ? (1u << rb) : 0;
+        int rv;
+        if (val && val->kind == VAL_INST && val->phys_reg < 0) {
+            // Unallocated (spill-rewritten) value: by convention it is in
+            // the default scratch already; nothing to materialise.
+            int sc = (rb == 0) ? 1 : 0;
+            g_scratch_borrows |= (uint8_t)(1u << sc);
+            rv = get_val_reg(out, val, sc);
+        } else if (val && (val->kind == VAL_CONST || val->kind == VAL_UNDEF)) {
+            int sc = find_free_scratch(inst, (int)used);
+            if (sc < 0) {
+                sc = (rb == 0) ? 1 : 0;
+                g_scratch_borrows |= (uint8_t)(1u << sc);
+                fprintf(out, "    pushr %s\n", regname(sc));
+                saved[nsaved++] = sc;
+            }
+            rv = get_val_reg(out, val, sc);
+        } else {
+            rv = get_val_reg(out, val, 0);
+        }
+        used |= 1u << rv;
 
-        int rb_scratch = (rv == 0) ? 1 : 0;
         if (base && base->kind == VAL_CONST) {
-            g_scratch_borrows |= (uint8_t)(1u << rb_scratch);
-            emit_const_into(out, base, rb_scratch);
-            rb = rb_scratch;
+            int sc = find_free_scratch(inst, (int)used);
+            if (sc < 0) {
+                sc = 0;
+                while (used & (1u << sc)) sc++;
+                g_scratch_borrows |= (uint8_t)(1u << sc);
+                fprintf(out, "    pushr %s\n", regname(sc));
+                saved[nsaved++] = sc;
+            }
+            emit_const_into(out, base, sc);
+            rb = sc;
         }
 
         if (!base || (inst->nops < 2)) {
-            // Spill store: base is implicit bp.  Need a scratch distinct
-            // from rv for the out-of-F2-range lea base.
-            int tmp = (rv == 0) ? 1 : 0;
-            if (tmp == rv) tmp = 2;
+            // Spill store: base is implicit bp. The out-of-F2-range form
+            // needs an address temp distinct from rv.
+            int tmp = (rv == 0) ? 1 : 0;              // unused by the F2 form
+            if (!f2_range(off, size)) {
+                tmp = find_free_scratch(inst, (int)used);
+                if (tmp < 0) {
+                    tmp = 0;
+                    while (used & (1u << tmp)) tmp++;
+                    g_scratch_borrows |= (uint8_t)(1u << tmp);
+                    fprintf(out, "    pushr %s\n", regname(tmp));
+                    saved[nsaved++] = tmp;
+                }
+            }
             emit_bp_store(out, rv, tmp, off, size);
         } else {
             // F3c: mnem rv, ry, scaled_imm10
@@ -931,6 +964,7 @@ static void emit_inst(Inst *inst, FILE *out) {
                     store_f3c(size), regname(rv), regname(rb),
                     f_scaled(off, size));
         }
+        while (nsaved > 0) fprintf(out, "    popr %s\n", regname(saved[--nsaved]));
         break;
     }
 

@@ -1,5 +1,4 @@
 // EXPECT_R0: 15
-// XFAIL: issue 0009 (opt_scalar_promote keeps *p in a register while g is read from memory; always-on pass)
 int g;
 int main(void) {
     int *p = &g, i, s = 0;

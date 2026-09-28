@@ -1025,6 +1025,8 @@ static int is_pure_inst(Inst *inst) {
         case IK_BR: case IK_JMP: case IK_RET: case IK_SWITCH:
         case IK_PUTCHAR: case IK_MEMCPY:
             return 0;
+        case IK_LOAD:
+            return !inst->is_volatile && inst->dst != NULL;   // a volatile read happens even if unused
         default:
             return inst->dst != NULL;
     }

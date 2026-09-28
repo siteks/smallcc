@@ -1,6 +1,7 @@
 # 0008 — Known-bits treats every narrow load as zero-extending
 
-Status: OPEN (found 2026-09-26 by the compiler review, `docs/review-2026-09.md`; reproduced on `sim_c` and, where marked, at `-O0` as well).
+Status: FIXED 2026-09-28: known-bits assumes nothing about the upper bits of
+a signed narrow load (destination type I8/I16).
 
 Reproducer: `tests/cases/opt/known_bits_signed_byte_load.c` (`// XFAIL: issue 0008`).
 `char g = -1; return *p & 0xff;` gives -1 at `-O2` (255 at `-O0`).
