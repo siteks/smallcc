@@ -5,6 +5,8 @@
 #ifndef CPU4_EXEC_GEN_H
 #define CPU4_EXEC_GEN_H
 
+#include "../cpu4/fpu_model.h"
+
 /* halt: H = 1 */
 static void cpu4_gx_halt(Core *cc, uint32_t w, uint16_t oldpc) {
     (void)w; (void)oldpc;

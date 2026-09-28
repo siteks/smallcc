@@ -344,6 +344,8 @@ def gen_c(isa):
          " * opcodes, operands, invariants and semantics in the ISA definition.",
          " * Included by sim_c.c after isatool/exec_common.h. */",
          f"#ifndef {p.upper()}_EXEC_GEN_H", f"#define {p.upper()}_EXEC_GEN_H", ""]
+    if isa.prim_c:      # the primitives' header, a path from the toolchain root; this file is <arch>/exec_gen.h
+        L += [f'#include "../{isa.prim_c}"', ""]
     for i in isa.instrs:
         L.append(CGen(isa, i).function()); L.append("")
     # invariants

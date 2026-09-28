@@ -124,7 +124,7 @@ def convert(design, name, base):
     forder = list(formats)
     rows.sort(key=lambda r: (forder.index(r[1]), r[2]))
     names = {r[0] for r in rows}
-    pseudos = {n: v for n, v in b.pseudos.items() if v[0] in names}
+    pseudos = {n: v for n, v in b.pseudos.items() if v[0] in names and n not in names}
     return b, ngpr, formats, rows, sems, gaps, notes, pseudos
 
 

@@ -15,9 +15,9 @@ instruction generator all work from the definition.
 | `STATE` | `{'gpr': 8, 'gpr_bits': 32, 'special': {'PC': 16, 'SP': 16, 'BP': 16, 'LR': 16}}` |
 | `FORMATS` | `{name: template}`. Template characters, most significant bit of the first byte first: `0`/`1` fixed, `o` opcode, `d x y z r` register fields, `i j k` immediate fields, `-` reserved; spaces ignored |
 | `INSTRUCTIONS` | `[(name, format, opcode, operands[, fields])]`. `opcode` is the value of the format's `o` bits, most significant first. `operands` are in assembly order: `'rd'`/`'rx'`/`'ry'` or `(name, kind[, scale])`. An operand's width is the width of the field it binds to. Registers bind to the register letters in order and immediates to the immediate letters in order, unless `fields` (`{operand: letter}`) says otherwise |
-| `PSEUDOS` | `{name: (real, [source operand for each real operand])}` — operand permutations such as `gt` → `lt` swapped, `mov rd, rx` → `or rd, rx, rx` |
+| `PSEUDOS` | `{name: (real, [source operand for each real operand])}` — operand permutations such as `gt` → `lt` swapped, `mov rd, rx` → `or rd, rx, rx`. A pseudo-op may not share a name with an instruction |
 | `INVARIANTS` | `[(expression, message)]` — checked after every instruction; nonzero stops the machine (CPU4: SP and BP word-aligned) |
-| `PRIMITIVES`, `PRIMITIVE_PREFIX`, `PRIMITIVE_C`, `PRIMITIVE_PY` | Functions the semantics may call that are too big for one line (CPU4's float ops), implemented as `<prefix><name>` in a C header and a Python file |
+| `PRIMITIVES`, `PRIMITIVE_PREFIX`, `PRIMITIVE_C`, `PRIMITIVE_PY` | Functions the semantics may call that are too big for one line (CPU4's float ops), implemented as `<prefix><name>` in a C header and a Python file, both paths from the toolchain root. The generated `exec_gen.h` includes the header, so it needs an include guard, and quoted includes inside it resolve from its own directory |
 | `SEMANTICS_PREAMBLE`, `SEMANTICS` | The notation, and `{name: line}` |
 
 Immediate kinds decide how an assembly operand becomes a field value and what

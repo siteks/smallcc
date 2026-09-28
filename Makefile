@@ -10,7 +10,9 @@ ISA_DEFS  = $(wildcard */isa.py)
 ISA_TOOLS = isatool/gen.py isatool/model.py isatool/sem.py
 ISA_GEN   = isatool/arches.h $(ISA_DEFS:isa.py=isa_table_c.h) $(ISA_DEFS:isa.py=exec_gen.h) $(ISA_DEFS:isa.py=exec_gen.py)
 
-sim_c: sim_c.c cpu4/fpu_model.h cpu4/fpu_roms.h isatool/isa_types.h isatool/exec_common.h .isa-stamp
+ISA_HDRS  = $(filter-out %/isa_table_c.h %/exec_gen.h,$(wildcard $(ISA_DEFS:isa.py=*.h)))
+
+sim_c: sim_c.c $(ISA_HDRS) isatool/isa_types.h isatool/exec_common.h .isa-stamp
 	$(CC) $(CFLAGS) -O2 -o sim_c sim_c.c -lm
 
 # Every generated ISA file (tables, both executors, encoding docs) for every

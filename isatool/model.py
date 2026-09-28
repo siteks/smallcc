@@ -191,6 +191,8 @@ class ISA:
         for n, (real, perm) in self.pseudos.items():
             if real not in self.by_name:
                 raise ISAError(f"pseudo-op {n} expands to unknown {real}")
+            if n in self.by_name:
+                raise ISAError(f"pseudo-op {n} has the name of an instruction, which it would hide from the assemblers")
         self.check_overlaps()
 
     @property
