@@ -106,7 +106,16 @@ typedef struct {
     int    pre_idx;
     int    back_idx;
     int    has_inner;
+    int   *body;       // natural loop body: body[block id] != 0 (all back edges)
+    int    body_sz;    // entries in body[]; blocks created later are outside
 } LoopInfo;
+
+// Whether block b is in loop L's natural body (the header, and every block
+// that reaches a back edge without passing through the header). Code after
+// the loop is not, although the header dominates it.
+static inline int in_loop(const LoopInfo *L, const Block *b) {
+    return b && b->id >= 0 && b->id < L->body_sz && L->body[b->id];
+}
 
 /*
  * Discover natural loops via back-edge detection and populate LoopInfo.
@@ -172,48 +181,39 @@ static int find_loops(Function *f, LoopInfo **out) {
         }
         loops[li].back_idx = back_idx;
 
-        for (int k = 0; k < nloops; k++) {
-            if (k != li && dominates(h, loops[k].header)) {
+        // Natural body: the header plus everything that reaches a back-edge
+        // predecessor backwards without passing through the header.
+        int sz = f->next_blk_id;
+        int *body = arena_alloc(sz * sizeof(int));
+        memset(body, 0, sz * sizeof(int));
+        Block **wl = arena_alloc((f->nblocks + 1) * sizeof(Block *));
+        int wn = 0;
+        body[h->id] = 1;
+        for (int k = 0; k < h->npreds; k++) {
+            Block *p = h->preds[k];
+            if (dominates(h, p) && p->id < sz && !body[p->id]) { body[p->id] = 1; wl[wn++] = p; }
+        }
+        while (wn > 0) {
+            Block *c = wl[--wn];
+            for (int k = 0; k < c->npreds; k++) {
+                Block *p = c->preds[k];
+                if (p->id < sz && !body[p->id]) { body[p->id] = 1; wl[wn++] = p; }
+            }
+        }
+        loops[li].body = body;
+        loops[li].body_sz = sz;
+    }
+    for (int li = 0; li < nloops; li++)
+        for (int k = 0; k < nloops; k++)
+            if (k != li && in_loop(&loops[li], loops[k].header)) {
                 loops[li].has_inner = 1;
                 break;
             }
-        }
-    }
 
     *out = loops;
     return nloops;
 }
 
-/*
- * Compute the natural loop body for header h with back-edge latch: mark h,
- * then walk predecessors backward from the latch.  Returns a calloc'd array
- * indexed by block id (size f->next_blk_id) with 1 for in-body blocks —
- * caller frees — or NULL on allocation failure (caller skips the loop).
- * Blocks beyond the fixed worklist capacity are marked but not explored.
- */
-static int *loop_body_marks(Function *f, Block *h, Block *latch) {
-    int mark_sz = f->next_blk_id;
-    int *in_body = calloc(mark_sz, sizeof(int));
-    if (!in_body) return NULL;
-    in_body[h->id] = 1;
-    Block *wl[256]; int wl_n = 0, wl_overflow = 0;
-    if (latch != h) { in_body[latch->id] = 1; wl[wl_n++] = latch; }
-    while (wl_n > 0) {
-        Block *c = wl[--wl_n];
-        for (int p = 0; p < c->npreds; p++) {
-            Block *pr = c->preds[p];
-            if (pr->id < mark_sz && !in_body[pr->id]) {
-                in_body[pr->id] = 1;
-                if (wl_n < 256) wl[wl_n++] = pr;
-                else wl_overflow = 1;
-            }
-        }
-    }
-    // An under-approximated body would make in-loop defs look invariant
-    // (wrong code), so refuse the loop entirely on worklist overflow.
-    if (wl_overflow) { free(in_body); return NULL; }
-    return in_body;
-}
 
 /*
  * Register-pressure proxy shared by opt_licm_const and opt_lsr: append to
@@ -222,17 +222,17 @@ static int *loop_body_marks(Function *f, Block *h, Block *latch) {
  * count.  opt_licm keeps its own walk — it interleaves loop-def counting in
  * the same array, which this helper does not model.
  */
-static int count_loop_liveins(Function *f, Block *h, int *live_ids,
+static int count_loop_liveins(Function *f, const LoopInfo *L, int *live_ids,
                               int nlive, int cap) {
     for (int bi = 0; bi < f->nblocks; bi++) {
         Block *b = f->blocks[bi];
-        if (!dominates(h, b)) continue;
+        if (!in_loop(L, b)) continue;
         for (Inst *inst = b->head; inst; inst = inst->next) {
             if (inst->is_dead) continue;
             for (int j = 0; j < inst->nops; j++) {
                 Value *v = val_resolve(inst->ops[j]);
                 if (!v || v->kind != VAL_INST || !v->def) continue;
-                if (dominates(h, v->def->block)) continue;  // defined inside
+                if (in_loop(L, v->def->block)) continue;  // defined inside
                 int vid = v->id, dup = 0;
                 for (int k = 0; k < nlive && !dup; k++)
                     if (live_ids[k] == vid) dup = 1;
@@ -1636,7 +1636,7 @@ void opt_licm_const(Function *f) {
         // cause spill cascades.
         #define LIVE_CAP 32
         int live_ids[LIVE_CAP];
-        int nlive = count_loop_liveins(f, h, live_ids, 0, LIVE_CAP);
+        int nlive = count_loop_liveins(f, &loops[li], live_ids, 0, LIVE_CAP);
         // Also count operands of the header block itself — these are
         // live at loop entry and include phi-variables.
         for (Inst *inst = h->head; inst; inst = inst->next) {
@@ -1656,7 +1656,7 @@ void opt_licm_const(Function *f) {
         int body_insts = 0;
         for (int bi = 0; bi < f->nblocks; bi++) {
             Block *b = f->blocks[bi];
-            if (!dominates(h, b)) continue;
+            if (!in_loop(&loops[li], b)) continue;
             for (Inst *inst = b->head; inst; inst = inst->next)
                 if (!inst->is_dead) body_insts++;
         }
@@ -1689,7 +1689,7 @@ void opt_licm_const(Function *f) {
                 inst_insert_before(preheader->tail, ni);
                 for (int bi2 = 0; bi2 < f->nblocks; bi2++) {
                     Block *b2 = f->blocks[bi2];
-                    if (!dominates(h, b2)) continue;
+                    if (!in_loop(&loops[li], b2)) continue;
                     for (Inst *inst = b2->head; inst; inst = inst->next) {
                         if (inst->is_dead) continue;
                         for (int k = 0; k < inst->nops; k++) {
@@ -1715,7 +1715,7 @@ void opt_licm_const(Function *f) {
         for (int bi = 0; bi < f->nblocks; bi++) {
             Block *b = f->blocks[bi];
             if (b->loop_depth == 0) continue;
-            if (!dominates(h, b)) continue;
+            if (!in_loop(&loops[li], b)) continue;
 
             for (Inst *inst = b->head; inst; inst = inst->next) {
                 if (inst->is_dead) continue;
@@ -1770,7 +1770,7 @@ void opt_licm_const(Function *f) {
         for (int bi = 0; bi < f->nblocks; bi++) {
             Block *b = f->blocks[bi];
             if (b->loop_depth == 0) continue;
-            if (!dominates(h, b)) continue;
+            if (!in_loop(&loops[li], b)) continue;
 
             for (Inst *inst = b->head; inst; inst = inst->next) {
                 if (inst->is_dead) continue;
@@ -1832,7 +1832,7 @@ void opt_licm(Function *f) {
         int nloop_defs = 0;     // unique values defined inside
         for (int bi = 0; bi < f->nblocks; bi++) {
             Block *b = f->blocks[bi];
-            if (!dominates(h, b)) continue;
+            if (!in_loop(&loops[li], b)) continue;
             for (Inst *inst = b->head; inst; inst = inst->next) {
                 if (inst->is_dead) continue;
                 // Count defs
@@ -1849,7 +1849,7 @@ void opt_licm(Function *f) {
                 for (int j = 0; j < inst->nops; j++) {
                     Value *v = val_resolve(inst->ops[j]);
                     if (!v || v->kind != VAL_INST || !v->def) continue;
-                    if (!dominates(h, v->def->block)) {
+                    if (!in_loop(&loops[li], v->def->block)) {
                         int vid = v->id, dup2 = 0;
                         for (int k = 0; k < nlive && !dup2; k++)
                             if (live_ids[k] == vid) dup2 = 1;
@@ -1879,7 +1879,7 @@ void opt_licm(Function *f) {
         if (!loop_defined || !def_count) goto next_loop;
 
         for (int bi = 0; bi < f->nblocks; bi++) {
-            if (!dominates(h, f->blocks[bi])) continue;
+            if (!in_loop(&loops[li], f->blocks[bi])) continue;
             Block *b = f->blocks[bi];
             for (Inst *inst = b->head; inst; inst = inst->next) {
                 if (!inst->dst) continue;
@@ -1901,7 +1901,7 @@ void opt_licm(Function *f) {
         // When true, loads from invariant addresses can be hoisted.
         int loop_store_free = 1;
         for (int bi = 0; bi < f->nblocks && loop_store_free; bi++) {
-            if (!dominates(h, f->blocks[bi])) continue;
+            if (!in_loop(&loops[li], f->blocks[bi])) continue;
             Block *b = f->blocks[bi];
             for (Inst *inst = b->head; inst; inst = inst->next) {
                 if (inst->is_dead) continue;
@@ -1922,7 +1922,7 @@ void opt_licm(Function *f) {
         while (progress) {
             progress = 0;
             for (int bi = 0; bi < f->nblocks; bi++) {
-                if (!dominates(h, f->blocks[bi])) continue;
+                if (!in_loop(&loops[li], f->blocks[bi])) continue;
                 Block *b = f->blocks[bi];
                 for (Inst *inst = b->head; inst; inst = inst->next) {
                     if (inst->is_dead || !inst->dst) continue;
@@ -1971,7 +1971,7 @@ void opt_licm(Function *f) {
         if (!to_hoist) goto next_loop;
 
         for (int bi = 0; bi < f->nblocks && nhoist < budget; bi++) {
-            if (!dominates(h, f->blocks[bi])) continue;
+            if (!in_loop(&loops[li], f->blocks[bi])) continue;
             Block *b = f->blocks[bi];
             for (Inst *inst = b->head; inst && nhoist < budget; inst = inst->next) {
                 if (inst->is_dead || !inst->dst) continue;
@@ -2502,9 +2502,8 @@ typedef struct {
 /*
  * Detect basic induction variables among the header phis: a phi whose
  * back-edge operand is phi + step_const (or step_const + phi), with the
- * ADD inside the loop.  The containment test uses in_body[] when given
- * (natural loop body, opt_addr_iv) or dominates(h, ...) otherwise
- * (opt_lsr).  Fills ivs[] and returns the count.
+ * ADD inside the loop (in_body[], the natural loop body).  Fills ivs[]
+ * and returns the count.
  */
 static int find_basic_ivs(Block *h, int pre_idx, int back_idx, int *in_body,
                           IVInfo *ivs, int max) {
@@ -2521,8 +2520,7 @@ static int find_basic_ivs(Block *h, int pre_idx, int back_idx, int *in_body,
         if (back->kind != VAL_INST || !back->def) continue;
         Inst *add = back->def;
         if (add->kind != IK_ADD || add->nops != 2) continue;
-        if (in_body ? !in_body[add->block->id]
-                    : !dominates(h, add->block)) continue;  // must be inside loop
+        if (!in_body[add->block->id]) continue;  // must be inside loop
 
         Value *a0 = val_resolve(add->ops[0]);
         Value *a1 = val_resolve(add->ops[1]);
@@ -2700,7 +2698,7 @@ void opt_downcount(Function *f) {
         if (add_val->kind != VAL_INST || !add_val->def ||
             add_val->def->kind != IK_ADD || add_val->def->nops < 2) continue;
         Inst *add = add_val->def;
-        if (!dominates(h, add->block)) continue;   // increment inside the loop
+        if (!in_loop(&loops[li], add->block)) continue;   // increment inside the loop
 
         // The add may also read the phi through one coercion copy.
         Value *a0 = val_resolve(add->ops[0]);
@@ -2731,7 +2729,7 @@ void opt_downcount(Function *f) {
             if (!(bound_is_const && bk >= 0 && bk <= cap)) continue;
         }
         if (!bound_is_const && bound->kind == VAL_INST && bound->def &&
-            dominates(h, bound->def->block)) continue;
+            in_loop(&loops[li], bound->def->block)) continue;
 
         // Use discipline, by direct scan (pre-OOS use_counts are
         // approximate): iv used only by {add, cmp}; back only by {phi};
@@ -2816,14 +2814,14 @@ void opt_lsr(Function *f) {
                 if (nlive < live_cap) live_ids[nlive++] = inst->dst->id;
             }
             // Count external values used inside the loop
-            nlive = count_loop_liveins(f, h, live_ids, nlive, live_cap);
+            nlive = count_loop_liveins(f, &loops[li], live_ids, nlive, live_cap);
         }
         int lsr_budget = g_target->nregs - 4 - nlive;  // K - scratch - existing cross-loop values
         if (lsr_budget <= 0) continue;
 
         // Step 2: Detect basic induction variables in header phis.
         IVInfo ivs[LSR_MAX_IVS];
-        int niv = find_basic_ivs(h, pre_idx, back_idx, NULL, ivs, LSR_MAX_IVS);
+        int niv = find_basic_ivs(h, pre_idx, back_idx, loops[li].body, ivs, LSR_MAX_IVS);
         if (niv == 0) continue;
 
         // Step 3: Find MUL candidates in loop body.
@@ -2831,7 +2829,7 @@ void opt_lsr(Function *f) {
         int max_reds = lsr_budget < LSR_MAX_REDS ? lsr_budget : LSR_MAX_REDS;
         for (int bi = 0; bi < f->nblocks && nreduced < max_reds; bi++) {
             Block *b = f->blocks[bi];
-            if (!dominates(h, b)) continue;
+            if (!in_loop(&loops[li], b)) continue;
             for (Inst *inst = b->head; inst && nreduced < max_reds; inst = inst->next) {
                 if (inst->is_dead || inst->kind != IK_MUL || inst->nops != 2) continue;
 
@@ -2847,7 +2845,7 @@ void opt_lsr(Function *f) {
                     if (!inv) continue;
 
                     // inv must be loop-invariant (defined outside or constant)
-                    if (inv->kind == VAL_INST && inv->def && dominates(h, inv->def->block))
+                    if (inv->kind == VAL_INST && inv->def && in_loop(&loops[li], inv->def->block))
                         continue;  // defined inside loop — not invariant
 
                     // Create strength-reduced induction variable:
@@ -3006,7 +3004,8 @@ void opt_scalar_promote(Function *f) {
 
         // Compute natural loop body via worklist
         int mark_sz = f->next_blk_id;
-        int *in_body = loop_body_marks(f, h, latch);
+        int *in_body = calloc(f->next_blk_id, sizeof(int));   // this pass frees its copy
+        if (in_body) memcpy(in_body, loops[li].body, loops[li].body_sz * sizeof(int));
         if (!in_body) continue;
 
         // Single exit block
@@ -3242,7 +3241,8 @@ void opt_addr_iv(Function *f) {
         if (!preh || back_idx < 0) continue;
 
         // Compute natural loop body
-        int *in_body = loop_body_marks(f, h, latch);
+        int *in_body = calloc(f->next_blk_id, sizeof(int));   // this pass frees its copy
+        if (in_body) memcpy(in_body, loops[li].body, loops[li].body_sz * sizeof(int));
         if (!in_body) continue;
 
         // Detect basic induction variables (same as LSR)
