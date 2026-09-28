@@ -6,13 +6,13 @@ import assembler
 import cpu
 
 
-def runfile(sourcefile, maxsteps=1000, verbose=False):
+def runfile(sourcefile, maxsteps=1000, verbose=False, retire=None):
     # Get text of C program
     text = open(sourcefile).read()
-    return runasm(text, sourcefile, maxsteps, verbose)
+    return runasm(text, sourcefile, maxsteps, verbose, retire)
 
 
-def runasm(text, filename, maxsteps=1000, verbose=True):
+def runasm(text, filename, maxsteps=1000, verbose=True, retire=None):
 
     # Create memory
     m = cpu.Mem()
@@ -31,7 +31,7 @@ def runasm(text, filename, maxsteps=1000, verbose=True):
         m.dumpmem(0x2000, 0x20)
 
     # Create the CPU and step until halted or run out of steps
-    c = cpu.CPU(m)
+    c = cpu.CPU(m, retire=retire)
     c.reset()
     for i in range(maxsteps):
         s = c.step(trace=verbose)
@@ -46,8 +46,11 @@ if __name__ == "__main__":
     argparser.add_argument('filename', help='name of file to parse')
     argparser.add_argument('-v', '--verbose', action='store_true', help='verbose')
     argparser.add_argument('--maxsteps', type=int, default=1000, help='max simulation steps')
+    argparser.add_argument('--retire', metavar='FILE', help='write one line per retired instruction (sim_c -retire format)')
     args = argparser.parse_args()
 
-    s = runfile(args.filename, maxsteps=args.maxsteps, verbose=args.verbose)
+    ret = open(args.retire, 'w') if args.retire else None
+    s = runfile(args.filename, maxsteps=args.maxsteps, verbose=args.verbose, retire=ret)
+    if ret: ret.close()
     print(s)
 

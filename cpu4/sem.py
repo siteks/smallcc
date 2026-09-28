@@ -5,10 +5,13 @@ isa.SEMANTICS gives every instruction one line of register-transfer notation;
 isa.SEMANTICS_PREAMBLE defines it. This module parses those lines against the
 instruction's operands and format template and generates:
 
-  gen_c()   cpu4/exec_gen.h  a complete fetch/decode/execute step for sim_c
-            (`gen_step`), derived only from the templates, opcode values and
-            semantics -- it shares no code with sim_c's hand-written decoder,
-            which is what makes comparing the two meaningful.
+  gen_c()   cpu4/exec_gen.h   the fetch/decode/execute step sim_c runs (`gen_step`)
+  gen_py()  cpu4/exec_gen.py  the same step for cpu4/cpu.py
+
+Both are derived only from the templates, opcode values and semantics, from
+the same syntax tree, but through different back ends and different float
+implementations (fpu_model.h and its Python port fpu_model.py), so running
+them in lockstep checks each against the other.
 
 The AST is small and target-neutral, so other back ends (a Python executor,
 SMT constraints for formal checks) are further functions over the same tree.
@@ -304,7 +307,7 @@ def gen_c():
     L = [f"/* {HDR} */",
          "/* A complete fetch/decode/execute step for CPU4, generated from the",
          " * format templates, opcode values and semantics lines in cpu4/isa.py.",
-         " * Included by sim_c.c after its memory helpers; used with -gen. */",
+         " * Included by sim_c.c after its memory helpers: this is the executor sim_c runs. */",
          "#ifndef CPU4_EXEC_GEN_H", "#define CPU4_EXEC_GEN_H",
          "static uint32_t sx32(uint32_t v, int n) { uint32_t m = 1u << (n - 1); v &= (n == 32) ? 0xffffffffu : ((1u << n) - 1); return (v ^ m) - m; }",
          "static uint32_t shl32(uint32_t a, uint32_t b) { return b >= 32 ? 0 : a << b; }",
@@ -358,6 +361,7 @@ def gen_c():
         blocks.setdefault((n, code), []).append(v)
     L += ["static void gen_unknown(Core *cc, uint32_t w, uint16_t oldpc) {",
           "    fprintf(stderr, \"cpu4: unknown instruction 0x%x at pc=%04x\\n\", (unsigned)w, oldpc);",
+          "    g_gen_bad = 1;",
           "    cc->H = 1;", "}", "",
           "/* Execute one instruction for core cc; returns its length in bytes. */",
           "static int gen_step(Core *cc) {",
@@ -378,10 +382,202 @@ def gen_c():
     return "\n".join(L)
 
 
+# ---------------------------------------------------------------- Python back end
+M32 = "0xffffffff"
+
+
+class PyGen(CGen):
+    """Same tree, Python output. Every value is a non-negative int below 2**32."""
+
+    def e(self, n):
+        k = n[0]
+        if k == 'num':
+            return str(n[1])
+        if k == 'operand':
+            if n[1] in ('rd', 'rx', 'ry'):
+                raise SemError(f"{self.d['name']}: register field {n[1]} used as a value; write R[{n[1]}]")
+            return f"f_{n[1]}"
+        if k == 'reg':
+            idx = n[1]
+            if idx[0] == 'operand' and idx[1] in ('rd', 'rx', 'ry'):
+                return f"s.r[f_{idx[1]}]"
+            if idx[0] == 'num':
+                return f"s.r[{idx[1]}]"
+            raise SemError(f"{self.d['name']}: R[] takes a register field or a constant")
+        if k == 'spec':
+            return f"s.{n[1] if n[1] == 'H' else n[1].lower()}"
+        if k == 'mem':
+            return f"rd{n[1]}(m, {self.e(n[2])}, oldpc)"
+        if k == 'un':
+            a = self.e(n[2])
+            return {'-': f"((-{a}) & {M32})", '~': f"((~{a}) & {M32})", '!': f"(0 if {a} else 1)"}[n[1]]
+        if k == 'cond':
+            return f"({self.e(n[2])} if {self.e(n[1])} else {self.e(n[3])})"
+        if k == 'call':
+            f, a = n[1], n[2]
+            if f == 'sext':
+                return f"sx32(f_{a[0][1]}, {len(self.fl[a[0][1]])})"
+            if f == 'sx':
+                return f"sx32({self.e(a[0])}, {self.const(a[1])})"
+            if f == 'zx':
+                return f"({self.e(a[0])} & {(1 << self.const(a[1])) - 1})"
+            if f == 'lo16':
+                return f"({self.e(a[0])} & 0xffff)"
+            if f in PRIM1:
+                return f"cpu4_{f}({self.e(a[0])})"
+            if f in PRIM2:
+                return f"cpu4_{f}({self.e(a[0])}, {self.e(a[1])})"
+            raise SemError(f"{f}() is a statement, not a value")
+        if k == 'bin':
+            op, a, b = n[1], self.e(n[2]), self.e(n[3])
+            if op in ('+', '-', '*'):
+                return f"(({a} {op} {b}) & {M32})"
+            if op in ('&', '|', '^'):
+                return f"({a} {op} {b})"
+            if op in ('==', '!='):
+                return f"int({a} {op} {b})"
+            if op[-1] in 'us' and op[:-1] in ('<', '<=', '>', '>='):
+                c = op[:-1]
+                return f"int({a} {c} {b})" if op[-1] == 'u' else f"int(s32({a}) {c} s32({b}))"
+            fn = {'<<': 'shl32', '>>': 'shr32', '>>s': 'sar32', '/u': 'divu32', '%u': 'modu32',
+                  '/s': 'divs32', '%s': 'mods32'}[op]
+            return f"{fn}({a}, {b})"
+        raise SemError(f"cannot generate {k}")
+
+    def s(self, st, ind="    "):
+        k = st[0]
+        if k == 'if':
+            return f"{ind}if {self.e(st[1])}:\n{self.s(st[2], ind + '    ')}"
+        if k == 'do':
+            return f"{ind}putc({self.e(st[1][2][0])})\n"
+        lv, v = st[1], self.e(st[2])
+        if lv[0] == 'reg':
+            return f"{ind}{self.e(lv)} = {v}\n"
+        if lv[0] == 'spec':
+            return f"{ind}s.H = {v} & 1\n" if lv[1] == 'H' else f"{ind}s.{lv[1].lower()} = {v} & 0xffff\n"
+        if lv[0] == 'mem':
+            return f"{ind}wr{lv[1]}(m, {self.e(lv[2])}, {v}, oldpc)\n"
+        raise SemError("bad assignment")
+
+    def function(self):
+        d, L = self.d, len(self.tpl)
+        body = [f"def gx_{d['name']}(s, m, w, oldpc):", f"    # {isa.SEMANTICS[d['name']]}"]
+        for op, pos in self.fl.items():
+            body.append(f"    f_{op} = {c_extract(pos, L).replace('u)', ')')}")
+        for st in parse(d):
+            body.append(self.s(st).rstrip("\n"))
+        return "\n".join(body)
+
+
+def gen_py():
+    L = [f"# {HDR}",
+         '"""A complete fetch/decode/execute step for CPU4, generated from the format',
+         'templates, opcode values and semantics lines in cpu4/isa.py. cpu4/cpu.py runs it."""',
+         "import sys",
+         "from fpu_model import (cpu4_fadd, cpu4_fsub, cpu4_fmul, cpu4_fdiv, cpu4_flt, cpu4_fle,",
+         "                       cpu4_itof, cpu4_ftoi, cpu4_frecip, cpu4_frsqrt)",
+         "",
+         "M = 0xffffffff",
+         "MW = None   # when a list, every store is appended as (address, value, bytes) for the retirement trace",
+         "",
+         "def s32(v): return v - 0x100000000 if v & 0x80000000 else v",
+         "def sx32(v, n): v &= (1 << n) - 1; return (v - (1 << n)) & M if v >> (n - 1) else v",
+         "def shl32(a, b): return 0 if b >= 32 else (a << b) & M",
+         "def shr32(a, b): return 0 if b >= 32 else a >> b",
+         "def sar32(a, b): return (M if a & 0x80000000 else 0) if b >= 32 else (s32(a) >> b) & M",
+         "def divu32(a, b): return a // b if b else 0",
+         "def modu32(a, b): return a % b if b else 0",
+         "def divs32(a, b):",
+         "    if not b: return 0",
+         "    if a == 0x80000000 and b == M: return a",
+         "    q = abs(s32(a)) // abs(s32(b))",
+         "    return (q if (s32(a) < 0) == (s32(b) < 0) else -q) & M",
+         "def mods32(a, b):",
+         "    if not b: return 0",
+         "    if a == 0x80000000 and b == M: return 0",
+         "    r = abs(s32(a)) % abs(s32(b))",
+         "    return (-r if s32(a) < 0 else r) & M",
+         "def _fault(bits, a, pc):",
+         "    sys.stderr.write('CPU4 alignment error: %d-bit access to unaligned address 0x%08x at pc=0x%04x\\n' % (bits, a, pc))",
+         "    sys.exit(1)",
+         "def rd8(m, a, pc): return m.read8(a, False)",
+         "def rd16(m, a, pc):",
+         "    if a & 1: _fault(16, a, pc)",
+         "    return m.read16(a, False)",
+         "def rd32(m, a, pc):",
+         "    if a & 3: _fault(32, a, pc)",
+         "    return m.read32(a, False)",
+         "def wr8(m, a, v, pc):",
+         "    if MW is not None: MW.append((a, v & 0xff, 1))",
+         "    m.write8(a, v & 0xff)",
+         "def wr16(m, a, v, pc):",
+         "    if a & 1: _fault(16, a, pc)",
+         "    if MW is not None: MW.append((a, v & 0xffff, 2))",
+         "    m.write16(a, v & 0xffff)",
+         "def wr32(m, a, v, pc):",
+         "    if a & 3: _fault(32, a, pc)",
+         "    if MW is not None: MW.append((a, v, 4))",
+         "    m.write32(a, v)",
+         "def putc(v):",
+         "    sys.stderr.write(chr(v & 0xff)); sys.stderr.flush()",
+         ""]
+    for d in isa.INSTRUCTIONS:
+        L.append(PyGen(d).function()); L.append("")
+    pats = {d['name']: pattern(d) for d in isa.INSTRUCTIONS}
+    entries, keyfns = [], {}
+    for v in range(256):
+        cands = [d for d in isa.INSTRUCTIONS
+                 if all(((v >> (7 - p)) & 1) == b for p, b in pats[d['name']][1].items() if p < 8)]
+        if not cands:
+            continue
+        n = len(pats[cands[0]['name']][0]) // 8
+        keypos = sorted({p for d in cands for p in pats[d['name']][1] if p >= 8})
+        if len(cands) == 1 and not keypos:
+            entries.append(f"    0x{v:02x}: ({n}, gx_{cands[0]['name']}, None, None),")
+            continue
+        kexpr = c_extract(keypos, n * 8).replace('u)', ')')
+        kname = keyfns.setdefault(kexpr, f"_key{len(keyfns)}")
+        arms = []
+        for d in cands:
+            kv = 0
+            for p in keypos:
+                kv = (kv << 1) | pats[d['name']][1][p]
+            arms.append(f"0x{kv:x}: gx_{d['name']}")
+        entries.append(f"    0x{v:02x}: ({n}, None, {kname}, {{{', '.join(arms)}}}),")
+    for kexpr, kname in keyfns.items():
+        L.append(f"def {kname}(w): return {kexpr}")
+    L += ["", "DECODE = {"] + entries + ["}", "",
+          "def unknown(s, w, pc):",
+          "    sys.stderr.write('cpu4: unknown instruction 0x%x at pc=%04x\\n' % (w, pc))",
+          "    s.H = 1",
+          "",
+          "def step(s, m):",
+          '    """Execute one instruction; returns its length in bytes."""',
+          "    oldpc = s.pc",
+          "    e = DECODE.get(m.read8(oldpc, False))",
+          "    if e is None:",
+          "        unknown(s, m.read8(oldpc, False), oldpc); s.pc = (oldpc + 1) & 0xffff",
+          "        return 1",
+          "    n, fn, key, table = e",
+          "    w = 0",
+          "    for i in range(n):",
+          "        w = (w << 8) | m.read8((oldpc + i) & 0xffff, False)",
+          "    s.pc = (oldpc + n) & 0xffff",
+          "    if fn is None:",
+          "        fn = table.get(key(w))",
+          "        if fn is None:",
+          "            unknown(s, w, oldpc)",
+          "            return n",
+          "    fn(s, m, w, oldpc)",
+          "    return n",
+          ""]
+    return "\n".join(L)
+
+
 def check_all():
     """Parse every line and build every pattern; raise on the first problem."""
     for d in isa.INSTRUCTIONS:
-        parse(d); pattern(d); CGen(d).function()
+        parse(d); pattern(d); CGen(d).function(); PyGen(d).function()
 
 
 if __name__ == '__main__':

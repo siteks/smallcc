@@ -496,11 +496,9 @@ typedef struct {
     int         subop;   /* F1b: subopcode in byte1[5:0] */
 } Instr4;
 
-#include "cpu4/isa_table_c.h"   /* generated from cpu4/isa.py: the encoding source of truth.
-                                  * The table only assembles/disassembles; what an instruction
-                                  * DOES is the hand-written switch in run_cpu4() below, which is
-                                  * the executable ISA spec (docs/isa/cpu4.md, "Where an
-                                  * instruction is defined"). */
+#include "cpu4/isa_table_c.h"   /* generated from cpu4/isa.py: the assembler's and disassembler's
+                                  * encoding table. What an instruction does is cpu4/exec_gen.h,
+                                  * generated from the same file (see run_cpu4). */
 
 static const Instr4 *find_instr4(const char *n)
 {
@@ -1322,19 +1320,16 @@ static void print_dump(uint16_t code_end, uint16_t data_end, const char *path)
 #define MAX_STEPS 100000000
 static int g_max_steps = MAX_STEPS;
 
-static int32_t sx7 (int32_t v) { v &= 0x7f;   return (v >= 64)   ? v - 128   : v; }
 static int32_t sx9 (int32_t v) { v &= 0x1ff;  return (v >= 256)  ? v - 512   : v; }
 static int32_t sx10(int32_t v) { v &= 0x3ff;  return (v >= 512)  ? v - 1024  : v; }
-static int32_t sx14(int32_t v) { v &= 0x3fff; return (v >= 8192) ? v - 16384 : v; }
-static int32_t sx16(int32_t v) { return (int32_t)(int16_t)(v & 0xffff); }
 
 /* ------------------------------------------------------------------ */
 /* CPU4 executor                                                        */
 /* ------------------------------------------------------------------ */
 
 static FILE *g_trace_out = NULL;
-static int   g_gen_exec = 0;          /* -gen: execute with the generated step */
 static int   g_last_len = 1;          /* length of the instruction just executed */
+static int   g_gen_bad  = 0;          /* set by the generated step on an unknown instruction */
 
 #include "cpu4/exec_gen.h"            /* generated from cpu4/isa.py SEMANTICS */
 
@@ -1385,319 +1380,19 @@ static void run_cpu4(void)
 
         const uint16_t step_pc = pc;
         uint32_t r_before[8]; uint16_t sp_before = sp, bp_before = bp, lr_before = lr;
-        if (g_retire_out) { memcpy(r_before, r, sizeof r_before); g_nmw = 0; }
-        if (g_gen_exec) {
-            if (g_profile) prof_count[step_pc]++;
-            g_watch_pc = step_pc; g_watch_r0 = r[0]; g_watch_sp = sp; g_watch_bp = bp;
-            g_last_len = gen_step(cc);
-            goto executed;
-        }
-        {
-        uint8_t  b0 = read8(pc);
-        uint16_t oldpc = pc;
-        pc++;
-        if (g_profile) prof_count[oldpc]++;
-
-        uint8_t  b1 = 0, b2 = 0;
-        int      rd = 0, rx = 0, ry = 0;
-        int32_t  imm = 0;
-        uint8_t  lookupop;
-        int      subop = 0;
-        uint8_t  fmt2 = b0 >> 6;
-
-        if (fmt2 == 0 && (b0 & 0xf0) == 0x10) {
-            /* F0b: two-op + imm9 — 3 bytes, 0001oooo odddxxxiiiiiiiii */
-            b1 = read8(pc); pc++;
-            b2 = read8(pc); pc++;
-            uint32_t ins24 = ((uint32_t)b0 << 16) | ((uint32_t)b1 << 8) | b2;
-            lookupop = b0;                  /* 0x10-0x1b */
-            subop    = (int)((ins24 >> 15) & 1);
-            rd = rx  = (int)((ins24 >> 12) & 0x7);
-            ry       = (int)((ins24 >> 9) & 0x7);
-            imm      = (int32_t)(ins24 & 0x1ff);
-        } else if (fmt2 == 0 && (b0 & 0xe0) == 0x20) {
-            /* F0c: cbeq/cbne — 3 bytes, 001odddiiiiiiiiiiiiiiiiii */
-            b1 = read8(pc); pc++;
-            b2 = read8(pc); pc++;
-            uint32_t ins24 = ((uint32_t)b0 << 16) | ((uint32_t)b1 << 8) | b2;
-            lookupop = b0 & 0xf0;           /* 0x20=cbeq, 0x30=cbne */
-            rd = rx  = (int)((ins24 >> 17) & 0x7);
-            imm      = (int32_t)(ins24 & 0x1ffff);  /* raw imm17 */
-        } else if (fmt2 == 0) {
-            /* F0a: 1 byte */
-            lookupop = b0;
-        } else if (fmt2 == 1) {
-            /* F1a or F1b: 2 bytes */
-            b1 = read8(pc); pc++;
-            uint16_t ins16 = ((uint16_t)b0 << 8) | b1;
-            if ((b0 & 0xfe) == 0x7e) {
-                /* F1b */
-                lookupop = 0x7e;
-                rd       = (ins16 >> 6) & 0x7;
-                subop    = b1 & 0x3f;
-            } else {
-                /* F1a */
-                lookupop = b0 & 0xfe;
-                rd = (ins16 >> 6) & 0x7;
-                rx = (ins16 >> 3) & 0x7;
-                ry =  ins16       & 0x7;
-            }
-        } else if (fmt2 == 2) {
-            /* F2: 2 bytes, bp-relative */
-            b1 = read8(pc); pc++;
-            uint16_t ins16 = ((uint16_t)b0 << 8) | b1;
-            lookupop = b0 & 0xfc;
-            rd = rx  = (ins16 >> 7) & 0x7;
-            imm      =  ins16       & 0x7f;  /* raw 7-bit; scaled per instruction */
-        } else {
-            /* F3a / F3b / F3c / F3d / F3e: 3 bytes */
-            b1 = read8(pc); pc++;
-            b2 = read8(pc); pc++;
-            uint32_t ins24 = ((uint32_t)b0 << 16) | ((uint32_t)b1 << 8) | b2;
-            if ((b0 & 0xfc) == 0xc4) {
-                /* F3b: adjw, lea (0xc4–0xc7); rd + imm14 */
-                lookupop = b0 & 0xfe;
-                rd = rx  = (int)((ins24 >> 14) & 0x7);
-                imm      = (int32_t)(ins24 & 0x3fff);  /* raw imm14 */
-            } else if ((b0 & 0xfc) == 0xc0) {
-                /* F3a: j, jl, enter (0xc0–0xc3) */
-                lookupop = b0;
-                imm      = (int32_t)(uint32_t)(((uint16_t)b1 << 8) | b2);
-            } else if (b0 == 0xdf) {
-                /* F3d: beqz, bnez */
-                lookupop = 0xdf;
-                rd = rx  = (int)((ins24 >> 13) & 0x7);
-                subop    = (int)((ins24 >> 10) & 0x7);
-                imm      = (int32_t)(ins24 & 0x3ff);
-            } else if ((b0 & 0xf0) == 0xd0) {
-                /* F3c: two-reg + imm10 (0xd0–0xdd) */
-                lookupop = b0;
-                rd = rx  = (int)((ins24 >> 13) & 0x7);
-                ry       = (int)((ins24 >> 10) & 0x7);
-                imm      = (int32_t)(ins24 & 0x3ff);
-            } else {
-                /* F3e: one-reg + imm16 (0xe0–0xff) */
-                lookupop = b0 & 0xf8;
-                rd       = b0 & 0x7;
-                imm      = (int32_t)(uint32_t)(((uint16_t)b1 << 8) | b2);
-            }
-        }
-
-        g_last_len = (int)(uint16_t)(pc - oldpc);
-        g_watch_pc = oldpc; g_watch_r0 = r[0]; g_watch_sp = sp; g_watch_bp = bp;
-        trace[trace_idx].t_pc = oldpc; trace[trace_idx].t_op = b0;
+        if (g_retire_out || g_trace_out) { memcpy(r_before, r, sizeof r_before); g_nmw = 0; }
+        if (g_profile) prof_count[step_pc]++;
+        g_watch_pc = step_pc; g_watch_r0 = r[0]; g_watch_sp = sp; g_watch_bp = bp;
+        trace[trace_idx].t_pc = step_pc; trace[trace_idx].t_op = read8(step_pc);
         trace[trace_idx].t_r0 = r[0]; trace[trace_idx].t_sp = sp; trace[trace_idx].t_bp = bp;
         trace[trace_idx].t_core = ci;
         trace_idx = (trace_idx + 1) % TRACE_N4;
 
-        if (g_trace_out) {
-            int ilen = (int)(uint16_t)(pc - oldpc);
-            if (ilen < 1) ilen = 1;
-            if (ilen > 3) ilen = 3;
-            char ins_buf[8];
-            int p = 0;
-            for (int i = 0; i < ilen; i++)
-                p += snprintf(ins_buf + p, sizeof(ins_buf) - p,
-                              "%02x", read8((uint16_t)(oldpc + i)));
-            if (g_ncores > 1) fprintf(g_trace_out, "c%d ", ci);
-            fprintf(g_trace_out,
-                "pc=%04x ins=%-6s r0=%08x r1=%08x r2=%08x r3=%08x "
-                "r4=%08x r5=%08x r6=%08x r7=%08x sp=%04x bp=%04x lr=%04x\n",
-                oldpc, ins_buf,
-                r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7],
-                sp, bp, lr);
-        }
+        /* Fetch, decode and execute: generated from cpu4/isa.py (cpu4/exec_gen.h). */
+        g_gen_bad = 0;
+        g_last_len = gen_step(cc);
 
-        switch (lookupop) {
-        /* F0 */
-        case 0x00: H = 1; break;  /* halt */
-        case 0x01:                /* ret: unpack lr+bp from one 32-bit word */
-            sp = bp;
-            bp = (uint16_t)(read32(sp) & 0xffff);
-            pc = (uint16_t)(read32(sp) >> 16);
-            sp = (uint16_t)(sp + 4);
-            break;
-        case 0x02: r[0]=0; break;  /* zero0 */
-        case 0x03: r[1]=0; break;  /* zero1 */
-        case 0x04: r[2]=0; break;  /* zero2 */
-        case 0x05: r[3]=0; break;  /* zero3 */
-        case 0x06: r[4]=0; break;  /* zero4 */
-        case 0x07: r[5]=0; break;  /* zero5 */
-        case 0x08: r[6]=0; break;  /* zero6 */
-        case 0x09: r[7]=0; break;  /* zero7 */
-        /* F1a */
-        case 0x40: r[rd]=r[rx]+r[ry]; break;  /* add */
-        case 0x42: r[rd]=r[rx]-r[ry]; break;  /* sub */
-        case 0x44: r[rd]=r[rx]*r[ry]; break;  /* mul */
-        case 0x46: r[rd]=r[ry]?r[rx]/r[ry]:0; break;  /* div */
-        case 0x48: r[rd]=r[ry]?r[rx]%r[ry]:0; break;  /* mod */
-        case 0x4a: r[rd]=r[rx]<<(r[ry]&31); break;    /* shl */
-        case 0x4c: r[rd]=r[rx]>>(r[ry]&31); break;    /* shr */
-        case 0x4e: r[rd]=(r[rx]<r[ry])?1:0; break;    /* lt  */
-        case 0x50: r[rd]=(r[rx]<=r[ry])?1:0; break;    /* le  */
-        case 0x52: r[rd]=(r[rx]==r[ry])?1:0; break;   /* eq  */
-        case 0x54: r[rd]=(r[rx]!=r[ry])?1:0; break;   /* ne  */
-        case 0x56: r[rd]=r[rx]&r[ry]; break;  /* and */
-        case 0x58: r[rd]=r[rx]|r[ry]; break;  /* or  */
-        case 0x5a: r[rd]=r[rx]^r[ry]; break;  /* xor */
-        case 0x5c: r[rd]=((int32_t)r[rx]<(int32_t)r[ry])?1:0; break; /* lts */
-        case 0x5e: r[rd]=((int32_t)r[rx]<=(int32_t)r[ry])?1:0; break; /* les */
-        case 0x60: r[rd]=(uint32_t)(r[ry]?(int32_t)r[rx]/(int32_t)r[ry]:0); break; /* divs */
-        case 0x62: r[rd]=(uint32_t)(r[ry]?(int32_t)r[rx]%(int32_t)r[ry]:0); break; /* mods */
-        case 0x64: r[rd]=(uint32_t)((int32_t)r[rx]>>(r[ry]&31)); break; /* shrs */
-        case 0x66: r[rd]=cpu4_fadd(r[rx],r[ry]); break; /* fadd */
-        case 0x68: r[rd]=cpu4_fsub(r[rx],r[ry]); break; /* fsub */
-        case 0x6a: r[rd]=cpu4_fmul(r[rx],r[ry]); break; /* fmul */
-        case 0x6c: r[rd]=cpu4_fdiv(r[rx],r[ry]); break; /* fdiv = fmul(a, frecip(b)) */
-        case 0x6e: r[rd]=cpu4_flt(r[rx],r[ry]); break; /* flt */
-        case 0x70: r[rd]=cpu4_fle(r[rx],r[ry]); break; /* fle */
-        case 0x72: r[rd]=(r[rx]|r[ry])&0xffff; break; /* zxwor */
-        case 0x74: r[rd]=(uint32_t)(int32_t)(int16_t)((r[rx]|r[ry])&0xffff); break; /* sxwor */
-        /* F1b */
-        case 0x7e:
-            if      (subop==0x00) r[rd]=(uint32_t)(int32_t)(int8_t) (r[rd]&0xff);   /* sxb    */
-            else if (subop==0x01) r[rd]=(uint32_t)(int32_t)(int16_t)(r[rd]&0xffff); /* sxw    */
-            else if (subop==0x02) r[rd]=(r[rd]+1)&0xffffffff;                        /* inc    */
-            else if (subop==0x03) r[rd]=(r[rd]-1)&0xffffffff;                        /* dec    */
-            else if (subop==0x04) { sp -= 4; write32(sp, r[rd]); }                   /* pushr  */
-            else if (subop==0x05) { r[rd] = read32(sp); sp += 4; }                   /* popr   */
-            else if (subop==0x06) r[rd] = r[rd] & 0xff;                              /* zxb    */
-            else if (subop==0x07) r[rd] = r[rd] & 0xffff;                            /* zxw    */
-            else if (subop==0x08) { r[rd]=cpu4_itof(r[rd]); }                                     /* itof */
-            else if (subop==0x09) { r[rd]=cpu4_ftoi(r[rd]); }                                     /* ftoi */
-            else if (subop==0x0a) { uint16_t t=pc; pc=(uint16_t)(r[rd]&0xffff); lr=t; }       /* jlr  */
-            else if (subop==0x0b) { pc=(uint16_t)(r[rd]&0xffff); }                             /* jr   */
-            else if (subop==0x0c) { sp=(uint16_t)(r[rd]&0xffff); }                             /* ssp  */
-            else if (subop==0x0d) { r[rd] = (uint32_t)(-(int32_t)r[rd]); }                     /* neg  */
-            else if (subop==0x0e) { r[rd] = cpu4_frecip(r[rd]); }                              /* frecip */
-            else if (subop==0x0f) { r[rd] = cpu4_frsqrt(r[rd]); }                              /* frsqrt */
-            else if (subop==0x3f) { fputc((int)(r[rd]&0xff),stderr); fflush(stderr); }         /* putchar */
-            break;
-        /* F2 — bp-relative (imm is raw 7-bit; scaled by access size) */
-        case 0x80: r[rd]=read8 ((uint16_t)((int32_t)bp+sx7(imm)));     break; /* lb  */
-        case 0x84: { uint16_t a = (uint16_t)((int32_t)bp+sx7(imm)*2); check_align16(a, oldpc); r[rd]=read16(a); } break; /* lw  */
-        case 0x88: { uint16_t a = (uint16_t)((int32_t)bp+sx7(imm)*4); check_align32(a, oldpc); r[rd]=read32(a); } break; /* ll  */
-        case 0x8c: write8 ((uint16_t)((int32_t)bp+sx7(imm)),    (uint8_t) r[rx]); break; /* sb  */
-        case 0x90: { uint16_t a = (uint16_t)((int32_t)bp+sx7(imm)*2); check_align16(a, oldpc); write16(a, (uint16_t)r[rx]); } break; /* sw  */
-        case 0x94: { uint16_t a = (uint16_t)((int32_t)bp+sx7(imm)*4); check_align32(a, oldpc); write32(a, r[rx]); } break; /* sl  */
-        case 0x98: r[rd]=(uint32_t)(int32_t)(int8_t) read8 ((uint16_t)((int32_t)bp+sx7(imm)));   break; /* lbx */
-        case 0x9c: { uint16_t a = (uint16_t)((int32_t)bp+sx7(imm)*2); check_align16(a, oldpc); r[rd]=(uint32_t)(int32_t)(int16_t)read16(a); } break; /* lwx */
-        case 0xa0: r[rd]=r[rx]+(uint32_t)sx7(imm); break;           /* addi */
-        case 0xa4: r[rd]=r[rx]<<(imm&0x1f); break;                /* shli */
-        case 0xa8: r[rd]=r[rx]&(uint32_t)imm; break;              /* andi (no sext) */
-        case 0xac: r[rd]=(uint32_t)((int32_t)r[rx]>>(imm&0x1f)); break; /* shrsi */
-        case 0xb0: r[rd]=(uint32_t)sx7(imm); break;                     /* imms */
-        /* F3a */
-        case 0xc0: pc=(uint16_t)imm; break;  /* j   */
-        case 0xc1: lr=pc; pc=(uint16_t)imm; break; /* jl  */
-        case 0xc2:            /* enter: pack lr+bp into one 32-bit word (4-byte overhead) */
-            write32((uint16_t)(sp-4), ((uint32_t)lr << 16) | (uint32_t)bp);
-            bp=(uint16_t)(sp-4); sp=(uint16_t)(sp-(uint16_t)imm-4);
-            break;
-        /* F3b: adjw=0xc4, lea=0xc6 */
-        case 0xc4: sp=(uint16_t)(sp+(uint16_t)(sx14(imm)<<2)); break; /* adjw */
-        case 0xc6: /* lea: ILP32 — mask to 16 bits so the upper half is
-                   * always zero regardless of how negative offsets land in
-                   * int32 arithmetic. Mirrors the hardware (bp is 16-bit;
-                   * the address ALU computes bp+offset mod 2^16). */
-                   r[rd]=(uint32_t)(uint16_t)((int32_t)bp+(sx14(imm)<<2));
-                   break;
-        /* F0c: cbeq=0x20, cbne=0x30 — compare rx with imm7 and branch */
-        case 0x20: if(r[rx]==(uint32_t)(imm>>10)) pc=(uint16_t)(pc+sx10(imm&0x3ff)); break; /* cbeq */
-        case 0x30: if(r[rx]!=(uint32_t)(imm>>10)) pc=(uint16_t)(pc+sx10(imm&0x3ff)); break; /* cbne */
-        /* F3c — register-relative. Addresses are 32-bit so loads/stores
-         * can reach SDRAM (>= 0x10000) and its alias range. The previous
-         * (uint16_t) truncation that worked under LP32 is wrong now: any
-         * pointer with a non-zero upper half — i.e. anything aimed at
-         * SDRAM — would have been masked back into the low 64 KB. */
-        case 0xd0: r[rx]=read8 ((uint32_t)((int32_t)r[ry]+sx10(imm)));     break; /* llb  */
-        case 0xd1: { uint32_t a = (uint32_t)((int32_t)r[ry]+sx10(imm)*2); check_align16(a, oldpc); r[rx]=read16(a); } break; /* llw  */
-        case 0xd2: { uint32_t a = (uint32_t)((int32_t)r[ry]+sx10(imm)*4); check_align32(a, oldpc); r[rx]=read32(a); } break; /* lll  */
-        case 0xd3: write8 ((uint32_t)((int32_t)r[ry]+sx10(imm)),    (uint8_t) r[rx]); break; /* slb  */
-        case 0xd4: { uint32_t a = (uint32_t)((int32_t)r[ry]+sx10(imm)*2); check_align16(a, oldpc); write16(a, (uint16_t)r[rx]); } break; /* slw  */
-        case 0xd5: { uint32_t a = (uint32_t)((int32_t)r[ry]+sx10(imm)*4); check_align32(a, oldpc); write32(a, r[rx]); } break; /* sll  */
-        case 0xd6: r[rx]=(uint32_t)(int32_t)(int8_t) read8 ((uint32_t)((int32_t)r[ry]+sx10(imm)));   break; /* llbx */
-        case 0xd7: { uint32_t a = (uint32_t)((int32_t)r[ry]+sx10(imm)*2); check_align16(a, oldpc); r[rx]=(uint32_t)(int32_t)(int16_t)read16(a); } break; /* llwx */
-        case 0xd8: if(r[rx]==r[ry]) pc=(uint16_t)(pc+sx10(imm)); break; /* beq  */
-        case 0xd9: if(r[rx]!=r[ry]) pc=(uint16_t)(pc+sx10(imm)); break; /* bne  */
-        case 0xda: if(r[rx]< r[ry]) pc=(uint16_t)(pc+sx10(imm)); break; /* blt  */
-        case 0xdb: if(r[rx]<=r[ry]) pc=(uint16_t)(pc+sx10(imm)); break; /* ble  */
-        case 0xdc: if((int32_t)r[rx]<(int32_t)r[ry]) pc=(uint16_t)(pc+sx10(imm)); break; /* blts */
-        case 0xdd: if((int32_t)r[rx]<=(int32_t)r[ry]) pc=(uint16_t)(pc+sx10(imm)); break; /* bles */
-        /* F0b: two-op + imm9 (0x10-0x1b) */
-        case 0x10: /* addli (sub=0) / subli (sub=1) */
-            if (subop == 0) r[rd] = r[ry] + (uint32_t)sx9(imm);
-            else            r[rd] = r[ry] - (uint32_t)sx9(imm);
-            break;
-        case 0x11: /* mulli (sub=0) / divli (sub=1) */
-            if (subop == 0) r[rd] = r[ry] * (uint32_t)sx9(imm);
-            else            r[rd] = (imm & 0x1ff) ? r[ry] / (uint32_t)sx9(imm) : 0;
-            break;
-        case 0x12: /* modli (sub=0) / shlli (sub=1) */
-            if (subop == 0) r[rd] = (imm & 0x1ff) ? r[ry] % (uint32_t)sx9(imm) : 0;
-            else            r[rd] = r[ry] << (imm & 31);
-            break;
-        case 0x13: /* shrli (sub=0) / leli (sub=1) */
-            if (subop == 0) r[rd] = r[ry] >> (imm & 31);
-            else            r[rd] = (r[ry] <= (uint32_t)sx9(imm)) ? 1 : 0;
-            break;
-        case 0x14: /* gtli (sub=0) / eqli (sub=1) */
-            if (subop == 0) r[rd] = (r[ry] > (uint32_t)sx9(imm)) ? 1 : 0;
-            else            r[rd] = (r[ry] == (uint32_t)sx9(imm)) ? 1 : 0;
-            break;
-        case 0x15: /* neli (sub=0) / andli (sub=1) */
-            if (subop == 0) r[rd] = (r[ry] != (uint32_t)sx9(imm)) ? 1 : 0;
-            else            r[rd] = r[ry] & (uint32_t)sx9(imm);
-            break;
-        case 0x16: /* orli (sub=0) / xorli (sub=1) */
-            if (subop == 0) r[rd] = r[ry] | (uint32_t)sx9(imm);
-            else            r[rd] = r[ry] ^ (uint32_t)sx9(imm);
-            break;
-        case 0x17: /* lesli (sub=0) / gtsli (sub=1) */
-            if (subop == 0) r[rd] = ((int32_t)r[ry] <= sx9(imm)) ? 1 : 0;
-            else            r[rd] = ((int32_t)r[ry] > sx9(imm)) ? 1 : 0;
-            break;
-        case 0x18: /* divsli (sub=0) / modsli (sub=1) */
-            if (subop == 0) r[rd] = (uint32_t)((imm & 0x1ff) ? (int32_t)r[ry] / sx9(imm) : 0);
-            else            r[rd] = (uint32_t)((imm & 0x1ff) ? (int32_t)r[ry] % sx9(imm) : 0);
-            break;
-        case 0x19: /* shrsli (sub=0) / bitex (sub=1) */
-            if (subop == 0) r[rd] = (uint32_t)((int32_t)r[ry] >> (imm & 31));
-            else {
-                int shift = imm & 0x1f;
-                int width = (imm >> 5) & 0x0f;
-                uint32_t mask = (2u << width) - 1;
-                r[rd] = (r[ry] >> shift) & mask;
-            }
-            break;
-        case 0x1a: /* rsubli (sub=0) / rdivli (sub=1) */
-            if (subop == 0) r[rd] = (uint32_t)sx9(imm) - r[ry];
-            /* rdivli is UNSIGNED: the sign-extended imm9 bit pattern is the
-               unsigned dividend (spec: rd = sext9 / rx). */
-            else            r[rd] = r[ry] ? (uint32_t)sx9(imm) / r[ry] : 0;
-            break;
-        case 0x1b: /* rmodli (sub=0) / rdivsli (sub=1) */
-            /* rmodli is UNSIGNED (spec: rd = sext9 % rx). */
-            if (subop == 0) r[rd] = r[ry] ? (uint32_t)sx9(imm) % r[ry] : 0;
-            else            r[rd] = r[ry] ? (uint32_t)(sx9(imm) / (int32_t)r[ry]) : 0;
-            break;
-        /* F3d: beqz/bnez */
-        case 0xdf:
-            if      (subop==0x00) { if(!r[rd]) pc=(uint16_t)(pc+sx10(imm)); } /* beqz */
-            else if (subop==0x01) { if( r[rd]) pc=(uint16_t)(pc+sx10(imm)); } /* bnez */
-            else if (subop==0x02) { r[rd]-=1; if(r[rd]) pc=(uint16_t)(pc+sx10(imm)); } /* dbnz */
-            else if (subop==0x03) { if((int32_t)r[rd] <  0) pc=(uint16_t)(pc+sx10(imm)); } /* bltz */
-            else if (subop==0x04) { if((int32_t)r[rd] >= 0) pc=(uint16_t)(pc+sx10(imm)); } /* bgez */
-            else if (subop==0x05) { if((int32_t)r[rd] >  0) pc=(uint16_t)(pc+sx10(imm)); } /* bgtz */
-            else if (subop==0x06) { if((int32_t)r[rd] <= 0) pc=(uint16_t)(pc+sx10(imm)); } /* blez */
-            break;
-        /* F3e: one-reg + imm16 */
-        case 0xe0: r[rd]=(uint32_t)(uint16_t)imm; break;                              /* immw  */
-        case 0xe8: r[rd]=(r[rd]&0xffff)|((uint32_t)(uint16_t)imm<<16); break;        /* immwh */
-        case 0xf0: if(!r[rd]) pc=(uint16_t)imm; break;                               /* jz   */
-        case 0xf8: if( r[rd]) pc=(uint16_t)imm; break;                               /* jnz  */
-        default:
-            fprintf(stderr, "cpu4: unknown opcode 0x%02x at pc=%04x (core %d)\n", b0, oldpc, ci);
+        if (g_gen_bad) {
             fprintf(stderr, "Last %d instructions:\n", TRACE_N4);
             for (int _ti = 0; _ti < TRACE_N4; _ti++) {
                 int _idx = (trace_idx + _ti) % TRACE_N4;
@@ -1705,11 +1400,19 @@ static void run_cpu4(void)
                         trace[_idx].t_core, trace[_idx].t_pc, trace[_idx].t_op,
                         trace[_idx].t_r0, trace[_idx].t_sp, trace[_idx].t_bp);
             }
-            H = 1;
-            break;
         }
+        if (g_trace_out) {      /* state before the instruction, as the trace has always shown it */
+            char ins_buf[8]; int p = 0;
+            for (int i = 0; i < g_last_len && i < 3; i++)
+                p += snprintf(ins_buf + p, sizeof(ins_buf) - p, "%02x", read8((uint16_t)(step_pc + i)));
+            if (g_ncores > 1) fprintf(g_trace_out, "c%d ", ci);
+            fprintf(g_trace_out,
+                "pc=%04x ins=%-6s r0=%08x r1=%08x r2=%08x r3=%08x "
+                "r4=%08x r5=%08x r6=%08x r7=%08x sp=%04x bp=%04x lr=%04x\n",
+                step_pc, ins_buf,
+                r_before[0], r_before[1], r_before[2], r_before[3], r_before[4], r_before[5], r_before[6], r_before[7],
+                sp_before, bp_before, lr_before);
         }
-executed:
         for (int i = 0; i < 8; i++) r[i] &= 0xffffffff;
         sp &= 0xffff; bp &= 0xffff; lr &= 0xffff; pc &= 0xffff;
 
@@ -1875,7 +1578,6 @@ static const char *usage_text =
 "  -fb FILE           After running, dump the bitmap framebuffer to FILE.ppm\n"
 "                     (640x480 32bpp by default; honors DISP_MODE bits — 320x240 / 8bpp).\n"
 "  -profile           Collect and print a per-source-line execution profile\n"
-"  -gen               Execute with the executor generated from cpu4/isa.py SEMANTICS\n"
 "  -retire FILE       Write one line per retired instruction: pc, bytes, every\n"
 "                     register and memory change, next pc\n"
 "  -linemap FILE      Assemble and write a PC->source JSON map; do not execute\n"
@@ -1900,7 +1602,6 @@ int main(int argc, char **argv)
         }
         else if (strcmp(argv[i], "-trace") == 0 && i+1 < argc) trace_path = argv[++i];
         else if (strcmp(argv[i], "-profile") == 0) g_profile = 1;
-        else if (strcmp(argv[i], "-gen") == 0) g_gen_exec = 1;
         else if (strcmp(argv[i], "-retire") == 0 && i+1 < argc) {
             g_retire_out = fopen(argv[++i], "w");
             if (!g_retire_out) { perror(argv[i]); return 1; }

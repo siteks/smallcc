@@ -220,6 +220,8 @@ class Assembler:
                                 return 0
 
                         i.ins = []
+                        # data values are separated by spaces (sim_c, docs/abi.md) or commas
+                        operands = [t for op in operands for t in op.split()]
                         for tok in operands:
                             v = res_tok(tok)
                             for b in range(size):

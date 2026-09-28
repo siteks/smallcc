@@ -191,12 +191,14 @@ offset encoded ÷4, `raw16` 16-bit pattern, `pcrel` PC-relative displacement
 
 Each instruction's Semantics cell is one line of register-transfer notation
 (`SEMANTICS` in `cpu4/isa.py`). `cpu4/sem.py` parses it and generates `cpu4/exec_gen.h`,
-the executor `sim_c -gen` runs. The notation is defined as follows.
+the executor `sim_c` runs, and `cpu4/exec_gen.py`, the one `cpu4/cpu.py` runs. The notation is defined as follows.
 
 ```
 State: R[0..7] are 32-bit; PC, SP, BP, LR are 16-bit; H is the halt flag.
 Memory is byte-addressed, little-endian, 32-bit addresses. Memory the
-program image does not cover reads as 0 after reset. M8[a], M16[a],
+program image does not cover reads as 0 after reset (a machine guarantee;
+C's rules on uninitialised objects still apply to C programs, and loading a
+program over the debug port is not a reset). M8[a], M16[a],
 M32[a] read or write 1, 2, 4 bytes at a. M16 and M32 accesses must be
 naturally aligned: a misaligned access is an alignment fault and stops the
 machine (sim_c reports it; the RTL must match).

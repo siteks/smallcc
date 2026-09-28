@@ -10,10 +10,12 @@ sea-of-processors project. This file is the contract between the two.
 
 ## Canonical artifacts
 
-- **`docs/isa/cpu4.md`** wins all ties. **`sim_c.c`** is the executable spec:
-  when the doc is ambiguous, what `sim_c` does is what the compiler targets and
-  what the hardware must match. A doc/`sim_c` discrepancy is a spec bug to fix
-  here.
+- **`cpu4/isa.py`** is the definition: every instruction's encoding and
+  semantics, plus the preamble defining the notation (proposal 0005). `sim_c`
+  and `cpu4/cpu.py` execute code generated from it; `docs/isa/cpu4.md`
+  explains it. A disagreement between the prose and `isa.py` is a doc bug; a
+  disagreement between `isa.py` and the hardware is a hardware bug, unless
+  the definition is changed here first.
 - **`docs/abi.md`** is the software contract; hardware sees it only through the
   instructions the compiler emits.
 - **`tests/cases/`** is the single corpus. Downstream runs these same files
@@ -28,11 +30,8 @@ An ISA or ABI change is **one commit in smallcc** that touches, together:
   it (`cpu4/isa_table_c.h`, `cpu4/isa_table.py`, `docs/isa/cpu4-encoding.md`);
 - `docs/isa/cpu4.md` (or `docs/abi.md`) — the semantics in prose, and
   `cpu4/fpu_model.h` for a float op;
-- `cpu4/isa.py` `SEMANTICS` — the semantics, one line per instruction, from
-  which `make isa` generates `sim_c`'s `-gen` executor;
-- `sim_c.c` `run_cpu4()` and `cpu4/cpu.py` `CPU.step()` — the hand-written
-  executors, until proposal 0005 retires them (`make rig` checks the first
-  against the generated one);
+- `cpu4/isa.py` `SEMANTICS` — the semantics, one line per instruction; `make
+  isa` regenerates both simulators' executors from it;
 - the compiler (`emit.c`, `legalize.c`, `braun.c` for a builtin);
 - at least one corpus test that executes the change.
 

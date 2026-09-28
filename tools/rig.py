@@ -2,16 +2,20 @@
 """Random instruction generator (RIG) and lockstep checker for CPU4.
 
 Generates constrained-random CPU4 assembly programs from the instruction table
-in cpu4/isa.py, runs each on two or more executors, and compares them
-instruction by instruction:
+in cpu4/isa.py and runs each on two executors, comparing them instruction by
+instruction through their retirement traces:
 
-  hand   sim_c's hand-written executor              (sim_c -retire)
-  gen    the executor generated from isa.SEMANTICS  (sim_c -gen -retire)
-  cpupy  cpu4/cpu.py, final architectural state only (--cpupy)
+  sim_c    the C executor generated from isa.SEMANTICS (cpu4/exec_gen.h),
+           with the float model in cpu4/fpu_model.h
+  cpu.py   the Python executor generated from the same lines (cpu4/exec_gen.py),
+           with the float port in cpu4/fpu_model.py
 
-The retirement trace (one line per retired instruction: pc, bytes, every
-register and memory change, next pc) is the comparison contract; a
-retirement port on the RTL bench is meant to produce the same lines.
+Both come from one description, so agreement checks the two generators, the
+two float implementations and the two memory/state models against each other;
+a disagreement names the instruction and the operands. The retirement trace
+(one line per retired instruction: pc, bytes, every register and memory
+change, next pc) is also the contract a retirement port on the RTL bench is
+meant to produce, which is how the RTL joins the comparison.
 
 Constraints keep every program terminating and every access legal, while
 leaving operand values and instruction mixes as random as possible:
@@ -24,10 +28,9 @@ Registers start from a mix of random and edge values (0, 1, -1, INT_MIN,
 INT_MAX, float specials) so the edge cases of the semantics are reached.
 
   tools/rig.py -n 200 -len 300 -seed 1           # 200 programs
-  tools/rig.py -n 50 --cpupy                      # also compare with cpu.py
   tools/rig.py --keep out/                        # save every program that fails
 """
-import argparse, collections, hashlib, os, random, re, subprocess, sys, tempfile
+import argparse, collections, contextlib, io, os, random, re, subprocess, sys, tempfile
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, 'cpu4'))
 import isa, sem
@@ -186,21 +189,36 @@ def mnemonic(hexbytes):
     return '?'
 
 
-def run_sim(asm, gen, maxsteps):
+def run_sim(asm, maxsteps):
     with tempfile.NamedTemporaryFile(suffix='.ret', delete=False) as t:
         ret = t.name
-    cmd = [SIM] + (['-gen'] if gen else []) + ['-maxsteps', str(maxsteps), '-retire', ret, asm]
-    p = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
+    p = subprocess.run([SIM, '-maxsteps', str(maxsteps), '-retire', ret, asm], capture_output=True, text=True, errors="replace")
     trace = open(ret).read().splitlines(); os.unlink(ret)
     final = next((l for l in p.stdout.splitlines() if l.startswith('r0:')), '')
     return p.returncode, trace, final, p.stderr
 
 
+_PYSIM = None
 def run_cpupy(asm, maxsteps):
-    p = subprocess.run([sys.executable, 'sim.py', '--maxsteps', str(maxsteps), asm], capture_output=True, text=True, errors="replace",
-                       cwd=os.path.join(ROOT, 'cpu4'))
-    m = re.search(r'r0:.*?H:\d', p.stdout)
-    return m.group(0) if m else ('ERROR ' + (p.stderr.strip().splitlines() or ['?'])[-1])
+    """cpu.py in-process (its putchar output is discarded)."""
+    global _PYSIM
+    if _PYSIM is None:
+        cwd = os.getcwd(); os.chdir(os.path.join(ROOT, 'cpu4'))
+        try:
+            import sim as _sim
+        finally:
+            os.chdir(cwd)
+        _PYSIM = _sim
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            st = _PYSIM.runfile(asm, maxsteps=maxsteps, retire=buf)
+        code = 0
+    except SystemExit as e:
+        st, code = None, e.code or 1
+    except Exception as e:
+        return 1, buf.getvalue().splitlines(), 'EXC ' + type(e).__name__ + ': ' + str(e)[:80]
+    return code, buf.getvalue().splitlines(), (repr(st) if st is not None else '')
 
 
 def first_diff(a, b):
@@ -215,7 +233,6 @@ def main():
     ap.add_argument('-n', type=int, default=100, help='programs to generate')
     ap.add_argument('-len', type=int, default=300, help='items per program body')
     ap.add_argument('-seed', type=int, default=1)
-    ap.add_argument('--cpupy', action='store_true', help='also compare final state with cpu4/cpu.py')
     ap.add_argument('--keep', metavar='DIR', help='save each failing program here')
     ap.add_argument('--maxsteps', type=int, default=200000)
     a = ap.parse_args()
@@ -225,20 +242,17 @@ def main():
         src = Prog(random.Random(seed), a.len).program()
         with tempfile.NamedTemporaryFile('w', suffix='.s', delete=False) as f:
             f.write(src); asm = f.name
-        h = run_sim(asm, False, a.maxsteps); g = run_sim(asm, True, a.maxsteps)
+        g = run_sim(asm, a.maxsteps); c = run_cpupy(asm, a.maxsteps)
         problems = []
         if g[0] != 0:
-            problems.append(('gen-error', g[3].strip().splitlines()[-1:] if g[3].strip() else [f'exit {g[0]}']))
-        if h[0] != g[0] or h[1] != g[1] or h[2] != g[2]:
-            if h[0] < 0 or h[0] > 1:
-                problems.append(('hand-crash', [f'hand exit {h[0]} after {len(h[1])} instructions; next: ' + (g[1][len(h[1])] if len(g[1]) > len(h[1]) else '?')]))
+            problems.append(('sim_c-error', g[3].strip().splitlines()[-1:] if g[3].strip() else [f'exit {g[0]}']))
+        if g[1] != c[1] or not g[2].startswith(c[2][:c[2].find(' H:') + 4] if ' H:' in c[2] else '\x00'):
+            if c[2].startswith('EXC') or c[0]:
+                problems.append(('cpu.py-error', [c[2] or f'exit {c[0]}', f'after {len(c[1])} instructions']))
             else:
-                i, x, y = first_diff(h[1], g[1])
-                problems.append(('hand-vs-gen', [f'instruction {i}', f'hand {x}', f'gen  {y}']))
-        if a.cpupy and g[0] == 0:
-            c = run_cpupy(asm, a.maxsteps)
-            if not g[2].startswith(c):
-                problems.append(('cpupy-vs-gen', [f'gen   {g[2][:120]}', f'cpupy {c[:120]}']))
+                i, x, y = first_diff(g[1], c[1])
+                problems.append(('sim_c-vs-cpu.py', [f'instruction {i} (' + (mnemonic(x.split()[1]) if x != '<end>' else '?') + ')',
+                                                    f'sim_c  {x}', f'cpu.py {y}']))
         for line in g[1]:
             cover[mnemonic(line.split()[1])] += 1
         retired += len(g[1])

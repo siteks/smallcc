@@ -96,9 +96,8 @@ bp          := sp - 4              ; new bp points at the saved word
 sp          := sp - 4 - N          ; reserve N bytes for locals/spills
 ```
 
-`N` is unsigned, encoded in 14 bits, so up to 16383 bytes per frame. If a
-function needs more (rare), the compiler emits an additional `adjw` after the
-`enter`.
+`N` is unsigned and 16 bits wide, so a frame can be up to 65535 bytes, which
+covers everything the 64 KiB stack and code space can hold.
 
 ### `ret` semantics
 
@@ -153,7 +152,12 @@ All multi-byte memory access must be naturally aligned:
 The compiler is responsible for placing every local and spill slot at a
 properly-aligned bp-relative offset.
 
-**Enforcement is currently asymmetric.** `sim_c` checks every load/store
+**A misaligned access is an alignment fault** (decided 2026-09-28, proposal
+0005): the definition in `cpu4/isa.py` says it stops the machine, and `sim_c`
+and `cpu4/cpu.py` do exactly that. The CPU4 RTL does not implement the fault
+yet (below); it is a known deviation, and CPU5's RTL implements it.
+
+**Enforcement on CPU4 is therefore asymmetric.** `sim_c` checks every load/store
 and aborts with `CPU4 alignment error: 32-bit access to unaligned address
 0xXXXX at pc=0xYYYY` on a violation — that's how the spill-alignment bugs
 during the ILP32 transition were caught. The RTL does **not** raise an
@@ -161,12 +165,12 @@ exception on misaligned access; it silently performs whatever the
 hardware datapath does (typically dropping the low bits of the address),
 which produces wrong values rather than a clean trap.
 
-Adding a hardware alignment exception (along with a general exception /
-trap mechanism for future use — divide-by-zero, illegal opcode, etc.) is
-parked future work, **low priority**. Until then, the compiler is the
-only line of defence: any misalignment is a compiler bug to be caught by
-`sim_c` and fixed at source. User code that hand-writes pointer arithmetic
-risks silent corruption on the RTL even though `sim_c` would have caught it.
+The hardware alignment fault (and with it a general exception mechanism for
+illegal opcodes and the like) is planned for CPU5, not retrofitted to CPU4.
+Until then the compiler is the only line of defence on the CPU4 RTL: any
+misalignment is a compiler bug to be caught by `sim_c` and fixed at source,
+and hand-written pointer arithmetic can corrupt silently on the RTL even
+though `sim_c` would have caught it.
 
 ---
 

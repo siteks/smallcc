@@ -11,8 +11,8 @@ this file by cpu4/gen_isa.py:
 
 It also holds each instruction's semantics as one line of register-transfer
 notation (SEMANTICS below; the notation is defined in SEMANTICS_PREAMBLE and
-parsed by cpu4/sem.py, which generates cpu4/exec_gen.h, sim_c's generated
-executor). Float arithmetic is named primitives whose bit-exact definition is
+parsed by cpu4/sem.py, which generates the executors: cpu4/exec_gen.h for
+sim_c and cpu4/exec_gen.py for cpu4/cpu.py). Float arithmetic is named primitives whose bit-exact definition is
 cpu4/fpu_model.h. Prose in docs/isa/cpu4.md explains; this file defines.
 
 Formats (first-byte patterns, see docs/isa/cpu4.md):
@@ -166,7 +166,9 @@ def operand_syntax(d):
 SEMANTICS_PREAMBLE = """
 State: R[0..7] are 32-bit; PC, SP, BP, LR are 16-bit; H is the halt flag.
 Memory is byte-addressed, little-endian, 32-bit addresses. Memory the
-program image does not cover reads as 0 after reset. M8[a], M16[a],
+program image does not cover reads as 0 after reset (a machine guarantee;
+C's rules on uninitialised objects still apply to C programs, and loading a
+program over the debug port is not a reset). M8[a], M16[a],
 M32[a] read or write 1, 2, 4 bytes at a. M16 and M32 accesses must be
 naturally aligned: a misaligned access is an alignment fault and stops the
 machine (sim_c reports it; the RTL must match).

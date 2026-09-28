@@ -15,7 +15,7 @@ isa:
 isa-check:
 	python3 cpu4/gen_isa.py --check
 
-cpu4/isa_table_c.h cpu4/isa_table.py cpu4/exec_gen.h: cpu4/isa.py cpu4/gen_isa.py cpu4/sem.py
+cpu4/isa_table_c.h cpu4/isa_table.py cpu4/exec_gen.h cpu4/exec_gen.py: cpu4/isa.py cpu4/gen_isa.py cpu4/sem.py
 	python3 cpu4/gen_isa.py
 
 test: smallcc sim_c isa-check rig-quick
@@ -71,7 +71,7 @@ help:
 .PHONY: isa isa-check rig rig-quick rig-long test test_v test_p test_irsim test_irsim_v test_irsim_p clean help
 
 # Random instruction generator: constrained-random programs run in lockstep on
-# sim_c's hand-written executor and the one generated from cpu4/isa.py SEMANTICS.
+# sim_c and cpu4/cpu.py, whose executors are both generated from cpu4/isa.py SEMANTICS.
 rig-quick: sim_c
 	python3 tools/rig.py -n 100 -len 300 -seed 1
 rig: sim_c

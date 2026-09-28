@@ -121,27 +121,30 @@ instructions. It builds constrained-random programs from the table in
 `cpu4/isa.py` (every instruction, random registers, edge operand values such
 as 0, -1, `INT_MIN`, float specials; forward branches, bounded `dbnz` loops,
 calls to generated leaf functions, balanced `pushr`/`popr` and `adjw`; memory
-accesses confined to initialised data windows) and runs each on two
-executors, comparing them after every instruction:
+accesses confined to initialised data windows) and runs each on `sim_c` and on
+`cpu4/cpu.py`, comparing them after every instruction.
 
-- `sim_c` with its hand-written executor, and `sim_c -gen`, whose executor is
-  generated from the `SEMANTICS` lines in `cpu4/isa.py`;
-- optionally (`--cpupy`) `cpu4/cpu.py`, final state only.
+Both simulators execute code generated from the same semantics lines, through
+different back ends (C and Python) and different float implementations
+(`fpu_model.h` and its port `fpu_model.py`), so agreement checks the
+generators, the float port and the two state and memory models against each
+other.
 
-The comparison is the retirement trace, `sim_c -retire FILE`: one line per
-retired instruction with its pc, bytes, every register and memory change, and
-the next pc. A retirement port on the RTL bench is meant to produce the same
-lines, so the RTL can join the lockstep comparison.
+The comparison is the retirement trace, `sim_c -retire FILE` and
+`cpu4/sim.py --retire FILE`: one line per retired instruction with its pc,
+bytes, every register and memory change, and the next pc. A retirement port
+on the RTL bench is meant to produce the same lines, so the RTL can join the
+lockstep comparison.
 
 ```bash
 make rig-quick                                  # 100 programs (part of make test)
 make rig                                        # 1000 programs, fresh seed
-python3 tools/rig.py -n 500 -seed 3 --cpupy     # also against cpu.py
-python3 tools/rig.py --keep rig_failures        # save each failing program
+make rig-long                                   # 10000 programs, failures saved to rig_failures/
+python3 tools/rig.py -n 500 -seed 3 --keep out  # a specific seed, failures saved
 ```
 
-It reports how many of the 123 instructions it executed, which is 123 on any
-run of a few hundred programs.
+It reports how many of the 123 instructions it executed, which is all of them
+on any run of a hundred programs or more.
 
 ## Floating-point conformance (`tests/cases/floats/fpu_vectors.c`)
 
