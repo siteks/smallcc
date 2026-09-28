@@ -14,6 +14,8 @@
 #include "sx.h"
 #include "smallcc.h"
 #include "cpu4/fpu_model.h"
+#include "lower.h"
+#include "emit.h"
 
 // ============================================================
 // Cross-TU string literal dedup table: (data,len) → assigned _lN id.
@@ -76,132 +78,37 @@ static void strlits_push(int id, const char *data, int len) {
 // ============================================================
 // Static local variable accumulator (flushed by braun_emit_strlits)
 // ============================================================
+//
+// Each static local is laid out when its declaration is compiled, by the
+// same routine as globals (lower_static_data), into the data-section form
+// (gvar "_lsN" size init) that emit_globals and irsim_populate_globals take.
 
-typedef struct { int id; Symbol *sym; Node *init_node; } BStaticLocal;
-static BStaticLocal *g_static_locals;
-static int           g_nsl, g_sl_cap;
+static Sx  *g_static_locals;          // (program gvar...)
+static Sx **g_sl_tail;
+static int  g_nsl;
+static int *g_cur_strlit_id;          // the running _lN counter of the current compile
 
-static void static_locals_push(int id, Symbol *sym, Node *init) {
-    if (g_nsl >= g_sl_cap) {
-        int nc = g_sl_cap ? g_sl_cap * 2 : 8;
-        BStaticLocal *nb = arena_alloc(nc * sizeof(BStaticLocal));
-        memcpy(nb, g_static_locals, g_nsl * sizeof(BStaticLocal));
-        g_static_locals = nb;
-        g_sl_cap        = nc;
+// A string literal's label, registered with this function's literals if new.
+static const char *braun_intern_strlit(const char *data, int len) {
+    int lid = strlit_lookup(data, len);
+    if (lid < 0) {
+        lid = (*g_cur_strlit_id)++;
+        strlit_register(data, len, lid);
+        strlits_push(lid, data, len);
     }
-    g_static_locals[g_nsl].id        = id;
-    g_static_locals[g_nsl].sym       = sym;
-    g_static_locals[g_nsl].init_node = init;
+    char buf[32]; snprintf(buf, sizeof(buf), "_l%d", lid);
+    return arena_strdup(buf);
+}
+
+static void static_locals_push(Symbol *sym, Node *init) {
+    if (!g_static_locals) {
+        g_static_locals = sx_list(1, sx_sym("program"));
+        g_sl_tail = &g_static_locals->cdr;
+    }
+    Sx *gv = lower_static_data(sym_label(sym), sym->type, init, braun_intern_strlit);
+    *g_sl_tail = sx_cons(gv, NULL);
+    g_sl_tail = &(*g_sl_tail)->cdr;
     g_nsl++;
-}
-
-// Evaluate a scalar/element initializer that is a compile-time integer
-// literal, looking through the ND_CAST wrappers insert_coercions adds
-// (int literal -> short/char/unsigned/long) and a leading unary minus.
-// Returns 1 and stores the value in *out if the node is such a literal,
-// 0 otherwise. Shared by the BSS classifier, the assembly emitter and
-// the irsim byte renderer so the three cannot disagree (a previous
-// version checked init->kind == ND_LITERAL directly and so silently
-// zeroed `static short s = 0x1234;` and `static int n = -1;`).
-static int static_init_literal(Node *n, int *out) {
-    int neg = 1;
-    while (n && n->kind == ND_CAST) n = n->ch[1];
-    if (n && n->kind == ND_UNARYOP && n->op_kind == TK_MINUS) { neg = -1; n = n->ch[0]; }
-    while (n && n->kind == ND_CAST) n = n->ch[1];
-    if (!n || n->kind != ND_LITERAL || n->u.literal.strval) return 0;
-    *out = (int)n->u.literal.ival * neg;
-    return 1;
-}
-
-static int static_local_is_scalar(Type *ty) {
-    return ty && !istype_array(ty) && ty->base != TB_STRUCT;
-}
-
-// Returns 1 if the static local has no initializer or a zero scalar literal.
-static int static_local_is_bss(BStaticLocal *sl) {
-    Node *init = sl->init_node;
-    Type *ty   = sl->sym ? sl->sym->type : NULL;
-    if (!init) return 1;
-    if (ty && istype_array(ty) && init->kind == ND_LITERAL && init->u.literal.strval)
-        return 0;
-    /* Array with brace-initializer-list: { v0, v1, ... }. Treat as
-     * initialized data so emit_static_local_data emits per-element bytes
-     * rather than a bare allocb. (The previous fall-through silently
-     * dropped the initializer, leaving the array all-zero — found while
-     * bringing up NanoJPEG's static lookup tables under -target sim.) */
-    if (ty && istype_array(ty) && init->kind == ND_INITLIST)
-        return 0;
-    if (static_local_is_scalar(ty)) {
-        int v;
-        if (static_init_literal(init, &v)) return v == 0;
-    }
-    return 1;
-}
-
-// Emit data-section assembly for a static local variable
-static void emit_static_local_data(FILE *out, BStaticLocal *sl) {
-    Symbol *sym  = sl->sym;
-    Node   *init = sl->init_node;
-    Type   *ty   = sym->type;
-    int     size = ty ? ty->size : 2;
-
-    // Same rule as the global emitter (emit.c gvar path): any multi-byte
-    // static must start on a 4-byte boundary. Without this, a static
-    // int/short/array following odd-length data (a string literal, a
-    // char array, a 2-byte static) lands at a 2- or 3-mod-4 address and
-    // the hardware word load silently returns the aligned neighbour
-    // (docs/issues/0001).
-    if (size >= 2) fprintf(out, "    align\n");
-    fprintf(out, "_ls%d:", sl->id);
-
-    // String-literal initializer for a char array (e.g. static char s[] = "hello")
-    if (ty && istype_array(ty) && init && init->kind == ND_LITERAL && init->u.literal.strval) {
-        const char *str = init->u.literal.strval;
-        int         len = init->u.literal.strval_len;
-        for (int j = 0; j <= len; j++)
-            fprintf(out, "\n    byte %d", j < len ? (unsigned char)str[j] : 0);
-        fprintf(out, "\n");
-        return;
-    }
-
-    // Scalar integer initializer (literal, possibly behind coercion casts
-    // or a unary minus). Directive width follows the declared size so a
-    // 1-byte static never writes a 2-byte word.
-    int sv;
-    if (static_local_is_scalar(ty) && init && static_init_literal(init, &sv)) {
-        if (size == 1)
-            fprintf(out, "\n    byte %d\n", sv & 0xff);
-        else if (size == 2)
-            fprintf(out, "\n    word %d\n", sv & 0xffff);
-        else
-            fprintf(out, "\n    long %d\n", sv);
-        return;
-    }
-
-    // Array with brace-initialized element list: emit one directive per
-    // element using the element type's size, then pad any remainder up
-    // to the declared array size. Element-type discovery walks through
-    // any ND_CAST a coercion pass may have wrapped the literal in.
-    if (ty && istype_array(ty) && init && init->kind == ND_INITLIST) {
-        Type *etype = array_elem_type(ty);
-        int   esize = etype ? etype->size : 1;
-        int   emitted = 0;
-        fprintf(out, "\n");
-        for (Node *el = init->ch[0]; el; el = el->next) {
-            int v = 0;
-            static_init_literal(el, &v);
-            if      (esize == 1) fprintf(out, "    byte %d\n", v & 0xff);
-            else if (esize == 2) fprintf(out, "    word %d\n", v & 0xffff);
-            else if (esize == 4) fprintf(out, "    long %d\n", v);
-            else                 fprintf(out, "    byte %d\n", v & 0xff);  /* shouldn't happen */
-            emitted += esize;
-        }
-        if (emitted < size) fprintf(out, "    allocb %d\n", size - emitted);
-        return;
-    }
-
-    // Zero-initialized or unsupported: allocb
-    fprintf(out, "\n    allocb %d\n", size > 0 ? size : 2);
 }
 
 int braun_nstrlits(void) { return g_nstrlits; }
@@ -212,56 +119,9 @@ void braun_get_strlit(int i, char label_buf[32], const char **data, int *len) {
     *len  = g_strlits[i].len;
 }
 
-int braun_nstatic_locals(void) { return g_nsl; }
-
-// Little-endian byte image of a static local's data, for callers (irsim)
-// that need the raw bytes rather than assembly directives. Mirrors the
-// cases of emit_static_local_data. Returns a calloc'd buffer (caller
-// frees); *len_out gets the image size.
-unsigned char *braun_render_static_local(int i, char label_buf[32], int *len_out) {
-    BStaticLocal *sl  = &g_static_locals[i];
-    Node   *init = sl->init_node;
-    Type   *ty   = sl->sym->type;
-    int     size = ty ? ty->size : INT_SIZE;
-    snprintf(label_buf, 32, "_ls%d", sl->id);
-
-    // String-literal initializer may be longer than the declared size
-    // (static char s[] = "..." has size len+1 already; be safe either way).
-    int cap = size;
-    if (init && init->kind == ND_LITERAL && init->u.literal.strval &&
-        init->u.literal.strval_len + 1 > cap)
-        cap = init->u.literal.strval_len + 1;
-    if (cap <= 0) cap = 1;
-    unsigned char *buf = calloc(1, (size_t)cap);
-    if (!buf) { *len_out = 0; return NULL; }
-    *len_out = cap;
-
-    if (ty && istype_array(ty) && init && init->kind == ND_LITERAL && init->u.literal.strval) {
-        memcpy(buf, init->u.literal.strval, (size_t)init->u.literal.strval_len);
-        return buf;  // trailing NUL from calloc
-    }
-    int sv;
-    if (static_local_is_scalar(ty) && init && static_init_literal(init, &sv)) {
-        for (int j = 0; j < size && j < 4; j++)
-            buf[j] = (unsigned char)(((unsigned)sv >> (j * 8)) & 0xff);
-        return buf;
-    }
-    if (ty && istype_array(ty) && init && init->kind == ND_INITLIST) {
-        Type *etype = array_elem_type(ty);
-        int   esize = etype ? etype->size : 1;
-        int   off = 0;
-        for (Node *el = init->ch[0]; el && off + esize <= cap; el = el->next) {
-            int v = 0;
-            static_init_literal(el, &v);
-            for (int j = 0; j < esize && j < 4; j++)
-                buf[off + j] = (unsigned char)(((unsigned)v >> (j * 8)) & 0xff);
-            off += esize;
-        }
-        return buf;
-    }
-    // Zero-initialized or unsupported: all zeros from calloc.
-    return buf;
-}
+// The static locals compiled since the last braun_emit_strlits, as
+// (program gvar...), or NULL; for irsim_populate_globals.
+Sx *braun_static_locals_sx(void) { return g_nsl ? g_static_locals : NULL; }
 
 void braun_emit_strlits(FILE *init_out, FILE *bss_out) {
     // String literals are always initialized RODATA.
@@ -274,11 +134,9 @@ void braun_emit_strlits(FILE *init_out, FILE *bss_out) {
         fprintf(init_out, "\n    byte 0\n");
     }
     g_nstrlits = 0;
-    // Static locals split by whether their initializer is zero.
-    for (int i = 0; i < g_nsl; i++) {
-        FILE *dst = static_local_is_bss(&g_static_locals[i]) ? bss_out : init_out;
-        emit_static_local_data(dst, &g_static_locals[i]);
-    }
+    // Static locals, split into initialised data and BSS like globals.
+    if (g_nsl) emit_globals(g_static_locals, init_out, bss_out);
+    g_static_locals = NULL;
     g_nsl = 0;
 }
 
@@ -2264,7 +2122,7 @@ static Block *cg_stmt(BraunCtx *ctx, Block *b, Node *n) {
             // Static locals: emit data section entry
             if (sym->kind == SYM_STATIC_LOCAL) {
                 Node *init = d->ch[1];
-                static_locals_push(sym->offset, sym, init);
+                static_locals_push(sym, init);
                 continue;
             }
             Node *init = d->ch[1];
@@ -2610,6 +2468,7 @@ Function *braun_function(Node *func_decl, int tu_index, int *strlit_id) {
     ctx.f         = f;
     ctx.tu_index  = tu_index;
     ctx.strlit_id = strlit_id;
+    g_cur_strlit_id = strlit_id;
 
     // Pre-scan for address-taken locals/params
     scan_addr_taken(&ctx, body_node);

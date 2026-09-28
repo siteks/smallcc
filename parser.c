@@ -1,4 +1,5 @@
 
+#include "const.h"
 #include "smallcc.h"
 
 // Grammer
@@ -1195,10 +1196,7 @@ static void enum_decl(DeclParseState *ds)
             if (token_ctx.current->kind == TK_ASSIGN)
             {
                 expect(TK_ASSIGN);
-                int sign = 1;
-                if (token_ctx.current->kind == TK_MINUS) { sign = -1; expect(TK_MINUS); }
-                next_val = sign * (int)token_ctx.current->ival;
-                expect(TK_CONSTINT);
+                next_val = (int)const_int(cond_expr(), "an enumeration value");
             }
             insert_enum_const(type_ctx.curr_scope_st, ety, ename, next_val++);
             if (token_ctx.current->kind == TK_COMMA)
@@ -1397,29 +1395,7 @@ static Node *stmt()
     {
         node->kind = ND_CASESTMT;
         expect(TK_CASE);
-        if (token_ctx.current->kind == TK_IDENT)
-        {
-            Symbol *s = find_symbol_st(node->st, token_ctx.current->val, NS_IDENT);
-            if (!s || s->kind != SYM_ENUM_CONST)
-                src_error(token_ctx.current->line, token_ctx.current->col, "Expected integer constant in case");
-            node->u.casestmt.value = (long long)s->offset;
-            expect(TK_IDENT);
-        }
-        else if (token_ctx.current->kind == TK_CHARACTER)
-        {
-            node->u.casestmt.value = (unsigned char)token_ctx.current->val[0];
-            expect(TK_CHARACTER);
-        }
-        else if (token_ctx.current->kind == TK_MINUS)
-        {
-            /* negative integer constant: -N */
-            expect(TK_MINUS);
-            node->u.casestmt.value = -(long long)expect_number();
-        }
-        else
-        {
-            node->u.casestmt.value = (long long)expect_number();
-        }
+        node->u.casestmt.value = const_int(cond_expr(), "a case label");
         expect(TK_COLON);
     }
     else if (token_ctx.current->kind == TK_DEFAULT)

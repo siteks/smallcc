@@ -723,15 +723,8 @@ int main(int argc, char **argv)
                         braun_get_strlit(_si, _lbl, &_dat, &_len);
                         irsim_add_strlit(irsim, _lbl, _dat, _len);
                     }
-                    int nsl = braun_nstatic_locals();
-                    for (int _si = 0; _si < nsl; _si++) {
-                        char _lbl[32]; int _len;
-                        unsigned char *_img = braun_render_static_local(_si, _lbl, &_len);
-                        if (_img) {
-                            irsim_add_strlit(irsim, _lbl, (const char *)_img, _len);
-                            free(_img);
-                        }
-                    }
+                    Sx *sl = braun_static_locals_sx();
+                    if (sl) irsim_populate_globals(irsim, sl);
                 }
                 braun_emit_strlits(init_buf, bss_buf);
                 if (f) {

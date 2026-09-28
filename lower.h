@@ -16,4 +16,10 @@
 
 Sx *lower_globals(Node *root, int *strlit_id);
 
+/* The data-section form (gvar label size [init]) of one static object with
+ * initialiser `init` (NULL: zero-filled); braun.c uses it for static locals.
+ * `strlit` returns the label of a string literal's storage. */
+#include "const.h"
+Sx *lower_static_data(const char *label, Type *ty, Node *init, StrlitFn strlit);
+
 #endif // LOWER_H

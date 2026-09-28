@@ -80,12 +80,13 @@ Preprocessor excluded. Features are assessed against ANSI C89/ISO C90.
 | Multiple declarators (`int a, b;`) | ✅ | |
 | Scalar initializer (`int x = 5;`) | ✅ | |
 | Array initializer (`int a[] = {1,2,3};`) | ✅ | Including multi-dim |
-| Struct/union initializer | ✅ | Flat and nested; partial init zero-fills remainder |
+| Struct/union initializer | ✅ | Flat and nested; partial init zero-fills remainder; brace elision; a union initialises its first member |
+| Static initialisers | ✅ | Any constant expression (integer, float, address of a static object or string); laid out by type for globals and static locals; a non-constant initialiser is an error. An address plus an offset (`&a[2]`) is not supported (compile error) |
 | `typedef` declarations | ✅ | Stored in `NS_TYPEDEF` per scope; `gen_decl` skips typedef nodes |
 | `auto` | ⚠️ | Parsed; no semantic difference from default local |
 | `register` | ⚠️ | Parsed; ignored (no register allocator) |
 | `static` (file scope) | ✅ | Internal linkage: label mangled to `_s{tu_index}_{name}`; invisible to other TUs |
-| `static` (local) | ✅ | Persistent storage in data section; label `_ls{id}`; compile-time-constant initializers only (no function calls, no other variables — violations produce wrong code silently rather than an error) |
+| `static` (local) | ✅ | Persistent storage in data section; label `_ls{id}`; constant-expression initializers only, laid out like globals; anything else is a compile error |
 | `extern` | ✅ | Suppresses data allocation; real definition upgrades the symbol; cross-TU globals pre-populated automatically |
 | Forward declarations | ✅ | Functions declared before their definition resolve correctly via label references in assembly |
 | K&R (old-style) function definitions | N/A | Deliberately not supported; ANSI prototype style only |

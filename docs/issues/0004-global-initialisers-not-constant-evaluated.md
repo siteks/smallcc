@@ -1,6 +1,15 @@
 # 0004 — Global initialisers that are not a bare literal are silently zero-filled
 
-Status: OPEN (found 2026-09-26 by the compiler review, `docs/review-2026-09.md`; reproduced on `sim_c` and, where marked, at `-O0` as well).
+Status: FIXED 2026-09-28. `const.c` is the one constant evaluator (`const_eval`:
+integer, float with the target's arithmetic, address constants), and
+`lower_static_data` in `lower.c` lays out every static initialiser by walking
+the Type (nested arrays and structs, brace elision, unions, char arrays with
+padding). Static locals use the same routine (previously a struct or pointer
+initialiser on a static local was also zero-filled). A non-constant initialiser
+is a compile error. Remaining limit: an address plus an offset (`&a[2]`,
+`&s.f` past offset 0) is a compile error, because the assemblers' data
+directives take a bare label. Tests: `init/global_nested_aggregates.c`,
+`init/static_local_aggregates.c`, `errors/global_nonconst_init.c`.
 
 Reproducers (all `// XFAIL: issue 0004`):
 

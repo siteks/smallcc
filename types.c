@@ -1,5 +1,6 @@
 
 
+#include "const.h"
 #include "smallcc.h"
 
 // Type system context instance
@@ -298,42 +299,6 @@ static Type *type_from_declarator(Node *decl, Type *base)
 
 // Evaluate a compile-time constant integer expression (for array size).
 // Returns the integer value, or 0 if not a constant expression.
-static long long eval_const_expr(Node *n)
-{
-    if (!n) return 0;
-    if (n->kind == ND_LITERAL) return n->u.literal.ival;
-    if (n->kind == ND_IDENT)
-    {
-        /* Enum constants and #define-expanded identifiers that resolve to an
-           integer constant in the current scope.  The symbol table is already
-           populated for enum constants by the time array-size expressions are
-           evaluated inside add_types_and_symbols(). */
-        Symbol *sym = n->st ? find_symbol_st(n->st, n->u.ident.name, NS_IDENT) : NULL;
-        if (sym && sym->kind == SYM_ENUM_CONST) return (long long)sym->offset;
-        return 0;
-    }
-    if (n->kind == ND_BINOP)
-    {
-        long long l = eval_const_expr(n->ch[0]);
-        long long r = eval_const_expr(n->ch[1]);
-        switch (n->op_kind)
-        {
-            case TK_PLUS:    return l + r;
-            case TK_MINUS:   return l - r;
-            case TK_STAR:    return l * r;
-            case TK_SLASH:   return r ? l / r : 0;
-            case TK_PERCENT: return r ? l % r : 0;
-            default: return 0;
-        }
-    }
-    if (n->kind == ND_UNARYOP)
-    {
-        long long v = eval_const_expr(n->ch[0]);
-        if (n->op_kind == TK_MINUS) return -v;
-        if (n->op_kind == TK_PLUS)  return  v;
-    }
-    return 0;
-}
 
 static Type *type_from_direct_decl(Node *dd, Type *base)
 {
@@ -354,7 +319,12 @@ static Type *type_from_direct_decl(Node *dd, Type *base)
         Node *s = suf[i];
         if (s->kind == ND_ARRAY_DECL)
         {
-            int count = s->ch[0] ? (int)eval_const_expr(s->ch[0]) : 0;
+            int count = 0;
+            if (s->ch[0]) {
+                long long c = const_int(s->ch[0], "an array size");
+                if (c < 0) src_error(s->ch[0]->line, s->ch[0]->col, "array size is negative");
+                count = (int)c;
+            }
             t         = get_array_type(t, count);
         }
         else if (s->kind == ND_FUNC_DECL)
@@ -393,6 +363,10 @@ static Type *type_from_direct_decl(Node *dd, Type *base)
 // ---------------------------------------------------------------
 static Type *typespec_to_base(Decl_spec typespec)
 {
+    // Canonicalise: `int` is implied by short/long (`short int`, `unsigned
+    // long int`), and `long double` is double on this target (issue 0005).
+    if (typespec & (DS_SHORT | DS_LONG)) typespec &= ~DS_INT;
+    if ((typespec & DS_LONG) && (typespec & DS_DOUBLE)) typespec &= ~DS_LONG;
     switch ((int)typespec)
     {
     case DS_VOID:
@@ -1137,8 +1111,22 @@ static Symbol *insert_global_ident(Symbol_table *st, Type *type, const char *ide
     return n;
 }
 
+// The symbol named `name` in scope st itself (not its parents), or NULL.
+static Symbol *find_symbol_in_scope(Symbol_table *st, const char *name, Namespace nspace)
+{
+    if (!st || !st->hash_cap) return NULL;
+    uint32_t mask = (uint32_t)st->hash_cap - 1;
+    for (uint32_t i = st_key_hash(name, nspace) & mask; st->hash[i]; i = (i + 1) & mask)
+        if (st->hash[i]->ns == nspace && !strcmp(name, st->hash[i]->name)) return st->hash[i];
+    return NULL;
+}
+
 static Symbol *insert_local_ident(Symbol_table *st, Type *type, const char *ident, bool is_param, StorageClass sclass)
 {
+    // C89 3.1.2.2: an identifier declared twice in one block scope (parameters
+    // share the function body's scope) is an error, not a second object.
+    if (sclass != SC_EXTERN && find_symbol_in_scope(st, ident, NS_IDENT))
+        src_error(token_ctx.last_line, token_ctx.last_col, "redeclaration of '%s' in the same scope", ident);
     if (sclass == SC_STATIC)
     {
         // Local static: persistent storage in data section, not on the stack.

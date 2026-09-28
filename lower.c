@@ -13,6 +13,8 @@
 #include "sx.h"
 #include "smallcc.h"
 #include "braun.h"   // strlit_lookup / strlit_register (cross-TU dedup)
+#include "const.h"
+#include "cpu4/fpu_model.h"
 
 // ============================================================
 // String literal accumulator
@@ -53,220 +55,181 @@ static const char *assign_strlit(const char *data, int len) {
 }
 
 // ============================================================
+// Static data layout
 // ============================================================
-// Global variable lowering
-// ============================================================
+//
+// One walk, driven by the object's Type (array elements, struct fields, the
+// first member of a union), lays out every static initialiser: globals here
+// and static locals from braun.c. Values come from const_eval; anything it
+// cannot evaluate is a compile error, never a zero (docs/issues/0004).
+//
+// The result is the data-section form emit.c and irsim.c consume:
+//   (gvar label size)             zero-filled
+//   (gvar label size v)           scalar integer / float bits
+//   (gvar label size (strref L))  scalar pointer
+//   (gvar label size (gfields item...))  with items (sz v), (0 n) padding,
+//                                  (strref L) a pointer-sized address
+
+typedef struct {
+    Sx     *head;
+    Sx    **tail;
+    int     off;          // bytes laid out so far
+    StrlitFn strlit;
+} Layout;
+
+static void lay_item(Layout *L, int off, Sx *item, int size) {
+    if (off > L->off) {
+        *L->tail = sx_cons(sx_list(2, sx_int(0), sx_int(off - L->off)), NULL);
+        L->tail = &(*L->tail)->cdr;
+    }
+    if (item) {
+        *L->tail = sx_cons(item, NULL);
+        L->tail = &(*L->tail)->cdr;
+    }
+    L->off = off + size;
+}
+
+static bool is_aggregate(Type *t) {
+    return t && (t->base == TB_ARRAY || t->base == TB_STRUCT);
+}
+
+static Node *strip_casts(Node *n) {
+    while (n && n->kind == ND_CAST) n = n->ch[1];
+    return n;
+}
+
+// A string literal initialising a char array (possibly braced: {"abc"}).
+static Node *char_array_string(Type *t, Node *init) {
+    if (!t || t->base != TB_ARRAY || !t->u.arr.elem || t->u.arr.elem->size != 1) return NULL;
+    Node *n = init;
+    if (n && n->kind == ND_INITLIST && n->ch[0] && !n->ch[0]->next) n = n->ch[0];
+    n = strip_casts(n);
+    return (n && n->kind == ND_LITERAL && n->u.literal.strval) ? n : NULL;
+}
+
+static uint32_t uint_to_fbits(uint32_t u) {
+    float f = (float)u; uint32_t b; memcpy(&b, &f, 4); return b;
+}
+
+static void lay_scalar(Layout *L, Type *t, int off, Node *e) {
+    if (e && e->kind == ND_INITLIST) {                   // int x = { 5 };
+        if (e->ch[0] && e->ch[0]->next)
+            src_error(e->line, e->col, "too many initialisers for a scalar");
+        e = e->ch[0];
+        if (!e) return;
+    }
+    CVal v;
+    if (!const_eval(e, &v, L->strlit))
+        src_error(e->line, e->col, "initialiser is not a constant expression");
+    int size = t->size;
+    bool fp = (t->base == TB_FLOAT || t->base == TB_DOUBLE);
+    if (v.kind == CV_ADDR) {
+        if (fp || size != PTR_SIZE)
+            src_error(e->line, e->col, "an address does not fit a %d-byte initialiser", size);
+        if (v.i != 0)
+            src_error(e->line, e->col, "address-plus-offset initialisers are not supported");
+        lay_item(L, off, sx_list(2, sx_sym("strref"), sx_str(v.label)), PTR_SIZE);
+        return;
+    }
+    uint32_t bits;
+    if (fp) {
+        if (v.kind == CV_INT)
+            bits = v.uns ? uint_to_fbits((uint32_t)v.i) : cpu4_itof((uint32_t)v.i);
+        else
+            bits = v.fbits;
+    } else {
+        bits = (v.kind == CV_FLT) ? cpu4_ftoi(v.fbits) : (uint32_t)v.i;
+    }
+    int32_t val = (int32_t)bits;
+    if (size == 1) val = (int8_t)val;                    // the directive masks; keep the
+    else if (size == 2) val = (int16_t)val;              // printed value in range
+    lay_item(L, off, sx_list(2, sx_int(size), sx_int(val)), size);
+}
+
+static void lay_object(Layout *L, Type *t, int off, Node *init);
+
+// Fill aggregate t from a run of initialisers (the contents of a brace list,
+// or, under brace elision, the continuation of the enclosing one).
+static void lay_members(Layout *L, Type *t, int off, Node **cur) {
+    if (t->base == TB_ARRAY) {
+        Type *et = t->u.arr.elem;
+        int n = et && et->size ? t->size / et->size : 0;
+        for (int i = 0; i < n && *cur; i++) {
+            Node *e = *cur;
+            if (is_aggregate(et) && e->kind != ND_INITLIST && !char_array_string(et, e))
+                lay_members(L, et, off + i * et->size, cur);       // brace elision
+            else { lay_object(L, et, off + i * et->size, e); *cur = e->next; }
+        }
+        return;
+    }
+    for (Field *f = t->u.composite.members; f && *cur; f = f->next) {
+        Node *e = *cur;
+        if (is_aggregate(f->type) && e->kind != ND_INITLIST && !char_array_string(f->type, e))
+            lay_members(L, f->type, off + f->offset, cur);
+        else { lay_object(L, f->type, off + f->offset, e); *cur = e->next; }
+        if (t->u.composite.is_union) break;              // only the first member
+    }
+}
+
+static void lay_object(Layout *L, Type *t, int off, Node *init) {
+    if (!init) return;
+    Node *s = char_array_string(t, init);
+    if (s) {
+        int n = s->u.literal.strval_len + 1;
+        if (n > t->size) n = t->size;                    // char c[3] = "abc": no NUL
+        for (int j = 0; j < n; j++) {
+            int b = j < s->u.literal.strval_len ? (unsigned char)s->u.literal.strval[j] : 0;
+            lay_item(L, off + j, sx_list(2, sx_int(1), sx_int(b)), 1);
+        }
+        return;
+    }
+    if (is_aggregate(t)) {
+        if (init->kind != ND_INITLIST)
+            src_error(init->line, init->col, "an aggregate needs a brace-enclosed initialiser");
+        Node *cur = init->ch[0];
+        lay_members(L, t, off, &cur);
+        if (cur)
+            src_error(cur->line, cur->col, "too many initialisers");
+        return;
+    }
+    lay_scalar(L, t, off, init);
+}
+
+Sx *lower_static_data(const char *label, Type *ty, Node *init, StrlitFn strlit) {
+    int size = ty ? ty->size : INT_SIZE;
+    Sx *gv = sx_list(3, sx_sym("gvar"), sx_str(label), sx_int(size));
+    if (!init) return gv;                                // zero-filled
+
+    Layout L = { NULL, NULL, 0, strlit };
+    L.head = sx_list(1, sx_sym("gfields"));
+    L.tail = &L.head->cdr;
+    lay_object(&L, ty, 0, init);
+
+    Sx *val = L.head;
+    // A scalar is one item at offset 0: keep the plain forms (and the BSS
+    // test on a zero value) that emit.c and irsim.c use for scalars.
+    Sx *first = L.head->cdr ? L.head->cdr->car : NULL;
+    if (!is_aggregate(ty) && first && !L.head->cdr->cdr) {
+        if (first->car->kind == SX_INT && first->car->i == size) val = first->cdr->car;
+        else if (first->car->kind == SX_SYM) val = first;          // (strref L)
+    } else if (L.off < size) {
+        lay_item(&L, size, NULL, 0);                     // tail padding
+    }
+    Sx **tail = &gv->cdr->cdr->cdr;
+    *tail = sx_cons(val, NULL);
+    return gv;
+}
+
+static const char *lower_strlit(const char *data, int len) { return assign_strlit(data, len); }
 
 static Sx *lower_global(Node *decl, Symbol *sym) {
-    const char *name = sym_label(sym);
-
-    // Find initializer node
     Node *init = NULL;
     for (Node *d = decl->ch[1]; d; d = d->next) {
         if (d->kind == ND_DECLARATOR && d->symbol == sym && d->ch[1]) {
             init = d->ch[1]; break;
         }
     }
-
-    int size = sym->type ? sym->type->size : INT_SIZE;
-    Sx *gv = sx_list(2, sx_sym("gvar"), sx_str(name));
-    Sx **tail = &gv->cdr->cdr;
-    *tail = sx_cons(sx_int(size), NULL); tail = &(*tail)->cdr;
-
-    if (!init) return gv; // zero-filled
-
-    // Peel casts and unary minus for compile-time constant evaluation.
-    {
-        int neg = 1;
-        Node *r = init;
-        while (r && r->kind == ND_CAST) r = r->ch[1];
-        if (r && r->kind == ND_UNARYOP && r->op_kind == TK_MINUS) {
-            neg = -1;
-            r = r->ch[0];
-        }
-        while (r && r->kind == ND_CAST) r = r->ch[1];
-        if (r && r->kind == ND_LITERAL && !r->u.literal.strval) {
-            if (neg != 1) {
-                Node *tmp = r;
-                r = (Node *)arena_alloc(sizeof(Node));
-                *r = *tmp;
-                r->u.literal.ival = -tmp->u.literal.ival;
-                r->u.literal.fval = -tmp->u.literal.fval;
-            }
-            init = r;
-        }
-    }
-
-    if (init->kind == ND_LITERAL && !init->u.literal.strval) {
-        if (sym->type && (sym->type->base == TB_FLOAT ||
-                          sym->type->base == TB_DOUBLE)) {
-            float fv = (float)init->u.literal.fval;
-            uint32_t bits; memcpy(&bits, &fv, 4);
-            *tail = sx_cons(sx_int((int)bits), NULL);
-        } else {
-            *tail = sx_cons(sx_int((int)init->u.literal.ival), NULL);
-        }
-        return gv;
-    }
-
-    if (init->kind == ND_LITERAL && init->u.literal.strval) {
-        const char *bytes = init->u.literal.strval;
-        int len = init->u.literal.strval_len;
-        if (sym->type && sym->type->base == TB_ARRAY) {
-            // char s[] = "hello" → embed bytes directly (no separate strlit label)
-            Sx *sb = sx_list(1, sx_sym("strbytes"));
-            Sx **bt = &sb->cdr;
-            for (int j = 0; j <= len; j++) {
-                *bt = sx_cons(sx_int(j < len ? (unsigned char)bytes[j] : 0), NULL);
-                bt = &(*bt)->cdr;
-            }
-            *tail = sx_cons(sb, NULL);
-        } else {
-            // char *p = "hello" → pointer to string literal label
-            const char *lbl = assign_strlit(bytes, len);
-            *tail = sx_cons(sx_list(2, sx_sym("strref"), sx_str(lbl)), NULL);
-        }
-        return gv;
-    }
-
-    // Struct initializer list — fields can have different sizes (e.g. `struct
-    // { char c; int i; }` is 1 + (3 pad) + 4), so we walk fields and emit each
-    // as a (size value) pair rather than the homogeneous ginit form below.
-    if (init->kind == ND_INITLIST && sym->type && sym->type->base == TB_STRUCT) {
-        Sx *gf = sx_list(1, sx_sym("gfields"));
-        Sx **gt = &gf->cdr;
-        Field *f = sym->type->u.composite.members;
-        Node *el = init->ch[0];
-        int cur_off = 0;
-        while (f && el) {
-            // Padding before this field
-            if (f->offset > cur_off) {
-                *gt = sx_cons(sx_list(2, sx_int(0), sx_int(f->offset - cur_off)), NULL);
-                gt = &(*gt)->cdr;
-            }
-            int fsz = f->type ? f->type->size : INT_SIZE;
-            Node *r = el;
-            int neg = 1;
-            while (r && r->kind == ND_CAST) r = r->ch[1];
-            if (r && r->kind == ND_UNARYOP && r->op_kind == TK_MINUS) { neg = -1; r = r->ch[0]; }
-            while (r && r->kind == ND_CAST) r = r->ch[1];
-            // Nested struct init: { ... }
-            if (r && r->kind == ND_INITLIST && f->type && f->type->base == TB_STRUCT) {
-                // Recursively encode each subfield
-                Field *sf = f->type->u.composite.members;
-                Node *se = r->ch[0];
-                int sub_off = 0;
-                while (sf && se) {
-                    if (sf->offset > sub_off) {
-                        *gt = sx_cons(sx_list(2, sx_int(0), sx_int(sf->offset - sub_off)), NULL);
-                        gt = &(*gt)->cdr;
-                    }
-                    int ssz = sf->type ? sf->type->size : INT_SIZE;
-                    Node *sr = se;
-                    while (sr && sr->kind == ND_CAST) sr = sr->ch[1];
-                    int sv = (sr && sr->kind == ND_LITERAL) ? (int)sr->u.literal.ival : 0;
-                    *gt = sx_cons(sx_list(2, sx_int(ssz), sx_int(sv)), NULL);
-                    gt = &(*gt)->cdr;
-                    sub_off = sf->offset + ssz;
-                    sf = sf->next;
-                    se = se->next;
-                }
-                // Tail padding inside the nested struct
-                if (sub_off < fsz) {
-                    *gt = sx_cons(sx_list(2, sx_int(0), sx_int(fsz - sub_off)), NULL);
-                    gt = &(*gt)->cdr;
-                }
-            } else if (r && r->kind == ND_UNARYOP && r->op_kind == TK_AMPERSAND) {
-                Node *operand = r->ch[0];
-                Symbol *osym = (operand && operand->kind == ND_IDENT) ? operand->symbol : NULL;
-                const char *olabel = osym ? sym_label(osym) : "_nil";
-                *gt = sx_cons(sx_list(2, sx_sym("strref"), sx_str(olabel)), NULL);
-                gt = &(*gt)->cdr;
-            } else if (r && r->kind == ND_LITERAL && r->u.literal.strval &&
-                       f->type && f->type->base == TB_POINTER) {
-                const char *lbl = assign_strlit(r->u.literal.strval, r->u.literal.strval_len);
-                *gt = sx_cons(sx_list(2, sx_sym("strref"), sx_str(lbl)), NULL);
-                gt = &(*gt)->cdr;
-            } else {
-                int v = (r && r->kind == ND_LITERAL) ? (int)r->u.literal.ival * neg : 0;
-                if (f->type && (f->type->base == TB_FLOAT || f->type->base == TB_DOUBLE)) {
-                    double fv = (r && r->kind == ND_LITERAL) ? r->u.literal.fval * neg : 0.0;
-                    float fv32 = (float)fv;
-                    uint32_t bits; memcpy(&bits, &fv32, 4); v = (int)bits;
-                }
-                *gt = sx_cons(sx_list(2, sx_int(fsz), sx_int(v)), NULL);
-                gt = &(*gt)->cdr;
-            }
-            cur_off = f->offset + fsz;
-            f = f->next;
-            el = el->next;
-        }
-        // Tail padding to bring up to declared struct size
-        if (cur_off < size) {
-            *gt = sx_cons(sx_list(2, sx_int(0), sx_int(size - cur_off)), NULL);
-            gt = &(*gt)->cdr;
-        }
-        *tail = sx_cons(gf, NULL);
-        return gv;
-    }
-
-    // Array / struct initializer list
-    if (init->kind == ND_INITLIST) {
-        Type *etype = (sym->type && sym->type->base == TB_ARRAY)
-                      ? sym->type->u.arr.elem : NULL;
-        int esize = etype ? etype->size : INT_SIZE;
-        Sx *gi = sx_list(2, sx_sym("ginit"), sx_int(esize));
-        Sx **gt = &gi->cdr->cdr;
-
-        for (Node *el = init->ch[0]; el; el = el->next) {
-            // Flatten nested init list (multi-dim arrays)
-            if (el->kind == ND_INITLIST) {
-                for (Node *el2 = el->ch[0]; el2; el2 = el2->next) {
-                    Node *raw_el2 = el2;
-                    while (raw_el2 && raw_el2->kind == ND_CAST) raw_el2 = raw_el2->ch[1];
-                    int v = (raw_el2 && raw_el2->kind == ND_LITERAL) ? (int)raw_el2->u.literal.ival : 0;
-                    *gt = sx_cons(sx_int(v), NULL); gt = &(*gt)->cdr;
-                }
-                continue;
-            }
-            Node *raw_el = el;
-            while (raw_el && raw_el->kind == ND_CAST) raw_el = raw_el->ch[1];
-            if (raw_el && raw_el->kind == ND_UNARYOP && raw_el->op_kind == TK_AMPERSAND) {
-                // &global_var element in pointer array
-                Node *operand = raw_el->ch[0];
-                Symbol *osym = (operand && operand->kind == ND_IDENT) ? operand->symbol : NULL;
-                const char *olabel = osym ? sym_label(osym) : "_nil";
-                *gt = sx_cons(sx_list(2, sx_sym("strref"), sx_str(olabel)), NULL);
-                gt = &(*gt)->cdr;
-            } else {
-                int neg = 1;
-                Node *r = raw_el;
-                if (r && r->kind == ND_UNARYOP && r->op_kind == TK_MINUS) {
-                    neg = -1; r = r->ch[0];
-                }
-                while (r && r->kind == ND_CAST) r = r->ch[1];
-                // String literal element in pointer array: char *arr[] = {"a", "b"}
-                if (r && r->kind == ND_LITERAL && r->u.literal.strval &&
-                    etype && etype->base == TB_POINTER) {
-                    const char *lbl = assign_strlit(r->u.literal.strval, r->u.literal.strval_len);
-                    *gt = sx_cons(sx_list(2, sx_sym("strref"), sx_str(lbl)), NULL);
-                    gt = &(*gt)->cdr;
-                } else {
-                    int v = (r && r->kind == ND_LITERAL) ? (int)r->u.literal.ival * neg : 0;
-                    if (etype && (etype->base == TB_FLOAT || etype->base == TB_DOUBLE)) {
-                        double fv = (r && r->kind == ND_LITERAL) ? r->u.literal.fval * neg : 0.0;
-                        float fv32 = (float)fv;
-                        uint32_t bits; memcpy(&bits, &fv32, 4); v = (int)bits;
-                    }
-                    *gt = sx_cons(sx_int(v), NULL); gt = &(*gt)->cdr;
-                }
-            }
-        }
-        *tail = sx_cons(gi, NULL);
-        return gv;
-    }
-
-    return gv;
+    return lower_static_data(sym_label(sym), sym->type, init, lower_strlit);
 }
 
 // ============================================================

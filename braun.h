@@ -3,6 +3,7 @@
 
 #include <stdio.h>
 #include "ssa.h"
+#include "sx.h"
 #include "smallcc.h"
 
 /*
@@ -27,8 +28,7 @@ void      braun_register_inline_candidate(Node *func_decl, int tu_index);
  * clears both lists. */
 int       braun_nstrlits(void);
 void      braun_get_strlit(int i, char label_buf[32], const char **data, int *len);
-int            braun_nstatic_locals(void);
-unsigned char *braun_render_static_local(int i, char label_buf[32], int *len_out);
+Sx            *braun_static_locals_sx(void);
 
 /* Cross-TU string literal dedup table (shared with lower.c):
  * strlit_lookup returns the _lN id already assigned to (data,len), or -1;

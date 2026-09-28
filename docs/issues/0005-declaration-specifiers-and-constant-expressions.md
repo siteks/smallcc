@@ -1,6 +1,12 @@
 # 0005 — Specifier combinations default to int; constant expressions are five partial evaluators
 
-Status: OPEN (found 2026-09-26 by the compiler review, `docs/review-2026-09.md`; reproduced on `sim_c` and, where marked, at `-O0` as well).
+Status: FIXED 2026-09-28. Specifiers are canonicalised before lookup (`int`
+implied by short/long, `long double` is double); array sizes, enum values and
+case labels are parsed as expressions and folded by `const_int` (`const.c`,
+shared with issue 0004), with a compile error when not constant; a second
+declaration of an identifier in the same block scope is an error. `long long`
+is still `long` (C89 has no `long long`). Tests: `ops/const_expr_contexts.c`,
+`errors/case_label_nonconst.c`.
 
 Reproducers (all `// XFAIL: issue 0005`):
 

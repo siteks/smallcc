@@ -134,7 +134,8 @@ Per-TU loop [smallcc.c] (lib TUs first, then user TUs):
 | `parser.c` | Recursive-descent parser — builds AST; `resolve_symbols`, `derive_types`, `insert_coercions` |
 | `types.c` | Type table, symbol table, struct layout, `add_types_and_symbols`, `reset_types_state`, `insert_extern_sym` |
 | `sx.h` / `sx.c` | Sexp AST: `Sx` cons-cell tree with `SX_PAIR/SX_SYM/SX_STR/SX_INT` kinds; constructors + accessors (data-section interchange only) |
-| `lower.h` / `lower.c` | Global lowering: Node* → Sexp `gvar`/`strlit` nodes for the data section; function bodies compiled directly by braun.c |
+| `lower.h` / `lower.c` | Data-section lowering: every static initialiser (globals here, static locals from braun.c) laid out by type (`lower_static_data`) into `gvar`/`strlit` nodes; function bodies compiled directly by braun.c |
+| `const.h` / `const.c` | The one constant-expression evaluator: array sizes, enum values, case labels, static initialisers |
 | `ssa.h` / `ssa.c` | SSA IR types (`Value`, `Inst`, `Block`, `Function`); `InstKind` opcodes; constructors; IR printer (`print_function`) |
 | `braun.h` / `braun.c` | Braun SSA construction directly from Node* AST; Symbol*-keyed variable maps; derives ValType/CallDesc from Node*.type; handles all statement/expression kinds; accumulates function-body string literals and static locals |
 | `dom.h` / `dom.c` | Dominator tree (Cooper 2001); loop depth; `compute_dominators`; `dominates` query |
