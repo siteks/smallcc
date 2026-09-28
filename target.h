@@ -30,6 +30,8 @@ typedef struct Target {
 
 extern const Target *g_target;
 extern const Target  target_cpu4;
+const Target *target_find(const char *name);   // by -arch name, or NULL
+const char   *target_names(void);              // "cpu4, cpu5" for messages
 
 static inline regmask_t target_all_regs(void) {
     return g_target->nregs >= 32 ? 0xffffffffu : ((1u << g_target->nregs) - 1);

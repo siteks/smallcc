@@ -7,7 +7,7 @@ Each .c file may have magic // comments on its leading lines:
     // EXPECT_STDOUT: hello
     // FILES: lib.c main.c   (multi-TU: all relative to the .c file's directory)
 
-Default run: tests against cpu4 (via sim_c -arch cpu4),
+Default run: tests against cpu4 (via sim_c -arch cpu4; --arch cpu4,cpu5 for others),
 producing items named e.g. recursive_factorial[cpu4].
 
 With --irsim: tests against the built-in IR interpreter using -runoos and -runirc,
@@ -24,7 +24,6 @@ import os
 import tempfile
 from pathlib import Path
 
-ARCHES = ['cpu4']
 IRSIM_MODES = ['runoos', 'runirc']
 CPU4_MAXSTEPS = 100_000   # generous limit for recursive/expensive tests
 
@@ -32,6 +31,8 @@ CPU4_MAXSTEPS = 100_000   # generous limit for recursive/expensive tests
 def pytest_addoption(parser):
     parser.addoption('--irsim', action='store_true', default=False,
                      help='Run tests via -runoos and -runirc instead of assembly+sim_c')
+    parser.addoption('--arch', default='cpu4',
+                     help='Comma-separated ISAs to compile and simulate for (smallcc/sim_c -arch)')
 
 
 def parse_meta(path):
@@ -59,10 +60,11 @@ class CTestFile(pytest.File):
     def collect(self):
         meta = parse_meta(self.path)
         irsim = self.config.getoption('--irsim')
+        arches = [a for a in self.config.getoption('--arch').split(',') if a]
         if 'EXPECT_COMPILE_FAIL' in meta:
             # Compile errors are arch-independent; run once
             yield CTestItem.from_parent(self, name=self.path.stem,
-                                        path=self.path, arch='cpu4')
+                                        path=self.path, arch=arches[0])
         else:
             if irsim and (meta.get('TARGET') == 'hw'
                           or self.path.parent.name in ('hw', 'multicore')
@@ -72,7 +74,7 @@ class CTestFile(pytest.File):
                 # SIM_ARGS: -cores 4) exercise sim_c itself; the IR
                 # interpreter has no devices/cores, so they cannot run there.
                 return
-            modes = IRSIM_MODES if irsim else ARCHES
+            modes = IRSIM_MODES if irsim else arches
             for arch in modes:
                 yield CTestItem.from_parent(self, name=arch,
                                             path=self.path, arch=arch)
@@ -82,7 +84,9 @@ class CTestItem(pytest.Item):
     def __init__(self, *, path, arch, **kw):
         super().__init__(**kw)
         self.src_path = path
-        self.arch = arch
+        self.arch = arch      # an ISA, or an irsim mode
+        self.isa = arch if arch not in IRSIM_MODES else \
+            [a for a in self.config.getoption('--arch').split(',') if a][0]
         self.meta = parse_meta(path)
         if 'XFAIL' in self.meta:
             # A reproducer for a known bug (// XFAIL: issue NNNN ...). Strict in sim_c
@@ -107,7 +111,7 @@ class CTestItem(pytest.Item):
         if self.arch in IRSIM_MODES:
             # IR interpreter: smallcc -arch cpu4 -runoos/-runirc prints r0 to stdout,
             # putchar output to stderr — no separate simulator step needed.
-            run_cmd = [str(root / 'smallcc'), '-arch', 'cpu4',
+            run_cmd = [str(root / 'smallcc'), '-arch', self.isa,
                        f'-{self.arch}']
             if 'CFLAGS' in meta:
                 run_cmd += meta['CFLAGS'].split()
@@ -142,7 +146,7 @@ class CTestItem(pytest.Item):
             asm = os.path.join(tmp, 'out.s')
 
             # Compile with -arch cpu4 -target <target>
-            compile_cmd = [str(root / 'smallcc'), '-arch', 'cpu4',
+            compile_cmd = [str(root / 'smallcc'), '-arch', self.isa,
                            '-target', target, '-o', asm]
             if 'CFLAGS' in meta:                      # // CFLAGS: -Opass=fmadd  (verbatim compiler flags)
                 compile_cmd += meta['CFLAGS'].split()
@@ -160,7 +164,7 @@ class CTestItem(pytest.Item):
 
             # Simulate with sim_c -arch cpu4; for hw target, request framebuffer dump.
             # SIM_ARGS passes extra flags verbatim (e.g. // SIM_ARGS: -cores 4).
-            sim_cmd = [str(root / 'sim_c'), '-arch', 'cpu4']
+            sim_cmd = [str(root / 'sim_c'), '-arch', self.isa]
             if target == 'hw':
                 sim_cmd.append('-dumpfb')
             if 'SIM_ARGS' in meta:

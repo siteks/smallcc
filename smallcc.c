@@ -5,6 +5,7 @@
 #include "braun.h"
 #include "dom.h"
 #include "oos.h"
+#include "target.h"
 #include "opt.h"
 #include "legalize.h"
 #include "alloc.h"
@@ -365,7 +366,7 @@ int main(int argc, char **argv)
                 "  -I<dir>            Add directory to #include <...> search path\n"
                 "\n"
                 "Target:\n"
-                "  -arch cpu4         Target architecture (only cpu4 is supported; default)\n"
+                "  -arch NAME         Target ISA (default cpu4; see target.c for the list)\n"
                 "  -target sim|hw     Select runtime backend (default: sim).\n"
                 "                     sim  = putchar via __putchar opcode -> stderr\n"
                 "                     hw   = putchar writes to 0xF000 ASCII framebuffer\n"
@@ -437,8 +438,9 @@ int main(int argc, char **argv)
         else if (strcmp(argv[file_start], "-arch") == 0 && file_start + 1 < argc)
         {
             const char *arch = argv[file_start + 1];
-            if (strcmp(arch, "cpu4") == 0) { /* cpu4 is the only target */ }
-            else { fprintf(stderr, "smallcc: unknown arch: %s\n", arch); return 1; }
+            const Target *t = target_find(arch);
+            if (!t) { fprintf(stderr, "smallcc: unknown arch: %s (have %s)\n", arch, target_names()); return 1; }
+            g_target = t;
             file_start += 2;
         }
         else if (strcmp(argv[file_start], "-target") == 0 && file_start + 1 < argc)

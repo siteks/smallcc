@@ -19,6 +19,24 @@ const Target target_cpu4 = {
 
 const Target *g_target = &target_cpu4;
 
+static const Target *const all_targets[] = { &target_cpu4, NULL };
+
+const Target *target_find(const char *name) {
+    for (int i = 0; all_targets[i]; i++)
+        if (!strcmp(all_targets[i]->name, name)) return all_targets[i];
+    return NULL;
+}
+
+const char *target_names(void) {
+    static char buf[128];
+    buf[0] = 0;
+    for (int i = 0; all_targets[i]; i++) {
+        if (i) strncat(buf, ", ", sizeof buf - strlen(buf) - 1);
+        strncat(buf, all_targets[i]->name, sizeof buf - strlen(buf) - 1);
+    }
+    return buf;
+}
+
 // ---- encoding queries -------------------------------------------------
 // A small open-addressed cache from mnemonic to table entry per target.
 

@@ -36,6 +36,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 SMALLCC = ROOT / "smallcc"
 SIM_C = ROOT / "sim_c"
+ARCH = "cpu4"          # -arch NAME (set from the command line)
 FAILDIR = ROOT / "fuzz_failures"
 
 BINOPS = ["+", "-", "*", "&", "|", "^"]
@@ -171,11 +172,11 @@ def check_one(seed, tmpdir, keep):
 
     for tag, extra in [("O2", ["-O2"]), ("O0", ["-O0"])]:
         asm = tmpdir / f"fuzz_{seed}_{tag}.s"
-        p = run([str(SMALLCC), "-arch", "cpu4", *extra, "-o", str(asm), str(cfile)])
+        p = run([str(SMALLCC), "-arch", ARCH, *extra, "-o", str(asm), str(cfile)])
         if p.returncode != 0:
             fail = f"compile {tag} failed:\n{p.stderr}"
             break
-        s = run([str(SIM_C), "-arch", "cpu4", "-maxsteps", "10000000", str(asm)])
+        s = run([str(SIM_C), "-arch", ARCH, "-maxsteps", "10000000", str(asm)])
         r0 = r0_of(s.stdout)
         if s.returncode != 0 or r0 is None:
             fail = f"sim_c {tag} failed:\n{s.stdout}{s.stderr}"
@@ -184,7 +185,7 @@ def check_one(seed, tmpdir, keep):
 
     if not fail:
         for tag in ["runoos", "runirc"]:
-            p = run([str(SMALLCC), "-arch", "cpu4", f"-{tag}", str(cfile)])
+            p = run([str(SMALLCC), "-arch", ARCH, f"-{tag}", str(cfile)])
             r0 = r0_of(p.stdout)
             if p.returncode != 0 or r0 is None:
                 fail = f"{tag} failed:\n{p.stdout}{p.stderr}"
@@ -194,7 +195,7 @@ def check_one(seed, tmpdir, keep):
     if not fail:
         import os
         env = dict(os.environ, IR_VERIFY="1")
-        p = run([str(SMALLCC), "-arch", "cpu4", "-o", "/dev/null", str(cfile)], env=env)
+        p = run([str(SMALLCC), "-arch", ARCH, "-o", "/dev/null", str(cfile)], env=env)
         if p.returncode != 0:
             fail = f"IR_VERIFY failed:\n{p.stderr}"
 
@@ -221,7 +222,10 @@ def main():
     ap.add_argument("-n", type=int, default=100, help="iterations (default 100)")
     ap.add_argument("-seed", type=int, default=1, help="base seed (default 1)")
     ap.add_argument("-keep", action="store_true", help="keep generated files")
+    ap.add_argument("-arch", default="cpu4", help="ISA to compile and simulate for (default cpu4)")
     args = ap.parse_args()
+    global ARCH
+    ARCH = args.arch
 
     if not SMALLCC.exists() or not SIM_C.exists():
         sys.exit("build smallcc and sim_c first (make smallcc sim_c)")
