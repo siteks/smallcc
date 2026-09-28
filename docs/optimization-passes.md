@@ -44,6 +44,7 @@ opt_fold_branches()          R2A   re-run: R2K's phi-select fold exposes
 opt_remove_dead_blocks()     R2B   convergent branches; dominators recomputed
 opt_pre_oos_cse()            GVN   OPT_CSE
 opt_load_cse()                     OPT_CSE (dominating-load reuse)
+opt_narrow_wrap_range()             (always on)
 opt_scalar_promote()                (always on)
 opt_addr_iv()                       (always on)
 opt_lsr()                           (always on)
@@ -130,6 +131,7 @@ detection and accumulator promotion.
 | GVN | `OPT_CSE` | `opt_pre_oos_cse` | Dominator-tree CSE on true SSA form |
 | — | `OPT_CSE` | `opt_load_cse` | Reuse identical dominating loads (clobber-free region; const addrs skipped) |
 | — | — | `opt_range_check` | `AND(LE(a,x), LE(x,b))` → `ULE(SUB(x,a), b-a)` |
+| — | — | `opt_narrow_wrap_range` | Drop braun's wrap of an unsigned char/short `x + k` when a dominating branch bounds `x` (`i < 8` before `i++`), so counted loops stay visible to down-counting |
 | — | — | `opt_scalar_promote` | Hoist load-modify-store to register accumulator phi |
 | — | — | `opt_addr_iv` | Address induction variables: replace recomputation with pointer IV |
 | — | — | `opt_lsr` | Loop strength reduction: `iv*invariant` → ADD chain |

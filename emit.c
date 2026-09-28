@@ -424,7 +424,7 @@ static int p7_fold(InstKind kind, int32_t a, int32_t b, int32_t *result) {
     case IK_OR:   *result = a | b;  return 1;
     case IK_XOR:  *result = a ^ b;  return 1;
     case IK_SHL:  *result = (int32_t)(ua << (ub & 31)); return 1;
-    case IK_SHR:  *result = (int32_t)(ua >> (ub & 31)); return 1;
+    case IK_SHR:  *result = a >> (ub & 31); return 1;   // signed; IK_USHR is logical
     case IK_USHR: *result = (int32_t)(ua >> (ub & 31)); return 1;
     case IK_EQ:   *result = (a == b); return 1;
     case IK_NE:   *result = (a != b); return 1;

@@ -1438,6 +1438,82 @@ void opt_range_check(Function *f) {
     if (changed) recount_uses(f);
 }
 
+// ── Redundant narrow wrap ────────────────────────────────────────────────
+//
+// braun wraps the result of `u op= k` / `u++` on an unsigned char or short
+// (IK_TRUNC to 0xff / 0xffff) because widening such a value is a plain copy.
+// When the operand is bounded by a dominating branch, the wrap cannot fire:
+// in `for (unsigned char i = 0; i < 8; i++)` the increment runs only where
+// i < 8, so i + 1 <= 8. Turning the TRUNC into a copy keeps such counters
+// visible to the loop passes (down-counting, dbnz). Needs dominators.
+
+// The bound `v <= *hi` implied on edge `taken` of branch `br`, if any.
+static bool nw_edge_bound(Inst *br, bool taken, Value *v, int *hi) {
+    Value *c = val_resolve(br->ops[0]);
+    if (c->kind != VAL_INST || !c->def || c->def->nops < 2) return false;
+    Inst *cmp = c->def;
+    Value *a = rc_chase_copies(cmp->ops[0]), *b = rc_chase_copies(cmp->ops[1]);
+    int k;
+    bool lt = (cmp->kind == IK_LT || cmp->kind == IK_ULT);
+    bool le = (cmp->kind == IK_LE || cmp->kind == IK_ULE);
+    if (!lt && !le) return false;
+    if (taken && a == v && get_iconst(b, &k)) {           // v < k / v <= k holds
+        *hi = lt ? k - 1 : k; return true;
+    }
+    if (!taken && b == v && get_iconst(a, &k)) {          // !(k < v) / !(k <= v)
+        *hi = lt ? k : k - 1; return true;
+    }
+    return false;
+}
+
+void opt_narrow_wrap_range(Function *f) {
+    int changed = 0;
+    for (int bi = 0; bi < f->nblocks; bi++) {
+        Block *b = f->blocks[bi];
+        for (Inst *inst = b->head; inst; inst = inst->next) {
+            if (inst->is_dead || inst->kind != IK_TRUNC || !inst->dst || inst->nops < 1) continue;
+            uint32_t mask = (uint32_t)inst->imm;
+            if (mask != 0xff && mask != 0xffff) continue;
+            Value *x = val_resolve(inst->ops[0]);
+            if (x->kind != VAL_INST || !x->def || x->def->kind != IK_ADD || x->def->nops < 2) continue;
+            int c;
+            Value *v;
+            if (get_iconst(val_resolve(x->def->ops[1]), &c)) v = x->def->ops[0];
+            else if (get_iconst(val_resolve(x->def->ops[0]), &c)) v = x->def->ops[1];
+            else continue;
+            if (c <= 0) continue;
+            v = rc_chase_copies(v);
+            ValType vt = v->vtype;
+            if (!(vt == VT_U8 || vt == VT_U16)) continue;         // in range, so >= 0
+            // Look for a dominating branch edge that bounds v.
+            bool redundant = false;
+            for (int pj = 0; pj < f->nblocks && !redundant; pj++) {
+                Block *p = f->blocks[pj];
+                Inst *br = p->tail;
+                if (!br || br->kind != IK_BR || br->nops < 1 || !br->target || !br->target2) continue;
+                for (int e = 0; e < 2 && !redundant; e++) {
+                    Block *t = e == 0 ? br->target : br->target2;
+                    if (t == (e == 0 ? br->target2 : br->target) || t->npreds != 1) continue;
+                    if (!dominates(t, b)) continue;
+                    int hi;
+                    if (nw_edge_bound(br, e == 0, v, &hi) && hi >= 0 &&
+                        (int64_t)hi + c <= (int64_t)mask)
+                        redundant = true;
+                }
+            }
+            if (!redundant) continue;
+            if (x->vtype == inst->dst->vtype) {       // the usual case: alias, as if never wrapped
+                inst->dst->alias = x;
+                inst->is_dead = 1;
+                changed = 1;
+            } else {
+                inst->kind = IK_COPY; inst->imm = 0;
+            }
+        }
+    }
+    if (changed) recount_uses(f);
+}
+
 // ── R2L: Bitwise distribution ────────────────────────────────────────────
 //
 // OP(AND(a, c), AND(b, c)) → AND(OP(a, b), c)  where OP ∈ {XOR, OR, AND}.

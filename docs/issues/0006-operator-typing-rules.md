@@ -1,6 +1,20 @@
 # 0006 — Type derivation is wrong for shifts, pointer difference, ternary and compound assignment
 
-Status: OPEN (found 2026-09-26 by the compiler review, `docs/review-2026-09.md`; reproduced on `sim_c` and, where marked, at `-O0` as well).
+Status: FIXED 2026-09-28. Shifts take the promoted left operand's type and
+each operand is promoted alone; the constant folds in `braun.c` and `emit.c`
+(P7) shift `IK_SHR` arithmetically. Pointer difference is `int`, the byte
+difference shifted right (power-of-two element) or divided. `?:` converts both
+branches to the common type (same-typed branches keep their type, which is
+as-if). Compound assignment runs in the common type through
+`cg_rmw_as` in `braun.c`, except for integer `+ - * & | ^ << >>`, whose low
+bits do not depend on the width. Cast folds of constants use the target's
+`itof`/`ftoi`. Found on the way and fixed: `+=`/`++` on an unsigned char or
+short held in a register did not wrap (250 + 10 stayed 260); braun now wraps
+the result where the operation can overflow, and `opt_narrow_wrap_range`
+drops the wrap where a dominating branch bounds the operand (loop counters),
+so CoreMark stays within 0.2%. Not done: `&&`/`||` still convert operands to a
+common type (one wasted `itof` on a mixed condition, not a correctness bug).
+Tests: `ops/operator_typing_rules.c`, `ops/narrow_unsigned_wrap.c`.
 
 Reproducers (all `// XFAIL: issue 0006`):
 

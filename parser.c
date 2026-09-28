@@ -1739,6 +1739,9 @@ static void insert_binop_coercions(Node *n)
     if (pl != lhs->type) insert_cast(n, 0, pl);
     if (pr != rhs->type) insert_cast(n, 1, pr);
 
+    // Shifts stop here: each operand is promoted on its own (C89 3.3.7).
+    if (n->op_kind == TK_SHIFTL || n->op_kind == TK_SHIFTR) return;
+
     // Step 2: usual arithmetic conversions — bring both to the common type.
     Type *common = usual_arith_type(pl, pr);
     if (n->ch[0]->type != common) insert_cast(n, 0, common);
@@ -1759,6 +1762,11 @@ static void insert_unary_coercions(Node *n)
     DBG_PRINT("%s %016llx\n", __func__, (unsigned long long)operand->type);
     Type *pt = promote(operand->type);
     if (pt != operand->type) insert_cast(n, 0, pt);
+}
+
+static bool is_pointerish(Type *t)
+{
+    return t && (t->base == TB_POINTER || t->base == TB_ARRAY);
 }
 
 bool is_unscaled_ptr(Node *n)
@@ -1810,10 +1818,33 @@ static Type *binop_result_type(Node *n)
     // If either operand type is unknown (t_void), defer — can't determine result type.
     // Internal stride literals (created by the parser, not typed) have t_void.
     if (l == t_void || r == t_void) return t_void;
+    // Shifts: the type of the promoted left operand; the count does not take
+    // part in the usual arithmetic conversions (C89 3.3.7).
+    if (n->op_kind == TK_SHIFTL || n->op_kind == TK_SHIFTR) return promote(l);
+    // Pointer difference: an int count of elements (ptrdiff_t).
+    if (n->op_kind == TK_MINUS && (l->base == TB_POINTER || l->base == TB_ARRAY)
+                               && (r->base == TB_POINTER || r->base == TB_ARRAY)) return t_int;
     // Pointer/array arithmetic: pointer + int → pointer; preserve the pointer type.
     if (l->base == TB_POINTER || l->base == TB_ARRAY) return l;
     if (r->base == TB_POINTER || r->base == TB_ARRAY) return r;
     return usual_arith_type(promote(l), promote(r));
+}
+
+// The type of c ? a : b (C89 3.3.15): the usual arithmetic conversions of
+// two arithmetic branches; otherwise the pointer (or struct/void) branch's type.
+static Type *ternary_result_type(Node *n)
+{
+    Type *a = n->ch[1]->type, *b = n->ch[2]->type;
+    if (a == t_void || b == t_void || !a || !b) return a;
+    // Same type: keep it unpromoted. Every use promotes it anyway, so this is
+    // as-if, and it spares a truncation when the result is stored back.
+    if (a == b) return a;
+    bool arith_a = istype_intlike(a) && !istype_ptr(a), arith_b = istype_intlike(b) && !istype_ptr(b);
+    if ((arith_a || istype_fp(a)) && (arith_b || istype_fp(b)))
+        return usual_arith_type(promote(a), promote(b));
+    if (istype_ptr(a) || istype_array(a)) return a;
+    if (istype_ptr(b) || istype_array(b)) return b;
+    return a;
 }
 
 // Pure helper: compute the result type for a unary expression after promotions,
@@ -1867,7 +1898,7 @@ static void derive_types_step(Node *n)
     if (n->is_expr)
     {
         if (n->kind == ND_TERNARY)
-            n->type = n->ch[1]->type;   // then_
+            n->type = ternary_result_type(n);
         if (n->kind == ND_BINOP)
         {
             if (n->op_kind == TK_COMMA)
@@ -1949,10 +1980,33 @@ static void insert_coercions_step(Node *n)
     if (n->is_expr && n->kind == ND_BINOP && n->op_kind != TK_COMMA)
     {
         insert_binop_coercions(n);
-        // Scale pointer arithmetic: if one side is a pointer and the other an integer,
-        // scale the integer by the size of the pointed-to element.
         Node *lhs = n->ch[0];
         Node *rhs = n->ch[1];
+        // Pointer difference: the byte difference divided by the element size.
+        // The division is exact, so a power-of-two size is an arithmetic shift.
+        if (n->op_kind == TK_MINUS && is_pointerish(lhs->type) && is_pointerish(rhs->type))
+        {
+            int esize = elem_type(lhs->type)->size;
+            if (esize > 1)
+            {
+                Node *diff = new_node(ND_BINOP, 0, true);
+                *diff = *n;
+                diff->type = t_int;
+                Node *k = new_node(ND_LITERAL, NULL, true);
+                k->type = t_int;
+                int sh = 0;
+                while ((1 << sh) < esize) sh++;
+                bool pow2 = (1 << sh) == esize;
+                k->u.literal.ival = pow2 ? sh : esize;
+                n->op_kind = pow2 ? TK_SHIFTR : TK_SLASH;
+                n->ch[0] = diff;
+                n->ch[1] = k;
+                n->type = t_int;
+            }
+            return;
+        }
+        // Scale pointer arithmetic: if one side is a pointer and the other an integer,
+        // scale the integer by the size of the pointed-to element.
         if (is_unscaled_ptr(lhs) && istype_intlike(rhs->type))
             insert_scale(n, 1, elem_type(lhs->type)->size);
         else if (is_unscaled_ptr(rhs) && istype_intlike(lhs->type))
@@ -1968,14 +2022,42 @@ static void insert_coercions_step(Node *n)
         if (rhs->type != lhs_type)
             insert_cast(n, 1, lhs_type);
     }
+    if (n->is_expr && n->kind == ND_TERNARY && n->type && n->type != t_void
+            && (istype_fp(n->type) || (istype_intlike(n->type) && !istype_ptr(n->type))))
+    {
+        // Both branches convert to the result type (C89 3.3.15).
+        if (n->ch[1]->type != n->type) insert_cast(n, 1, n->type);
+        if (n->ch[2]->type != n->type) insert_cast(n, 2, n->type);
+    }
     if (n->kind == ND_COMPOUND_ASSIGN)
     {
-        // If RHS type differs from LHS type, cast RHS so codegen uses consistent ops.
+        // a op= b is a = (T)(a op b), computed in the common type of a and b
+        // (C89 3.3.16.2). The RHS is cast to the type the operation runs in;
+        // braun converts the LHS value to it and the result back. For + - *
+        // & | ^ << on integers the low bits do not depend on the width, so the
+        // operation stays in the LHS type (as-if); likewise for shifts, whose
+        // result type is the promoted LHS.
         Node *lhs = n->ch[0];
         Node *rhs = n->ch[1];
         Type *lhs_type = lhs->type;
-        if (rhs->type != lhs_type)
-            insert_cast(n, 1, lhs_type);
+        Type *op_type = lhs_type;
+        bool arith = !istype_ptr(lhs_type) && !istype_ptr(rhs->type) &&
+                     (istype_intlike(lhs_type) || istype_fp(lhs_type)) &&
+                     (istype_intlike(rhs->type) || istype_fp(rhs->type));
+        if (arith)
+        {
+            Type *common = usual_arith_type(promote(lhs_type), promote(rhs->type));
+            bool int_only = !istype_fp(common) && !istype_fp(lhs_type);
+            bool width_free = n->op_kind == TK_PLUS || n->op_kind == TK_MINUS ||
+                              n->op_kind == TK_STAR || n->op_kind == TK_AMPERSAND ||
+                              n->op_kind == TK_BITOR || n->op_kind == TK_BITXOR ||
+                              n->op_kind == TK_SHIFTL;
+            bool shift = n->op_kind == TK_SHIFTL || n->op_kind == TK_SHIFTR;
+            if (!shift && !(int_only && width_free))
+                op_type = common;
+        }
+        if (rhs->type != op_type)
+            insert_cast(n, 1, op_type);
     }
     if (n->kind == ND_DECLARATOR && n->ch[1] && n->symbol)
     {

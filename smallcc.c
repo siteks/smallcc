@@ -757,6 +757,7 @@ int main(int argc, char **argv)
                     if (opt_flags & OPT_CSE) STAT("pre-cse", opt_stat_cse_alias, opt_pre_oos_cse(f));
                     if (opt_flags & OPT_CSE) opt_load_cse(f);
                     verify_function(f, "pre-simplify+cse", VERIFY_PRE_OOS);
+                    opt_narrow_wrap_range(f);
                     opt_scalar_promote(f);
                     opt_addr_iv(f);
                     opt_lsr(f);

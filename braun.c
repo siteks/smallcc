@@ -705,7 +705,7 @@ static int32_t fold_binop(InstKind kind, int32_t a, int32_t b) {
     case IK_OR:   return a | b;
     case IK_XOR:  return a ^ b;
     case IK_SHL:  return (int32_t)(ua << (ub & 31));
-    case IK_SHR:  return (int32_t)(ua >> (ub & 31));
+    case IK_SHR:  return a >> (ub & 31);               // signed (braun emits IK_USHR for unsigned)
     case IK_USHR: return (int32_t)(ua >> (ub & 31));
     case IK_EQ:   return a == b ? 1 : 0;
     case IK_NE:   return a != b ? 1 : 0;
@@ -1083,22 +1083,102 @@ static bool is_ssa_var(BraunCtx *ctx, Node *lhs) {
 // Perform a read-modify-write on lhs: new = binop(old, rhs).
 // Writes new back via write_var (SSA path) or store (memory path).
 // Returns old if want_old, else new.
+// Convert v to value type vt: the lowering of a cast, shared with compound
+// assignment (which computes in the common type and converts back).
+static Value *emit_convert(BraunCtx *ctx, Block *b, Value *v, ValType vt) {
+    ValType src_vt = v->vtype;
+    if (vt == VT_VOID || vt == src_vt) return v;
+
+    InstKind kind = IK_COPY;
+    if (vt == VT_F32 && src_vt != VT_F32)                     kind = IK_ITOF;
+    else if (vt != VT_F32 && src_vt == VT_F32)                kind = IK_FTOI;
+    else if ((vt == VT_I8 || vt == VT_U8) && src_vt != VT_I8
+             && src_vt != VT_U8)                               kind = IK_TRUNC;
+    else if ((vt == VT_I16 || vt == VT_U16) &&
+             (src_vt == VT_I32 || src_vt == VT_U32))          kind = IK_TRUNC;
+    else if ((vt == VT_U32 && src_vt == VT_I32) ||
+             (vt == VT_I32 && src_vt == VT_U32))              kind = IK_COPY;
+    else if (vt == VT_I8  && src_vt == VT_U8)                 kind = IK_SEXT8;
+    else if (vt == VT_I16 && src_vt == VT_U16)                kind = IK_SEXT16;
+    else if (vt == VT_U8  && src_vt == VT_I8)                 kind = IK_TRUNC;
+    else if (vt == VT_U16 && src_vt == VT_I16)                kind = IK_TRUNC;
+    else if (src_vt == VT_I8)                                  kind = IK_SEXT8;
+    else if (src_vt == VT_I16)                                 kind = IK_SEXT16;
+
+    // Fold casts of constants at construction time.
+    // Skip pointer types: VAL_CONST can't be used as a memory base
+    // address (no phys_reg), so pointer-typed constants must remain
+    // as VAL_INST to get a register from IRC.
+    if (v->kind == VAL_CONST && vt != VT_PTR) {
+        int32_t k = v->iconst;
+        if (kind == IK_SEXT8)  return new_const(ctx->f, (int8_t)(k & 0xff), vt);
+        if (kind == IK_SEXT16) return new_const(ctx->f, (int16_t)(k & 0xffff), vt);
+        // The target's conversions (cpu4/fpu_model.h), as for the float binops:
+        // the host's differ above 2^24 and on out-of-range values.
+        if (kind == IK_ITOF) return new_const(ctx->f, (int32_t)cpu4_itof((uint32_t)k), vt);
+        if (kind == IK_FTOI) return new_const(ctx->f, (int32_t)cpu4_ftoi((uint32_t)k), vt);
+    }
+
+    Value *dst = new_value(ctx->f, VAL_INST, vt);
+    Inst  *inst = bi(ctx, b, kind, dst);
+    inst->imm = (vt == VT_I8 || vt == VT_U8) ? 0xff :
+                (vt == VT_I16 || vt == VT_U16) ? 0xffff : 0;
+    inst_add_op(inst, v);
+    inst_append(b, inst);
+    return dst;
+}
+
+// Whether `x bop rhs`, with x an in-range unsigned char/short, can leave the
+// range. Right shifts and AND cannot; OR and XOR cannot when rhs is in range
+// too (a constant that fits, or a value of the same unsigned narrow type).
+static bool narrow_may_overflow(InstKind bop, Value *rhs, ValType vt) {
+    uint32_t mask = (vt == VT_U8) ? 0xffu : 0xffffu;
+    if (bop == IK_USHR || bop == IK_SHR || bop == IK_AND) return false;
+    if (bop == IK_OR || bop == IK_XOR) {
+        if (rhs->kind == VAL_CONST) return ((uint32_t)rhs->iconst & ~mask) != 0;
+        return !(rhs->vtype == vt || (vt == VT_U16 && rhs->vtype == VT_U8));
+    }
+    return true;
+}
+
+// lhs = lhs bop rhs. The operation runs in op_vt (the common type of a
+// compound assignment); when that differs from the lhs type vt, the old
+// value is converted to it and the result converted back.
+static Value *cg_rmw_as(BraunCtx *ctx, Block **cur, Node *lhs, InstKind bop,
+                        Value *rhs, ValType vt, ValType op_vt, bool want_old) {
+    Block *b = *cur;
+    Value *old, *addr = NULL;
+    int    sz = lhs->type ? lhs->type->size : 2;
+    bool   ssa = is_ssa_var(ctx, lhs);
+    if (ssa) old = read_var(ctx, b, lhs->symbol);
+    else {
+        addr = cg_addr(ctx, cur, lhs); b = *cur;
+        old  = emit_load(ctx, b, addr, sz, 0, vt);
+    }
+    Value *newv;
+    if (op_vt == vt) newv = emit_binop(ctx, b, bop, old, rhs, vt);
+    else newv = emit_convert(ctx, b, emit_binop(ctx, b, bop, emit_convert(ctx, b, old, op_vt), rhs, op_vt), vt);
+    if (!ssa) emit_store(ctx, b, addr, newv, sz, 0);     // the store truncates
+    // An unsigned char/short value is assumed in range wherever it is widened
+    // (the widening is a plain copy), so the result of arithmetic in that
+    // type must wrap here: 250 + 10 is 4. Signed narrow values are
+    // re-extended when widened and need nothing.
+    if ((vt == VT_U8 || vt == VT_U16) && newv->kind != VAL_CONST &&
+        narrow_may_overflow(bop, rhs, vt)) {
+        Value *t = new_value(ctx->f, VAL_INST, vt);
+        Inst  *in = bi(ctx, b, IK_TRUNC, t);
+        in->imm = (vt == VT_U8) ? 0xff : 0xffff;
+        inst_add_op(in, newv);
+        inst_append(b, in);
+        newv = t;
+    }
+    if (ssa) write_var(b, lhs->symbol, newv);
+    return want_old ? old : newv;
+}
+
 static Value *cg_rmw(BraunCtx *ctx, Block **cur, Node *lhs,
                      InstKind bop, Value *rhs, ValType vt, bool want_old) {
-    Block *b = *cur;
-    if (is_ssa_var(ctx, lhs)) {
-        Symbol *sym  = lhs->symbol;
-        Value  *old  = read_var(ctx, b, sym);
-        Value  *newv = emit_binop(ctx, b, bop, old, rhs, vt);
-        write_var(b, sym, newv);
-        return want_old ? old : newv;
-    }
-    Value *addr = cg_addr(ctx, cur, lhs); b = *cur;
-    int    sz   = lhs->type ? lhs->type->size : 2;
-    Value *old  = emit_load(ctx, b, addr, sz, 0, vt);
-    Value *newv = emit_binop(ctx, b, bop, old, rhs, vt);
-    emit_store(ctx, b, addr, newv, sz, 0);
-    return want_old ? old : newv;
+    return cg_rmw_as(ctx, cur, lhs, bop, rhs, vt, vt, want_old);
 }
 
 // ============================================================
@@ -1666,64 +1746,20 @@ static Value *cg_expr(BraunCtx *ctx, Block **cur, Node *n) {
 
     // ----------------------------------------------------------
     case ND_COMPOUND_ASSIGN: {
+        // insert_coercions cast the RHS to the type the operation runs in.
         ValType lhs_vt = vt_of(n->ch[0]->type);
+        ValType op_vt  = vt_of(n->ch[1]->type);
+        if (lhs_vt == VT_PTR || op_vt == VT_PTR) op_vt = lhs_vt;
         Value   *rhs  = cg_expr(ctx, cur, n->ch[1]); b = *cur;
-        InstKind kind = tok_binop_kind(n->op_kind, lhs_vt);
-        return cg_rmw(ctx, cur, n->ch[0], kind, rhs, lhs_vt, false);
+        InstKind kind = tok_binop_kind(n->op_kind, op_vt);
+        return cg_rmw_as(ctx, cur, n->ch[0], kind, rhs, lhs_vt, op_vt, false);
     }
 
     // ----------------------------------------------------------
     case ND_CAST: {
         // ch[1] = expression; ch[0] = type declaration (for target type)
-        ValType src_vt;
         Value *v = cg_expr(ctx, cur, n->ch[1]); b = *cur;
-        src_vt = v->vtype;
-
-        if (vt == VT_VOID || vt == src_vt) return v;
-
-        InstKind kind = IK_COPY;
-        if (vt == VT_F32 && src_vt != VT_F32)                     kind = IK_ITOF;
-        else if (vt != VT_F32 && src_vt == VT_F32)                kind = IK_FTOI;
-        else if ((vt == VT_I8 || vt == VT_U8) && src_vt != VT_I8
-                 && src_vt != VT_U8)                               kind = IK_TRUNC;
-        else if ((vt == VT_I16 || vt == VT_U16) &&
-                 (src_vt == VT_I32 || src_vt == VT_U32))          kind = IK_TRUNC;
-        else if ((vt == VT_U32 && src_vt == VT_I32) ||
-                 (vt == VT_I32 && src_vt == VT_U32))              kind = IK_COPY;
-        else if (vt == VT_I8  && src_vt == VT_U8)                 kind = IK_SEXT8;
-        else if (vt == VT_I16 && src_vt == VT_U16)                kind = IK_SEXT16;
-        else if (vt == VT_U8  && src_vt == VT_I8)                 kind = IK_TRUNC;
-        else if (vt == VT_U16 && src_vt == VT_I16)                kind = IK_TRUNC;
-        else if (src_vt == VT_I8)                                  kind = IK_SEXT8;
-        else if (src_vt == VT_I16)                                 kind = IK_SEXT16;
-
-        // Fold casts of constants at construction time.
-        // Skip pointer types: VAL_CONST can't be used as a memory base
-        // address (no phys_reg), so pointer-typed constants must remain
-        // as VAL_INST to get a register from IRC.
-        if (v->kind == VAL_CONST && vt != VT_PTR) {
-            int32_t k = v->iconst;
-            if (kind == IK_SEXT8)  return new_const(ctx->f, (int8_t)(k & 0xff), vt);
-            if (kind == IK_SEXT16) return new_const(ctx->f, (int16_t)(k & 0xffff), vt);
-            if (kind == IK_ITOF) {
-                float fv = (float)k;
-                uint32_t bits; memcpy(&bits, &fv, sizeof bits);
-                return new_const(ctx->f, (int32_t)bits, vt);
-            }
-            if (kind == IK_FTOI) {
-                float fv; uint32_t uk = (uint32_t)k;
-                memcpy(&fv, &uk, sizeof fv);
-                return new_const(ctx->f, (int32_t)fv, vt);
-            }
-        }
-
-        Value *dst = new_value(ctx->f, VAL_INST, vt);
-        Inst  *inst = bi(ctx, b, kind, dst);
-        inst->imm = (vt == VT_I8 || vt == VT_U8) ? 0xff :
-                    (vt == VT_I16 || vt == VT_U16) ? 0xffff : 0;
-        inst_add_op(inst, v);
-        inst_append(b, inst);
-        return dst;
+        return emit_convert(ctx, b, v, vt);
     }
 
     // ----------------------------------------------------------

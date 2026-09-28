@@ -61,6 +61,7 @@ Node* parse tree  (output of resolve_symbols / derive_types / insert_coercions)
       ├─ opt_known_bits()     opt.c      R2K: known-bits simplification
       ├─ opt_bitwise_dist()   opt.c      R2L: bitwise distribution
       ├─ opt_pre_oos_cse()    opt.c      GVN on true SSA form (relaxed cross-block policy)
+      ├─ opt_narrow_wrap_range() opt.c   drop a bounded unsigned char/short wrap (loop counters)
       ├─ opt_scalar_promote() opt.c      hoist load-modify-store to register accumulator phi
       ├─ opt_addr_iv()        opt.c      address induction variables
       ├─ opt_lsr()            opt.c      loop strength reduction (iv*invariant → ADD chain)
