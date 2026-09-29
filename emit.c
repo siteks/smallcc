@@ -2545,13 +2545,22 @@ static void emit_function_body(Function *f, FILE *out, BranchFuse *fuse,
             fprintf(out, "_%s_B%d:\n", f->name, b->id);
         FILE *real_out = out;
         for (Inst *inst = b->head; inst; inst = inst->next) {
-            if (flag_annotate && inst->line && inst->line != ann_prev_line) {
-                emit_src_comment(inst->line, real_out);
-                ann_prev_line = inst->line;
+            // inst->line is a src_loc id: the line in this TU's text for
+            // -ann (inlined code from another file has none), and for -g
+            // the file and line followed by each inline call site,
+            // innermost first: "; @src FILE LINE @ FILE LINE ...".
+            int src_line = src_loc_line(inst->line);
+            const char *src_file = src_loc_file(inst->line);
+            if (flag_annotate && src_line && src_line != ann_prev_line &&
+                src_file && f->filename && !strcmp(src_file, f->filename)) {
+                emit_src_comment(src_line, real_out);
+                ann_prev_line = src_line;
             }
             if (flag_linemap && inst->line && inst->line != lm_prev_line) {
-                fprintf(real_out, "; @src %s %d\n",
-                        f->filename ? f->filename : "?", inst->line);
+                fprintf(real_out, "; @src %s %d", src_file, src_line);
+                for (int site = src_loc_parent(inst->line); site; site = src_loc_parent(site))
+                    fprintf(real_out, " @ %s %d", src_loc_file(site), src_loc_line(site));
+                fputc('\n', real_out);
                 lm_prev_line = inst->line;
             }
             // Redirect output to buffer so we can append live annotation

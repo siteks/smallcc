@@ -1,3 +1,4 @@
+#include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 #include "ssa.h"
@@ -315,3 +316,48 @@ ValType type_to_valtype(Type *t) {
     default:                            return VT_VOID;
     }
 }
+
+// ---- source locations (ssa.h) ------------------------------------------
+typedef struct { const char *file; int line, parent; } SrcLocEnt;
+static SrcLocEnt *g_locs;
+static int g_nlocs = 1, g_loc_cap;          // id 0 = unknown
+static int *g_loc_hash;
+static int g_loc_hcap;
+
+static unsigned loc_hash(const char *file, int line, int parent) {
+    unsigned h = 2166136261u;
+    for (const char *c = file ? file : ""; *c; c++) { h ^= (unsigned char)*c; h *= 16777619u; }
+    h ^= (unsigned)line * 2654435761u; h ^= (unsigned)parent * 40503u;
+    return h;
+}
+
+int src_loc(const char *file, int line, int parent) {
+    if (line <= 0) return 0;
+    if (!file) file = "?";
+    if (2 * g_nlocs >= g_loc_hcap) {                      // grow and rehash
+        int nc = g_loc_hcap ? 2 * g_loc_hcap : 1024;
+        int *nh = calloc(nc, sizeof(int));
+        for (int i = 1; i < g_nlocs; i++) {
+            unsigned k = loc_hash(g_locs[i].file, g_locs[i].line, g_locs[i].parent) & (nc - 1);
+            while (nh[k]) k = (k + 1) & (nc - 1);
+            nh[k] = i;
+        }
+        free(g_loc_hash); g_loc_hash = nh; g_loc_hcap = nc;
+    }
+    unsigned k = loc_hash(file, line, parent) & (g_loc_hcap - 1);
+    for (; g_loc_hash[k]; k = (k + 1) & (g_loc_hcap - 1)) {
+        SrcLocEnt *e = &g_locs[g_loc_hash[k]];
+        if (e->line == line && e->parent == parent && !strcmp(e->file, file)) return g_loc_hash[k];
+    }
+    if (g_nlocs >= g_loc_cap) {
+        g_loc_cap = g_loc_cap ? 2 * g_loc_cap : 1024;
+        g_locs = realloc(g_locs, g_loc_cap * sizeof *g_locs);
+    }
+    g_locs[g_nlocs] = (SrcLocEnt){ file, line, parent };
+    g_loc_hash[k] = g_nlocs;
+    return g_nlocs++;
+}
+
+const char *src_loc_file(int id)  { return id > 0 && id < g_nlocs ? g_locs[id].file : NULL; }
+int         src_loc_line(int id)  { return id > 0 && id < g_nlocs ? g_locs[id].line : 0; }
+int         src_loc_parent(int id) { return id > 0 && id < g_nlocs ? g_locs[id].parent : 0; }

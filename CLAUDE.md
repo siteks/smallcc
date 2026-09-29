@@ -61,6 +61,8 @@ Tests are pytest-collected `.c` files under `tests/cases/` with `EXPECT_R0`/`EXP
 | `-retire FILE` | One line per retired instruction: pc, bytes, every register and memory change, next pc. `isatool/pysim.py --retire` (and `cpu4/sim.py --retire`) writes the same format; `tools/rig.py` compares the two this way |
 | `-pccount FILE`, `-imap FILE` | Execution count per pc; the assembler's instruction addresses, lengths and mnemonics. `tools/isaprof.py` (the ISA profile of the standard workloads, `--arch`) is built on them; see docs/testing.md |
 
+`tools/srcprof.py` turns a run into profile-annotated source: self and inclusive (through inlining) instructions per line, and a kernel table of invocations and instructions per invocation (`--html` writes a heatmap page; docs/testing.md). It relies on `smallcc -g`, whose `; @src` directives carry the inline call chain.
+
 ### CoreMark Benchmark
 
 `bench/coremark/coremark_single.c` is a single-file CoreMark (1 iteration,

@@ -157,6 +157,7 @@ typedef struct {
     int         has_cf;     // body has control flow: expanded through cg_stmt with
                             // returns jumping to a continuation block
     Type       *ret_type;   // has_cf: the return type (NULL: void)
+    const char *file;       // the source file it was defined in
 } InlineCandidate;
 
 #define MAX_INLINE        256
@@ -390,6 +391,7 @@ void braun_register_inline_candidate(Node *func_decl, int tu_index) {
 
     InlineCandidate *ic = &g_inline[g_ninline++];
     ic->name = label;
+    ic->file = token_ctx.filename;
     ic->func_decl = func_decl;
     ic->nparams = np;
     ic->body = body;
@@ -469,13 +471,15 @@ typedef struct {
     Symbol  **inl_slot_syms;
     int      *inl_slot_offs;
     int       n_inl_slots, inl_slot_cap;
+    const char *cur_file;   // the file cur_line belongs to (an inlined callee's own)
+    int       inl_site;     // src_loc of the call being expanded inline (0: none)
 } BraunCtx;
 
 // Create an instruction and stamp the current source line on it.
 static Inst *bi(BraunCtx *ctx, Block *b, InstKind k, Value *dst)
 {
     Inst *inst = new_inst(ctx->f, b, k, dst);
-    inst->line = ctx->cur_line;
+    inst->line = src_loc(ctx->cur_file, ctx->cur_line, ctx->inl_site);
     return inst;
 }
 
@@ -1528,6 +1532,8 @@ static Value *cg_addr(BraunCtx *ctx, Block **cur, Node *n) {
 // Returns non-NULL SSA value if inlined, NULL if not.
 // ============================================================
 
+static Value *inline_body(BraunCtx *ctx, Block **cur, InlineCandidate *ic);
+
 static Value *braun_try_inline(BraunCtx *ctx, Block **cur, Symbol *fsym,
                                Node *args_head, ValType call_vt) {
     if (!istype_function(fsym->type)) return NULL;
@@ -1566,6 +1572,20 @@ static Value *braun_try_inline(BraunCtx *ctx, Block **cur, Symbol *fsym,
     }
     b = *cur;
     for (int i = 0; i < nav; i++) write_var(b, ic->param_syms[i], avs[i]);
+
+    // The body's instructions carry the callee's own lines, under this
+    // call site (src_loc parent), for -g and profiling.
+    const char *saved_file = ctx->cur_file;
+    int saved_line = ctx->cur_line, saved_site = ctx->inl_site;
+    ctx->inl_site = src_loc(ctx->cur_file, ctx->cur_line, ctx->inl_site);
+    if (ic->file) ctx->cur_file = ic->file;
+    Value *res = inline_body(ctx, cur, ic);
+    ctx->cur_file = saved_file; ctx->cur_line = saved_line; ctx->inl_site = saved_site;
+    return res;
+}
+
+static Value *inline_body(BraunCtx *ctx, Block **cur, InlineCandidate *ic) {
+    Block *b = *cur;
 
     if (ic->has_cf) {
         // The whole body through cg_stmt; `return` writes the result
@@ -2786,6 +2806,7 @@ Function *braun_function(Node *func_decl, int tu_index, int *strlit_id) {
     ctx.f         = f;
     ctx.tu_index  = tu_index;
     ctx.strlit_id = strlit_id;
+    ctx.cur_file  = token_ctx.filename;
     g_cur_strlit_id = strlit_id;
 
     // Pre-scan for address-taken locals/params

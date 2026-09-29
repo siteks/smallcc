@@ -125,7 +125,8 @@ struct Inst {
     Block    *block;
     int       is_dead;
     int       is_volatile;  // IK_LOAD/IK_STORE through a volatile lvalue: never moved, merged, narrowed or deleted
-    int       line;         // source line (0 = unknown); used by -ann emission
+    int       line;         // source location id (src_loc; 0 = unknown): file, line and
+                            // the inline call site; passes copy it from a neighbour
 };
 
 // Braun variable maps (valid only during SSA construction)
@@ -221,5 +222,13 @@ void inst_insert_after(Inst *prev, Inst *new_inst);
 
 // ValType size in bytes
 int vtype_size(ValType vt);
+
+// Source locations: an interned (file, line, parent) triple, where parent is
+// the location of the call an inlined body was expanded at (0: none).
+// Inst.line holds an id; emission turns it back into file and line.
+int         src_loc(const char *file, int line, int parent);
+const char *src_loc_file(int id);
+int         src_loc_line(int id);
+int         src_loc_parent(int id);
 
 #endif // SSA_H
