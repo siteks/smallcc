@@ -1044,6 +1044,207 @@ static Value *unwrap_for_mask(Value *v, uint32_t mask) {
     return val_resolve(v);
 }
 
+// ── Sign-extension idiom ─────────────────────────────────────────────────
+//
+// Decoders sign-extend a field x of k+1 bits by testing its top bit:
+//     x | ((x & 2^k) ? -2^(k+1) : 0)        (ternary: or of a phi of constants)
+//     if (x & 2^k) x |= -2^(k+1);           (phi of x | -2^(k+1) and x)
+// Both are a branch and a phi; when every bit of x above bit k is known zero
+// they are sext(x, k+1) = (int)(x << (31-k)) >> (31-k), and when x is itself
+// y >> (31-k) (logical) they are y >> (31-k) arithmetic: one shrsli for a
+// RISC-V I-type immediate. The diamond left behind is removed by the branch
+// folding that runs next.
+
+// The two predecessors of join block b come (through straight-line blocks)
+// from the two sides of one branch; *h is the branching block and *ti the
+// index of the predecessor on its true side.
+static int diamond_sides(Block *b, Block **h, int *ti) {
+    if (b->npreds != 2) return 0;
+    Block *arm[2], *anc[2];
+    for (int s = 0; s < 2; s++) {
+        Block *p = b->preds[s];
+        while (p->npreds == 1 && p->preds[0]->nsuccs == 1) p = p->preds[0];
+        if (p->npreds != 1) return 0;
+        arm[s] = p;                    // first block of this side
+        anc[s] = p->preds[0];          // the branching block
+    }
+    if (anc[0] != anc[1] || arm[0] == arm[1]) return 0;
+    Inst *term = anc[0]->tail;
+    while (term && term->is_dead) term = term->prev;
+    if (!term || term->kind != IK_BR || term->nops < 1 || !term->target || !term->target2) return 0;
+    if (arm[0] == term->target && arm[1] == term->target2) *ti = 0;
+    else if (arm[1] == term->target && arm[0] == term->target2) *ti = 1;
+    else return 0;
+    *h = anc[0];
+    return 1;
+}
+
+// cond tests bit k of x: AND(x, 2^k) or NE(AND(x, 2^k), 0). Returns k or -1.
+static int bit_test_of(Value *cond, Value **x) {
+    cond = val_resolve(cond);
+    if (!cond || cond->kind != VAL_INST || !cond->def || cond->def->is_dead) return -1;
+    Inst *d = cond->def;
+    if (d->kind == IK_NE && d->nops == 2) {
+        Value *z = val_resolve(d->ops[1]);
+        if (!z || z->kind != VAL_CONST || z->iconst != 0) return -1;
+        return bit_test_of(d->ops[0], x);
+    }
+    if (d->kind != IK_AND || d->nops != 2) return -1;
+    Value *a = val_resolve(d->ops[0]), *m = val_resolve(d->ops[1]);
+    if (a && a->kind == VAL_CONST) { Value *t = a; a = m; m = t; }
+    if (!m || m->kind != VAL_CONST || !a || a->kind != VAL_INST) return -1;
+    uint32_t p = (uint32_t)m->iconst;
+    if (!p || (p & (p - 1)) || p >= 0x80000000u) return -1;
+    *x = a;
+    return __builtin_ctz(p);
+}
+
+// v with copies looked through (an int cast of a u32 is a copy).
+static Value *strip_copies(Value *v) {
+    v = val_resolve(v);
+    while (v && v->kind == VAL_INST && v->def && v->def->kind == IK_COPY && v->def->nops == 1)
+        v = val_resolve(v->def->ops[0]);
+    return v;
+}
+
+// v is a known constant (through copies): *k gets it.
+static int kb_const(Value *v, uint32_t *k) {
+    KnownBits kb = kb_get(v);
+    if (~kb.zero & ~kb.one) return 0;
+    *k = kb.one;
+    return 1;
+}
+
+// Drop one use of v; an instruction of the idiom left unused dies with it
+// (a dead phi is aliased to an operand, as R2K does, so OOS skips it).
+static void drop_use(Value *v) {
+    v = val_resolve(v);
+    if (!v || v->kind != VAL_INST || v->use_count <= 0) return;
+    if (--v->use_count > 0 || !v->def || v->def->is_dead) return;
+    Inst *d = v->def;
+    switch (d->kind) {
+    case IK_PHI: case IK_OR: case IK_COPY: case IK_CONST:
+        break;
+    default:
+        return;
+    }
+    d->is_dead = 1;
+    if (d->kind == IK_PHI && d->nops > 0) {
+        Value *a = val_resolve(d->ops[0]);
+        if (a && a != v) v->alias = a;
+    }
+    for (int i = 0; i < d->nops; i++) drop_use(d->ops[i]);
+}
+
+// Insert before `at` the value sext(x, k+1), retyped to vt.
+static Value *emit_sext(Function *f, Inst *at, Value *x, int k, ValType vt) {
+    int sh = 31 - k;
+    Value *src = x;
+    Inst *xd = x->def;
+    Value *xs = xd && xd->kind == IK_USHR && xd->nops == 2 ? val_resolve(xd->ops[1]) : NULL;
+    int direct = xs && xs->kind == VAL_CONST && xs->iconst == sh;
+    if (direct) {
+        src = val_resolve(xd->ops[0]);
+    } else {
+        Value *t = new_value(f, VAL_INST, VT_I32);
+        Inst  *si = new_inst(f, at->block, IK_SHL, t);
+        si->line = at->line;
+        inst_add_op(si, x);
+        inst_add_op(si, new_const(f, sh, VT_I32));
+        inst_insert_before(at, si);
+        src = t;
+    }
+    Value *r = new_value(f, VAL_INST, VT_I32);
+    Inst  *ri = new_inst(f, at->block, IK_SHR, r);
+    ri->line = at->line;
+    inst_add_op(ri, src);
+    inst_add_op(ri, new_const(f, sh, VT_I32));
+    inst_insert_before(at, ri);
+    if (vt == VT_I32) return r;
+    Value *c = new_value(f, VAL_INST, vt);
+    Inst  *ci = new_inst(f, at->block, IK_COPY, c);
+    ci->line = at->line;
+    inst_add_op(ci, r);
+    inst_insert_before(at, ci);
+    return c;
+}
+
+int opt_stat_sext;
+
+// After a rewrite the diamond's arms hold only leftovers (constant copies
+// nothing reads); clear them so the branch folding that follows sees empty
+// arms and removes the branch.
+static void clear_arms(Block *b) {
+    for (int s = 0; s < b->npreds; s++)
+        for (Block *p = b->preds[s]; p; p = (p->npreds == 1 && p->preds[0]->nsuccs == 1) ? p->preds[0] : NULL)
+            for (Inst *i = p->head; i; i = i->next)
+                if (!i->is_dead && i->dst && i->dst->use_count == 0 &&
+                    (i->kind == IK_COPY || i->kind == IK_CONST || i->kind == IK_OR)) {
+                    i->is_dead = 1;
+                    for (int o = 0; o < i->nops; o++) drop_use(i->ops[o]);
+                }
+}
+
+void opt_sext_idiom(Function *f) {
+    compute_known_bits(f);
+    for (int bi = 0; bi < f->nblocks; bi++) {
+        Block *b = f->blocks[bi];
+        if (b->npreds != 2) continue;
+        Block *h; int ti;
+        if (!diamond_sides(b, &h, &ti)) continue;
+        Inst *term = h->tail;
+        while (term && term->is_dead) term = term->prev;
+        Value *x = NULL;
+        int k = bit_test_of(term->ops[0], &x);
+        if (k < 0 || k > 30) continue;
+        Value *xs = strip_copies(x);
+        uint32_t above = ~((2u << k) - 1);
+        if ((kb_get(x).zero & above) != above) continue;      // x fits in k+1 bits
+        uint32_t ext = above;                                 // -2^(k+1)
+        for (Inst *inst = b->head; inst; inst = inst->next) {
+            if (inst->is_dead || inst->kind != IK_PHI || inst->nops != 2 || !inst->dst) continue;
+            Value *vt = val_resolve(inst->ops[ti]), *vf = val_resolve(inst->ops[1 - ti]);
+            uint32_t kt, kf;
+            // if-form: phi(x | ext on the true side, x on the false side)
+            if (strip_copies(vf) == xs && vt && vt->kind == VAL_INST && vt->def && vt->def->kind == IK_OR &&
+                vt->def->nops == 2 && !vt->def->is_dead) {
+                Value *o0 = val_resolve(vt->def->ops[0]), *o1 = val_resolve(vt->def->ops[1]);
+                Value *kk = (strip_copies(o0) == xs) ? o1 : (strip_copies(o1) == xs) ? o0 : NULL;
+                if (!kk || !kb_const(kk, &kt) || kt != ext) continue;
+                Inst *at = inst;
+                while (at && at->kind == IK_PHI) at = at->next;
+                if (!at) continue;
+                Value *s = emit_sext(f, at, x, k, inst->dst->vtype);
+                inst->dst->alias = s;
+                inst->is_dead = 1;
+                drop_use(inst->ops[0]); drop_use(inst->ops[1]);
+                clear_arms(b);
+                opt_stat_sext++;
+                continue;
+            }
+            // ternary form: phi(ext on the true side, 0 on the false side), ORed into x
+            if (!(vt && kb_const(vt, &kt) && kt == ext && vf && kb_const(vf, &kf) && kf == 0)) continue;
+            for (Inst *u = inst->next; u; u = u->next) {
+                if (u->is_dead || u->kind != IK_OR || u->nops != 2 || !u->dst) continue;
+                Value *o0 = val_resolve(u->ops[0]), *o1 = val_resolve(u->ops[1]);
+                if (!((strip_copies(o0) == xs && o1 == inst->dst) || (strip_copies(o1) == xs && o0 == inst->dst))) continue;
+                // The OR becomes a copy of the result in place (an aliased dead
+                // instruction would still run in irsim, which executes dead
+                // coalesced copies).
+                Value *s = emit_sext(f, u, x, k, VT_I32);
+                Value *o[2] = { u->ops[0], u->ops[1] };
+                u->kind = IK_COPY;
+                u->nops = 0;
+                u->ops  = NULL;
+                inst_add_op(u, s);
+                drop_use(o[0]); drop_use(o[1]);
+                clear_arms(b);
+                opt_stat_sext++;
+            }
+        }
+    }
+}
+
 // ── R2K: Known-bits simplification ──────────────────────────────────────
 //
 // Uses computed known bits to eliminate redundant operations:

@@ -50,6 +50,31 @@ static int store_size(Inst *inst) {
     Value *v = val_resolve(inst->ops[inst->nops - 1]);
     return v ? vtype_size(v->vtype) : 4;
 }
+// Pass G3: the access's register-relative forms (llw and llwx, lll; slw, sll)
+// have an element displacement covering the whole 64 KB image.
+static int g3_reaches(Inst *inst, int size) {
+    const char *ms[2] = { inst->kind == IK_STORE ? (size == 2 ? "slw" : "sll") : (size == 2 ? "llw" : "lll"),
+                          inst->kind == IK_LOAD && size == 2 ? "llwx" : NULL };
+    for (int i = 0; i < 2; i++) {
+        long lo, hi;
+        if (ms[i] && !(isa_real(ms[i]) && isa_imm_range(ms[i], 0, &lo, &hi) && hi * size >= 0x10000 - size)) return 0;
+    }
+    return 1;
+}
+
+// Pass G3: v is a global's address, or one plus a constant (*k): the symbol.
+static const char *g3_symbol(Value *v, int *k) {
+    *k = 0;
+    if (!v || v->kind != VAL_INST || !v->def || v->def->is_dead) return NULL;
+    if (v->def->kind == IK_ADD && v->def->nops == 2) {
+        Value *p = val_resolve(v->def->ops[0]), *c = val_resolve(v->def->ops[1]);
+        if (p && p->kind == VAL_CONST) { Value *t = p; p = c; c = t; }
+        if (!c || !get_iconst(c, k) || !p || p->kind != VAL_INST || !p->def) return NULL;
+        v = p;
+    }
+    return v->def->kind == IK_GADDR ? v->def->fname : NULL;
+}
+
 static int is_slot_load(Inst *inst)  { return inst->kind == IK_LOAD  && inst->nops >= 1 && !inst->ops[0] && !inst->fname && inst->dst && !inst->is_volatile; }
 static int is_slot_store(Inst *inst) { return inst->kind == IK_STORE && inst->nops == 1 && !inst->fname && !inst->is_volatile; }
 
@@ -686,6 +711,42 @@ void legalize_function(Function *f) {
             }
     }
 
+    // ── Pass G3: global array elements ───────────────────────────────────
+    // When a 2- or 4-byte register-relative load or store's scaled
+    // displacement reaches every element of the 64 KB image (CPU5: a 16-bit
+    // element index), `sym + x` with x in a register is addressed as base x
+    // plus displacement sym/size: the access keeps x as its base and names
+    // sym in fname. g[i] loses the immw of the address and the add.
+    // Globals of 2 or more bytes are 4-aligned, so sym/size is exact.
+    if (opt_flags & OPT_LEG_G) {
+        for (int bi = 0; bi < f->nblocks; bi++)
+            for (Inst *inst = f->blocks[bi]->head; inst; inst = inst->next) {
+                if (inst->is_dead || inst->fname) continue;
+                if (inst->kind == IK_LOAD  && (inst->nops < 1 || !inst->dst)) continue;
+                if (inst->kind == IK_STORE && inst->nops != 2) continue;
+                if (inst->kind != IK_LOAD && inst->kind != IK_STORE) continue;
+                int size = inst->kind == IK_LOAD ? load_size(inst) : store_size(inst);
+                if ((size != 2 && size != 4) || !g3_reaches(inst, size)) continue;
+                Value *base = inst->ops[0] ? val_resolve(inst->ops[0]) : NULL;
+                if (!base || base->kind != VAL_INST || !base->def || base->def->is_dead) continue;
+                if (base->def->kind != IK_ADD || base->def->nops != 2) continue;
+                Value *a0 = val_resolve(base->def->ops[0]), *a1 = val_resolve(base->def->ops[1]);
+                const char *sym = NULL;
+                int k = 0;
+                Value *x = NULL;
+                if ((sym = g3_symbol(a0, &k)) != NULL) x = a1;
+                else if ((sym = g3_symbol(a1, &k)) != NULL) x = a0;
+                if (!sym || !x || x->kind != VAL_INST) continue;
+                int off = inst->imm + k;              // a member array's offset, an element offset
+                if (off % size || off < -256 || off > 256) continue;
+                if (base->use_count > 0) base->use_count--;
+                x->use_count++;
+                inst->ops[0] = x;
+                inst->imm    = off;
+                inst->fname  = (char *)sym;
+            }
+    }
+
     // ── Pass H: forward frame-slot stores to later loads, drop dead private stores ──
     // After Pass G a local that never escapes is just a set of bp offsets; a
     // store followed (on every path) by a same-sized load of the same offset
@@ -793,12 +854,13 @@ void legalize_materialize_consts(Function *f) {
                     }
                     break;
                 case IK_AND:
-                    // P14 handles 0..255 (andi 0..127, andli 128..255); P8 handles 0xFFFF
+                    // P14 takes any constant andli's sign-extended immediate holds
+                    // (andi for small in-place masks); P8 handles 0xFFFF
                     for (int j = 0; j < inst->nops; j++) {
                         Value *v = inst->ops[j] ? val_resolve(inst->ops[j]) : NULL;
                         if (!v || v->kind != VAL_CONST) continue;
                         int k = v->iconst;
-                        if (k >= 0 && isa_imm_fits("andli", 0, k)) continue;  // P14 andi/andli
+                        if (isa_imm_fits("andli", 0, k)) continue;  // P14 andi/andli
                         if (k == 0xffff) continue;  // P8 zxw
                         Value *cv = new_value(f, VAL_INST, inst->dst->vtype);
                         Inst  *ci = new_inst(f, b, IK_CONST, cv);

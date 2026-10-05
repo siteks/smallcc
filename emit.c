@@ -492,9 +492,10 @@ static int p7_fold(InstKind kind, int32_t a, int32_t b, int32_t *result) {
 }
 
 // P8/P14: AND(x, kv) with a single constant operand — zxb/zxw for
-// 0xFF/0xFFFF (P8), andi/andli for 0..255 (P14).
+// 0xFF/0xFFFF (P8), andi/andli for anything andli's sign-extended
+// immediate holds (P14), e.g. & 0xfffff000 as andli -4096 on CPU5.
 static int p8_p14_and_fires(int kv) {
-    return (kv >= 0 && isa_imm_fits("andli", 0, kv)) || kv == 0xffff;
+    return isa_imm_fits("andli", 0, kv) || kv == 0xffff;
 }
 
 // P11/P13: SHL/SHR/USHR(x, k) with a resolvable constant shift amount
@@ -673,7 +674,7 @@ static void emit_inst(Inst *inst, FILE *out) {
         //      AND(x, 0xFFFF) → zxw (in-place) / zxwor rd, ps, ps (F1a 2 bytes,
         //      degenerate form of zxwor).
         // P14: AND(x, k) k in 0..127 in-place → andi (F2, 2 bytes);
-        //      otherwise k in 0..255 → andli (F0b, 3 bytes vs 5 for immw+and).
+        //      otherwise any k andli holds (sign-extended) → andli.
         if (inst->kind == IK_AND && (k0 ^ k1) && p8_p14_and_fires(kv)) {
             if (kv == 0xff) {
                 if (kreg == rd)
@@ -927,7 +928,12 @@ static void emit_inst(Inst *inst, FILE *out) {
         int is_s    = vtype_signed(dst->vtype);
         int off     = inst->imm;
 
-        if (inst->fname) {
+        if (inst->fname && base) {
+            // Global array element (legalize Pass G3): base register plus
+            // the symbol in the scaled displacement.
+            fprintf(out, "    %s %s, %s, %s/%d%+d\n", load_f3c(size, is_s), regname(rd),
+                    regname(preg(base)), inst->fname, size, off / size);
+        } else if (inst->fname) {
             // Absolute (legalize Pass G2): one ldl from symbol + offset.
             if (off) fprintf(out, "    ldl %s, %s%+d\n", regname(rd), inst->fname, off);
             else     fprintf(out, "    ldl %s, %s\n", regname(rd), inst->fname);
@@ -1001,7 +1007,11 @@ static void emit_inst(Inst *inst, FILE *out) {
             rb = sc;
         }
 
-        if (inst->fname) {
+        if (inst->fname && base && rb >= 0) {
+            // Global array element (legalize Pass G3).
+            fprintf(out, "    %s %s, %s, %s/%d%+d\n", store_f3c(size), regname(rv),
+                    regname(rb), inst->fname, size, off / size);
+        } else if (inst->fname) {
             // Absolute (legalize Pass G2): one stl to symbol + offset.
             if (off) fprintf(out, "    stl %s, %s%+d\n", regname(rv), inst->fname, off);
             else     fprintf(out, "    stl %s, %s\n", regname(rv), inst->fname);

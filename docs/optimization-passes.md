@@ -39,6 +39,7 @@ opt_frame_promote()                (frame_promote)
 opt_redundant_bool()         R2G   OPT_REDUNDANT_BOOL
 opt_narrow_loads()           R2H   OPT_NARROW_LOADS
 opt_known_bits()             R2K   (always on)
+opt_sext_idiom()                   (always on) sign extension written as a conditional OR
 opt_bitwise_dist()           R2L   (always on)
 opt_range_check()                  (always on)
 opt_fold_branches()          R2A   re-run: R2K's phi-select fold exposes
@@ -82,6 +83,7 @@ legalize_function()
   Pass G: frame-slot access    LEG_G   OPT_LEG_G   (IK_ADDR[+k] + load/store → bp-relative F2 form;
                                                    p+k + load/store → register-relative offset)
   Pass G2: absolute globals    LEG_G   OPT_LEG_G   (4-byte access to sym+k → ldl/stl, if the ISA has them)
+  Pass G3: global elements     LEG_G   OPT_LEG_G   (2/4-byte access to sym[+k]+x → x + displacement sym/N, if it reaches)
   Pass H: slot forwarding      LEG_H   OPT_LEG_H   (store→load forwarding on private frame slots,
                                                    dead private stores removed)
 
@@ -130,6 +132,7 @@ detection and accumulator promotion.
 | R2H | `OPT_NARROW_LOADS` | `opt_narrow_loads` | `AND(LOAD(2), 0xFF)` → `LOAD(1)` |
 | R2K | — | `opt_known_bits` | Known-bits: eliminate redundant AND/TRUNC/ZEXT |
 | R2L | — | `opt_bitwise_dist` | `OP(AND(a,c),AND(b,c))` → `AND(OP(a,b),c)` |
+| — | — | `opt_sext_idiom` | `x \| ((x & 2^k) ? -2^(k+1) : 0)` and `if (x & 2^k) x \|= -2^(k+1)`, with x known to fit k+1 bits → `sext(x, k+1)` as `shl`+`shr` (one `shrsli` when x is `y >> (31-k)`); the diamond is left empty for R2A. mini-rv32ima boot -5.5% (an RV32 I-type immediate goes from 5-6 instructions and a branch to 1) |
 | GVN | `OPT_CSE` | `opt_pre_oos_cse` | Dominator-tree CSE on true SSA form |
 | — | `OPT_CSE` | `opt_load_cse` | Reuse identical dominating loads (clobber-free region; const addrs skipped) |
 | — | — | `opt_frame_promote` | Scalar replacement of aggregates: each 4-byte field of a local that never escapes becomes an SSA value (stores define it, loads read it, phis built on demand at joins). Escape = a frame address reaching anything but a load/store address or a constant add; the object's extent runs to the next frame base, as in Pass H. Parameters are left in memory. `frame_promote` |
@@ -190,6 +193,7 @@ R2J ──→ R2D(2nd)      (unroll creates copies that need propagation)
 | Pass F | `OPT_LEG_F` | Materialize large `VAL_CONST` operands (ALU ops and float compares); also run at the start of the post-OOS pipeline | Optimization (avoids pushr/popr scratch; lets CSE/LICM see constants) |
 | Pass G | `OPT_LEG_G` | `IK_ADDR(slot) [+ k]` as a load/store base → bp-relative form (`lea`+`lll` → one F2 `ll`); `p + k` base → folded into the F3c offset when within ±511 elements | Optimization (one instruction per frame-slot access) |
 | Pass G2 | `OPT_LEG_G` | A 4-byte load/store at a global (+ constant) → absolute `ldl`/`stl`, on an ISA that has them (docs/compiler-pipeline.md) | Optimization (one instruction per global access) |
+| Pass G3 | `OPT_LEG_G` | A 2/4-byte load/store at `sym[+k] + x` → base `x`, displacement `sym/N` (`lll rd, rx, g/4+k`), when the scaled displacement reaches the whole image (CPU5) | Optimization (`g[i]`: 5 instructions → 3) |
 | Pass H | `OPT_LEG_H` | Forward a frame-slot store to later same-sized loads (same block, or single-predecessor chain); delete stores to private slots nothing loads. Escape analysis: a slot reachable from a live `IK_ADDR` (call arg, memcpy, pointer store) is invalidated by calls and pointer stores. Pre-coloured values are forwarded through a working copy | Optimization (out-param vectors and union puns live in registers) |
 
 Passes A–D are correctness requirements — they must always run. emit.c has no
@@ -223,7 +227,7 @@ Pass H after G        (H only sees slots that G exposed as bp offsets)
 | P11 | `SHL(x, k)` → `shli`/`shlli` | F2/F0b | 3/2 (5→2/3) |
 | P12 | Loop rotation (duplicate header BR) | — | 3 per loop iter |
 | P13 | `SHR/USHR(x, k)` → `shrsi`/`shrsli`/`shrli` | F2/F0b | 3/2 (5→2/3) |
-| P14 | `AND(x, 0-255)` → `andi`/`andli` | F2/F0b | 3/2 (5→2/3) |
+| P14 | `AND(x, k)`, k any value `andli`'s sign-extended immediate holds (CPU5: -32768..32767, so `& 0xfffff000` is `andli -4096`) → `andi`/`andli` | F2/F0b | 3/2 (5→2/3) |
 | P15 | Redundant AND via known-bits | — | 2-5 per elim |
 | P16 | `SHR(x,k)+AND(r,mask)` → `bitex` | F0b | 1-3 (4-6→3) |
 | P17 | `EQ/NE(x,const7)+BR` → `cbeq`/`cbne` | F0c | 2-3 (5-6→3) |

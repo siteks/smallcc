@@ -80,6 +80,8 @@ void opt_narrow_loads(Function *f);
 // R2K: Known-bits simplification: eliminate redundant AND/TRUNC/ZEXT using
 // forward known-bits analysis + unwrap_for_mask.
 void opt_known_bits(Function *f);
+void opt_sext_idiom(Function *f);   // x | (x & 2^k ? -2^(k+1) : 0) and its if-form -> sign extension
+extern int opt_stat_sext;
 
 // Redundant load elimination: reuse an identical dominating load when all
 // paths between are store/call-free (bounded region walk; skips constant

@@ -59,6 +59,7 @@ Node* parse tree  (output of resolve_symbols / derive_types / insert_coercions)
       ├─ opt_redundant_bool() opt.c      R2G: eliminate NE(cmp, 0) → cmp
       ├─ opt_narrow_loads()   opt.c      R2H: AND(LOAD, mask) → narrower LOAD
       ├─ opt_known_bits()     opt.c      R2K: known-bits simplification
+      ├─ opt_sext_idiom()     opt.c      x | (x & 2^k ? -2^(k+1) : 0) and its if-form → sign extension
       ├─ opt_bitwise_dist()   opt.c      R2L: bitwise distribution
       ├─ opt_pre_oos_cse()    opt.c      GVN on true SSA form (relaxed cross-block policy)
       ├─ opt_narrow_wrap_range() opt.c   drop a bounded unsigned char/short wrap (loop counters)
@@ -569,6 +570,25 @@ no base operand (the bp-relative shape) and `Inst.fname = sym`, `imm` the
 offset. It emits as `ldl rd, sym+k` / `stl rs, sym+k`; the address register
 goes away. Pass H, the IR interpreter and the printer read `fname` first.
 
+### Pass G3 — global array elements
+
+When the register-relative 2- and 4-byte loads and stores (`llw`/`llwx`,
+`lll`; `slw`, `sll`) have an element displacement that reaches every
+element of the 64 KB image (CPU5's 16-bit index; not CPU4's 8-bit one), a
+load or store whose base is `IK_ADD(sym-address, x)`, the symbol address
+being `IK_GADDR sym` or `IK_ADD(IK_GADDR sym, k)` (an array inside a global
+struct), keeps `x` as its base and names the symbol in `Inst.fname`, with
+`k` and any element offset in `imm`. It emits as `lll rd, rx, sym/4+k/4`
+(`label/N` is an assembler form for index operands): `g[i]` is
+`bitex; shli; lll` instead of `immw; bitex; shli; add; lll`. Globals of 2
+bytes or more are 4-aligned, so `sym/N` is exact; byte accesses are left
+alone (`llb`'s byte displacement reaches only the first 32 KB). The IR
+interpreter adds the base when both are present.
+
+On the mini-rv32ima emulator, whose register file is then a global array,
+this and P14 taking negative `andli` masks took the boot to the login prompt from
+3,167M to 2,933M CPU5 instructions (-7.4%); the ray tracer -0.85%.
+
 ### Constant loads the compiler uses when the ISA has them
 
 CPU5 defines them (S6a `ldl`/`stl`, S6b `lui`; CPU4 does not). The compiler
@@ -955,6 +975,7 @@ See **@docs/optimization-passes.md** for the full catalog with dependencies and 
 | R2G redundant bool (pre-OOS) | `opt.c` | Eliminate NE(cmp, 0) → cmp |
 | R2H narrow loads (pre-OOS) | `opt.c` | AND(LOAD(2), 0xFF) → LOAD(1) |
 | R2K known bits (pre-OOS) | `opt.c` | Eliminate redundant AND/TRUNC/ZEXT via forward analysis |
+| sign-extension idiom (pre-OOS) | `opt.c` | `opt_sext_idiom`: a conditional OR of the sign mask on a value known to fit k+1 bits → shifts |
 | R2L bitwise dist (pre-OOS) | `opt.c` | OP(AND(a,c),AND(b,c)) → AND(OP(a,b),c) |
 | pre-OOS GVN | `opt.c` | Dominator-tree CSE on true SSA form (relaxed cross-block) |
 | scalar promotion (pre-OOS) | `opt.c` | Hoist load-modify-store to register accumulator phi |

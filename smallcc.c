@@ -839,6 +839,7 @@ int main(int argc, char **argv)
                     if (opt_flags & OPT_REDUNDANT_BOOL) opt_redundant_bool(f);
                     if (opt_flags & OPT_NARROW_LOADS)   opt_narrow_loads(f);
                     STAT("pre",  opt_stat_kb_change, opt_known_bits(f));
+                    STAT("pre",  opt_stat_sext,      opt_sext_idiom(f));
                     STAT("pre",  opt_stat_bd_change, opt_bitwise_dist(f));
                     opt_range_check(f);
                     // Re-run the CFG cleanup: R2K's phi-select fold turns
