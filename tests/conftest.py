@@ -165,12 +165,13 @@ class CTestItem(pytest.Item):
                 f"compile failed (exit {proc.returncode}):\n{proc.stderr}"
 
             # Simulate with sim_c -arch cpu4; for hw target, request framebuffer dump.
-            # SIM_ARGS passes extra flags verbatim (e.g. // SIM_ARGS: -cores 4).
+            # SIM_ARGS passes extra flags verbatim (e.g. // SIM_ARGS: -cores 4);
+            # {dir} is the test file's directory (for -load ADDR {dir}/data).
             sim_cmd = [str(root / 'sim_c'), '-arch', self.isa]
             if target == 'hw':
                 sim_cmd.append('-dumpfb')
             if 'SIM_ARGS' in meta:
-                sim_cmd += meta['SIM_ARGS'].split()
+                sim_cmd += meta['SIM_ARGS'].replace('{dir}', str(self.path.parent)).split()
             sim_cmd.append(asm)
 
             sim = subprocess.run(sim_cmd, capture_output=True, text=True)

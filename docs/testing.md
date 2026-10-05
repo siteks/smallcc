@@ -42,7 +42,8 @@ This compiles `sim_c.c` (self-contained) against the system libc with `-lm`.
 ./sim_c [options] file.s
   -trace FILE        per-instruction execution trace
   -arch NAME         ISA (default cpu4; any <arch>/isa.py present)
-  -maxsteps N        override the instruction-step cap
+  -maxsteps N        override the instruction-step cap (64-bit)
+  -load ADDR FILE    copy FILE into SDRAM at ADDR (>= 0x10000) before running; repeatable
   -dump FILE         assemble + write bytecode dump; no execution
   -dumpfb            dump the 80x30 text framebuffer at 0xF000 after running
   -fb FILE           dump the bitmap framebuffer to FILE.ppm (honors DISP_MODE)
@@ -348,7 +349,7 @@ containing `FILES` needs `EXPECT_*` keys.
 | `FILES` | space-separated filenames | Multi-TU: compile all listed files (relative to this file's directory) |
 | `TARGET` | `sim` (default) or `hw` | Selects the crt0 variant; `hw` tests are skipped in irsim mode |
 | `CFLAGS` | verbatim compiler flags | Appended to the `smallcc` command line (e.g. `-O0`, `-Ono-pass=licm`) |
-| `SIM_ARGS` | verbatim `sim_c` flags | Appended to the `sim_c` command line (e.g. `-cores 4`, `-maxsteps 200000`); such a case is skipped in irsim mode and on the RTL bench |
+| `SIM_ARGS` | verbatim `sim_c` flags | Appended to the `sim_c` command line (e.g. `-cores 4`, `-maxsteps 200000`); `{dir}` stands for the test file's directory (`-load 0x20000 {dir}/data.bin`); such a case is skipped in irsim mode and on the RTL bench |
 | `XFAIL` | `issue NNNN (reason)` | The case reproduces a known bug in `docs/issues/NNNN-*.md` and is expected to fail. Strict in sim_c mode: when the fix lands the case passes, pytest reports XPASS as a failure, and the tag is removed in the same commit. Not strict in irsim mode, which cannot observe every bug (no alignment checks, no devices) |
 | `TIMEOUT` | simulation time units | Read by the hardware harness only (`hw/test/conftest.py`); `sim_c`'s step cap is set with `SIM_ARGS: -maxsteps N` |
 
