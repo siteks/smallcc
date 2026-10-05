@@ -27,7 +27,7 @@ range it accepts:
 |---|---|---|---|
 | `simm` | signed | the value | no |
 | `uimm` | unsigned | the value | no |
-| `index` | signed element index (the semantics scale it) | the value | no |
+| `index` | signed element index (the semantics scale it) | the value | as `label/N` |
 | `bytes` | signed byte offset, a multiple of `scale` | value ÷ `scale` | no |
 | `raw` | a bit pattern: the signed or the unsigned range | the value | yes |
 | `abs` | an absolute address | the value | yes |
@@ -35,7 +35,10 @@ range it accepts:
 
 Where labels are allowed, `label+N` and `label-N` (decimal or hex `N`) are
 too, in both assemblers; the compiler uses it for absolute accesses to a
-field of a global.
+field of a global. An `index` operand takes `label/N`, `label/N+K` or
+`label/N-K`: the label's address divided by the element size `N` (it must
+divide exactly), plus `K` elements. The compiler uses it to put a jump
+table's address in a scaled load's displacement.
 
 An instruction without a `SEMANTICS` line still assembles, disassembles and
 decodes; executing it stops the machine with "has no semantics yet", and the

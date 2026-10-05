@@ -24,7 +24,8 @@ const Target target_cpu4 = {
     .tune         = { .lc_reserve = 6, .lc_reserve_large = 6, .lc_large_body = 16,
                       .lc_cap_reserve = 5, .lc_max_hoist = 4, .lc_min_uses = 1,
                       .licm_reserve = 5, .licm_max = 4, .licm_dense_hi = 30,
-                      .licm_dense_lo = 6, .lsr_reserve = 7, .ipra = 1, .ipra_reserve = 2, .inline_cf_nodes = 0, .frame_promote = 1, .spill_cost = 1, .spill_slots = 1 },
+                      .licm_dense_lo = 6, .lsr_reserve = 7, .ipra = 1, .ipra_reserve = 2, .inline_cf_nodes = 0, .frame_promote = 1, .spill_cost = 1, .spill_slots = 1,
+                      .jt_min_cases = 12, .jt_density = 50 },
 };
 
 // CPU5 (proposal 0004): 16 registers. The minimal ABI change from CPU4:
@@ -47,7 +48,10 @@ const Target target_cpu5 = {
     .tune         = { .lc_reserve = 14, .lc_reserve_large = 14, .lc_large_body = 64,
                       .lc_cap_reserve = 10, .lc_max_hoist = 2, .lc_min_uses = 3,
                       .licm_reserve = 4, .licm_max = 5, .licm_dense_hi = 1000,
-                      .licm_dense_lo = 14, .lsr_reserve = 15, .ipra = 1, .ipra_reserve = 0, .inline_cf_nodes = 160, .frame_promote = 1, .spill_cost = 1, .spill_slots = 1 },
+                      .licm_dense_lo = 14, .lsr_reserve = 15, .ipra = 1, .ipra_reserve = 0, .inline_cf_nodes = 160, .frame_promote = 1, .spill_cost = 1, .spill_slots = 1,
+                      // Jump tables (2026-10-05): rv32emu -7.3%; 7 cases stay a
+                      // chain (CoreMark's state machine is 2.8% slower as a table).
+                      .jt_min_cases = 8, .jt_density = 10 },
 };
 
 const Target *g_target = &target_cpu4;
@@ -79,6 +83,7 @@ static const struct { const char *name; size_t off; } tune_fields[] = {
     TF(lc_reserve), TF(lc_reserve_large), TF(lc_large_body), TF(lc_cap_reserve),
     TF(lc_max_hoist), TF(lc_min_uses), TF(licm_reserve), TF(licm_max),
     TF(licm_dense_hi), TF(licm_dense_lo), TF(lsr_reserve), TF(ipra), TF(ipra_reserve), TF(inline_cf_nodes), TF(frame_promote), TF(spill_cost), TF(spill_slots),
+    TF(jt_min_cases), TF(jt_density),
 #undef TF
 };
 

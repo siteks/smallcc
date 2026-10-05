@@ -83,8 +83,15 @@ def encode(isa, ins, operands, addr, resolve, final):
             try:
                 v = int(tok, 0)
             except ValueError:
+                m = re.match(r'^([^/]+)/(\d+)([+-]\d+)?$', tok) if o.kind == 'index' else None
                 if o.kind in model.LABEL_KINDS:
                     v = resolve(tok)
+                elif m:                                  # label/N[+-K]: an element index
+                    a, n = resolve(m.group(1)), int(m.group(2))
+                    if not n or a % n:
+                        fail(f"{ins.name} operand {k + 1}: {m.group(1)} (0x{a:04x}) is not a multiple of {n}")
+                        n = n or 1
+                    v = a // n + int(m.group(3) or 0)
                 else:
                     fail(f"{ins.name} operand {k + 1}: expected a number, got {tok!r}")
                     v = 0

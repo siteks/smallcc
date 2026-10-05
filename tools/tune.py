@@ -27,7 +27,7 @@ SMALLCC, SIM = os.path.join(ROOT, 'smallcc'), os.path.join(ROOT, 'sim_c')
 
 PARAMS = ['lc_reserve', 'lc_reserve_large', 'lc_large_body', 'lc_cap_reserve', 'lc_max_hoist',
           'lc_min_uses', 'licm_reserve', 'licm_max', 'licm_dense_hi', 'licm_dense_lo', 'lsr_reserve',
-          'ipra', 'ipra_reserve', 'inline_cf_nodes', 'frame_promote', 'spill_cost']
+          'ipra', 'ipra_reserve', 'inline_cf_nodes', 'frame_promote', 'spill_cost', 'jt_min_cases', 'jt_density']
 
 
 def ranges(K):
@@ -39,6 +39,7 @@ def ranges(K):
         'lsr_reserve': range(1, K), 'ipra': range(0, 2), 'ipra_reserve': range(0, K // 2 + 1),
         'inline_cf_nodes': [0, 40, 80, 120, 160, 200, 240],
         'frame_promote': range(0, 2), 'spill_cost': range(0, 2),
+        'jt_min_cases': [4, 6, 8, 10, 12, 16], 'jt_density': [5, 10, 20, 35, 50],
     }
 
 

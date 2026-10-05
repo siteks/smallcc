@@ -276,7 +276,7 @@ and attached to `Inst.calldesc` at each call site.
 | `ND_WHILESTMT` | header (unsealed) → body → seal; `IK_JMP` back-edge |
 | `ND_FORSTMT` | entry; cond_blk (unsealed); body; step; seal |
 | `ND_DOWHILESTMT` | body_blk; cond; `IK_BR` back-edge / exit |
-| `ND_SWITCHSTMT` | comparison chain with `IK_BR`/`IK_JMP`; dense switches (≥ 12 cases, value range ≤ 256, ≥ 50% density) emit `IK_SWITCH` instead — a jump-table dispatch that emission lowers to a range check + `shli` + table load + `jr` with a per-function `word` label table |
+| `ND_SWITCHSTMT` | comparison chain with `IK_BR`/`IK_JMP`; a switch with at least `jt_min_cases` cases covering at least `jt_density`% of a value range of at most 256 (Tune: CPU4 12 and 50, CPU5 8 and 10) emits `IK_SWITCH` instead, a jump-table dispatch (see Instruction selection) with a per-function `word` label table |
 | `ND_RETURNSTMT` | `IK_RET cg_expr(expr)` |
 | `ND_BREAKSTMT` | `IK_JMP brk_target` |
 | `ND_CONTINUESTMT` | `IK_JMP cont_target` |
@@ -786,10 +786,22 @@ used callee-saved register (r4–r7). Callee saves are stored **below** the spil
 | `IK_ICALL fp` | `jlr` (fp in r0) |
 | `IK_BR cond, T, F` | `jnz rx, T_label`; `j F_label` (both branches explicit) |
 | `IK_JMP target` | `j target` |
+| `IK_SWITCH sel` (llw's displacement reaches the whole image: CPU5) | `[gtli s, sel, hi; jnz s, default]` (`subli` first when the table starts above 0), `add s, sel, sel`, `llw s, s, _f_jtN/2-lo`, `jr s`. A minimum below 32 extends the table down to 0; a selector whose possible bits (`known_bits_mask`) fit a table of at most 256 entries needs no range check, so `switch (x & 0x7f)` is three instructions |
+| `IK_SWITCH sel` (CPU4) | `pushr sel`, signed range checks, table address in `sel`, `llw`, `popr`, `jr` |
 | `IK_RET v` | move v to r0 (if not already); `ret` |
 | `IK_PUTCHAR v` | move v to r0; `putchar` |
 
 Block labels: `_{funcname}_BN:` (function-scoped to avoid cross-function collisions).
+
+Block layout (`reorder_blocks`) builds traces: each block is followed by its
+jump target or its deeper branch successor when that is still unplaced. A new
+trace starts at the deepest unplaced block, preferring one that no unplaced
+block of the same depth jumps to (back edges aside). Without that preference
+the blocks after a jump table (which has no fall-through) were placed tail
+first, the loop latch before the join blocks that jump to it, costing a
+jump per block per iteration. Loop headers keep their place: loop rotation and
+P20 `dbnz` fusion expect the header before the body (placing a body first
+made `dbnz` fusion drop the decrement).
 
 Callee-saved registers (r4–r7): emit stores to frame immediately after `enter`, loads
 immediately before each `ret`. Uses bp-relative F2 instructions when in range.
@@ -988,8 +1000,10 @@ except `jl`/`jlr`, so a sibling's `ret` cannot return to the original caller
 without an ISA change.
 
 (Jump tables for switch are **implemented** — see `IK_SWITCH` above; sparse
-switches still lower to comparison chains, which P17 `cbeq`/`cbne` fusion
-keeps at 3 bytes per link.)
+or short switches still lower to comparison chains, which P17 `cbeq`/`cbne`
+fusion keeps at 3 bytes per link. A short chain beats a table that needs a
+range check when the first cases are the common ones: CoreMark's 7-case state
+machine is 2.8% slower as a table, hence CPU5's `jt_min_cases` of 8.)
 
 ---
 

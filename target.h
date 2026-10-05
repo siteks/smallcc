@@ -38,6 +38,8 @@ typedef struct Tune {
     int frame_promote;     // promote non-escaping frame slots to SSA values
     int spill_cost;        // IRC spill cost: 0 use count by def depth, 1 uses and defs by their depth
     int spill_slots;       // coalesce copy-related spill slots after allocation
+    int jt_min_cases;      // switch: a jump table needs at least this many cases ...
+    int jt_density;        //   ... covering at least this percentage of the case value range (at most 256)
 } Tune;
 extern Tune g_tune;        // the target's, then -Oparam overrides
 int tune_set(const char *name_eq_value);   // 0 if the name is unknown

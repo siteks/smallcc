@@ -6,6 +6,7 @@
 #include "target.h"
 #include "emit.h"
 #include "alloc.h"   // irc_add_clobbers
+#include "dom.h"     // dominates (block layout)
 
 // ============================================================
 // Source annotation (-ann)
@@ -1571,11 +1572,31 @@ static void reorder_blocks(Function *f) {
         }
 
         if (next_idx < 0) {
-            int best = -1, best_d = -1;
+            // New trace: the deepest unplaced block, preferring one that no
+            // unplaced block of its depth jumps to, so that a chain of
+            // blocks each jumping to the next (the join after a switch) is
+            // placed head first and falls through rather than being entered
+            // at its tail. Loop headers keep their place: loop rotation and
+            // dbnz fusion expect the header before the body.
+            int best = -1, best_d = -1, best_free = 0;
             for (int i = 0; i < n; i++) {
-                if (!placed[i] && f->blocks[i]->loop_depth > best_d) {
-                    best_d = f->blocks[i]->loop_depth;
-                    best = i;
+                if (placed[i]) continue;
+                Block *c = f->blocks[i];
+                int free_ = 1;
+                for (int pi = 0; pi < c->npreds && free_; pi++) {
+                    Block *p = c->preds[pi];
+                    // Only a predecessor this deep competes for the slot: a
+                    // shallower one (a preheader) is placed later anyway, and
+                    // a back edge means c heads a loop.
+                    if (p == c || p->loop_depth < c->loop_depth || dominates(c, p)) continue;
+                    Inst *pt = p->tail;
+                    while (pt && pt->is_dead) pt = pt->prev;
+                    if (!pt || pt->kind != IK_JMP || pt->target != c) continue;
+                    for (int j = 0; j < n; j++)
+                        if (f->blocks[j] == p) { if (!placed[j]) free_ = 0; break; }
+                }
+                if (c->loop_depth > best_d || (c->loop_depth == best_d && free_ && !best_free)) {
+                    best_d = c->loop_depth; best = i; best_free = free_;
                 }
             }
             next_idx = best;
@@ -2498,7 +2519,12 @@ static int emit_rotated_branch(Function *f, FILE *out, Inst *inst,
 // emit_function — main entry point
 // ============================================================
 
-#define MAX_JT 16
+// The CPU5-style dispatch puts the table's address in llw's displacement,
+// which needs the displacement to reach any 2-byte entry in the 64 KB image.
+static int jt_disp_in_llw(void) {
+    long lo, hi;
+    return isa_real("llw") && isa_real("gtli") && isa_imm_range("llw", 0, &lo, &hi) && hi >= 0x7fff;
+}
 
 // Emit the function body (per-block instructions + jump tables) to `out`.
 // Invoked twice: once to a memstream for exact byte-size measurement, once
@@ -2509,8 +2535,8 @@ static void emit_function_body(Function *f, FILE *out, BranchFuse *fuse,
                                int frame, int ann_live,
                                const int *block_start, const int *block_size,
                                uint8_t *no_rotate) {
-    struct { Inst *inst; int mn, mx; } jt_info[MAX_JT];
-    int jt_count = 0;
+    struct JtInfo { Inst *inst; int lo, hi; } *jt_info = NULL;   // tables, emitted after the body
+    int jt_count = 0, jt_cap = 0;
     int ann_prev_line = 0;
     int lm_prev_line  = 0;   // separate tracker for -g line-map directives
 
@@ -2643,7 +2669,7 @@ static void emit_function_body(Function *f, FILE *out, BranchFuse *fuse,
                     emit_inst(inst, out);
             } else if (inst->kind == IK_SWITCH && inst->nops >= 1) {
                 int sel_r = get_val_reg(out, inst->ops[0], 0);
-                int scr = (sel_r == 0) ? 1 : 0;
+                int scr = (sel_r == 0) ? 1 : 0;      // alloc keeps r0/r1 free across a switch
                 int nc = inst->switch_ncase;
                 int mn = inst->switch_vals[0], mx = inst->switch_vals[0];
                 for (int i = 1; i < nc; i++) {
@@ -2651,36 +2677,71 @@ static void emit_function_body(Function *f, FILE *out, BranchFuse *fuse,
                     if (inst->switch_vals[i] > mx) mx = inst->switch_vals[i];
                 }
                 int def_id = inst->switch_default->id;
-                fprintf(out, "    pushr %s\n", regname(sel_r));
-                emit_imm(out, scr, mn);
-                fprintf(out, "    blts %s, %s, _%s_sw%d\n",
-                        regname(sel_r), regname(scr), f->name, jt_count);
-                emit_imm(out, scr, mx);
-                fprintf(out, "    blts %s, %s, _%s_sw%d\n",
-                        regname(scr), regname(sel_r), f->name, jt_count);
-                if (mn == 0) {
-                    fprintf(out, "    add %s, %s, %s\n",
-                            regname(scr), regname(sel_r), regname(sel_r));
+                int lo = mn, hi = mx;
+                if (lo > 0 && lo < 32 && jt_disp_in_llw()) lo = 0;
+                if (jt_disp_in_llw() && isa_imm_fits("subli", 0, lo)) {
+                    // [range check;] add scr,sel,sel; llw scr,scr,_jt/2-lo; jr scr.
+                    // A small positive minimum extends the table down to 0 (no
+                    // subtraction), and a selector whose possible bits all fit in
+                    // a table of at most 256 entries needs no range check.
+                    // -lo goes in the displacement when _jt/2-lo stays in range
+                    // wherever the table lands (0 <= lo <= 32767); otherwise
+                    // the index is rebased in the register.
+                    int fold = lo >= 0 && lo <= 0x7fff;
+                    int km = known_bits_mask(inst->ops[0], 4);
+                    int check = 1;
+                    if (lo == 0 && km >= 0 && km < 256 && km >= hi) { hi = km; check = 0; }
+                    if (check) {
+                        if (lo == 0) {
+                            fprintf(out, "    gtli %s, %s, %d\n", regname(scr), regname(sel_r), hi);
+                        } else {
+                            fprintf(out, "    subli %s, %s, %d\n", regname(scr), regname(sel_r), lo);
+                            fprintf(out, "    gtli %s, %s, %d\n", regname(scr), regname(scr), hi - lo);
+                        }
+                        fprintf(out, "    jnz %s, _%s_B%d\n", regname(scr), f->name, def_id);
+                    }
+                    if (fold) {
+                        fprintf(out, "    add %s, %s, %s\n", regname(scr), regname(sel_r), regname(sel_r));
+                    } else {
+                        fprintf(out, "    subli %s, %s, %d\n", regname(scr), regname(sel_r), lo);
+                        fprintf(out, "    add %s, %s, %s\n", regname(scr), regname(scr), regname(scr));
+                    }
+                    fprintf(out, "    llw %s, %s, _%s_jt%d/2%+d\n", regname(scr), regname(scr), f->name, jt_count, fold ? -lo : 0);
+                    fprintf(out, "    jr %s\n", regname(scr));
                 } else {
+                    fprintf(out, "    pushr %s\n", regname(sel_r));
                     emit_imm(out, scr, mn);
-                    fprintf(out, "    sub %s, %s, %s\n",
+                    fprintf(out, "    blts %s, %s, _%s_sw%d\n",
+                            regname(sel_r), regname(scr), f->name, jt_count);
+                    emit_imm(out, scr, mx);
+                    fprintf(out, "    blts %s, %s, _%s_sw%d\n",
+                            regname(scr), regname(sel_r), f->name, jt_count);
+                    if (mn == 0) {
+                        fprintf(out, "    add %s, %s, %s\n",
+                                regname(scr), regname(sel_r), regname(sel_r));
+                    } else {
+                        emit_imm(out, scr, mn);
+                        fprintf(out, "    sub %s, %s, %s\n",
+                                regname(scr), regname(sel_r), regname(scr));
+                        fprintf(out, "    shli %s, 1\n", regname(scr));
+                    }
+                    fprintf(out, "    immw %s, _%s_jt%d\n", regname(sel_r), f->name, jt_count);
+                    fprintf(out, "    add %s, %s, %s\n",
                             regname(scr), regname(sel_r), regname(scr));
-                    fprintf(out, "    shli %s, 1\n", regname(scr));
+                    emit_rr(out, "llw", scr, scr, 0);
+                    fprintf(out, "    popr %s\n", regname(sel_r));
+                    fprintf(out, "    jr %s\n", regname(scr));
+                    fprintf(out, "_%s_sw%d:\n", f->name, jt_count);
+                    fprintf(out, "    popr %s\n", regname(sel_r));
+                    fprintf(out, "    j _%s_B%d\n", f->name, def_id);
                 }
-                fprintf(out, "    immw %s, _%s_jt%d\n", regname(sel_r), f->name, jt_count);
-                fprintf(out, "    add %s, %s, %s\n",
-                        regname(scr), regname(sel_r), regname(scr));
-                emit_rr(out, "llw", scr, scr, 0);
-                fprintf(out, "    popr %s\n", regname(sel_r));
-                fprintf(out, "    jr %s\n", regname(scr));
-                fprintf(out, "_%s_sw%d:\n", f->name, jt_count);
-                fprintf(out, "    popr %s\n", regname(sel_r));
-                fprintf(out, "    j _%s_B%d\n", f->name, def_id);
-                if (jt_count < MAX_JT) {
-                    jt_info[jt_count].inst = inst;
-                    jt_info[jt_count].mn = mn;
-                    jt_info[jt_count].mx = mx;
+                if (jt_count == jt_cap) {
+                    jt_cap = jt_cap ? 2 * jt_cap : 8;
+                    jt_info = realloc(jt_info, (size_t)jt_cap * sizeof *jt_info);
                 }
+                jt_info[jt_count].inst = inst;
+                jt_info[jt_count].lo = lo;
+                jt_info[jt_count].hi = hi;
                 jt_count++;
             } else {
                 emit_inst(inst, out);
@@ -2722,9 +2783,9 @@ static void emit_function_body(Function *f, FILE *out, BranchFuse *fuse,
     }
 
     // Emit jump tables after function body
-    for (int ti = 0; ti < jt_count && ti < MAX_JT; ti++) {
+    for (int ti = 0; ti < jt_count; ti++) {
         Inst *sw = jt_info[ti].inst;
-        int mn = jt_info[ti].mn, mx = jt_info[ti].mx;
+        int mn = jt_info[ti].lo, mx = jt_info[ti].hi;
         int def_id = sw->switch_default->id;
         fprintf(out, "    align\n");
         fprintf(out, "_%s_jt%d:\n", f->name, ti);
@@ -2741,6 +2802,7 @@ static void emit_function_body(Function *f, FILE *out, BranchFuse *fuse,
                 fprintf(out, "    word _%s_B%d\n", f->name, def_id);
         }
     }
+    free(jt_info);
 }
 
 void emit_function(Function *f, FILE *out) {

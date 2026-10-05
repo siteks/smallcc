@@ -2665,15 +2665,15 @@ static Block *cg_stmt(BraunCtx *ctx, Block *b, Node *n) {
 
         // Check if dense enough for jump table dispatch
         int use_jumptable = 0;
-        if (ncases >= 12) {
+        if (ncases >= g_tune.jt_min_cases) {
             int mn = case_vals[0], mx = case_vals[0];
             for (int i = 1; i < ncases; i++) {
                 if (case_vals[i] < mn) mn = case_vals[i];
                 if (case_vals[i] > mx) mx = case_vals[i];
             }
             int range = mx - mn + 1;
-            // Dense if ≥50% coverage and table fits in 256 entries
-            if (range > 0 && range <= 256 && ncases * 2 >= range)
+            // Dense enough (Tune jt_density, a percentage) and at most 256 entries
+            if (range > 0 && range <= 256 && ncases * 100 >= g_tune.jt_density * range)
                 use_jumptable = 1;
         }
 

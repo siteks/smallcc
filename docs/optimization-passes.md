@@ -274,6 +274,8 @@ Rerun it after a change to the ISA or to these passes.
 | `frame_promote` | `opt_frame_promote` | promote non-escaping frame slots to SSA values | 1 | 1 |
 | `spill_cost` | allocator | spill cost: 0 = use count scaled by the def's loop depth; 1 = every use and def weighted by its own loop depth | 1 | 1 |
 | `spill_slots` | allocator | after allocation, merge the slots of copy-related spilled values (and stack parameters) that are never live together; drop the copies | 1 | 1 |
+| `jt_min_cases` | braun `switch` | a jump table needs at least this many cases ... | 12 | 8 |
+| `jt_density` | braun `switch` | ... covering at least this percentage of the case value range (at most 256 values) | 50 | 10 |
 
 Both targets settle on less aggressive constant hoisting and strength
 reduction than the old hand-set values (2, 5, 16, 2, 4, 1, 4, 4, 10, 6, 4):

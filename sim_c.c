@@ -624,6 +624,20 @@ static void isa_encode(const IsaInstr *in, char ops[][MAX_NAME], int nops, int a
             char *e; long n = strtol(t, &e, 0);
             if (e != t && *e == '\0') v = n;
             else if (o->kind == ISA_RAW || o->kind == ISA_ABS || o->kind == ISA_PCREL) v = (pass == 2) ? (int64_t)lookup_sym(t) : 0;
+            else if (o->kind == ISA_INDEX && strchr(t, '/')) {
+                /* label/N[+-K]: the label's address in elements of N bytes, plus K */
+                char lab[MAX_NAME]; const char *sl = strchr(t, '/');
+                memcpy(lab, t, (size_t)(sl - t)); lab[sl - t] = '\0';
+                char *e2; long n2 = strtol(sl + 1, &e2, 10), k2 = 0;
+                if (*e2 == '+' || *e2 == '-') k2 = strtol(e2, &e2, 10);
+                if (n2 <= 0 || *e2 != '\0') asm_fail(line, "%s operand %d: expected label/N[+-K], got '%s'", in->name, k + 1, t);
+                v = 0;
+                if (pass == 2) {
+                    long a2 = lookup_sym(lab);
+                    if (a2 % n2) asm_fail(line, "%s operand %d: %s (0x%04lx) is not a multiple of %ld", in->name, k + 1, lab, a2, n2);
+                    v = a2 / n2 + k2;
+                }
+            }
             else {
                 if (pass == 2) asm_fail(line, "%s operand %d: expected a number, got '%s'", in->name, k + 1, t);
                 v = 0;

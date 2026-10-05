@@ -20,7 +20,7 @@ Preprocessor excluded. Features are assessed against ANSI C89/ISO C90.
 | `while` | ✅ | |
 | `do-while` | ✅ | |
 | `for` | ✅ | init/cond/inc all optional (ND_EMPTY for absent parts); init may be a declaration (C99) |
-| `switch` / `case` / `default` | ✅ | fall-through supported; selector re-evaluated per case |
+| `switch` / `case` / `default` | ✅ | fall-through supported; selector evaluated once; comparison chain, or a jump table when dense enough (`jt_min_cases`, `jt_density`) |
 | `break` | ✅ | works inside `while`, `for`, `do-while`, `switch` |
 | `continue` | ✅ | works inside `while`, `for`, `do-while` |
 | `goto` | ✅ | function-scoped labels; forward and backward jumps |

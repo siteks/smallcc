@@ -14,7 +14,7 @@ An ISA definition module provides:
               operands in assembly order: 'rd' | 'rx' | 'ry' for registers, or
                        (name, kind[, scale]) for an immediate; kinds:
                          simm  signed value        uimm  unsigned value
-                         index signed element index (the semantics scale it)
+                         index signed element index (the semantics scale it); label/N[+-K] too
                          bytes signed byte offset, encoded divided by `scale`
                          raw   bit pattern: accepts the signed and unsigned range, and labels
                          abs   absolute address: a label or a number
